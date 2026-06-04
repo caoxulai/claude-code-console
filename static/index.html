@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1e1e2e">
+  <title>claude-web</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <span class="title">claude-web</span>
+    <span class="cwd" id="cwd-label"></span>
+    <button id="reset-btn" type="button" title="Start a fresh session">new</button>
+  </header>
+  <main id="transcript" aria-live="polite"></main>
+  <form id="composer">
+    <textarea id="input" rows="2" placeholder="ask claude — Enter to send, Shift+Enter for newline" autocomplete="off"></textarea>
+    <button type="submit" id="send">send</button>
+  </form>
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

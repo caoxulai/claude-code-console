@@ -1,0 +1,20 @@
+[project]
+name = "claude-web"
+version = "0.1.0"
+description = "Single-user web UI for Claude Code, reachable from any device via AWS Tunnels + AEA"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "aiohttp[testing]",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
