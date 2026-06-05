@@ -129,13 +129,15 @@ def _get_all_project_dirs() -> list[Path]:
     return dirs
 
 
-def _app_url_for_project(project_name: str) -> str | None:
-    """Heuristic: return a localhost URL if the project has a known running server."""
+def _app_urls_for_project(project_name: str) -> list[dict]:
+    """Return known URLs for a project (local dev servers and deployed apps)."""
+    urls = []
     if "claude-web" in project_name:
-        return "http://127.0.0.1:7780"
+        urls.append({"url": "http://127.0.0.1:7780", "label": "Local", "type": "local"})
     if "oncall-kpi" in project_name:
-        return "http://127.0.0.1:8080"
-    return None
+        urls.append({"url": "http://127.0.0.1:8080", "label": "Local", "type": "local"})
+        urls.append({"url": "https://black-falcon-oncall-dashboard.beta.harmony.a2z.com/", "label": "Harmony", "type": "deployed"})
+    return urls
 
 
 def _collect_sop_files(project_path: Path) -> list[dict]:
@@ -237,8 +239,8 @@ async def list_projects(request: web.Request) -> web.Response:
         if memory_dir and memory_dir.is_dir():
             memory_count = len(list(memory_dir.glob("*.md")))
 
-        # e. appUrl heuristic
-        app_url = _app_url_for_project(project_name)
+        # e. appUrls heuristic
+        app_urls = _app_urls_for_project(project_name)
 
         # f. lastActivity from most recent .jsonl mtime
         last_activity = None
@@ -262,7 +264,8 @@ async def list_projects(request: web.Request) -> web.Response:
             "lastActivity": last_activity,
             "claudeMd": claude_md_content,
             "hasSettings": has_settings,
-            "appUrl": app_url,
+            "appUrl": app_urls[0]["url"] if app_urls else None,
+            "appUrls": app_urls,
             "sopFiles": sop_files,
             "memoryFiles": memory_files,
             "_mtime": last_mtime,  # internal sort key

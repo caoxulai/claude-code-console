@@ -130,29 +130,32 @@ export default function DashboardPage() {
                           {project.sessionCount} sessions
                         </span>
                       )}
-                      {project.appUrl ? (
-                        <a
-                          href={project.appUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          onClick={(e) => e.stopPropagation()}
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: '0.3em',
-                            background: '#1a2f2a',
-                            color: '#6dab8a',
-                            fontSize: '0.72em',
-                            fontWeight: 600,
-                            padding: '2px 8px',
-                            borderRadius: '999px',
-                            border: '1px solid #2a4a3a',
-                            textDecoration: 'none',
-                          }}
-                        >
-                          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#6dab8a', display: 'inline-block' }} />
-                          Running
-                        </a>
+                      {(project.appUrls || []).length > 0 ? (
+                        (project.appUrls || []).map((u, idx) => (
+                          <a
+                            key={idx}
+                            href={u.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '0.3em',
+                              background: u.type === 'deployed' ? '#1a2a3a' : '#1a2f2a',
+                              color: u.type === 'deployed' ? '#7ab8e6' : '#6dab8a',
+                              fontSize: '0.72em',
+                              fontWeight: 600,
+                              padding: '2px 8px',
+                              borderRadius: '999px',
+                              border: `1px solid ${u.type === 'deployed' ? '#2a4a5a' : '#2a4a3a'}`,
+                              textDecoration: 'none',
+                            }}
+                          >
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: u.type === 'deployed' ? '#7ab8e6' : '#6dab8a', display: 'inline-block' }} />
+                            {u.label}
+                          </a>
+                        ))
                       ) : (
                         <span style={{
                           display: 'inline-flex',
