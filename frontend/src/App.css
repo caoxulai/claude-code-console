@@ -210,6 +210,10 @@ html, body, #root {
 .badge-ok { background: #1a3a2a; color: var(--accent2); }
 .badge-warn { background: #3a2a1a; color: var(--warning); }
 .badge-error { background: #3a1a2a; color: var(--error); }
+.badge-feedback { background: #2a2a1a; color: #e6c87a; }
+.badge-user { background: #1a2a3a; color: #7ab8e6; }
+.badge-project { background: #1a3a2a; color: #7ae6a8; }
+.badge-reference { background: #2a1a3a; color: #b87ae6; }
 
 /* Empty state */
 .empty-state {
