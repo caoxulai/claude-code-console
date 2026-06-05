@@ -6,7 +6,6 @@ import { SessionList } from './components/SessionList';
 import { CronPanel } from './components/CronPanel';
 import { CwdSelector } from './components/CwdSelector';
 import { FiSend, FiPlus, FiSidebar } from 'react-icons/fi';
-import 'highlight.js/styles/github-dark.css';
 import './App.css';
 
 function App() {

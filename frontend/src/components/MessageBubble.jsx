@@ -5,21 +5,24 @@ import rehypeHighlight from 'rehype-highlight';
 export function MessageBubble({ message }) {
   if (message.role === 'user') {
     return (
-      <div className="msg msg-user">
-        <div className="msg-label">You</div>
-        <div className="msg-body">{message.content}</div>
+      <div className="chat-msg chat-msg-user" data-role="user">
+        <div className="chat-msg-inner">
+          <div className="chat-msg-content">{message.content}</div>
+        </div>
       </div>
     );
   }
 
   if (message.role === 'assistant') {
     return (
-      <div className="msg msg-assistant">
-        <div className="msg-label">Claude</div>
-        <div className="msg-body markdown-body">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-            {message.content}
-          </ReactMarkdown>
+      <div className="chat-msg chat-msg-assistant" data-role="assistant">
+        <div className="chat-msg-inner">
+          <div className="chat-msg-avatar">C</div>
+          <div className="chat-msg-content markdown-body">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+              {message.content}
+            </ReactMarkdown>
+          </div>
         </div>
       </div>
     );
@@ -27,9 +30,10 @@ export function MessageBubble({ message }) {
 
   if (message.role === 'error') {
     return (
-      <div className="msg msg-error">
-        <div className="msg-label">Error</div>
-        <div className="msg-body">{message.content}</div>
+      <div className="chat-msg chat-msg-error" data-role="error">
+        <div className="chat-msg-inner">
+          <div className="chat-msg-content">{message.content}</div>
+        </div>
       </div>
     );
   }

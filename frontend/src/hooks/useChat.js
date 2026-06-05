@@ -38,22 +38,24 @@ export function useChat() {
           }
         } else if (evt.type === 'user' && evt.message) {
           for (const c of evt.message.content || []) {
-            if (c.type === 'tool_result' && currentToolCall) {
+            if (c.type === 'tool_result') {
               const resultText = typeof c.content === 'string'
                 ? c.content
                 : Array.isArray(c.content)
                   ? c.content.map(x => x.text || '').join('')
                   : '';
-              currentToolCall.result = resultText;
-              setMessages(prev => {
-                const idx = prev.findLastIndex(m => m.toolCall?.id === currentToolCall.id);
-                if (idx >= 0) {
-                  const updated = [...prev];
-                  updated[idx] = { ...updated[idx], toolCall: { ...currentToolCall } };
-                  return updated;
-                }
-                return prev;
-              });
+              const toolId = c.tool_use_id || currentToolCall?.id;
+              if (toolId) {
+                setMessages(prev => {
+                  const idx = prev.findLastIndex(m => m.toolCall && m.toolCall.id === toolId);
+                  if (idx >= 0) {
+                    const updated = [...prev];
+                    updated[idx] = { ...updated[idx], toolCall: { ...updated[idx].toolCall, result: resultText } };
+                    return updated;
+                  }
+                  return prev;
+                });
+              }
               currentToolCall = null;
               assistantText = '';
             }
@@ -79,5 +81,5 @@ export function useChat() {
     setSessionId(id);
   }, []);
 
-  return { messages, streaming, sessionId, send, reset, resume };
+  return { messages, streaming, sessionId, send, reset, resume, setMessages };
 }
