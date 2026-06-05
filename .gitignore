@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+
+# Build output — frontend dist copied here by build-tools/bin/custom-build
+server/static/
+frontend/dist/
+
+# Brazil build artifacts
+/build/
+*.egg-info/
