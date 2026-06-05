@@ -51,7 +51,7 @@ function extractPhases(content, skillName) {
 
   // 2. Try content body: look for "## Phase: Name" or numbered step headers
   const phaseHeaders = [];
-  const phasePattern = /^##\s+(?:Phase|Step)\s*[:\-]\s*(.+)/gm;
+  const phasePattern = /^##\s+(?:Phase|Step)\s*[:-]\s*(.+)/gm;
   let match;
   while ((match = phasePattern.exec(content)) !== null) {
     phaseHeaders.push(match[1].trim());
@@ -59,7 +59,7 @@ function extractPhases(content, skillName) {
   if (phaseHeaders.length >= 2) return phaseHeaders;
 
   // 3. Also try numbered patterns like "## 1. Design" or "## 1 - Design"
-  const numberedPattern = /^##\s+\d+[\.\)]\s*(.+)/gm;
+  const numberedPattern = /^##\s+\d+[.)]\s*(.+)/gm;
   const numberedPhases = [];
   while ((match = numberedPattern.exec(content)) !== null) {
     numberedPhases.push(match[1].trim());
@@ -151,9 +151,9 @@ function SkillContentView({ content, skillName }) {
   }, [content]);
 
   return (
-    <div>
+    <div style={{ minWidth: 0, overflow: 'hidden' }}>
       <PhaseDiagram phases={phases} />
-      <div className="markdown-body" style={{ fontSize: '0.92em', lineHeight: 1.6 }}>
+      <div className="markdown-body" style={{ fontSize: '0.92em', lineHeight: 1.6, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
         <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
           {displayContent}
         </ReactMarkdown>
@@ -241,7 +241,7 @@ export default function SkillsPage() {
         </button>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: '1em', minHeight: '500px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(250px, 300px) 1fr', gap: '1em', minHeight: '500px' }}>
         {/* Left Panel - Skill List */}
         <div className="card" style={{ overflowY: 'auto', maxHeight: '70vh' }}>
           {skills.length === 0 ? (
@@ -254,25 +254,25 @@ export default function SkillsPage() {
                 style={{
                   padding: '0.6em 0.75em', cursor: 'pointer', borderRadius: 'var(--radius)',
                   background: selected === skill.name ? 'var(--user-bg)' : 'transparent',
-                  display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                   marginBottom: '4px',
                 }}
               >
-                <div style={{ overflow: 'hidden', flex: 1 }}>
-                  <div style={{ fontSize: '0.85em', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {skill.name}
+                <div style={{ overflow: 'hidden', flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em' }}>
+                    <span style={{ fontSize: '0.85em', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {skill.name}
+                    </span>
+                    <span className={skill.source === 'local' ? 'badge badge-ok' : 'badge'} style={{ flexShrink: 0 }}>
+                      {skill.source}
+                    </span>
                   </div>
                   <div style={{ fontSize: '0.72em', color: 'var(--muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: '2px' }}>
                     {getDescription(skill)}
                   </div>
-                  <div style={{ marginTop: '4px' }}>
-                    <span className={skill.source === 'local' ? 'badge badge-ok' : 'badge'}>
-                      {skill.source}
-                    </span>
-                  </div>
                 </div>
                 {skill.source === 'local' && (
-                  <button className="icon-btn" onClick={e => { e.stopPropagation(); deleteSkill(skill.name); }} title="Delete">
+                  <button className="icon-btn" onClick={e => { e.stopPropagation(); deleteSkill(skill.name); }} title="Delete" style={{ flexShrink: 0, marginLeft: '0.5em' }}>
                     <FiTrash2 size={12} />
                   </button>
                 )}
@@ -282,7 +282,7 @@ export default function SkillsPage() {
         </div>
 
         {/* Right Panel - Skill Content */}
-        <div className="card">
+        <div className="card" style={{ minWidth: 0, overflow: 'hidden' }}>
           {creating ? (
             <>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75em' }}>
