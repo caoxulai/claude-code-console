@@ -194,7 +194,7 @@ html, body, #root {
   text-align: left;
   border-bottom: 1px solid var(--border);
 }
-.data-table th { color: var(--muted); font-weight: 600; font-size: 0.82em; text-transform: uppercase; }
+.data-table th { color: var(--muted); font-weight: 600; font-size: 0.82em; text-transform: uppercase; text-align: center; }
 .data-table tr:hover td { background: var(--surface2); }
 
 /* Tags/badges */

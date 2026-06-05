@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2 } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
@@ -9,20 +9,6 @@ import { SkeletonLine } from '../components/Skeleton';
 function StatusBadge({ status }) {
   const cls = status === 'busy' ? 'badge-warn' : 'badge-ok';
   return <span className={`badge ${cls}`}>{status}</span>;
-}
-
-function formatSize(bytes) {
-  if (!bytes) return '';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatDate(dateStr) {
-  if (!dateStr) return '';
-  const d = new Date(dateStr);
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) +
-    ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }
 
 function extractUserText(msg) {
@@ -214,7 +200,7 @@ export default function SessionsPage() {
     }
   };
 
-  const fetchHistory = async (currentOffset = 0, append = false) => {
+  const fetchHistory = useCallback(async (currentOffset = 0, append = false) => {
     try {
       const projectParam = searchParams.get('project');
       let url = `/api/sessions?limit=${LIMIT}&offset=${currentOffset}`;
@@ -229,28 +215,28 @@ export default function SessionsPage() {
       setTotal(json.total || 0);
     } catch { /* ignore */ }
     setLoading(false);
-  };
+  }, [searchParams]);
 
-  const fetchLive = async () => {
+  const fetchLive = useCallback(async () => {
     try {
       const res = await fetch('/api/sessions/live');
       const json = await res.json();
       setLiveSessions(json || []);
     } catch { /* ignore */ }
     setLoading(false);
-  };
+  }, []);
 
   // Refetch every time we navigate to this page (location changes) or tab switches
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loading/offset reset before async fetch is intentional
+    setLoading(true);
+    setOffset(0);
     if (tab === 'history') {
-      setLoading(true);
-      setOffset(0);
       fetchHistory(0);
     } else {
-      setLoading(true);
       fetchLive();
     }
-  }, [tab, location.key, searchParams]);
+  }, [tab, location.key, searchParams, fetchHistory, fetchLive]);
 
   const loadMore = () => {
     const next = offset + LIMIT;
@@ -350,12 +336,11 @@ export default function SessionsPage() {
                 <table className="data-table">
                   <thead>
                     <tr>
-                      <th>Title</th>
-                      <th>Scope</th>
-                      <th>Last Activity</th>
-                      <th>Size</th>
-                      <th></th>
-                      <th></th>
+                      <th style={{ textAlign: 'left', width: '35%' }}>Title</th>
+                      <th style={{ width: '15%' }}>Scope</th>
+                      <th style={{ width: '20%' }}>Last Activity</th>
+                      <th style={{ width: '10%' }}>Size</th>
+                      <th style={{ textAlign: 'right', width: '20%' }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -368,46 +353,46 @@ export default function SessionsPage() {
                           background: selectedId === s.id ? 'var(--user-bg, rgba(59,130,246,0.1))' : undefined,
                         }}
                       >
-                        <td style={{ fontWeight: 500, maxWidth: '400px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        <td style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                           {s.title || s.id}
                         </td>
-                        <td>
+                        <td style={{ textAlign: 'center' }}>
                           <span className={`badge ${getScopeName(s) !== 'Global' ? 'badge-ok' : ''}`}>
                             {getScopeName(s)}
                           </span>
                         </td>
-                        <td style={{ fontSize: '0.85em', color: 'var(--muted)', whiteSpace: 'nowrap' }}>
+                        <td style={{ fontSize: '0.85em', color: 'var(--muted)', whiteSpace: 'nowrap', textAlign: 'center' }}>
                           {s.date}
                         </td>
-                        <td style={{ fontSize: '0.85em', color: 'var(--muted)' }}>
+                        <td style={{ fontSize: '0.85em', color: 'var(--muted)', textAlign: 'center' }}>
                           {s.size}
                         </td>
-                        <td>
-                          <button
-                            className="btn"
-                            style={{ padding: '0.25em 0.6em', fontSize: '0.78em' }}
-                            onClick={(e) => { e.stopPropagation(); navigate(`/chat?resume=${s.id}`); }}
-                            title="Continue this session"
-                          >
-                            <FiPlay size={12} /> Continue
-                          </button>
-                        </td>
-                        <td>
-                          <button
-                            className="icon-btn"
-                            style={{ color: 'var(--muted)' }}
-                            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--error)'; }}
-                            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--muted)'; }}
-                            onClick={async (e) => {
-                              e.stopPropagation();
-                              if (!confirm(`Delete session "${s.title}"? This cannot be undone.`)) return;
-                              await fetch(`/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
-                              fetchHistory(0);
-                            }}
-                            title="Delete session"
-                          >
-                            <FiTrash2 size={14} />
-                          </button>
+                        <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5em' }}>
+                            <button
+                              className="btn"
+                              style={{ padding: '0.25em 0.6em', fontSize: '0.78em' }}
+                              onClick={(e) => { e.stopPropagation(); navigate(`/chat?resume=${s.id}`); }}
+                              title="Continue this session"
+                            >
+                              <FiPlay size={12} /> Continue
+                            </button>
+                            <button
+                              className="icon-btn"
+                              style={{ color: 'var(--muted)' }}
+                              onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--error)'; }}
+                              onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--muted)'; }}
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!confirm(`Delete session "${s.title}"? This cannot be undone.`)) return;
+                                await fetch(`/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+                                fetchHistory(0);
+                              }}
+                              title="Delete session"
+                            >
+                              <FiTrash2 size={14} />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -458,8 +443,8 @@ export default function SessionsPage() {
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>Name</th>
-                    <th>CWD</th>
+                    <th style={{ textAlign: 'left' }}>Name</th>
+                    <th style={{ textAlign: 'left' }}>CWD</th>
                     <th>Status</th>
                     <th>Kind</th>
                     <th>Version</th>
@@ -472,9 +457,9 @@ export default function SessionsPage() {
                       <td style={{ fontFamily: 'monospace', fontSize: '0.83em', maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {s.cwd}
                       </td>
-                      <td><StatusBadge status={s.status} /></td>
-                      <td style={{ fontSize: '0.85em' }}>{s.kind || '-'}</td>
-                      <td style={{ fontSize: '0.85em', color: 'var(--muted)' }}>{s.version || '-'}</td>
+                      <td style={{ textAlign: 'center' }}><StatusBadge status={s.status} /></td>
+                      <td style={{ fontSize: '0.85em', textAlign: 'center' }}>{s.kind || '-'}</td>
+                      <td style={{ fontSize: '0.85em', color: 'var(--muted)', textAlign: 'center' }}>{s.version || '-'}</td>
                     </tr>
                   ))}
                 </tbody>
