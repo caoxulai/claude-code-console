@@ -10,11 +10,23 @@ from server.ws import WebSocketManager
 from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, tasks, plugins
 
 
-FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+def _resolve_frontend_dist() -> Path:
+    """Find the frontend dist directory (works both in dev and installed mode)."""
+    # Dev mode: frontend/dist lives next to the server/ package
+    dev_path = Path(__file__).parent.parent / "frontend" / "dist"
+    if dev_path.is_dir():
+        return dev_path
+    # Installed mode: static/ is bundled inside the server package
+    installed_path = Path(__file__).parent / "static"
+    if installed_path.is_dir():
+        return installed_path
+    return dev_path  # fallback (will just fail gracefully in create_app)
+
+
+FRONTEND_DIST = _resolve_frontend_dist()
 
 ALLOWED_CWD_ROOTS = [
     Path.home(),
-    Path("$HOME/workspace"),
 ]
 
 

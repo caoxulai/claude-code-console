@@ -2,13 +2,23 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
 
 
-WORKSPACE_DIR = Path("$HOME/workspace/projects")
+def _resolve_workspace_dir() -> Path:
+    """Resolve the workspace directory from config or environment."""
+    env = os.environ.get("CLAUDE_WEB_WORKSPACE")
+    if env:
+        return Path(env)
+    # Default: ~/workspace/projects (common convention)
+    return Path.home() / "workspace" / "projects"
+
+
+WORKSPACE_DIR = _resolve_workspace_dir()
 CLAUDE_PROJECTS_BASE = Path.home() / ".claude" / "projects"
 LIVE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 
@@ -129,15 +139,31 @@ def _get_all_project_dirs() -> list[Path]:
     return dirs
 
 
+def _load_project_urls_config() -> dict:
+    """Load project URLs from user config file."""
+    config_path = Path(os.environ.get(
+        "CLAUDE_WEB_CONFIG",
+        Path.home() / ".claude-web" / "config.json",
+    ))
+    if config_path.is_file():
+        try:
+            data = json.loads(config_path.read_text())
+            return data.get("projectUrls", {})
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
 def _app_urls_for_project(project_name: str) -> list[dict]:
-    """Return known URLs for a project (local dev servers and deployed apps)."""
-    urls = []
-    if "claude-web" in project_name:
-        urls.append({"url": "http://127.0.0.1:7780", "label": "Local", "type": "local"})
-    if "oncall-kpi" in project_name:
-        urls.append({"url": "http://127.0.0.1:8080", "label": "Local", "type": "local"})
-        urls.append({"url": "https://black-falcon-oncall-dashboard.beta.harmony.a2z.com/", "label": "Harmony", "type": "deployed"})
-    return urls
+    """Return known URLs for a project from user config.
+
+    Config keys are matched as substrings against the project name.
+    """
+    urls_config = _load_project_urls_config()
+    for key, urls in urls_config.items():
+        if key in project_name:
+            return urls
+    return []
 
 
 def _collect_sop_files(project_path: Path) -> list[dict]:
