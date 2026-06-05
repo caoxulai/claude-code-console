@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useState, useMemo } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -7,6 +7,61 @@ import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus } from 'react-ic
 import { SkeletonCard } from '../components/Skeleton';
 
 const TABS = ['Overview', 'CLAUDE.md', 'Memory', 'Skills/SOPs'];
+
+function parseFrontmatter(content) {
+  if (!content) return { meta: null, body: content };
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+  if (!match) return { meta: null, body: content };
+  const raw = match[1];
+  const body = match[2].trim();
+  const meta = {};
+  let currentKey = null;
+  for (const line of raw.split('\n')) {
+    const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
+    if (kv) {
+      currentKey = kv[1];
+      const val = kv[2].replace(/^["']|["']$/g, '').trim();
+      if (val) meta[currentKey] = val;
+    } else if (currentKey && line.match(/^\s+\w/)) {
+      const nested = line.match(/^\s+(\w[\w-]*):\s*(.*)$/);
+      if (nested) {
+        if (typeof meta[currentKey] !== 'object') meta[currentKey] = {};
+        meta[currentKey][nested[1]] = nested[2].replace(/^["']|["']$/g, '').trim();
+      }
+    }
+  }
+  return { meta, body };
+}
+
+function typeBadgeClass(type) {
+  const map = { feedback: 'badge-feedback', user: 'badge-user', project: 'badge-project', reference: 'badge-reference' };
+  return map[type] || '';
+}
+
+function MemoryContentView({ content }) {
+  const { meta, body } = useMemo(() => parseFrontmatter(content), [content]);
+  const description = meta?.description;
+  return (
+    <div>
+      {description && (
+        <div style={{
+          marginBottom: '1em',
+          padding: '0.75em 1em',
+          background: 'var(--surface2)',
+          borderRadius: 'var(--radius)',
+          border: '1px solid var(--border)',
+        }}>
+          <div style={{ fontSize: '0.85em', color: 'var(--muted)', lineHeight: 1.5 }}>
+            {description}
+          </div>
+        </div>
+      )}
+      <div className="markdown-body" style={{ fontSize: '0.92em', lineHeight: 1.6 }}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{body}</ReactMarkdown>
+      </div>
+    </div>
+  );
+}
 
 function projectPathToSlug(path) {
   return path.replace(/\//g, "-");
@@ -30,9 +85,10 @@ const CLAUDE_MD_TEMPLATE = `# Project Instructions
 
 export default function ProjectsPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [expandedId, setExpandedId] = useState(null);
+  const [expandedId, setExpandedId] = useState(searchParams.get('expand') || null);
   const [activeTab, setActiveTab] = useState('Overview');
 
   // CLAUDE.md editing state
@@ -313,44 +369,54 @@ export default function ProjectsPage() {
     </div>
   );
 
+  const statCardStyle = {
+    background: 'var(--surface2)',
+    borderRadius: 'var(--radius)',
+    padding: 'var(--space-md)',
+    cursor: 'pointer',
+    border: '1px solid var(--border)',
+    transition: 'border-color 0.15s, background 0.15s',
+    textAlign: 'center',
+  };
+
   const renderOverviewTab = (project) => (
     <div style={{ fontSize: 'var(--fs-sm)' }}>
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
         gap: 'var(--space-md)',
         marginBottom: 'var(--space-md)',
       }}>
         <div
           onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
-          style={{ background: 'var(--bg)', borderRadius: 'var(--radius)', padding: 'var(--space-sm) var(--space-md)', cursor: 'pointer' }}
-          onMouseEnter={(e) => { e.currentTarget.querySelector('.stat-value').style.textDecoration = 'underline'; }}
-          onMouseLeave={(e) => { e.currentTarget.querySelector('.stat-value').style.textDecoration = 'none'; }}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase' }}>Sessions</div>
-          <div className="stat-value" style={{ fontSize: 'var(--fs-lg)', fontWeight: 700 }}>{project.sessionCount}</div>
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.sessionCount}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Sessions</div>
         </div>
         <div
           onClick={() => setActiveTab('Memory')}
-          style={{ background: 'var(--bg)', borderRadius: 'var(--radius)', padding: 'var(--space-sm) var(--space-md)', cursor: 'pointer' }}
-          onMouseEnter={(e) => { e.currentTarget.querySelector('.stat-value').style.textDecoration = 'underline'; }}
-          onMouseLeave={(e) => { e.currentTarget.querySelector('.stat-value').style.textDecoration = 'none'; }}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase' }}>Memory Files</div>
-          <div className="stat-value" style={{ fontSize: 'var(--fs-lg)', fontWeight: 700 }}>{project.memoryCount}</div>
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.memoryCount}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Memory Files</div>
         </div>
         <div
           onClick={() => setActiveTab('Skills/SOPs')}
-          style={{ background: 'var(--bg)', borderRadius: 'var(--radius)', padding: 'var(--space-sm) var(--space-md)', cursor: 'pointer' }}
-          onMouseEnter={(e) => { e.currentTarget.querySelector('.stat-value').style.textDecoration = 'underline'; }}
-          onMouseLeave={(e) => { e.currentTarget.querySelector('.stat-value').style.textDecoration = 'none'; }}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase' }}>Skills/SOPs</div>
-          <div className="stat-value" style={{ fontSize: 'var(--fs-lg)', fontWeight: 700 }}>{(project.sopFiles || []).length}</div>
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{(project.sopFiles || []).length}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Skills/SOPs</div>
         </div>
-        <div style={{ background: 'var(--bg)', borderRadius: 'var(--radius)', padding: 'var(--space-sm) var(--space-md)' }}>
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase' }}>Last Activity</div>
-          <div style={{ fontSize: 'var(--fs-sm)', fontWeight: 600, marginTop: '0.2em' }}>{project.lastActivity || 'None'}</div>
+        <div style={{ ...statCardStyle, cursor: 'default' }}>
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.lastActivity || '—'}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Last Activity</div>
         </div>
       </div>
 
@@ -485,16 +551,19 @@ export default function ProjectsPage() {
           ) : (
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-sm)' }}>
-                <span style={{ fontWeight: 600, fontSize: 'var(--fs-sm)' }}>{selectedMemory}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em' }}>
+                  <span style={{ fontWeight: 600, fontSize: 'var(--fs-sm)' }}>{selectedMemory}</span>
+                  {(() => {
+                    const { meta } = parseFrontmatter(memoryContent);
+                    const t = meta?.metadata?.type || meta?.type;
+                    return t ? <span className={`badge ${typeBadgeClass(t)}`}>{t}</span> : null;
+                  })()}
+                </div>
                 <button className="btn" onClick={() => { setEditingMemory(true); setMemoryDraft(memoryContent); }} style={{ fontSize: 'var(--fs-xs)' }}>
                   <FiEdit3 size={13} /> Edit
                 </button>
               </div>
-              <div className="markdown-body" style={{ fontSize: 'var(--fs-sm)' }}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                  {memoryContent}
-                </ReactMarkdown>
-              </div>
+              <MemoryContentView content={memoryContent} />
             </div>
           )}
         </div>
