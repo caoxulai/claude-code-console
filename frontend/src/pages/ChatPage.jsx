@@ -54,10 +54,9 @@ function parseTranscriptToMessages(records) {
 export default function ChatPage() {
   const { messages, streaming, sessionId, send, reset, resume, setMessages } = useChat();
   const [input, setInput] = useState('');
-  const [cwd, setCwd] = useState(localStorage.getItem('claude_web_cwd') || '/home/xulaicao');
+  const [cwd] = useState(localStorage.getItem('claude_web_cwd') || '/home/xulaicao');
   const transcriptRef = useRef(null);
   const [searchParams, setSearchParams] = useSearchParams();
-  const [loadingHistory, setLoadingHistory] = useState(false);
   const [sessionTitle, setSessionTitle] = useState('');
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
@@ -66,7 +65,6 @@ export default function ChatPage() {
   useEffect(() => {
     const resumeId = searchParams.get('resume');
     if (resumeId && resumeId !== sessionId) {
-      setLoadingHistory(true);
       resume(resumeId);
       fetch(`/api/sessions/${encodeURIComponent(resumeId)}/title`)
         .then(r => r.json())
@@ -78,10 +76,9 @@ export default function ChatPage() {
           const history = parseTranscriptToMessages(data.messages || []);
           setMessages(history);
         })
-        .catch(() => {})
-        .finally(() => setLoadingHistory(false));
+        .catch(() => {});
     }
-  }, [searchParams]);
+  }, [searchParams, sessionId, resume, setMessages]);
 
   // Fetch title when a new session is created (after first response)
   useEffect(() => {
@@ -91,7 +88,7 @@ export default function ChatPage() {
         .then(data => setSessionTitle(data.title || ''))
         .catch(() => {});
     }
-  }, [sessionId]);
+  }, [sessionId, searchParams]);
 
   const saveTitle = () => {
     const newTitle = titleDraft.trim();

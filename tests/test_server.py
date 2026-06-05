@@ -1,41 +1,39 @@
-"""Smoke + auth + SSE-shape tests for claude-web. claude is mocked."""
+"""Smoke + API-shape tests for claude-web. claude is mocked."""
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 import pytest
-from aiohttp import web
+
+try:
+    from aiohttp import web
+except ModuleNotFoundError:
+    pytest.skip("aiohttp not installed", allow_module_level=True)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import server  # noqa: E402
-
-
-SECRET = "test-secret-do-not-use"
+from server.app import create_app, ALLOWED_CWD_ROOTS  # noqa: E402
 
 
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch) -> web.Application:
-    # Allow tmp paths so the test client can pass cwd values without hitting the
-    # production allowlist ($HOME, $HOME/workspace).
-    monkeypatch.setattr(server, "ALLOWED_CWD_ROOTS", [tmp_path, Path("/etc/__never__")])
-    return server.make_app(SECRET, tmp_path)
+    # Patch ALLOWED_CWD_ROOTS in server.app so the test client can pass cwd values
+    # without hitting the production allowlist.
+    monkeypatch.setattr("server.app.ALLOWED_CWD_ROOTS", [tmp_path, Path("/etc/__never__")])
+    monkeypatch.setenv("CLAUDE_WEB_CWD", str(tmp_path))
+    application = create_app()
+    # Also patch the runtime copy stored in app state
+    application["allowed_cwd_roots"] = [tmp_path, Path("/etc/__never__")]
+    application["default_cwd"] = tmp_path
+    return application
 
 
 @pytest.fixture
 async def client(aiohttp_client, app):
     return await aiohttp_client(app)
-
-
-@pytest.fixture
-async def authed_client(aiohttp_client, app):
-    # Inject the device cookie directly. /auth sets Secure=True, which the test
-    # client (plain HTTP) drops on the round trip, so we mint the cookie value
-    # ourselves using the same HMAC the server expects.
-    cookies = {server.COOKIE_NAME: server._mint_cookie(SECRET)}
-    return await aiohttp_client(app, cookies=cookies)
 
 
 async def test_healthz_is_public(client):
@@ -44,68 +42,42 @@ async def test_healthz_is_public(client):
     assert (await resp.json()) == {"ok": True}
 
 
-async def test_chat_requires_auth(client):
-    resp = await client.post("/api/chat", json={"prompt": "hi"})
-    assert resp.status == 401
+async def test_chat_rejects_empty_prompt(client):
+    resp = await client.post("/api/chat", json={"prompt": "   "})
+    assert resp.status == 400
 
 
-async def test_auth_bad_secret(client):
-    resp = await client.get("/auth?secret=wrong", allow_redirects=False)
-    assert resp.status == 401
+async def test_chat_rejects_cwd_outside_allowlist(client):
+    # "/" is not under the allowlist (which is just tmp_path in this test setup).
+    resp = await client.post("/api/chat", json={"prompt": "hi", "cwd": "/"})
+    assert resp.status == 403
 
 
-async def test_auth_good_secret_sets_cookie(client):
-    resp = await client.get(f"/auth?secret={SECRET}", allow_redirects=False)
-    assert resp.status == 302
-    assert resp.headers["Location"] == "/"
-    assert server.COOKIE_NAME in resp.cookies
+async def test_chat_streams_sse(client, tmp_path):
+    fake_events = [
+        {"type": "system", "session_id": "abc"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hello"}]}},
+        {"type": "result", "is_error": False, "result": "hello"},
+    ]
 
+    async def fake_send(prompt):
+        for evt in fake_events:
+            yield evt
 
-async def test_authed_chat_streams_sse(authed_client, tmp_path):
-    fake_stream = (
-        b'{"type":"system","session_id":"abc"}\n'
-        b'{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}\n'
-        b'{"type":"result","is_error":false,"result":"hello"}\n'
-    )
+    # Mock the session manager to return a fake session
+    fake_session = AsyncMock()
+    fake_session.session_id = "abc"
+    fake_session.send = fake_send
 
-    class FakeProc:
-        def __init__(self):
-            self.stdout = self._mk_reader(fake_stream)
-            self.stderr = self._mk_reader(b"")
+    fake_manager = AsyncMock()
+    fake_manager.get_or_create = AsyncMock(return_value=fake_session)
+    fake_manager.register = lambda s: None
 
-        @staticmethod
-        def _mk_reader(data: bytes):
-            r = asyncio.StreamReader()
-            r.feed_data(data)
-            r.feed_eof()
-            return r
-
-        async def wait(self):
-            return 0
-
-        def terminate(self):
-            pass
-
-    async def fake_exec(*_args, **_kwargs):
-        return FakeProc()
-
-    with patch.object(asyncio, "create_subprocess_exec", fake_exec):
-        resp = await authed_client.post("/api/chat", json={"prompt": "hi", "cwd": str(tmp_path)})
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.post("/api/chat", json={"prompt": "hi", "cwd": str(tmp_path)})
     assert resp.status == 200
     body = await resp.text()
     # Should be a sequence of SSE frames terminated by [DONE].
     assert "data: [DONE]" in body
-    assert '"type":"system"' in body
-    assert '"type":"assistant"' in body
-
-
-async def test_chat_rejects_cwd_outside_allowlist(authed_client):
-    # /tmp is not under the allowlist (which is just tmp_path in this test setup,
-    # but we pass / directly to verify the rejection path).
-    resp = await authed_client.post("/api/chat", json={"prompt": "hi", "cwd": "/"})
-    assert resp.status == 403
-
-
-async def test_chat_rejects_empty_prompt(authed_client):
-    resp = await authed_client.post("/api/chat", json={"prompt": "   "})
-    assert resp.status == 400
+    assert '"type":"system"' in body or '"type": "system"' in body
+    assert '"type":"assistant"' in body or '"type": "assistant"' in body

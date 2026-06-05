@@ -1,11 +1,10 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { streamChat } from '../api/client';
 
 export function useChat() {
   const [messages, setMessages] = useState([]);
   const [streaming, setStreaming] = useState(false);
   const [sessionId, setSessionId] = useState(null);
-  const abortRef = useRef(null);
 
   const send = useCallback(async (prompt, { cwd } = {}) => {
     setMessages(prev => [...prev, { role: 'user', content: prompt }]);
