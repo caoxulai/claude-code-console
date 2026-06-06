@@ -426,6 +426,16 @@ def _cwd_to_project_dir(cwd: str) -> str:
     return "-" + cwd.lstrip("/").replace("/", "-")
 
 
+def _validate_session_id(session_id: str) -> None:
+    """Reject session ids containing path-traversal characters.
+
+    session_id is joined as f'{session_id}.jsonl' against project dirs, so guard
+    against traversal for defense in depth (mirrors the filename checks elsewhere).
+    """
+    if ".." in session_id or "/" in session_id or "\\" in session_id:
+        raise web.HTTPBadRequest(reason="invalid session id")
+
+
 async def list_sessions(request: web.Request) -> web.Response:
     """List sessions from all projects by default, or filtered to a single project.
 
@@ -445,7 +455,11 @@ async def list_sessions(request: web.Request) -> web.Response:
     home_bucket = _cwd_to_project_dir(default_cwd)
 
     if project:
-        # Specific project requested — show all sessions from that dir (no filter)
+        # Specific project requested — show all sessions from that dir (no filter).
+        # Reject path traversal in the project slug (defense in depth; mirrors the
+        # filename checks in get_project_sop/get_project_memory).
+        if ".." in project or "/" in project or "\\" in project:
+            raise web.HTTPBadRequest(reason="invalid project")
         dirs = [CLAUDE_PROJECTS_BASE / project]
     else:
         # No project param — scan ALL project dirs
@@ -466,19 +480,20 @@ async def list_sessions(request: web.Request) -> web.Response:
     # - For other project dirs: no filter (show everything).
 
     sessions = []
-    skipped = 0
+    matched = 0  # count of files that pass the interactive filter (== total)
     for f, proj_name in all_files:
         if proj_name == home_bucket:
             # Home bucket: always apply interactive filter to hide print-mode sessions
             if not _is_interactive_session(f):
-                skipped += 1
                 continue
-        title = _extract_title(f)
-        if len(sessions) >= offset + limit:
-            break
-        if len(sessions) < offset:
-            sessions.append(None)  # placeholder for offset counting
+        # This file counts toward the total; its zero-based rank is `matched`.
+        rank = matched
+        matched += 1
+        # Skip files before the requested page, and stop once the page is full.
+        # _extract_title reads the whole file, so only do it for files we return.
+        if rank < offset or len(sessions) >= limit:
             continue
+        title = _extract_title(f)
         stat = f.stat()
         size_kb = stat.st_size // 1024
         sessions.append({
@@ -491,10 +506,7 @@ async def list_sessions(request: web.Request) -> web.Response:
             "size": f"{size_kb}KB" if size_kb < 1024 else f"{size_kb // 1024}MB",
         })
 
-    # Remove offset placeholders
-    sessions = [s for s in sessions if s is not None]
-    total_with_titles = len(all_files) - skipped
-    return web.json_response({"sessions": sessions, "total": total_with_titles})
+    return web.json_response({"sessions": sessions, "total": matched})
 
 
 async def list_live_sessions(request: web.Request) -> web.Response:
@@ -523,6 +535,7 @@ async def list_live_sessions(request: web.Request) -> web.Response:
 async def get_transcript(request: web.Request) -> web.Response:
     """Stream a session transcript as JSON array (paginated by line count)."""
     session_id = request.match_info["session_id"]
+    _validate_session_id(session_id)
 
     # Search across all project dirs for this session
     path = None
@@ -555,6 +568,7 @@ async def get_transcript(request: web.Request) -> web.Response:
 
 def _find_session_path(session_id: str) -> Path | None:
     """Find the JSONL file for a session across all project dirs."""
+    _validate_session_id(session_id)
     for d in _get_all_project_dirs():
         candidate = d / f"{session_id}.jsonl"
         if candidate.exists():
@@ -594,6 +608,7 @@ async def set_session_title(request: web.Request) -> web.Response:
 async def delete_session(request: web.Request) -> web.Response:
     """Delete a session's JSONL file."""
     session_id = request.match_info["session_id"]
+    _validate_session_id(session_id)
 
     # Search all project dirs for the session file
     for d in _get_all_project_dirs():
