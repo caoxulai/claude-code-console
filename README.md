@@ -31,37 +31,80 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 
 ## Installation
 
-### Option A — Install via BuilderToolbox (recommended, Amazon-internal)
+> **New here?** Follow Option A. It's the fastest path and needs nothing but a
+> Cloud Desktop. You do **not** need to check out any code or know anything
+> about how the console is built.
 
-The console is vended as a Toolbox tool. On any Cloud Desktop (Amazon Linux x86 or ARM):
+### Prerequisites
+
+1. **An Amazon Cloud Desktop** running Amazon Linux (x86_64 or ARM/aarch64).
+   This is where the console runs. (macOS is not yet supported.)
+2. **Midway credentials.** Run `mwinit` if you haven't authenticated today —
+   `toolbox` needs it to download the tool.
+3. **Builder Toolbox installed.** Check with `toolbox --version`. If the command
+   is not found, install it from
+   <https://builderhub.corp.amazon.com/docs/builder-toolbox/user-guide/getting-started.html>,
+   then open a new terminal.
+4. **Claude Code installed and used at least once.** The console is a *viewer and
+   manager* for the data Claude Code stores in `~/.claude/`. If you've never run
+   `claude`, the pages will simply be empty (and the Chat page needs the `claude`
+   binary on your `PATH`). Install Claude Code first:
+   <https://docs.claude.com/en/docs/claude-code>.
+
+### Option A — Install via Builder Toolbox (recommended)
+
+No code checkout required — the tool ships as a fully self-contained bundle
+(its own Python + the web UI + all dependencies).
 
 ```bash
-# 1. Add the registry (one time)
+# 1. Authenticate with Midway (skip if you've already run it today)
+mwinit
+
+# 2. Register the tool's registry (one time, ever)
 toolbox registry add s3://buildertoolbox-registry-claude-code-console-us-west-2/tools.json
 
-# 2. Install the tool
+# 3. Install the tool
 toolbox install claude-web --channel head
 
-# 3. Run it
+# 4. Start the console
 claude-web
 ```
 
-`claude-web` starts the server on `http://127.0.0.1:7780` and opens your browser.
-The bundle is fully self-contained (bundled Python + frontend + dependencies) — no other prerequisites.
+**What happens on step 4:** the server starts on `http://127.0.0.1:7780` and your
+browser opens to it. Leave the terminal running — closing it stops the server.
+To stop, press `Ctrl-C` in that terminal.
 
-> The tool is currently on the `head` channel. Once promoted to `stable`, drop the `--channel head` flag.
+> The tool is currently published on the `head` channel. Once it's promoted to
+> `stable`, you can drop the `--channel head` flag in step 3.
 
-**Commands:**
+**Updating later:**
+```bash
+toolbox update claude-web
+```
+
+**Other commands:**
 ```bash
 claude-web                      # start on :7780 and open the browser
-claude-web start --port 8888    # custom port
-claude-web start --no-browser   # don't auto-open the browser (e.g. on a remote host)
-claude-web setup                # create ~/.claude-web/config.json
+claude-web start --port 8888    # use a different port
+claude-web start --no-browser   # don't auto-open a browser (e.g. on a headless/remote host)
+claude-web setup                # create the optional config file (see Configuration)
 ```
+
+#### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `toolbox: command not found` | Builder Toolbox isn't installed — see Prerequisite 3, then open a new terminal. |
+| `AccessDenied` / registry add fails | Run `mwinit` and retry. |
+| `claude-web: command not found` after install | Open a new terminal so `~/.toolbox/bin` is on your `PATH`, or run `~/.toolbox/bin/claude-web`. |
+| Browser doesn't open (remote/headless) | Use `claude-web start --no-browser`, then open `http://127.0.0.1:7780` yourself (tunnel/port-forward if remote — see [Accessing from other devices](#accessing-from-other-devices)). |
+| Pages are empty | You haven't used Claude Code yet, or your projects live somewhere other than `~/workspace/projects` — set `CLAUDE_WEB_WORKSPACE` (see [Configuration](#configuration)). |
+| Chat page errors | The `claude` binary isn't on your `PATH`. Install Claude Code (Prerequisite 4). |
 
 ### Option B — Install from source (for development)
 
-Requires Python ≥ 3.10 and Node.js (to build the frontend).
+Use this only if you're modifying the console itself. Requires Python ≥ 3.10,
+Node.js, and GitFarm access.
 
 ```bash
 # 1. Clone
