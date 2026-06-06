@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus } from 'react-icons/fi';
+import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 
 const TABS = ['Overview', 'CLAUDE.md', 'Memory', 'Skills/SOPs'];
@@ -65,6 +65,29 @@ function MemoryContentView({ content }) {
 
 function projectPathToSlug(path) {
   return path.replace(/\//g, "-");
+}
+
+// Format a raw epoch timestamp (seconds or ms) into a compact relative-time
+// label like "3d ago". Returns null when the value is missing/unparseable so
+// callers can fall back to an em-dash.
+function formatRelativeTime(ts) {
+  if (ts === null || ts === undefined) return null;
+  const num = Number(ts);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  // Accept seconds or milliseconds.
+  const ms = num < 1e12 ? num * 1000 : num;
+  const diff = Date.now() - ms;
+  if (diff < 0) return 'just now';
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  const mo = Math.floor(day / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(mo / 12)}y ago`;
 }
 
 const CLAUDE_MD_TEMPLATE = `# Project Instructions
@@ -261,6 +284,31 @@ export default function ProjectsPage() {
                 {u.label}
               </a>
             ))}
+            {project.codeUrl && (
+              <a
+                href={project.codeUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={project.codeUrl}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3em',
+                  background: '#2a2440',
+                  color: '#b39ddb',
+                  fontSize: '0.72em',
+                  fontWeight: 600,
+                  padding: '2px 8px',
+                  borderRadius: '999px',
+                  border: '1px solid #443a5a',
+                  textDecoration: 'none',
+                }}
+              >
+                <FiCode size={11} />
+                code.amazon.com
+              </a>
+            )}
           </div>
           <div style={{
             fontSize: 'var(--fs-xs)',
@@ -326,6 +374,22 @@ export default function ProjectsPage() {
           )}
           {project.hasSettings && (
             <span className="badge badge-ok">has settings</span>
+          )}
+          {formatRelativeTime(project.lastActivityTs) && (
+            <span
+              className="badge"
+              title="Most recent session activity"
+              onClick={(e) => {
+                e.stopPropagation();
+                const slug = projectPathToSlug(project.path);
+                navigate(`/sessions?project=${slug}`);
+              }}
+              style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
+              onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
+            >
+              active {formatRelativeTime(project.lastActivityTs)}
+            </span>
           )}
           <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', whiteSpace: 'nowrap' }}>
             {project.lastActivity || 'No activity'}
@@ -415,11 +479,42 @@ export default function ProjectsPage() {
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{(project.sopFiles || []).length}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Skills/SOPs</div>
         </div>
-        <div style={{ ...statCardStyle, cursor: 'default' }}>
+        <div
+          onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.lastActivity || '—'}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Last Activity</div>
+          {formatRelativeTime(project.lastActivityTs) && (
+            <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', marginTop: '0.2em' }}>
+              {formatRelativeTime(project.lastActivityTs)}
+            </div>
+          )}
         </div>
       </div>
+
+      {project.codeUrl && (
+        <div style={{ marginBottom: 'var(--space-sm)' }}>
+          <a
+            href={project.codeUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.4em',
+              color: 'var(--accent)',
+              fontSize: 'var(--fs-sm)',
+              textDecoration: 'none',
+            }}
+          >
+            <FiCode size={14} />
+            View on code.amazon.com
+          </a>
+        </div>
+      )}
 
       {project.hasSettings && (
         <div style={{ color: 'var(--muted)', fontStyle: 'italic', fontSize: 'var(--fs-xs)' }}>

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch, AsyncMock
@@ -440,6 +441,154 @@ async def test_projects_slug_roundtrips_to_session_dir(client, projects_layout):
         assert (claude_base / slug).is_dir(), (
             f"slug {slug!r} for project {name} does not match an on-disk session dir"
         )
+
+
+async def test_projects_last_activity_presence_and_type(client, projects_layout):
+    """`lastActivity` is present on every project; it's a formatted string for
+    projects with sessions and None for projects with none."""
+    projects = await _get_projects(client)
+    for name in ("alpha", "beta", "gamma"):
+        assert "lastActivity" in projects[name]
+
+    # alpha (2 sessions) and beta (1 session) get a formatted timestamp string.
+    assert isinstance(projects["alpha"]["lastActivity"], str)
+    assert projects["alpha"]["lastActivity"]
+    assert isinstance(projects["beta"]["lastActivity"], str)
+    assert projects["beta"]["lastActivity"]
+
+    # gamma has no Claude activity -> no timestamp.
+    assert projects["gamma"]["lastActivity"] is None
+
+
+async def test_projects_last_activity_reflects_newest_session_mtime(client, projects_layout):
+    """`lastActivity` is derived from the most recent .jsonl mtime in the
+    project's session dir, formatted as '%b %d %H:%M'."""
+    claude_base = projects_layout["claude_base"]
+    alpha_dir = claude_base / sessions_mod._project_path_to_claude_slug(
+        str(projects_layout["workspace"] / "alpha")
+    )
+    # Make s2.jsonl the newest file with a fixed, known mtime.
+    newest = alpha_dir / "s2.jsonl"
+    os.utime(alpha_dir / "s1.jsonl", (1_700_000_000, 1_700_000_000))
+    os.utime(newest, (1_700_100_000, 1_700_100_000))
+
+    projects = await _get_projects(client)
+    from datetime import datetime
+    expected = datetime.fromtimestamp(1_700_100_000).strftime("%b %d %H:%M")
+    assert projects["alpha"]["lastActivity"] == expected
+
+
+async def test_projects_sorted_by_recency_with_nulls_last(client, projects_layout):
+    """Projects are returned most-recent-first; projects without activity
+    (null lastActivity) sort to the end. The internal `_mtime` sort key must
+    not leak into the response."""
+    claude_base = projects_layout["claude_base"]
+    alpha_dir = claude_base / sessions_mod._project_path_to_claude_slug(
+        str(projects_layout["workspace"] / "alpha")
+    )
+    beta_dir = claude_base / sessions_mod._project_path_to_claude_slug(
+        str(projects_layout["workspace"] / "beta")
+    )
+    # beta's session is newer than any of alpha's -> beta sorts before alpha.
+    for f in alpha_dir.glob("*.jsonl"):
+        os.utime(f, (1_700_000_000, 1_700_000_000))
+    os.utime(beta_dir / "b1.jsonl", (1_700_200_000, 1_700_200_000))
+
+    resp = await client.get("/api/projects")
+    assert resp.status == 200
+    ordered = await resp.json()
+    names = [p["name"] for p in ordered]
+
+    # beta (newest) before alpha (older); gamma (no activity) last.
+    assert names.index("beta") < names.index("alpha")
+    assert names[-1] == "gamma"
+
+    # The internal sort key must never be exposed.
+    for p in ordered:
+        assert "_mtime" not in p
+
+
+# --------------------------------------------------------------------------- #
+# codeUrl: GitFarm origin remote -> code.amazon.com package URL
+#
+# list_projects reads each workspace project's .git/config origin remote and,
+# when it is a git.amazon.com/pkg/<Package> URL, surfaces
+# https://code.amazon.com/packages/<Package> as `codeUrl`. Projects whose
+# remote isn't a GitFarm package URL (or that aren't git repos) get null.
+# --------------------------------------------------------------------------- #
+
+
+def _write_git_remote(project_dir: Path, url: str) -> None:
+    """Plant a minimal .git/config with an origin remote pointing at `url`."""
+    git_dir = project_dir / ".git"
+    git_dir.mkdir(parents=True, exist_ok=True)
+    (git_dir / "config").write_text(
+        '[core]\n\trepositoryformatversion = 0\n'
+        f'[remote "origin"]\n\turl = {url}\n'
+        '\tfetch = +refs/heads/*:refs/remotes/origin/*\n',
+        encoding="utf-8",
+    )
+
+
+async def test_projects_code_url_present_on_every_project(client, projects_layout):
+    """`codeUrl` is present on every project object (string or null)."""
+    projects = await _get_projects(client)
+    for name in ("alpha", "beta", "gamma"):
+        assert "codeUrl" in projects[name]
+
+
+async def test_projects_code_url_maps_gitfarm_remote(client, projects_layout):
+    """A git.amazon.com/pkg/<Pkg> origin maps to the code.amazon.com URL.
+
+    Mirrors the real claude-web (ClaudeCodeConsole) and oncall-kpi
+    (GlennBlackFalconOncallDashboard) mappings the UAT checks.
+    """
+    workspace = projects_layout["workspace"]
+    _write_git_remote(workspace / "alpha", "ssh://git.amazon.com/pkg/ClaudeCodeConsole")
+    _write_git_remote(
+        workspace / "beta", "https://git.amazon.com/pkg/GlennBlackFalconOncallDashboard"
+    )
+
+    projects = await _get_projects(client)
+    assert projects["alpha"]["codeUrl"] == "https://code.amazon.com/packages/ClaudeCodeConsole"
+    assert (
+        projects["beta"]["codeUrl"]
+        == "https://code.amazon.com/packages/GlennBlackFalconOncallDashboard"
+    )
+
+
+async def test_projects_code_url_null_without_gitfarm_remote(client, projects_layout):
+    """Projects lacking a git.amazon.com/pkg remote get codeUrl null.
+
+    Covers three cases: no git repo at all (gamma), and a non-GitFarm remote
+    (alpha pointed at github). Both must yield null rather than a bogus URL.
+    """
+    workspace = projects_layout["workspace"]
+    _write_git_remote(workspace / "alpha", "git@github.com:someuser/somerepo.git")
+
+    projects = await _get_projects(client)
+    # gamma has no .git at all.
+    assert projects["gamma"]["codeUrl"] is None
+    # alpha's remote isn't a GitFarm package URL.
+    assert projects["alpha"]["codeUrl"] is None
+
+
+def test_code_url_for_project_strips_dot_git_suffix(tmp_path):
+    """A trailing .git on the package segment is stripped from the package name."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _write_git_remote(proj, "ssh://git.amazon.com/pkg/ClaudeCodeConsole.git")
+    assert (
+        sessions_mod._code_url_for_project(proj)
+        == "https://code.amazon.com/packages/ClaudeCodeConsole"
+    )
+
+
+def test_code_url_for_project_non_git_dir_is_none(tmp_path):
+    """A directory that isn't a git repo yields codeUrl None."""
+    proj = tmp_path / "plain"
+    proj.mkdir()
+    assert sessions_mod._code_url_for_project(proj) is None
 
 
 # --------------------------------------------------------------------------- #

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -208,6 +209,29 @@ def _collect_sop_files(project_path: Path) -> list[dict]:
     return results
 
 
+def _last_activity_for_project(jsonl_files: list[Path]) -> tuple[float | None, str | None]:
+    """Compute the most-recent-activity timestamp for a project.
+
+    Returns (raw_mtime, formatted_label). The raw float timestamp is surfaced to
+    the frontend (as lastActivityTs) so it can sort/badge on recency without
+    re-parsing the human-readable label; the label preserves the existing
+    lastActivity display string. Both are None when the project has no sessions.
+
+    File IO is guarded like the other _collect_* helpers: a session file that
+    vanishes or is unreadable mid-scan is skipped rather than failing the listing.
+    """
+    mtimes: list[float] = []
+    for f in jsonl_files:
+        try:
+            mtimes.append(f.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return None, None
+    last_mtime = max(mtimes)
+    return last_mtime, datetime.fromtimestamp(last_mtime).strftime("%b %d %H:%M")
+
+
 def _collect_memory_files(session_dir: Path | None) -> list[dict]:
     """Collect memory file names from a project's Claude memory directory."""
     if not session_dir or not session_dir.is_dir():
@@ -216,6 +240,57 @@ def _collect_memory_files(session_dir: Path | None) -> list[dict]:
     if not memory_dir.is_dir():
         return []
     return [{"name": md.name} for md in sorted(memory_dir.glob("*.md")) if md.is_file()]
+
+
+# Matches a GitFarm package remote, e.g.
+#   ssh://git.amazon.com/pkg/ClaudeCodeConsole
+#   https://git.amazon.com/pkg/GlennBlackFalconOncallDashboard
+# and captures the package name. A trailing .git suffix (if present) is stripped.
+_GITFARM_PKG_RE = re.compile(r"git\.amazon\.com/pkg/(?P<pkg>[^/\s]+?)(?:\.git)?/?$")
+
+
+def _git_remote_url(project_path: Path) -> str | None:
+    """Read the origin remote URL from a project's .git/config, if any.
+
+    Parses the config file directly rather than shelling out to git so the call
+    is cheap and side-effect free. Returns None when the directory is not a git
+    repo, has no [remote "origin"] section, or the file is unreadable.
+    """
+    config_path = project_path / ".git" / "config"
+    if not config_path.is_file():
+        return None
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_origin = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_origin = line.replace(" ", "") == '[remote"origin"]'
+            continue
+        if in_origin and line.startswith("url"):
+            _, _, value = line.partition("=")
+            value = value.strip()
+            if value:
+                return value
+    return None
+
+
+def _code_url_for_project(project_path: Path) -> str | None:
+    """Map a project's GitFarm remote to its code.amazon.com package URL.
+
+    Returns None for projects whose origin remote is not a
+    git.amazon.com/pkg/<Package> URL (including non-git directories), so the
+    field is always present but null when there's nothing to link to.
+    """
+    remote = _git_remote_url(project_path)
+    if not remote:
+        return None
+    match = _GITFARM_PKG_RE.search(remote)
+    if not match:
+        return None
+    return f"https://code.amazon.com/packages/{match.group('pkg')}"
 
 
 def _project_path_to_claude_slug(project_path: str) -> str:
@@ -272,18 +347,19 @@ async def list_projects(request: web.Request) -> web.Response:
         # e. appUrls heuristic
         app_urls = _app_urls_for_project(project_name)
 
-        # f. lastActivity from most recent .jsonl mtime
-        last_activity = None
-        last_mtime = None
-        if jsonl_files:
-            last_mtime = max(f.stat().st_mtime for f in jsonl_files)
-            last_activity = datetime.fromtimestamp(last_mtime).strftime("%b %d %H:%M")
+        # f. lastActivity (display label) + lastActivityTs (raw mtime) from most
+        #    recent .jsonl mtime. The raw timestamp is surfaced so the frontend can
+        #    sort/badge on recency; it doubles as the internal sort key below.
+        last_mtime, last_activity = _last_activity_for_project(jsonl_files)
 
         # g. SOP/skill files in the project directory
         sop_files = _collect_sop_files(d)
 
         # h. Memory files from Claude's project memory dir
         memory_files = _collect_memory_files(session_dir)
+
+        # i. code.amazon.com package URL derived from the git origin remote.
+        code_url = _code_url_for_project(d)
 
         projects.append({
             "id": project_name,
@@ -292,21 +368,19 @@ async def list_projects(request: web.Request) -> web.Response:
             "sessionCount": session_count,
             "memoryCount": memory_count,
             "lastActivity": last_activity,
+            "lastActivityTs": last_mtime,
             "claudeMd": claude_md_content,
             "hasSettings": has_settings,
             "appUrl": app_urls[0]["url"] if app_urls else None,
             "appUrls": app_urls,
+            "codeUrl": code_url,
             "sopFiles": sop_files,
             "memoryFiles": memory_files,
-            "_mtime": last_mtime,  # internal sort key
         })
 
-    # Sort by lastActivity (most recent first), nulls at the end
-    projects.sort(key=lambda p: (p["_mtime"] is None, -(p["_mtime"] or 0)))
-
-    # Remove internal sort key before returning
-    for p in projects:
-        del p["_mtime"]
+    # Sort by lastActivity (most recent first), nulls at the end.
+    # lastActivityTs is the raw mtime surfaced above; reuse it as the sort key.
+    projects.sort(key=lambda p: (p["lastActivityTs"] is None, -(p["lastActivityTs"] or 0)))
 
     return web.json_response(projects)
 
