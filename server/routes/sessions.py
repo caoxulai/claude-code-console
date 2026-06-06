@@ -10,12 +10,16 @@ from aiohttp import web
 
 
 def _resolve_workspace_dir() -> Path:
-    """Resolve the workspace directory from config or environment."""
+    """Resolve the workspace directory from config or environment.
+
+    Returns the real (symlink-resolved) path so project slugs match the ones
+    Claude Code wrote under ~/.claude/projects. On Cloud Desktops, $HOME is
+    /home/<user> which symlinks to /local/home/<user>; Claude records cwds
+    under the real /local/home path, so we must resolve() to match.
+    """
     env = os.environ.get("CLAUDE_WEB_WORKSPACE")
-    if env:
-        return Path(env)
-    # Default: ~/workspace/projects (common convention)
-    return Path.home() / "workspace" / "projects"
+    base = Path(env) if env else Path.home() / "workspace" / "projects"
+    return base.resolve()
 
 
 WORKSPACE_DIR = _resolve_workspace_dir()
