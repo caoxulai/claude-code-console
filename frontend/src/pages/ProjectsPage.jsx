@@ -306,7 +306,7 @@ export default function ProjectsPage() {
                 }}
               >
                 <FiCode size={11} />
-                code.amazon.com
+                Code Repo
               </a>
             )}
           </div>
@@ -391,9 +391,6 @@ export default function ProjectsPage() {
               active {formatRelativeTime(project.lastActivityTs)}
             </span>
           )}
-          <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', whiteSpace: 'nowrap' }}>
-            {project.lastActivity || 'No activity'}
-          </span>
         </div>
       </div>
     );
@@ -485,36 +482,10 @@ export default function ProjectsPage() {
           onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
           onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
-          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.lastActivity || '—'}</div>
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{formatRelativeTime(project.lastActivityTs) || '—'}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Last Activity</div>
-          {formatRelativeTime(project.lastActivityTs) && (
-            <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', marginTop: '0.2em' }}>
-              {formatRelativeTime(project.lastActivityTs)}
-            </div>
-          )}
         </div>
       </div>
-
-      {project.codeUrl && (
-        <div style={{ marginBottom: 'var(--space-sm)' }}>
-          <a
-            href={project.codeUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '0.4em',
-              color: 'var(--accent)',
-              fontSize: 'var(--fs-sm)',
-              textDecoration: 'none',
-            }}
-          >
-            <FiCode size={14} />
-            View on code.amazon.com
-          </a>
-        </div>
-      )}
 
       {project.hasSettings && (
         <div style={{ color: 'var(--muted)', fontStyle: 'italic', fontSize: 'var(--fs-xs)' }}>
