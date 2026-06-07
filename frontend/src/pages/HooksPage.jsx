@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { FiPlus, FiEdit3, FiTrash2, FiPlay, FiChevronDown, FiChevronRight } from 'react-icons/fi';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
 const EVENT_TYPES = [
   'Stop',
@@ -25,8 +26,8 @@ export default function HooksPage() {
   const [testResult, setTestResult] = useState(null);
   const [testInput, setTestInput] = useState('{}');
 
-  const fetchHooks = async () => {
-    setLoading(true);
+  const fetchHooks = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     setError(null);
     setConflict(false);
     try {
@@ -38,11 +39,15 @@ export default function HooksPage() {
     } catch (e) {
       setError(e.message);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => { fetchHooks(); }, []);
+  // Live-sync hooks when settings.json changes, unless mid-edit.
+  useLiveUpdates(['hooks_changed', 'settings_changed'], () => {
+    if (!addingTo && !editingKey) fetchHooks({ silent: true });
+  });
 
   const saveHooks = async (newHooks) => {
     setConflict(false);

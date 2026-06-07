@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { FiPlus, FiEdit3, FiTrash2, FiSave, FiX } from 'react-icons/fi';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
 function relativeTime(iso) {
   if (!iso) return '--';
@@ -42,12 +43,17 @@ export default function CronsPage() {
       setJobs(json.jobs || []);
       setEtag(json.etag);
       setError(null);
-    } catch (e) {
+    } catch {
       setError('Failed to load cron jobs.');
     }
   };
 
   useEffect(() => { refresh(); }, []);
+  // Don't refetch while the user is mid-edit (would clobber the form); only
+  // when not actively editing or creating.
+  useLiveUpdates(['cron_changed', 'cron_deleted'], () => {
+    if (!editingId && !showNew) refresh();
+  });
 
   const createJob = async () => {
     if (!newCron.trim() || !newPrompt.trim()) return;
@@ -69,7 +75,7 @@ export default function CronsPage() {
       setNewRecurring(true);
       setError(null);
       refresh();
-    } catch (e) {
+    } catch {
       setError('Failed to create job.');
     }
   };
@@ -107,7 +113,7 @@ export default function CronsPage() {
       setEditingId(null);
       setError(null);
       refresh();
-    } catch (e) {
+    } catch {
       setError('Failed to update job.');
     }
   };
@@ -128,7 +134,7 @@ export default function CronsPage() {
       setEtag(json.etag);
       setError(null);
       refresh();
-    } catch (e) {
+    } catch {
       setError('Failed to delete job.');
     }
   };

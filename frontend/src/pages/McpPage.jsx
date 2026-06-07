@@ -1,5 +1,6 @@
 import { useEffect, useState, Fragment } from 'react';
 import { FiPlus, FiEdit3, FiTrash2, FiChevronDown, FiChevronRight, FiServer } from 'react-icons/fi';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
 const SENSITIVE_KEYS = /SECRET|TOKEN|KEY|PASSWORD/i;
 
@@ -131,6 +132,7 @@ export default function McpPage() {
   };
 
   useEffect(() => { refresh(); }, []);
+  useLiveUpdates(['mcp_changed', 'mcp_deleted'], refresh);
 
   const handleAdd = async ({ name, config }) => {
     const res = await fetch('/api/mcp', {

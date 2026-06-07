@@ -1,10 +1,13 @@
 import { useEffect } from 'react';
 import { useSettingsStore } from '../stores/settingsStore';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
 export default function SettingsPage() {
   const { data, etag, loading, error, fetch: fetchSettings, save } = useSettingsStore();
 
   useEffect(() => { fetchSettings(); }, []);
+  // Reflect external settings.json edits (CLI / another tab) live.
+  useLiveUpdates(['settings_changed'], fetchSettings);
 
   if (loading && !data) return <div className="loading">Loading settings...</div>;
 

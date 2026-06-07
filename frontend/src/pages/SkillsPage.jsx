@@ -3,6 +3,7 @@ import { FiPlus, FiEdit3, FiTrash2, FiSave, FiEye, FiX } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
 const FRONTMATTER_TEMPLATE = `---
 name: ""
@@ -175,6 +176,10 @@ export default function SkillsPage() {
 
   const refresh = () => fetch('/api/skills').then(r => r.json()).then(setSkills);
   useEffect(() => { refresh(); }, []);
+  // Live-sync the skill list when skills change on disk, unless mid-edit/create.
+  useLiveUpdates(['skill_changed', 'skill_deleted'], () => {
+    if (!editing && !creating) refresh();
+  });
 
   const selectSkill = async (name) => {
     const res = await fetch(`/api/skills/${encodeURIComponent(name)}`);
