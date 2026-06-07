@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
-import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2 } from 'react-icons/fi';
+import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2, FiRefreshCw } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -246,23 +246,57 @@ export default function SessionsPage() {
     fetchHistory(next, true);
   };
 
-  const viewTranscript = async (id) => {
+  // Re-read a session's transcript from disk. The CLI and console share the
+  // same .jsonl files, so this surfaces anything typed in the CLI. `silent`
+  // skips the loading spinner for background refreshes (focus/poll) so the view
+  // doesn't flicker.
+  const loadTranscript = useCallback(async (id, { silent = false } = {}) => {
+    if (!silent) setLoadingTranscript(true);
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/transcript?limit=200&offset=0&tail=true`);
+      const json = await res.json();
+      setTranscript(json.messages || []);
+    } catch {
+      if (!silent) setTranscript([]);
+    }
+    if (!silent) setLoadingTranscript(false);
+  }, []);
+
+  const viewTranscript = (id) => {
     if (selectedId === id) {
       setSelectedId(null);
       setTranscript([]);
       return;
     }
     setSelectedId(id);
-    setLoadingTranscript(true);
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/transcript?limit=200&offset=0&tail=true`);
-      const json = await res.json();
-      setTranscript(json.messages || []);
-    } catch {
-      setTranscript([]);
-    }
-    setLoadingTranscript(false);
+    loadTranscript(id);
   };
+
+  // Sync with the CLI on tab focus: re-read the open transcript and the
+  // sessions list (both read the same files on disk). Fires only on focus, so
+  // it adds no background load.
+  useEffect(() => {
+    const onFocus = () => {
+      if (selectedId) loadTranscript(selectedId, { silent: true });
+      if (tab === 'history') fetchHistory(0);
+      else fetchLive();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [selectedId, tab, loadTranscript, fetchHistory, fetchLive]);
+
+  // Live-ish sync: while a transcript is open AND the tab is visible, re-read it
+  // every few seconds so CLI activity shows without switching away. Paused when
+  // the tab is hidden to avoid pointless requests.
+  useEffect(() => {
+    if (!selectedId) return undefined;
+    const POLL_MS = 4000;
+    const tick = () => {
+      if (!document.hidden) loadTranscript(selectedId, { silent: true });
+    };
+    const id = setInterval(tick, POLL_MS);
+    return () => clearInterval(id);
+  }, [selectedId, loadTranscript]);
 
   // After a transcript loads, jump to the bottom so the latest message is in
   // view (we fetch the tail, but the scroll position still starts at the top).
@@ -421,8 +455,19 @@ export default function SessionsPage() {
 
           {selectedId && (
             <div className="card" style={{ marginTop: '1em' }}>
-              <div style={{ fontWeight: 600, marginBottom: '0.75em', fontSize: '0.9em', color: 'var(--muted)' }}>
-                Transcript
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75em' }}>
+                <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--muted)' }}>
+                  Transcript
+                </span>
+                <button
+                  className="btn"
+                  title="Re-read from disk (picks up CLI activity)"
+                  onClick={() => loadTranscript(selectedId)}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3em', fontSize: '0.8em', padding: '0.2em 0.6em' }}
+                >
+                  <FiRefreshCw size={12} />
+                  Refresh
+                </button>
               </div>
               {loadingTranscript ? (
                 <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>Loading transcript...</div>
