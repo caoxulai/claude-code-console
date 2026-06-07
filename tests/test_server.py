@@ -402,6 +402,7 @@ def projects_layout(tmp_path: Path, monkeypatch):
     alpha = workspace / "alpha"
     alpha.mkdir()
     (alpha / "CLAUDE.md").write_text("# Alpha\n\nThe alpha project.\n", encoding="utf-8")
+    (alpha / "README.md").write_text("# Alpha README\n\nHow to use alpha.\n", encoding="utf-8")
     (alpha / "agent-sops").mkdir()
     (alpha / "agent-sops" / "a.md").write_text("sop", encoding="utf-8")
     (alpha / "skills").mkdir()
@@ -446,6 +447,32 @@ async def _get_projects(client) -> dict:
     return {p["name"]: p for p in await resp.json()}
 
 
+async def test_config_endpoint_exposes_paths_and_projects(client, projects_layout):
+    """GET /api/config surfaces home + slug + defaultCwd + workspace projects so
+    the frontend can avoid hardcoded personal paths.
+    """
+    resp = await client.get("/api/config")
+    assert resp.status == 200
+    cfg = await resp.json()
+
+    # Core fields present.
+    assert set(cfg) >= {"home", "homeSlug", "defaultCwd", "workspaceDir", "projects"}
+
+    # homeSlug is the slug encoding of the resolved home path.
+    from pathlib import Path as _P
+    expected_home = str(_P.home().resolve())
+    assert cfg["home"] == expected_home
+    assert cfg["homeSlug"] == sessions_mod._project_path_to_claude_slug(expected_home)
+
+    # Projects list the workspace dirs (alpha/beta/gamma), skipping hidden, each
+    # with a path and a slug that matches the encoding.
+    names = {p["name"] for p in cfg["projects"]}
+    assert names == {"alpha", "beta", "gamma"}
+    for p in cfg["projects"]:
+        assert p["slug"] == sessions_mod._project_path_to_claude_slug(p["path"])
+    assert ".hidden" not in names
+
+
 async def test_projects_lists_all_skips_hidden(client, projects_layout):
     projects = await _get_projects(client)
     assert set(projects) == {"alpha", "beta", "gamma"}
@@ -468,6 +495,34 @@ async def test_projects_claude_md_and_settings(client, projects_layout):
     assert projects["alpha"]["hasSettings"] is False
     assert projects["beta"]["hasSettings"] is True
     assert projects["beta"]["claudeMd"] is None
+
+
+async def test_projects_readme_inlined(client, projects_layout):
+    """A root README is inlined as `readme` with its filename in `readmeName`;
+    projects without one report null for both (field always present)."""
+    projects = await _get_projects(client)
+    # alpha has a README.md.
+    assert "How to use alpha." in projects["alpha"]["readme"]
+    assert projects["alpha"]["readmeName"] == "README.md"
+    # beta/gamma have no README — both fields present and null.
+    for name in ("beta", "gamma"):
+        assert projects[name]["readme"] is None
+        assert projects[name]["readmeName"] is None
+
+
+def test_read_project_readme_prefers_and_labels_variant(tmp_path):
+    """The helper finds a README, returns its real filename, and yields
+    (None, None) when there's none."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    assert sessions_mod._read_project_readme(proj) == (None, None)
+    (proj / "README.rst").write_text("rst readme", encoding="utf-8")
+    name, content = sessions_mod._read_project_readme(proj)
+    assert name == "README.rst" and content == "rst readme"
+    # README.md takes precedence over README.rst when both exist.
+    (proj / "README.md").write_text("md readme", encoding="utf-8")
+    name2, content2 = sessions_mod._read_project_readme(proj)
+    assert name2 == "README.md" and content2 == "md readme"
 
 
 async def test_projects_sop_files_collected(client, projects_layout):
@@ -805,3 +860,461 @@ async def test_send_releases_lock_on_aclose_after_abandon():
     assert not s._lock.locked()
     await asyncio.wait_for(s._lock.acquire(), timeout=1.0)
     s._lock.release()
+
+
+# --------------------------------------------------------------------------- #
+# Memory routes (/api/memory/files)
+#
+# The memory route reads/writes ~/.claude/projects/<home-slug>/memory. The
+# directory used to be a hardcoded personal slug (-local-home-xulaicao), which
+# made the page silently empty for any other user. It now derives the slug from
+# the resolved home path at call time. These tests point MEMORY_DIR at a
+# tmp-backed dir and exercise the CRUD + etag-conflict paths.
+# --------------------------------------------------------------------------- #
+import server.routes.memory as memory_mod  # noqa: E402
+
+
+@pytest.fixture
+def memory_dir(tmp_path: Path, monkeypatch) -> Path:
+    d = tmp_path / "memory"
+    d.mkdir()
+    monkeypatch.setattr(memory_mod, "MEMORY_DIR", d)
+    # Seed an index + one principle file with frontmatter.
+    (d / "MEMORY.md").write_text("# Index\n\n- [Foo](foo.md)\n", encoding="utf-8")
+    (d / "feedback_principle_x.md").write_text(
+        "---\nname: x\ndescription: a test principle\nmetadata:\n  type: feedback\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+async def test_memory_list_returns_meta(client, memory_dir):
+    resp = await client.get("/api/memory/files")
+    assert resp.status == 200
+    files = {f["name"]: f for f in await resp.json()}
+    assert "MEMORY.md" in files and "feedback_principle_x.md" in files
+    # Frontmatter description + type are surfaced.
+    assert files["feedback_principle_x.md"]["description"] == "a test principle"
+    assert files["feedback_principle_x.md"]["type"] == "feedback"
+
+
+async def test_memory_get_returns_content_and_etag(client, memory_dir):
+    resp = await client.get("/api/memory/files/feedback_principle_x.md")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "body" in data["content"]
+    assert data["etag"]
+
+
+async def test_memory_create_and_roundtrip(client, memory_dir):
+    resp = await client.post("/api/memory/files", json={"name": "new_note", "content": "hello"})
+    assert resp.status == 201
+    # .md suffix is added by _safe_name.
+    assert (memory_dir / "new_note.md").read_text() == "hello"
+
+    # Duplicate create is a 409.
+    dup = await client.post("/api/memory/files", json={"name": "new_note", "content": "x"})
+    assert dup.status == 409
+
+
+async def test_memory_put_etag_conflict(client, memory_dir):
+    # Read current etag.
+    got = await (await client.get("/api/memory/files/feedback_principle_x.md")).json()
+    etag = got["etag"]
+
+    # An external edit changes the file under us (bumps mtime/etag).
+    import time as _t
+    _t.sleep(0.01)
+    (memory_dir / "feedback_principle_x.md").write_text("changed externally\n", encoding="utf-8")
+
+    # Saving with the stale etag must 409, and return the current content.
+    resp = await client.put(
+        "/api/memory/files/feedback_principle_x.md",
+        json={"content": "my edit", "etag": etag},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "changed externally" in body["current"]
+
+
+async def test_memory_put_succeeds_with_current_etag(client, memory_dir):
+    got = await (await client.get("/api/memory/files/feedback_principle_x.md")).json()
+    resp = await client.put(
+        "/api/memory/files/feedback_principle_x.md",
+        json={"content": "fresh edit", "etag": got["etag"]},
+    )
+    assert resp.status == 200
+    assert (memory_dir / "feedback_principle_x.md").read_text() == "fresh edit"
+
+
+async def test_memory_delete_protects_index(client, memory_dir):
+    # MEMORY.md is the index and must not be deletable.
+    resp = await client.delete("/api/memory/files/MEMORY.md")
+    assert resp.status == 403
+    assert (memory_dir / "MEMORY.md").exists()
+
+
+async def test_memory_path_traversal_rejected(client, memory_dir):
+    resp = await client.get("/api/memory/files/..%2f..%2fsecret")
+    assert resp.status in (400, 404)
+
+
+def test_home_memory_dir_uses_resolved_home_slug(monkeypatch, tmp_path):
+    """Regression guard: the memory dir slug is derived from the RESOLVED home
+    path, not a hardcoded personal slug. On a machine where $HOME differs, the
+    computed dir must follow $HOME rather than '-local-home-xulaicao'.
+    """
+    fake_home = tmp_path / "home" / "alice"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr(memory_mod.Path, "home", staticmethod(lambda: fake_home))
+    got = memory_mod._home_memory_dir()
+    expected_slug = "-" + str(fake_home.resolve()).lstrip("/").replace("/", "-")
+    assert got == fake_home / ".claude" / "projects" / expected_slug / "memory"
+    assert "local-home-xulaicao" not in str(got)
+
+
+# --------------------------------------------------------------------------- #
+# MCP routes (/api/mcp)
+#
+# MCP config used to be read from a MeshClaw leftover
+# (~/.claude/agents/meshclaw.mcp.json). It now prefers the standard
+# ~/.claude.json (top-level mcpServers) and only falls back to the legacy file
+# when ~/.claude.json is absent. Writes must preserve all the OTHER keys in
+# ~/.claude.json (it holds far more than mcpServers).
+# --------------------------------------------------------------------------- #
+import server.routes.mcp as mcp_mod  # noqa: E402
+
+
+@pytest.fixture
+def mcp_files(tmp_path: Path, monkeypatch):
+    standard = tmp_path / ".claude.json"
+    legacy = tmp_path / "meshclaw.mcp.json"
+    monkeypatch.setattr(mcp_mod, "GLOBAL_STATE_PATH", standard)
+    monkeypatch.setattr(mcp_mod, "LEGACY_AGENT_MCP_PATH", legacy)
+    return {"standard": standard, "legacy": legacy}
+
+
+async def test_mcp_prefers_standard_over_legacy(client, mcp_files):
+    # Both files exist; the standard ~/.claude.json must win.
+    mcp_files["standard"].write_text(json.dumps({
+        "numStartups": 7,
+        "mcpServers": {"std-server": {"command": "x", "args": []}},
+    }), encoding="utf-8")
+    mcp_files["legacy"].write_text(json.dumps({
+        "mcpServers": {"legacy-server": {"command": "y", "args": []}},
+    }), encoding="utf-8")
+
+    resp = await client.get("/api/mcp")
+    assert resp.status == 200
+    names = {s["name"] for s in (await resp.json())["servers"]}
+    assert names == {"std-server"}
+
+
+async def test_mcp_falls_back_to_legacy_when_standard_absent(client, mcp_files):
+    # Only the legacy file exists -> it is used.
+    mcp_files["legacy"].write_text(json.dumps({
+        "mcpServers": {"legacy-server": {"command": "y", "args": []}},
+    }), encoding="utf-8")
+
+    resp = await client.get("/api/mcp")
+    names = {s["name"] for s in (await resp.json())["servers"]}
+    assert names == {"legacy-server"}
+
+
+async def test_mcp_masks_secret_env_values(client, mcp_files):
+    mcp_files["standard"].write_text(json.dumps({
+        "mcpServers": {"s": {"command": "x", "env": {"API_KEY": "supersecret", "REGION": "us-east-1"}}},
+    }), encoding="utf-8")
+    resp = await client.get("/api/mcp")
+    server = (await resp.json())["servers"][0]
+    assert server["env"]["API_KEY"] == "***"
+    assert server["env"]["REGION"] == "us-east-1"
+
+
+async def test_mcp_add_preserves_other_keys(client, mcp_files):
+    # ~/.claude.json holds far more than mcpServers; adding a server must not
+    # clobber the rest of the file.
+    mcp_files["standard"].write_text(json.dumps({
+        "numStartups": 42,
+        "tipsHistory": {"a": 1},
+        "mcpServers": {"existing": {"command": "x"}},
+    }), encoding="utf-8")
+
+    resp = await client.post("/api/mcp", json={"name": "newsrv", "config": {"command": "z"}})
+    assert resp.status == 201
+
+    on_disk = json.loads(mcp_files["standard"].read_text())
+    assert on_disk["numStartups"] == 42          # untouched
+    assert on_disk["tipsHistory"] == {"a": 1}    # untouched
+    assert set(on_disk["mcpServers"]) == {"existing", "newsrv"}
+
+
+async def test_mcp_add_duplicate_is_conflict(client, mcp_files):
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {"dup": {}}}), encoding="utf-8")
+    resp = await client.post("/api/mcp", json={"name": "dup", "config": {}})
+    assert resp.status == 409
+
+
+async def test_mcp_update_and_delete(client, mcp_files):
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {"s": {"command": "old"}}}), encoding="utf-8")
+
+    upd = await client.put("/api/mcp/s", json={"config": {"command": "new"}})
+    assert upd.status == 200
+    assert json.loads(mcp_files["standard"].read_text())["mcpServers"]["s"]["command"] == "new"
+
+    dele = await client.delete("/api/mcp/s", json={})
+    assert dele.status == 200
+    assert json.loads(mcp_files["standard"].read_text())["mcpServers"] == {}
+
+
+async def test_mcp_update_unknown_is_404(client, mcp_files):
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    resp = await client.put("/api/mcp/ghost", json={"config": {}})
+    assert resp.status == 404
+
+
+async def test_mcp_update_does_not_clobber_masked_secret(client, mcp_files):
+    """Editing a server must not overwrite a real secret env value with the
+    mask. GET returns API_KEY as '***'; if the edit form round-trips that, the
+    backend must restore the real value rather than persisting '***'.
+    """
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {"s": {
+        "command": "run",
+        "env": {"API_KEY": "real-secret-value", "REGION": "us-east-1"},
+    }}}), encoding="utf-8")
+
+    # Simulate the edit form: it received '***' for API_KEY and sends it back,
+    # while genuinely changing the command and a non-secret value.
+    resp = await client.put("/api/mcp/s", json={"config": {
+        "command": "run-v2",
+        "env": {"API_KEY": "***", "REGION": "eu-west-1"},
+    }})
+    assert resp.status == 200
+
+    on_disk = json.loads(mcp_files["standard"].read_text())["mcpServers"]["s"]
+    # The real secret is preserved...
+    assert on_disk["env"]["API_KEY"] == "real-secret-value"
+    # ...while the genuine edits land.
+    assert on_disk["command"] == "run-v2"
+    assert on_disk["env"]["REGION"] == "eu-west-1"
+
+
+async def test_mcp_update_persists_new_secret_value(client, mcp_files):
+    """A genuinely new secret value (not the mask) must be written through."""
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {"s": {
+        "command": "run", "env": {"API_KEY": "old-secret"},
+    }}}), encoding="utf-8")
+
+    resp = await client.put("/api/mcp/s", json={"config": {
+        "command": "run", "env": {"API_KEY": "brand-new-secret"},
+    }})
+    assert resp.status == 200
+    on_disk = json.loads(mcp_files["standard"].read_text())["mcpServers"]["s"]
+    assert on_disk["env"]["API_KEY"] == "brand-new-secret"
+
+
+# --------------------------------------------------------------------------- #
+# Skills routes (/api/skills)
+# --------------------------------------------------------------------------- #
+import server.routes.skills as skills_mod  # noqa: E402
+
+
+@pytest.fixture
+def skills_dirs(tmp_path: Path, monkeypatch):
+    skills = tmp_path / "skills"
+    commands = tmp_path / "commands"
+    skills.mkdir()
+    commands.mkdir()
+    monkeypatch.setattr(skills_mod, "SKILLS_DIR", skills)
+    monkeypatch.setattr(skills_mod, "COMMANDS_DIR", commands)
+    # One skill dir with SKILL.md, one command file.
+    (skills / "deploy").mkdir()
+    (skills / "deploy" / "SKILL.md").write_text(
+        "---\ndescription: deploy things\ntags: ops\n---\n\nSteps\n", encoding="utf-8"
+    )
+    (commands / "greet.md").write_text("---\ndescription: say hi\n---\n\nHi\n", encoding="utf-8")
+    return {"skills": skills, "commands": commands}
+
+
+async def test_skills_list_includes_both_sources(client, skills_dirs):
+    resp = await client.get("/api/skills")
+    assert resp.status == 200
+    by_name = {s["name"]: s for s in await resp.json()}
+    assert by_name["deploy"]["source"] == "local"
+    assert by_name["deploy"]["description"] == "deploy things"
+    assert by_name["greet"]["source"] == "command"
+
+
+async def test_skills_create_get_delete(client, skills_dirs):
+    create = await client.post("/api/skills", json={"name": "newskill", "content": "body"})
+    assert create.status == 201
+    assert (skills_dirs["skills"] / "newskill" / "SKILL.md").read_text() == "body"
+
+    got = await client.get("/api/skills/newskill")
+    assert got.status == 200
+    assert (await got.json())["content"] == "body"
+
+    dele = await client.delete("/api/skills/newskill")
+    assert dele.status == 200
+    assert not (skills_dirs["skills"] / "newskill").exists()
+
+
+async def test_skills_create_rejects_bad_name(client, skills_dirs):
+    resp = await client.post("/api/skills", json={"name": "../evil", "content": "x"})
+    assert resp.status == 400
+
+
+async def test_skills_put_etag_conflict(client, skills_dirs):
+    got = await (await client.get("/api/skills/deploy")).json()
+    import time as _t
+    _t.sleep(0.01)
+    (skills_dirs["skills"] / "deploy" / "SKILL.md").write_text("external\n", encoding="utf-8")
+    resp = await client.put("/api/skills/deploy", json={"content": "mine", "etag": got["etag"]})
+    assert resp.status == 409
+
+
+# --------------------------------------------------------------------------- #
+# Settings routes (/api/settings)
+# --------------------------------------------------------------------------- #
+import server.routes.settings as settings_mod  # noqa: E402
+
+
+@pytest.fixture
+def settings_file(tmp_path: Path, monkeypatch):
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", p)
+    return p
+
+
+async def test_settings_get_and_put(client, settings_file):
+    got = await (await client.get("/api/settings")).json()
+    assert got["data"]["theme"] == "dark"
+    assert got["etag"]
+
+    resp = await client.put("/api/settings", json={"data": {"theme": "light"}, "etag": got["etag"]})
+    assert resp.status == 200
+    assert json.loads(settings_file.read_text())["theme"] == "light"
+
+
+async def test_settings_put_requires_data(client, settings_file):
+    resp = await client.put("/api/settings", json={"etag": "x"})
+    assert resp.status == 400
+
+
+async def test_settings_put_etag_conflict(client, settings_file):
+    got = await (await client.get("/api/settings")).json()
+    import time as _t
+    _t.sleep(0.01)
+    settings_file.write_text(json.dumps({"theme": "externally-set"}), encoding="utf-8")
+    resp = await client.put("/api/settings", json={"data": {"theme": "mine"}, "etag": got["etag"]})
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["current"]["theme"] == "externally-set"
+
+
+# --------------------------------------------------------------------------- #
+# Crons routes (/api/crons)
+# --------------------------------------------------------------------------- #
+import server.routes.crons as crons_mod  # noqa: E402
+
+
+@pytest.fixture
+def crons_file(tmp_path: Path, monkeypatch):
+    p = tmp_path / "scheduled_tasks.json"
+    monkeypatch.setattr(crons_mod, "TASKS_PATH", p)
+    return p
+
+
+async def test_crons_empty_when_no_file(client, crons_file):
+    resp = await client.get("/api/crons")
+    assert resp.status == 200
+    assert (await resp.json())["jobs"] == []
+
+
+async def test_crons_create_list_update_delete(client, crons_file):
+    create = await client.post("/api/crons", json={"cron": "0 9 * * *", "prompt": "standup"})
+    assert create.status == 201
+    job = (await create.json())["job"]
+    assert job["cron"] == "0 9 * * *" and job["prompt"] == "standup"
+    job_id = job["id"]
+
+    listed = (await (await client.get("/api/crons")).json())["jobs"]
+    assert any(j["id"] == job_id for j in listed)
+
+    upd = await client.put(f"/api/crons/{job_id}", json={"prompt": "daily standup"})
+    assert upd.status == 200
+    assert (await upd.json())["job"]["prompt"] == "daily standup"
+
+    dele = await client.delete(f"/api/crons/{job_id}", json={})
+    assert dele.status == 200
+    assert (await (await client.get("/api/crons")).json())["jobs"] == []
+
+
+async def test_crons_create_requires_fields(client, crons_file):
+    resp = await client.post("/api/crons", json={"cron": "", "prompt": ""})
+    assert resp.status == 400
+
+
+async def test_crons_update_unknown_is_404(client, crons_file):
+    resp = await client.put("/api/crons/nope", json={"prompt": "x"})
+    assert resp.status == 404
+
+
+# --------------------------------------------------------------------------- #
+# CLI bind safety
+#
+# The server has no auth and can run shell commands (POST /api/hooks/test), so
+# binding to a non-loopback host without an explicit opt-in is unauthenticated
+# RCE. cmd_start must refuse a routable host unless --allow-remote is given.
+# --------------------------------------------------------------------------- #
+import server.cli as cli_mod  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+def test_is_loopback_classification():
+    assert cli_mod._is_loopback("127.0.0.1")
+    assert cli_mod._is_loopback("localhost")
+    assert cli_mod._is_loopback("::1")
+    assert cli_mod._is_loopback("LOCALHOST")  # case-insensitive
+    assert not cli_mod._is_loopback("0.0.0.0")
+    assert not cli_mod._is_loopback("192.168.1.5")
+
+
+def test_cmd_start_refuses_non_loopback_without_flag(monkeypatch):
+    monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
+    args = SimpleNamespace(host="0.0.0.0", port=7780, no_browser=True, allow_remote=False)
+    # Must exit(2) BEFORE importing/creating the app or calling run_app.
+    with pytest.raises(SystemExit) as exc:
+        cli_mod.cmd_start(args)
+    assert exc.value.code == 2
+
+
+def test_cmd_start_allows_non_loopback_with_flag(monkeypatch):
+    monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
+    started = {}
+    # Stub run_app so the test doesn't actually block on a server.
+    monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
+    args = SimpleNamespace(host="0.0.0.0", port=7780, no_browser=True, allow_remote=True)
+    cli_mod.cmd_start(args)
+    assert started.get("host") == "0.0.0.0"
+
+
+def test_cmd_start_allows_non_loopback_via_env(monkeypatch):
+    monkeypatch.setenv("CLAUDE_WEB_ALLOW_REMOTE", "1")
+    started = {}
+    monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
+    args = SimpleNamespace(host="0.0.0.0", port=7780, no_browser=True, allow_remote=False)
+    cli_mod.cmd_start(args)
+    assert started.get("host") == "0.0.0.0"
+
+
+def test_cmd_start_loopback_does_not_require_flag(monkeypatch):
+    monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
+    started = {}
+    monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
+    # no_browser=True so webbrowser.open isn't invoked during the test.
+    args = SimpleNamespace(host="127.0.0.1", port=7780, no_browser=True, allow_remote=False)
+    cli_mod.cmd_start(args)
+    assert started.get("host") == "127.0.0.1"

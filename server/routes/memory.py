@@ -9,7 +9,23 @@ from aiohttp import web
 from server import filestore
 
 
-MEMORY_DIR = Path.home() / ".claude" / "projects" / "-local-home-xulaicao" / "memory"
+def _home_memory_dir() -> Path:
+    """Resolve the user's top-level memory directory.
+
+    Claude Code stores the home-scope memory under
+    ~/.claude/projects/<home-slug>/memory, where <home-slug> is the user's
+    home path with / replaced by - and a leading - prepended. We resolve()
+    the home path first because on Cloud Desktops $HOME (/home/<user>) is a
+    symlink to /local/home/<user>, and Claude records the slug under the real
+    path. Computed at call time so the path is correct for any user/machine
+    rather than the original author's hardcoded slug.
+    """
+    home = Path.home().resolve()
+    slug = "-" + str(home).lstrip("/").replace("/", "-")
+    return Path.home() / ".claude" / "projects" / slug / "memory"
+
+
+MEMORY_DIR = _home_memory_dir()
 
 
 def register(app: web.Application):

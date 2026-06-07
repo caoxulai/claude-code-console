@@ -29,6 +29,7 @@ LIVE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 
 
 def register(app: web.Application):
+    app.router.add_get("/api/config", get_config)
     app.router.add_get("/api/projects", list_projects)
     app.router.add_put("/api/projects/{project_id}/claude-md", save_project_claude_md)
     app.router.add_get("/api/projects/{project_id}/sop/{filename}", get_project_sop)
@@ -256,6 +257,32 @@ def _last_activity_for_project(jsonl_files: list[Path]) -> tuple[float | None, s
     return last_mtime, datetime.fromtimestamp(last_mtime).strftime("%b %d %H:%M")
 
 
+# Candidate root README filenames, in preference order. Case variants are
+# included because filesystems here are case-sensitive and projects vary.
+_README_CANDIDATES = (
+    "README.md", "README.markdown", "README.mdown", "README.rst",
+    "README.txt", "README", "readme.md", "Readme.md",
+)
+
+
+def _read_project_readme(project_path: Path) -> tuple[str | None, str | None]:
+    """Return (filename, content) for the project's root README, or (None, None).
+
+    Inlined like CLAUDE.md since a README is a single top-level document. Only
+    the project root is checked (not subdirectories) so this stays a cheap
+    single-file read per project. A README that vanishes or is unreadable
+    mid-scan is treated as absent rather than failing the listing.
+    """
+    for name in _README_CANDIDATES:
+        candidate = project_path / name
+        if candidate.is_file():
+            try:
+                return name, candidate.read_text(encoding="utf-8")
+            except OSError:
+                return None, None
+    return None, None
+
+
 def _collect_memory_files(session_dir: Path | None) -> list[dict]:
     """Collect memory file names from a project's Claude memory directory."""
     if not session_dir or not session_dir.is_dir():
@@ -327,6 +354,39 @@ def _project_path_to_claude_slug(project_path: str) -> str:
     return "-" + project_path.lstrip("/").replace("/", "-")
 
 
+async def get_config(request: web.Request) -> web.Response:
+    """Expose environment paths so the frontend doesn't hardcode them.
+
+    The UI previously baked in '/home/xulaicao' and '-local-home-xulaicao'
+    slugs, which only worked on the original author's machine. This endpoint
+    surfaces the resolved home dir, its session-dir slug, the default chat cwd,
+    and the workspace projects (name + real path + slug) so the Chat, Sessions,
+    and cwd-picker UIs can be portable.
+    """
+    home = Path.home().resolve()
+    home_slug = _project_path_to_claude_slug(str(home))
+    default_cwd = str(request.app["default_cwd"])
+
+    projects = []
+    if WORKSPACE_DIR.is_dir():
+        for d in sorted(WORKSPACE_DIR.iterdir()):
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            projects.append({
+                "name": d.name,
+                "path": str(d),
+                "slug": _project_path_to_claude_slug(str(d)),
+            })
+
+    return web.json_response({
+        "home": str(home),
+        "homeSlug": home_slug,
+        "defaultCwd": default_cwd,
+        "workspaceDir": str(WORKSPACE_DIR),
+        "projects": projects,
+    })
+
+
 async def list_projects(request: web.Request) -> web.Response:
     """List all real projects from WORKSPACE_DIR with Claude Code activity metadata."""
     projects = []
@@ -352,6 +412,11 @@ async def list_projects(request: web.Request) -> web.Response:
                 claude_md_content = claude_md_path.read_text(encoding="utf-8")
             except OSError:
                 pass
+
+        # a2. Check for a root README (inlined like CLAUDE.md, since it's a
+        #     single top-level doc). readme_name preserves the actual filename
+        #     so the UI can label it correctly (README.md vs README.rst, etc.).
+        readme_name, readme_content = _read_project_readme(d)
 
         # b. Check for .claude/settings.json
         has_settings = (d / ".claude" / "settings.json").is_file()
@@ -394,6 +459,8 @@ async def list_projects(request: web.Request) -> web.Response:
             "lastActivity": last_activity,
             "lastActivityTs": last_mtime,
             "claudeMd": claude_md_content,
+            "readme": readme_content,
+            "readmeName": readme_name,
             "hasSettings": has_settings,
             "appUrl": app_urls[0]["url"] if app_urls else None,
             "appUrls": app_urls,
@@ -567,10 +634,18 @@ async def list_sessions(request: web.Request) -> web.Response:
     for d in dirs:
         if d.is_dir():
             for f in d.glob("*.jsonl"):
-                all_files.append((f, d.name))
+                # stat() once here, guarded: the CLI can delete a session file
+                # between the glob and the stat. Skip vanished files rather than
+                # letting the whole listing fail with a 500. The captured stat is
+                # reused below so we never stat the same file twice.
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                all_files.append((f, d.name, st))
 
-    # Sort by mtime descending
-    all_files.sort(key=lambda x: x[0].stat().st_mtime, reverse=True)
+    # Sort by mtime descending using the captured stat.
+    all_files.sort(key=lambda x: x[2].st_mtime, reverse=True)
 
     # Filter logic:
     # - For the home bucket: ALWAYS apply _is_interactive_session to hide print-mode
@@ -579,7 +654,7 @@ async def list_sessions(request: web.Request) -> web.Response:
 
     sessions = []
     matched = 0  # count of files that pass the interactive filter (== total)
-    for f, proj_name in all_files:
+    for f, proj_name, stat in all_files:
         if proj_name == home_bucket:
             # Home bucket: always apply interactive filter to hide print-mode sessions
             if not _is_interactive_session(f):
@@ -596,7 +671,6 @@ async def list_sessions(request: web.Request) -> web.Response:
         if rank < offset or len(sessions) >= limit:
             continue
         title = _extract_title(f)
-        stat = f.stat()
         size_kb = stat.st_size // 1024
         sessions.append({
             "id": f.stem,

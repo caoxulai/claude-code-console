@@ -21,14 +21,47 @@ def load_config() -> dict:
     return {}
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"}
+
+
+def _is_loopback(host: str) -> bool:
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
+
 def cmd_start(args):
+    # Safety gate: the server has no authentication and exposes endpoints that
+    # read/write ~/.claude and run shell commands (e.g. POST /api/hooks/test).
+    # That is acceptable bound to loopback (same trust boundary as the CLI), but
+    # binding to a routable interface without auth is unauthenticated RCE on the
+    # network. Require an explicit opt-in for any non-loopback host.
+    allow_remote = args.allow_remote or os.environ.get("CLAUDE_WEB_ALLOW_REMOTE") == "1"
+    if not _is_loopback(args.host) and not allow_remote:
+        print(
+            f"[claude-web] REFUSING to bind to non-loopback host {args.host!r}.\n"
+            "  This server has no authentication and can run shell commands, so\n"
+            "  exposing it on a network is unauthenticated remote code execution.\n"
+            "  To reach it from another device, prefer an SSH tunnel / port-forward\n"
+            "  to 127.0.0.1. If you understand the risk and control the network,\n"
+            "  re-run with --allow-remote (or CLAUDE_WEB_ALLOW_REMOTE=1).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     from server.app import create_app
 
     app = create_app()
     url = f"http://{args.host}:{args.port}"
     print(f"[claude-web] listening on {url}")
+    if not _is_loopback(args.host):
+        print(
+            f"[claude-web] WARNING: bound to {args.host} — anyone who can reach this "
+            "host:port has full, unauthenticated access (including shell execution).",
+            file=sys.stderr,
+        )
 
-    if not args.no_browser:
+    # Only auto-open a browser for loopback binds (a remote host has no local
+    # browser to open, and the URL wouldn't resolve there anyway).
+    if not args.no_browser and _is_loopback(args.host):
         webbrowser.open(url)
 
     web.run_app(app, host=args.host, port=args.port, print=lambda *_: None)
@@ -59,6 +92,12 @@ def main():
     start_parser.add_argument("--port", type=int, default=int(os.environ.get("CLAUDE_WEB_PORT", "7780")))
     start_parser.add_argument("--host", default="127.0.0.1")
     start_parser.add_argument("--no-browser", action="store_true", help="Don't open browser on start")
+    start_parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Permit binding to a non-loopback host. UNSAFE: the server has no auth "
+        "and can run shell commands. Prefer an SSH tunnel to 127.0.0.1 instead.",
+    )
 
     # setup
     sub.add_parser("setup", help="Initialize config file")
@@ -74,6 +113,7 @@ def main():
         args.port = int(os.environ.get("CLAUDE_WEB_PORT", "7780"))
         args.host = "127.0.0.1"
         args.no_browser = False
+        args.allow_remote = False
         cmd_start(args)
 
 

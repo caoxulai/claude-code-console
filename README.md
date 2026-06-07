@@ -162,7 +162,17 @@ Optional config at `~/.claude-web/config.json` (or set `CLAUDE_WEB_CONFIG` to po
 
 ## Accessing from other devices
 
-The server binds to `127.0.0.1`. To reach it from a phone or laptop, expose `:7780` through a tunnel from your Cloud Desktop (e.g. AWS Tunnels + AEA), then open the tunnel URL.
+The server binds to `127.0.0.1` and has **no authentication** — it can read/write
+your `~/.claude` files and run shell commands. The recommended way to reach it
+from a phone or laptop is to keep it on loopback and forward the port over a
+trusted channel: expose `:7780` through a tunnel from your Cloud Desktop (e.g.
+AWS Tunnels + AEA) or an SSH port-forward, then open the tunnel URL.
+
+Binding directly to a routable interface (`--host 0.0.0.0`) is refused by
+default, because an unauthenticated server that can execute shell commands is
+remote code execution for anyone who can reach the port. If you genuinely
+control the network and accept that risk, pass `--allow-remote` (or set
+`CLAUDE_WEB_ALLOW_REMOTE=1`); the server then prints a warning and binds anyway.
 
 ---
 
