@@ -652,20 +652,38 @@ async def get_transcript(request: web.Request) -> web.Response:
 
     limit = int(request.query.get("limit", "200"))
     offset = int(request.query.get("offset", "0"))
+    # tail=true returns the LAST `limit` records instead of the first ones —
+    # the right default for a transcript viewer, which should show the most
+    # recent activity. Sessions can be thousands of lines long; showing the
+    # head means the recent messages are never visible.
+    tail = request.query.get("tail", "").lower() in ("1", "true", "yes")
 
-    messages = []
+    # Parse all records (session files are local and at most a few thousand
+    # lines, so a full read is cheap and lets us compute total + tail slice).
+    records = []
     with open(path) as fh:
-        for i, line in enumerate(fh):
-            if i < offset:
-                continue
-            if len(messages) >= limit:
-                break
+        for line in fh:
             try:
-                messages.append(json.loads(line))
+                records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
 
-    return web.json_response({"messages": messages, "offset": offset, "limit": limit})
+    total = len(records)
+    if tail:
+        # Last `limit` records; offset counts backward from the end so the UI
+        # can page toward older messages.
+        end = total - offset
+        start = max(0, end - limit)
+        window = records[start:max(start, end)]
+    else:
+        window = records[offset:offset + limit]
+
+    return web.json_response({
+        "messages": window,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+    })
 
 
 def _find_session_path(session_id: str) -> Path | None:

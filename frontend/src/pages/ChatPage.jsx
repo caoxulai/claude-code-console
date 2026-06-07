@@ -71,7 +71,7 @@ export default function ChatPage() {
         .then(r => r.json())
         .then(data => setSessionTitle(data.title || ''))
         .catch(() => {});
-      fetch(`/api/sessions/${encodeURIComponent(resumeId)}/transcript?limit=500&offset=0`)
+      fetch(`/api/sessions/${encodeURIComponent(resumeId)}/transcript?limit=500&offset=0&tail=true`)
         .then(r => r.json())
         .then(data => {
           const history = parseTranscriptToMessages(data.messages || []);

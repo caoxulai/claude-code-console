@@ -301,6 +301,36 @@ async def test_get_transcript_paginates(client, projects_base):
     data2 = await resp2.json()
     assert [m["i"] for m in data2["messages"]] == [3, 4, 5]
 
+    # total reflects the full record count regardless of the page window.
+    assert data["total"] == 10
+
+
+async def test_get_transcript_tail_returns_latest(client, projects_base):
+    """tail=true returns the LAST `limit` records — what the transcript viewer
+    needs so a long session shows recent activity, not the oldest lines.
+    """
+    home_dir = projects_base / _slug_from_default(client)
+    records = [{"type": "user", "i": i} for i in range(10)]
+    _write_jsonl(home_dir / "tailsess.jsonl", records)
+
+    # tail with limit 3 -> the last 3 records [7, 8, 9].
+    resp = await client.get(
+        "/api/sessions/tailsess/transcript",
+        params={"limit": "3", "offset": "0", "tail": "true"},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["total"] == 10
+    assert [m["i"] for m in data["messages"]] == [7, 8, 9]
+
+    # tail offset pages backward toward older records: offset 3 -> [4, 5, 6].
+    resp2 = await client.get(
+        "/api/sessions/tailsess/transcript",
+        params={"limit": "3", "offset": "3", "tail": "true"},
+    )
+    data2 = await resp2.json()
+    assert [m["i"] for m in data2["messages"]] == [4, 5, 6]
+
 
 async def test_get_transcript_404_for_unknown(client, projects_base):
     resp = await client.get("/api/sessions/nope/transcript")

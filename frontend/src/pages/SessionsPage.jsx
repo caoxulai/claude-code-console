@@ -254,7 +254,7 @@ export default function SessionsPage() {
     setSelectedId(id);
     setLoadingTranscript(true);
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/transcript?limit=200&offset=0`);
+      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/transcript?limit=200&offset=0&tail=true`);
       const json = await res.json();
       setTranscript(json.messages || []);
     } catch {
