@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useChat } from '../hooks/useChat';
+import { useConfigStore } from '../stores/configStore';
 import { MessageBubble } from '../components/MessageBubble';
 import { ToolCallPanel } from '../components/ToolCallPanel';
 import { ErrorBoundary } from '../components/ErrorBoundary';
-import { FiSend, FiPlus, FiEdit3, FiCheck } from 'react-icons/fi';
+import { FiSend, FiPlus, FiEdit3, FiCheck, FiSquare } from 'react-icons/fi';
 
 function parseTranscriptToMessages(records) {
   const msgs = [];
@@ -53,10 +54,20 @@ function parseTranscriptToMessages(records) {
 }
 
 export default function ChatPage() {
-  const { messages, streaming, sessionId, send, reset, resume, setMessages } = useChat();
+  const { messages, streaming, sessionId, send, stop, reset, resume, setMessages } = useChat();
+  const ensureConfig = useConfigStore(s => s.ensure);
   const [input, setInput] = useState('');
-  const [cwd, setCwd] = useState(localStorage.getItem('claude_web_cwd') || '/home/xulaicao');
+  const [cwd, setCwd] = useState(localStorage.getItem('claude_web_cwd') || '');
   const transcriptRef = useRef(null);
+
+  // Seed the default cwd from the server (portable) when nothing is stored and
+  // we're not resuming a session (resume sets its own cwd).
+  useEffect(() => {
+    if (cwd) return;
+    ensureConfig().then(cfg => {
+      if (cfg?.defaultCwd) setCwd(prev => prev || cfg.defaultCwd);
+    });
+  }, [cwd, ensureConfig]);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sessionTitle, setSessionTitle] = useState('');
   const [editingTitle, setEditingTitle] = useState(false);
@@ -197,9 +208,15 @@ export default function ChatPage() {
           className="form-textarea"
           style={{ minHeight: '42px' }}
         />
-        <button type="submit" className="btn btn-primary" disabled={streaming || !input.trim()}>
-          <FiSend size={16} />
-        </button>
+        {streaming ? (
+          <button type="button" className="btn" onClick={stop} title="Stop generating">
+            <FiSquare size={16} /> Stop
+          </button>
+        ) : (
+          <button type="submit" className="btn btn-primary" disabled={!input.trim()} title="Send">
+            <FiSend size={16} />
+          </button>
+        )}
       </form>
     </div>
   );

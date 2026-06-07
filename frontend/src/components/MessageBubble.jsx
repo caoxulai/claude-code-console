@@ -38,5 +38,19 @@ export function MessageBubble({ message }) {
     );
   }
 
+  if (message.role === 'system') {
+    return (
+      <div data-role="system" style={{
+        textAlign: 'center',
+        color: 'var(--muted)',
+        fontSize: '0.8em',
+        fontStyle: 'italic',
+        padding: '0.3em 0',
+      }}>
+        {message.content}
+      </div>
+    );
+  }
+
   return null;
 }

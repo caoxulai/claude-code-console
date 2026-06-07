@@ -1,21 +1,26 @@
-import { useState, useCallback } from 'react';
-import { streamChat } from '../api/client';
+import { useState, useCallback, useRef } from 'react';
+import { streamChat, stopChat } from '../api/client';
 
 export function useChat() {
   const [messages, setMessages] = useState([]);
   const [streaming, setStreaming] = useState(false);
   const [sessionId, setSessionId] = useState(null);
+  // Holds the AbortController for the in-flight turn so stop() can cancel it.
+  const abortRef = useRef(null);
 
   const send = useCallback(async (prompt, { cwd } = {}) => {
     setMessages(prev => [...prev, { role: 'user', content: prompt }]);
     setStreaming(true);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     let assistantText = '';
     const toolCalls = [];
     let currentToolCall = null;
 
     try {
-      for await (const evt of streamChat(prompt, { cwd, resume: sessionId })) {
+      for await (const evt of streamChat(prompt, { cwd, resume: sessionId, signal: controller.signal })) {
         if (evt.type === 'system' && evt.session_id) {
           setSessionId(evt.session_id);
         } else if (evt.type === 'assistant' && evt.message) {
@@ -64,10 +69,24 @@ export function useChat() {
         }
       }
     } catch (err) {
-      setMessages(prev => [...prev, { role: 'error', content: err.message }]);
+      // An intentional stop (AbortController) isn't an error — show a quiet
+      // interruption notice instead of a red error bubble.
+      if (err.name === 'AbortError') {
+        setMessages(prev => [...prev, { role: 'system', content: 'Response stopped.' }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'error', content: err.message }]);
+      }
     } finally {
       setStreaming(false);
+      abortRef.current = null;
     }
+  }, [sessionId]);
+
+  // Interrupt the in-flight turn: abort the client stream AND tell the backend
+  // to terminate the session process (so it doesn't keep running detached).
+  const stop = useCallback(() => {
+    if (abortRef.current) abortRef.current.abort();
+    stopChat(sessionId);
   }, [sessionId]);
 
   const reset = useCallback(() => {
@@ -80,5 +99,5 @@ export function useChat() {
     setSessionId(id);
   }, []);
 
-  return { messages, streaming, sessionId, send, reset, resume, setMessages };
+  return { messages, streaming, sessionId, send, stop, reset, resume, setMessages };
 }
