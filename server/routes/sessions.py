@@ -697,13 +697,20 @@ def _find_session_path(session_id: str) -> Path | None:
 
 
 async def get_session_title(request: web.Request) -> web.Response:
-    """Get the title of a session."""
+    """Get the title of a session, plus the cwd it belongs to.
+
+    cwd is the real path the session was created under (decoded from its
+    project-dir slug). Resuming a session requires running `claude --resume` in
+    that same cwd — resume is cwd-scoped, so a mismatched cwd yields
+    "No conversation found".
+    """
     session_id = request.match_info["session_id"]
     path = _find_session_path(session_id)
     if not path:
         raise web.HTTPNotFound(reason="session not found")
     title = _extract_title(path)
-    return web.json_response({"sessionId": session_id, "title": title or ""})
+    cwd = _project_label(path.parent.name)
+    return web.json_response({"sessionId": session_id, "title": title or "", "cwd": cwd})
 
 
 async def set_session_title(request: web.Request) -> web.Response:

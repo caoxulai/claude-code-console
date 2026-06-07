@@ -225,7 +225,25 @@ async def test_get_session_title_and_extract_last_custom_title(client, projects_
     resp = await client.get("/api/sessions/renamed/title")
     assert resp.status == 200
     data = await resp.json()
-    assert data == {"sessionId": "renamed", "title": "Final name"}
+    assert data["sessionId"] == "renamed"
+    assert data["title"] == "Final name"
+    # The title response carries the session's cwd (decoded from its project-dir
+    # slug) so the Chat page can resume in the correct directory. renamed lives
+    # in the home bucket, whose slug decodes back to the home cwd.
+    assert data["cwd"] == str(client.app["default_cwd"])
+
+
+async def test_get_session_title_cwd_matches_project_dir(client, projects_base):
+    """A session in a non-home project dir reports that project's cwd, not home.
+
+    Regression guard for the resume bug: the Chat page must resume in the
+    directory the session was created under (claude --resume is cwd-scoped).
+    """
+    resp = await client.get("/api/sessions/other/title")
+    assert resp.status == 200
+    data = await resp.json()
+    # `other` lives in base/-some-other-proj, which decodes to /some/other/proj.
+    assert data["cwd"] == "/some/other/proj"
 
 
 async def test_set_session_title_round_trips(client, projects_base):

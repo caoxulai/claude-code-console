@@ -55,7 +55,7 @@ function parseTranscriptToMessages(records) {
 export default function ChatPage() {
   const { messages, streaming, sessionId, send, reset, resume, setMessages } = useChat();
   const [input, setInput] = useState('');
-  const [cwd] = useState(localStorage.getItem('claude_web_cwd') || '/home/xulaicao');
+  const [cwd, setCwd] = useState(localStorage.getItem('claude_web_cwd') || '/home/xulaicao');
   const transcriptRef = useRef(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sessionTitle, setSessionTitle] = useState('');
@@ -69,7 +69,12 @@ export default function ChatPage() {
       resume(resumeId);
       fetch(`/api/sessions/${encodeURIComponent(resumeId)}/title`)
         .then(r => r.json())
-        .then(data => setSessionTitle(data.title || ''))
+        .then(data => {
+          setSessionTitle(data.title || '');
+          // Resume is cwd-scoped: claude --resume must run in the directory the
+          // session was created under, or it reports "No conversation found".
+          if (data.cwd) setCwd(data.cwd);
+        })
         .catch(() => {});
       fetch(`/api/sessions/${encodeURIComponent(resumeId)}/transcript?limit=500&offset=0&tail=true`)
         .then(r => r.json())
