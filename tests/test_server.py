@@ -654,3 +654,95 @@ def test_load_project_urls_config_substring_match(monkeypatch, tmp_path):
     assert sessions_mod._app_urls_for_project("claude-web-frontend")[0]["url"] == "http://x"
     # No match -> empty list.
     assert sessions_mod._app_urls_for_project("unrelated") == []
+
+
+# --------------------------------------------------------------------------- #
+# PersistentSession lock release on abandoned stream
+#
+# session.send() holds self._lock across its yield loop. If a client disconnects
+# mid-turn the consumer abandons the async generator; without an explicit
+# aclose() the lock would only release on lazy GC finalization, so a fast
+# follow-up request reusing the session could block forever on the held lock
+# (asyncio.Lock has no acquire timeout). The chat route now calls gen.aclose()
+# in a finally; this test pins that the lock is released deterministically.
+# --------------------------------------------------------------------------- #
+import server.session_manager as session_mod  # noqa: E402
+
+
+class _FakeStdin:
+    def write(self, _data):
+        pass
+
+    async def drain(self):
+        pass
+
+
+class _FakeStdout:
+    """Yields a few JSONL event lines, slowly, then a result line."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        await asyncio.sleep(0)  # let the consumer interleave
+        return self._lines.pop(0)
+
+
+class _FakeProc:
+    returncode = None  # mimics a live process (so .alive is True)
+
+    def __init__(self, lines):
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStdout(lines)
+
+
+def _make_fake_session():
+    s = session_mod.PersistentSession(session_id="sess-1")
+    lines = [
+        (json.dumps({"type": "system", "session_id": "sess-1"}) + "\n").encode(),
+        (json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n").encode(),
+        (json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": " there"}]}}) + "\n").encode(),
+        (json.dumps({"type": "result", "is_error": False, "result": "hi there"}) + "\n").encode(),
+    ]
+    s._proc = _FakeProc(lines)
+    s._started = True
+    return s
+
+
+async def test_send_releases_lock_when_consumer_finishes_normally():
+    s = _make_fake_session()
+    got = [evt async for evt in s.send("hello")]
+    assert any(e.get("type") == "result" for e in got)
+    assert not s._lock.locked()
+
+
+async def test_send_releases_lock_on_aclose_after_abandon():
+    """Abandon the stream mid-turn (like a client disconnect), then aclose().
+
+    This is the regression guard: after aclose(), the lock MUST be free so the
+    next request reusing the session can proceed. Without the chat route's
+    finally: gen.aclose(), the lock would stay held until GC finalization.
+    """
+    s = _make_fake_session()
+    gen = s.send("hello")
+    got = []
+    async for evt in gen:
+        got.append(evt)
+        if evt.get("type") == "assistant":
+            break  # client disconnects mid-stream
+
+    # The generator is suspended at a yield, still holding the lock.
+    assert s._lock.locked()
+
+    # The fix: explicitly close the abandoned generator.
+    await gen.aclose()
+
+    # Lock is now released deterministically — a second send can acquire it.
+    assert not s._lock.locked()
+    await asyncio.wait_for(s._lock.acquire(), timeout=1.0)
+    s._lock.release()

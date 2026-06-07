@@ -80,8 +80,16 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
     )
     await resp.prepare(request)
 
+    # Hold a reference to the async generator so we can explicitly close it.
+    # session.send() holds the session lock across its yield loop; if the client
+    # disconnects mid-stream the loop is abandoned and the suspended generator
+    # would only release the lock on lazy GC finalization. A fast-following
+    # request that reuses the session could then block forever on the still-held
+    # lock (asyncio.Lock has no acquire timeout). aclose() in finally releases it
+    # deterministically the moment the client goes away.
+    gen = session.send(prompt)
     try:
-        async for evt in session.send(prompt):
+        async for evt in gen:
             line = json.dumps(evt)
             await resp.write(f"data: {line}\n\n".encode("utf-8"))
 
@@ -95,6 +103,8 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
     except RuntimeError as e:
         await resp.write(f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n".encode())
         await resp.write(b"data: [DONE]\n\n")
+    finally:
+        await gen.aclose()
 
     # For new sessions: mark as interactive so it appears in both CLI and GUI session lists
     if not resume and session.session_id:
