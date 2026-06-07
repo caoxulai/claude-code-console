@@ -60,6 +60,30 @@ def _is_interactive_session(path: Path) -> bool:
         return False
 
 
+def _has_real_turn(path: Path) -> bool:
+    """True if the session contains at least one actual user or assistant turn.
+
+    Filters out orphaned/empty sessions that were started but never ran — files
+    that only hold metadata records (last-prompt, custom-title, agent-name,
+    mode, etc.) with no real exchange. Bounded to the first 200 lines so a
+    healthy session short-circuits cheaply.
+    """
+    try:
+        with open(path) as fh:
+            for i, raw in enumerate(fh):
+                if i >= 200:
+                    break
+                try:
+                    rec = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") in ("user", "assistant"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def _extract_title(path: Path) -> str | None:
     """Extract session title from JSONL.
 
@@ -560,6 +584,10 @@ async def list_sessions(request: web.Request) -> web.Response:
             # Home bucket: always apply interactive filter to hide print-mode sessions
             if not _is_interactive_session(f):
                 continue
+        # Hide orphaned/empty sessions (started but never had a real exchange) in
+        # every bucket — these are noise (e.g. an interrupted one-off invocation).
+        if not _has_real_turn(f):
+            continue
         # This file counts toward the total; its zero-based rank is `matched`.
         rank = matched
         matched += 1

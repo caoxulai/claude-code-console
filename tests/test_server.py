@@ -133,14 +133,23 @@ def projects_base(tmp_path: Path, monkeypatch) -> Path:
     _write_jsonl(home_dir / "interactive.jsonl", [
         {"type": "mode", "mode": "default"},
         {"type": "ai-title", "aiTitle": "An AI generated title"},
+        {"type": "user", "message": {"content": "hello"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
     ])
     _write_jsonl(home_dir / "renamed.jsonl", [
         {"type": "custom-title", "customTitle": "First name"},
         {"type": "custom-title", "customTitle": "Final name"},
+        {"type": "user", "message": {"content": "do a thing"}},
     ])
     _write_jsonl(home_dir / "printmode.jsonl", [
         {"type": "queue-operation"},
         {"type": "custom-title", "customTitle": "should stay hidden"},
+    ])
+    # Orphaned/empty session: interactive first line but no real turn -> filtered
+    # by the _has_real_turn guard.
+    _write_jsonl(home_dir / "empty.jsonl", [
+        {"type": "mode", "mode": "default"},
+        {"type": "custom-title", "customTitle": "started but never ran"},
     ])
 
     other_dir = base / "-some-other-proj"
@@ -165,7 +174,9 @@ async def test_list_sessions_shape_and_home_bucket_filter(client, projects_base)
     ids = {s["id"] for s in data["sessions"]}
     # Home-bucket print-mode session is filtered out...
     assert "printmode" not in ids
-    # ...but interactive + renamed home sessions are kept...
+    # ...the orphaned/empty session (no real turn) is filtered out...
+    assert "empty" not in ids
+    # ...but interactive + renamed home sessions (with a real turn) are kept...
     assert "interactive" in ids
     assert "renamed" in ids
     # ...and the print-mode session in a NON-home dir is NOT filtered.
