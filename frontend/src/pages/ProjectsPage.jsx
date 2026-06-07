@@ -6,7 +6,7 @@ import rehypeHighlight from 'rehype-highlight';
 import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 
-const TABS = ['Overview', 'CLAUDE.md', 'Memory', 'Skills/SOPs'];
+const TABS = ['Overview', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs'];
 
 function parseFrontmatter(content) {
   if (!content) return { meta: null, body: content };
@@ -108,7 +108,7 @@ const CLAUDE_MD_TEMPLATE = `# Project Instructions
 
 export default function ProjectsPage() {
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState(searchParams.get('expand') || null);
@@ -495,6 +495,34 @@ export default function ProjectsPage() {
     </div>
   );
 
+  const renderReadmeTab = (project) => {
+    if (!project.readme) {
+      return (
+        <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
+          <h3>No README</h3>
+          <p style={{ color: 'var(--muted)' }}>
+            No README found in this project&apos;s root directory.
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em', marginBottom: 'var(--space-sm)' }}>
+          <span style={{ fontWeight: 600, fontSize: 'var(--fs-sm)', fontFamily: 'monospace', color: 'var(--muted)' }}>
+            {project.readmeName || 'README.md'}
+          </span>
+        </div>
+        <div className="markdown-body" style={{ fontSize: 'var(--fs-sm)' }}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+            {project.readme}
+          </ReactMarkdown>
+        </div>
+      </div>
+    );
+  };
+
   const renderClaudeMdTab = (project) => {
     if (!project.claudeMd && !editingClaudeMd) {
       return (
@@ -717,6 +745,7 @@ export default function ProjectsPage() {
       }}>
         {renderTabBar()}
         {activeTab === 'Overview' && renderOverviewTab(project)}
+        {activeTab === 'README' && renderReadmeTab(project)}
         {activeTab === 'CLAUDE.md' && renderClaudeMdTab(project)}
         {activeTab === 'Memory' && renderMemoryTab(project)}
         {activeTab === 'Skills/SOPs' && renderSopsTab(project)}
