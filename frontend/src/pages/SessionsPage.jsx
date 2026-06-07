@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2, FiRefreshCw } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { SkeletonLine } from '../components/Skeleton';
 import { ErrorBoundary } from '../components/ErrorBoundary';
+import { useConfigStore } from '../stores/configStore';
 
 function StatusBadge({ status }) {
   const cls = status === 'busy' ? 'badge-warn' : 'badge-ok';
@@ -156,10 +157,28 @@ export default function SessionsPage() {
   const [transcript, setTranscript] = useState([]);
   const [loadingTranscript, setLoadingTranscript] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [titleSearch, setTitleSearch] = useState('');
   const transcriptRef = useRef(null);
 
   const LIMIT = 50;
-  const HOME_SLUG = '-local-home-xulaicao';
+
+  // Environment config (home slug + workspace project slugs) from the server,
+  // so the project filter isn't tied to one user's hardcoded paths.
+  const config = useConfigStore(s => s.config);
+  const ensureConfig = useConfigStore(s => s.ensure);
+  useEffect(() => { ensureConfig(); }, [ensureConfig]);
+  const HOME_SLUG = config?.homeSlug || '';
+  // Map a workspace project name -> its session-dir slug. Prefer the exact slug
+  // from /api/config; fall back to constructing it from workspaceDir so a
+  // project that still has sessions but no longer exists on disk is filterable.
+  const slugForProject = (name) => {
+    const known = config?.projects?.find(p => p.name === name)?.slug;
+    if (known) return known;
+    if (config?.workspaceDir) {
+      return '-' + `${config.workspaceDir}/${name}`.replace(/^\//, '').replace(/\//g, '-');
+    }
+    return '';
+  };
 
   // Fixed filter options — loaded ONCE on mount from unfiltered "All" data, never changes
   const [filterOptions, setFilterOptions] = useState([]);
@@ -183,8 +202,11 @@ export default function SessionsPage() {
   const currentFilter = (() => {
     const p = searchParams.get('project');
     if (!p) return 'all';
-    if (p === HOME_SLUG) return 'Global';
-    // Convert slug back to project name for display
+    if (HOME_SLUG && p === HOME_SLUG) return 'Global';
+    // Prefer an exact match against a known project slug from config.
+    const known = config?.projects?.find(proj => proj.slug === p);
+    if (known) return known.name;
+    // Fall back to extracting the trailing segment of a workspace slug.
     const match = p.match(/workspace-projects-(.+)$/);
     return match ? match[1] : p;
   })();
@@ -196,9 +218,9 @@ export default function SessionsPage() {
     } else if (val === 'Global') {
       setSearchParams({ project: HOME_SLUG });
     } else {
-      // Convert project name to slug
-      const slug = `-local-home-xulaicao-workspace-projects-${val}`;
-      setSearchParams({ project: slug });
+      // Convert project name to slug using config (portable across users).
+      const slug = slugForProject(val);
+      if (slug) setSearchParams({ project: slug });
     }
   };
 
@@ -321,6 +343,16 @@ export default function SessionsPage() {
     fontSize: '0.9em',
   });
 
+  // Client-side title filter over the loaded page of sessions. (Server-side
+  // scope filtering still applies via the dropdown / ?project=.) Declared before
+  // any early return so the hook order stays stable across renders.
+  const visibleSessions = useMemo(() => {
+    const q = titleSearch.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(s =>
+      (s.title || '').toLowerCase().includes(q) || s.id.toLowerCase().includes(q));
+  }, [sessions, titleSearch]);
+
   if (loading && sessions.length === 0 && liveSessions.length === 0) {
     return (
       <div>
@@ -350,7 +382,7 @@ export default function SessionsPage() {
       </div>
 
       {tab === 'history' && (
-        <div style={{ marginBottom: '0.75em' }}>
+        <div style={{ marginBottom: '0.75em', display: 'flex', gap: '0.5em', alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             className="form-select"
             style={{ width: '180px', fontSize: 'var(--fs-sm)' }}
@@ -363,6 +395,18 @@ export default function SessionsPage() {
               <option key={name} value={name}>{name}</option>
             ))}
           </select>
+          <input
+            className="form-input"
+            value={titleSearch}
+            onChange={e => setTitleSearch(e.target.value)}
+            placeholder="Search titles…"
+            style={{ flex: 1, minWidth: '160px', fontSize: 'var(--fs-sm)' }}
+          />
+          {titleSearch && (
+            <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', whiteSpace: 'nowrap' }}>
+              {visibleSessions.length} match{visibleSessions.length === 1 ? '' : 'es'}
+            </span>
+          )}
         </div>
       )}
 
@@ -389,7 +433,7 @@ export default function SessionsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {sessions.map(s => (
+                    {visibleSessions.map(s => (
                       <tr
                         key={s.id}
                         onClick={() => viewTranscript(s.id)}
@@ -443,6 +487,12 @@ export default function SessionsPage() {
                     ))}
                   </tbody>
                 </table>
+                {visibleSessions.length === 0 && titleSearch && (
+                  <div style={{ padding: '1em', textAlign: 'center', color: 'var(--muted)', fontSize: 'var(--fs-sm)' }}>
+                    No loaded sessions match “{titleSearch}”.
+                    {sessions.length < total && ' Try “Load more” to search older sessions.'}
+                  </div>
+                )}
               </div>
 
               {sessions.length < total && (
