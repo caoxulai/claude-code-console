@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2 } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
@@ -156,6 +156,7 @@ export default function SessionsPage() {
   const [transcript, setTranscript] = useState([]);
   const [loadingTranscript, setLoadingTranscript] = useState(false);
   const [loading, setLoading] = useState(true);
+  const transcriptRef = useRef(null);
 
   const LIMIT = 50;
   const HOME_SLUG = '-local-home-xulaicao';
@@ -262,6 +263,15 @@ export default function SessionsPage() {
     }
     setLoadingTranscript(false);
   };
+
+  // After a transcript loads, jump to the bottom so the latest message is in
+  // view (we fetch the tail, but the scroll position still starts at the top).
+  useEffect(() => {
+    if (!loadingTranscript && transcript.length && transcriptRef.current) {
+      const el = transcriptRef.current;
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [transcript, loadingTranscript]);
 
   const tabStyle = (active) => ({
     padding: '0.5em 1.5em',
@@ -420,7 +430,7 @@ export default function SessionsPage() {
                 <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>No messages in this session.</div>
               ) : (
                 <ErrorBoundary label="Failed to render this transcript.">
-                  <div style={{ maxHeight: '500px', overflowY: 'auto', padding: '0.5em' }}>
+                  <div ref={transcriptRef} style={{ maxHeight: '500px', overflowY: 'auto', padding: '0.5em' }}>
                     {transcript.map((msg, i) => (
                       <TranscriptMessage key={i} msg={msg} />
                     ))}
