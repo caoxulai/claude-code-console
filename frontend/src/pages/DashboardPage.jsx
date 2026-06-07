@@ -11,8 +11,10 @@ export default function DashboardPage() {
   const navigate = useNavigate();
   const [stats, setStats] = useState(null);
   const [projects, setProjects] = useState([]);
+  const [error, setError] = useState(null);
 
-  useEffect(() => {
+  const load = () => {
+    setError(null);
     Promise.all([
       fetch('/api/sessions').then(r => r.json()),
       fetch('/api/memory/files').then(r => r.json()),
@@ -33,8 +35,13 @@ export default function DashboardPage() {
         live: live.length || 0,
         projects: projectsList.length,
       });
-    }).catch(() => {});
-  }, []);
+    }).catch(() => {
+      // Surface the failure instead of leaving cards blank with no explanation.
+      setError('Could not load dashboard data. Is the server still running?');
+    });
+  };
+
+  useEffect(() => { load(); }, []);
 
   const cards = [
     { icon: FiList, label: 'Sessions', value: stats?.sessions, link: '/sessions' },
@@ -63,6 +70,12 @@ export default function DashboardPage() {
   return (
     <div>
       <div className="page-header"><h2>Dashboard</h2></div>
+      {error && (
+        <div className="conflict-banner" style={{ marginBottom: '1em' }}>
+          <span>{error}</span>
+          <button className="btn" onClick={load}>Retry</button>
+        </div>
+      )}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1em' }}>
         {!stats ? (
           Array.from({ length: 7 }).map((_, i) => (
