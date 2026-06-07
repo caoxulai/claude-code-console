@@ -5,6 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { SkeletonLine } from '../components/Skeleton';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 
 function StatusBadge({ status }) {
   const cls = status === 'busy' ? 'badge-warn' : 'badge-ok';
@@ -418,11 +419,13 @@ export default function SessionsPage() {
               ) : transcript.length === 0 ? (
                 <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>No messages in this session.</div>
               ) : (
-                <div style={{ maxHeight: '500px', overflowY: 'auto', padding: '0.5em' }}>
-                  {transcript.map((msg, i) => (
-                    <TranscriptMessage key={i} msg={msg} />
-                  ))}
-                </div>
+                <ErrorBoundary label="Failed to render this transcript.">
+                  <div style={{ maxHeight: '500px', overflowY: 'auto', padding: '0.5em' }}>
+                    {transcript.map((msg, i) => (
+                      <TranscriptMessage key={i} msg={msg} />
+                    ))}
+                  </div>
+                </ErrorBoundary>
               )}
             </div>
           )}

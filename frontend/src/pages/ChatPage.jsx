@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useChat } from '../hooks/useChat';
 import { MessageBubble } from '../components/MessageBubble';
 import { ToolCallPanel } from '../components/ToolCallPanel';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 import { FiSend, FiPlus, FiEdit3, FiCheck } from 'react-icons/fi';
 
 function parseTranscriptToMessages(records) {
@@ -171,9 +172,11 @@ export default function ChatPage() {
           </div>
         )}
         {messages.map((msg, i) => (
-          msg.toolCall
-            ? <ToolCallPanel key={i} toolCall={msg.toolCall} />
-            : <MessageBubble key={i} message={msg} />
+          <ErrorBoundary key={i} label="Failed to render this message.">
+            {msg.toolCall
+              ? <ToolCallPanel toolCall={msg.toolCall} />
+              : <MessageBubble message={msg} />}
+          </ErrorBoundary>
         ))}
         {streaming && <div className="thinking-indicator">Claude is thinking…</div>}
       </div>
