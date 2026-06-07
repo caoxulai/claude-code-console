@@ -3,8 +3,46 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode } from 'react-icons/fi';
+import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiCopy, FiCheck } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
+
+// Small copy-to-clipboard icon button matching the app's icon-btn style.
+// Shows a brief check-mark confirmation after a successful copy. Stops click
+// propagation so copying inside a clickable card header doesn't toggle the card.
+function CopyButton({ text, title = 'Copy' }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async (e) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for non-secure contexts where the Clipboard API is unavailable.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  };
+
+  return (
+    <button
+      className="icon-btn"
+      onClick={copy}
+      title={copied ? 'Copied!' : title}
+      aria-label={copied ? 'Copied' : title}
+      style={{ padding: 3, flexShrink: 0 }}
+    >
+      {copied ? <FiCheck size={12} style={{ color: 'var(--accent)' }} /> : <FiCopy size={12} />}
+    </button>
+  );
+}
 
 const TABS = ['Overview', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs'];
 
@@ -310,16 +348,18 @@ export default function ProjectsPage() {
               </a>
             )}
           </div>
-          <div style={{
-            fontSize: 'var(--fs-xs)',
-            color: 'var(--muted)',
-            fontFamily: 'monospace',
-            marginTop: '0.2em',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}>
-            {project.path}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.25em', marginTop: '0.2em', minWidth: 0 }}>
+            <span style={{
+              fontSize: 'var(--fs-xs)',
+              color: 'var(--muted)',
+              fontFamily: 'monospace',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>
+              {project.path}
+            </span>
+            <CopyButton text={project.path} title="Copy directory path" />
           </div>
         </div>
 
