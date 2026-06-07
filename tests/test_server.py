@@ -1318,3 +1318,180 @@ def test_cmd_start_loopback_does_not_require_flag(monkeypatch):
     args = SimpleNamespace(host="127.0.0.1", port=7780, no_browser=True, allow_remote=False)
     cli_mod.cmd_start(args)
     assert started.get("host") == "127.0.0.1"
+
+
+# --------------------------------------------------------------------------- #
+# Usage aggregation (/api/usage)
+#
+# Sums message.usage across assistant records in every project transcript and
+# returns totals + breakdowns by model / project / agent / day with estimated
+# cost. Subagent turns are marked isSidechain + attributionAgent.
+# --------------------------------------------------------------------------- #
+import server.routes.usage as usage_mod  # noqa: E402
+
+
+@pytest.fixture
+def usage_projects(tmp_path: Path, monkeypatch) -> Path:
+    base = tmp_path / "claude_projects"
+    base.mkdir()
+    monkeypatch.setattr(usage_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    _uid = [0]
+
+    def assistant(model, inp, out, cr, cw, *, sidechain=False, agent=None,
+                  ts="2026-06-01T10:00:00.000Z", cwd="/home/alice/proj", uuid=None):
+        _uid[0] += 1
+        rec = {
+            "type": "assistant",
+            "uuid": uuid if uuid is not None else f"u{_uid[0]}",
+            "timestamp": ts,
+            "isSidechain": sidechain,
+            "cwd": cwd,
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cw,
+                },
+            },
+        }
+        if agent:
+            rec["attributionAgent"] = agent
+        return rec
+
+    proj = base / "-home-alice-proj"
+    proj.mkdir()
+    _write_jsonl(proj / "s1.jsonl", [
+        {"type": "user", "message": {"content": "hi"}},  # ignored (no usage)
+        assistant("claude-opus-4-8", 1000, 500, 2000, 100, uuid="main-1"),
+        {"type": "assistant", "message": {"model": "<synthetic>", "usage": {"input_tokens": 9}}},  # skipped
+    ])
+    # Subagent usage lives in a subagents/ subtree and is deduped globally by uuid.
+    subdir = base / "subagents"
+    subdir.mkdir()
+    _write_jsonl(subdir / "a1.jsonl", [
+        assistant("claude-haiku-4-5", 200, 100, 0, 0, sidechain=True, agent="Explore", uuid="sub-1"),
+    ])
+    # A transcripts/ export that re-writes the main record — must NOT double-count.
+    transdir = base / "transcripts"
+    transdir.mkdir()
+    _write_jsonl(transdir / "t1.jsonl", [
+        assistant("claude-opus-4-8", 1000, 500, 2000, 100, uuid="main-1"),  # dup of main-1
+    ])
+    return base
+
+
+async def test_usage_totals_and_breakdowns(client, usage_projects):
+    resp = await client.get("/api/usage")
+    assert resp.status == 200
+    data = await resp.json()
+
+    # Total tokens sum the two real assistant records (synthetic skipped).
+    t = data["total"]
+    assert t["inputTokens"] == 1200
+    assert t["outputTokens"] == 600
+    assert t["cacheReadTokens"] == 2000
+    assert t["messages"] == 2
+
+    # Per-model split.
+    assert set(data["byModel"]) == {"claude-opus-4-8", "claude-haiku-4-5"}
+    assert data["byModel"]["claude-opus-4-8"]["inputTokens"] == 1000
+
+    # Main vs subagent attribution.
+    assert data["byAgent"]["main"]["messages"] == 1
+    assert data["byAgent"]["Explore"]["messages"] == 1
+
+    # Project attribution comes from the record's cwd basename.
+    assert data["byProject"]["proj"]["messages"] == 2
+
+    # The transcripts/ duplicate of main-1 must NOT be double-counted.
+    assert data["byModel"]["claude-opus-4-8"]["messages"] == 1
+    assert t["inputTokens"] == 1200  # 1000 (main, counted once) + 200 (subagent)
+
+    # Cost is computed and positive (opus input 1000*$5/1M + output 500*$25/1M
+    # + cacheRead 2000*$5*0.1/1M + cacheWrite 100*$5*1.25/1M).
+    assert t["cost"] > 0
+
+
+def test_usage_cost_formula():
+    # Opus: input $5/1M, output $25/1M, cache read 0.1x, cache write 1.25x.
+    cost = usage_mod._cost_for("claude-opus-4-8", 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+    expected = 5.0 + 25.0 + 5.0 * 0.1 + 5.0 * 1.25
+    assert abs(cost - expected) < 1e-9
+
+
+def test_usage_unknown_model_falls_back_to_opus_pricing():
+    cost = usage_mod._cost_for("some-future-model", 1_000_000, 0, 0, 0)
+    assert abs(cost - 5.0) < 1e-9
+
+
+async def test_usage_empty_when_no_projects(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(usage_mod, "CLAUDE_PROJECTS_BASE", tmp_path / "nonexistent")
+    resp = await client.get("/api/usage")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["total"]["messages"] == 0
+    assert data["byModel"] == {}
+
+
+def _independent_usage_totals(base: Path) -> dict:
+    """Recompute deduped usage totals from scratch — the oracle the endpoint
+    must match. Mirrors the production rules (dedupe by uuid across all files,
+    skip <synthetic>, sum the four token fields) but is written independently
+    so a bug in one is unlikely to be mirrored in the other.
+    """
+    seen: set = set()
+    tin = tout = tcr = tcw = nmsg = 0
+    for f in sorted(base.rglob("*.jsonl")):
+        for line in f.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("type") != "assistant":
+                continue
+            m = r.get("message")
+            if not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
+                continue
+            if m.get("model") == "<synthetic>":
+                continue
+            uid = r.get("uuid")
+            if uid is not None:
+                if uid in seen:
+                    continue
+                seen.add(uid)
+            u = m["usage"]
+            tin += u.get("input_tokens", 0) or 0
+            tout += u.get("output_tokens", 0) or 0
+            tcr += u.get("cache_read_input_tokens", 0) or 0
+            tcw += u.get("cache_creation_input_tokens", 0) or 0
+            nmsg += 1
+    return {
+        "messages": nmsg,
+        "inputTokens": tin,
+        "outputTokens": tout,
+        "cacheReadTokens": tcr,
+        "cacheWriteTokens": tcw,
+    }
+
+
+async def test_usage_endpoint_matches_independent_recompute(client, usage_projects):
+    """Accuracy guard: the endpoint's totals must equal a from-scratch recompute,
+    field by field. If aggregation, dedup, or skipping logic regresses, this fails
+    rather than silently rendering wrong numbers.
+    """
+    oracle = _independent_usage_totals(usage_projects)
+    resp = await client.get("/api/usage")
+    data = await resp.json()
+    t = data["total"]
+    for field in ("messages", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"):
+        assert t[field] == oracle[field], f"{field}: endpoint {t[field]} != oracle {oracle[field]}"
+
+    # The per-breakdown message counts must also reconcile to the total (no
+    # turn counted in a breakdown but missing from the total, or vice versa).
+    assert sum(v["messages"] for v in data["byModel"].values()) == t["messages"]
+    assert sum(v["messages"] for v in data["byAgent"].values()) == t["messages"]
+    assert sum(v["messages"] for v in data["byProject"].values()) == t["messages"]
+    assert sum(v["messages"] for v in data["daily"]) == t["messages"]

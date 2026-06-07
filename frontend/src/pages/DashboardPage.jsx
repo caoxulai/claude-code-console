@@ -1,10 +1,18 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder } from 'react-icons/fi';
+import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder, FiBarChart2 } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 
 function projectPathToSlug(path) {
   return '-' + path.replace(/^\//,'').replace(/\//g, '-');
+}
+
+function fmtTokens(n) {
+  if (n == null) return '—';
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return `${n}`;
 }
 
 export default function DashboardPage() {
@@ -23,7 +31,8 @@ export default function DashboardPage() {
       fetch('/api/crons').then(r => r.json()),
       fetch('/api/sessions/live').then(r => r.json()),
       fetch('/api/projects').then(r => r.json()),
-    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData]) => {
+      fetch('/api/usage').then(r => r.json()),
+    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData, usage]) => {
       const projectsList = Array.isArray(projectsData) ? projectsData : [];
       setProjects(projectsList);
       setStats({
@@ -34,6 +43,11 @@ export default function DashboardPage() {
         crons: crons.jobs?.length || 0,
         live: live.length || 0,
         projects: projectsList.length,
+        usageCost: usage?.total?.cost ?? null,
+        usageTokens: usage?.total
+          ? (usage.total.inputTokens + usage.total.outputTokens
+             + usage.total.cacheReadTokens + usage.total.cacheWriteTokens)
+          : null,
       });
     }).catch(() => {
       // Surface the failure instead of leaving cards blank with no explanation.
@@ -51,6 +65,17 @@ export default function DashboardPage() {
     { icon: FiServer, label: 'MCP Servers', value: stats?.mcp, link: '/mcp' },
     { icon: FiClock, label: 'Cron Jobs', value: stats?.crons, link: '/crons' },
     { icon: FiFolder, label: 'Projects', value: stats?.projects, link: '/projects' },
+    {
+      icon: FiBarChart2,
+      label: 'Total Tokens',
+      // Headline is the total token count; the estimated cost rides along as a
+      // sub-line. Both come straight from the verified /api/usage totals.
+      value: fmtTokens(stats?.usageTokens),
+      sub: stats?.usageCost != null
+        ? `~$${stats.usageCost.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+        : null,
+      link: '/usage',
+    },
   ];
 
   const getProjectDescription = (project) => {
@@ -78,7 +103,7 @@ export default function DashboardPage() {
       )}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1em' }}>
         {!stats ? (
-          Array.from({ length: 7 }).map((_, i) => (
+          Array.from({ length: 8 }).map((_, i) => (
             <SkeletonCard key={i} />
           ))
         ) : (
@@ -90,6 +115,9 @@ export default function DashboardPage() {
                   {c.value}
                 </div>
                 <div style={{ fontSize: '0.82em', color: 'var(--muted)' }}>{c.label}</div>
+                {c.sub && (
+                  <div style={{ fontSize: '0.72em', color: 'var(--muted)', marginTop: '0.15em' }}>{c.sub}</div>
+                )}
               </div>
             </Link>
           ))

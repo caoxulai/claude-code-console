@@ -22,6 +22,7 @@ const CronsPage = lazy(() => import('./pages/CronsPage'));
 const SessionsPage = lazy(() => import('./pages/SessionsPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const PluginsPage = lazy(() => import('./pages/PluginsPage'));
+const UsagePage = lazy(() => import('./pages/UsagePage'));
 
 function lazyRoute(Component) {
   return (
@@ -48,6 +49,7 @@ export const router = createBrowserRouter([
       { path: 'sessions', element: lazyRoute(SessionsPage) },
       { path: 'tasks', element: lazyRoute(TasksPage) },
       { path: 'plugins', element: lazyRoute(PluginsPage) },
+      { path: 'usage', element: lazyRoute(UsagePage) },
     ],
   },
 ]);

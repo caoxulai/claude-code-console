@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom';
 import {
   FiHome, FiMessageSquare, FiSettings, FiBookOpen, FiZap,
-  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder
+  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2
 } from 'react-icons/fi';
 
 const NAV_ITEMS = [
@@ -9,6 +9,7 @@ const NAV_ITEMS = [
     { to: '/', icon: FiHome, label: 'Dashboard' },
     { to: '/projects', icon: FiFolder, label: 'Projects' },
     { to: '/chat', icon: FiMessageSquare, label: 'Chat' },
+    { to: '/usage', icon: FiBarChart2, label: 'Usage' },
   ]},
   { group: 'Config', items: [
     { to: '/settings', icon: FiSettings, label: 'Settings' },

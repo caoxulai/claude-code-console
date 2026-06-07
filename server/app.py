@@ -7,7 +7,7 @@ from pathlib import Path
 from aiohttp import web
 
 from server.ws import WebSocketManager
-from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, tasks, plugins
+from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, tasks, plugins, usage
 
 
 def _resolve_frontend_dist() -> Path:
@@ -54,6 +54,7 @@ def create_app() -> web.Application:
     crons.register(app)
     tasks.register(app)
     plugins.register(app)
+    usage.register(app)
 
     # Health check
     app.router.add_get("/healthz", _healthz)
