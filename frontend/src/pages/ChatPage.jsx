@@ -5,7 +5,8 @@ import { useConfigStore } from '../stores/configStore';
 import { MessageBubble } from '../components/MessageBubble';
 import { ToolCallPanel } from '../components/ToolCallPanel';
 import { ErrorBoundary } from '../components/ErrorBoundary';
-import { FiSend, FiPlus, FiEdit3, FiCheck, FiSquare } from 'react-icons/fi';
+import SlashCommandMenu from '../components/SlashCommandMenu';
+import { FiSend, FiPlus, FiEdit3, FiCheck, FiSquare, FiMessageSquare } from 'react-icons/fi';
 
 function parseTranscriptToMessages(records) {
   const msgs = [];
@@ -54,7 +55,7 @@ function parseTranscriptToMessages(records) {
 }
 
 export default function ChatPage() {
-  const { messages, streaming, sessionId, send, stop, reset, resume, setMessages } = useChat();
+  const { messages, streaming, sessionId, slashCommands, send, stop, reset, resume, setMessages } = useChat();
   const ensureConfig = useConfigStore(s => s.ensure);
   const [input, setInput] = useState('');
   const [cwd, setCwd] = useState(localStorage.getItem('claude_web_cwd') || '');
@@ -134,10 +135,38 @@ export default function ChatPage() {
     send(prompt, { cwd });
   };
 
+  const textareaRef = useRef(null);
+  const [showSlashMenu, setShowSlashMenu] = useState(false);
+
+  const slashMenu = SlashCommandMenu({
+    commands: slashCommands,
+    input,
+    visible: showSlashMenu,
+    onSelect: (cmd) => {
+      if (cmd) {
+        setInput(`/${cmd} `);
+        textareaRef.current?.focus();
+      }
+      setShowSlashMenu(false);
+    },
+  });
+
   const handleKeyDown = (e) => {
+    if (showSlashMenu && slashMenu?.handleKeyDown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmit(e);
+    }
+  };
+
+  const handleInput = (e) => {
+    const val = e.target.value;
+    setInput(val);
+    setShowSlashMenu(val.startsWith('/') && !val.includes(' '));
+    const ta = textareaRef.current;
+    if (ta) {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
     }
   };
 
@@ -183,8 +212,12 @@ export default function ChatPage() {
       <div ref={transcriptRef} style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1em' }}>
         {messages.length === 0 && (
           <div className="empty-state">
+            <FiMessageSquare size={32} style={{ color: 'var(--accent)', marginBottom: '0.5em', opacity: 0.6 }} />
             <h3>Send a prompt to Claude Code</h3>
             <p>All MCPs, skills, and CLAUDE.md are available.</p>
+            <p style={{ fontSize: '0.78em', color: 'var(--muted)', marginTop: '0.5em' }}>
+              Type <kbd>/</kbd> for commands · Enter to send · Shift+Enter for newline
+            </p>
           </div>
         )}
         {messages.map((msg, i) => (
@@ -194,19 +227,28 @@ export default function ChatPage() {
               : <MessageBubble message={msg} />}
           </ErrorBoundary>
         ))}
-        {streaming && <div className="thinking-indicator">Claude is thinking…</div>}
+        {streaming && (
+          <div className="thinking-indicator">
+            <span className="thinking-dot" />
+            <span className="thinking-dot" />
+            <span className="thinking-dot" />
+            <span style={{ marginLeft: '0.3em' }}>Claude is working</span>
+          </div>
+        )}
       </div>
 
-      <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '0.5em', paddingTop: '1em', borderTop: '1px solid var(--border)' }}>
+      <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '0.5em', paddingTop: '1em', borderTop: '1px solid var(--border)', position: 'relative' }}>
+        {slashMenu?.element}
         <textarea
+          ref={textareaRef}
           value={input}
-          onChange={e => setInput(e.target.value)}
+          onChange={handleInput}
           onKeyDown={handleKeyDown}
-          placeholder="Message Claude — Enter to send, Shift+Enter for newline"
-          rows={2}
+          placeholder="Message Claude…"
+          rows={1}
           disabled={streaming}
           className="form-textarea"
-          style={{ minHeight: '42px' }}
+          style={{ minHeight: '42px', maxHeight: '160px', resize: 'none', overflow: 'auto' }}
         />
         {streaming ? (
           <button type="button" className="btn" onClick={stop} title="Stop generating">

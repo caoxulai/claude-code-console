@@ -1,12 +1,13 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
-import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2, FiRefreshCw } from 'react-icons/fi';
+import { FiMessageSquare, FiTerminal, FiChevronDown, FiChevronRight, FiPlay, FiTrash2, FiRefreshCw, FiCode } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { SkeletonLine } from '../components/Skeleton';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { useConfigStore } from '../stores/configStore';
+import SessionDiff from '../components/SessionDiff';
 
 function StatusBadge({ status }) {
   const cls = status === 'busy' ? 'badge-warn' : 'badge-ok';
@@ -131,6 +132,36 @@ function TranscriptMessage({ msg }) {
     );
   }
 
+  // Tool result — shows the output that came back from a tool invocation.
+  if (msg.type === 'result') {
+    const content = msg.content || msg.result || '';
+    const text = typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+        : JSON.stringify(content, null, 2);
+    if (!text) return null;
+    const truncated = text.length > 800 ? text.slice(0, 800) + '\n…(truncated)' : text;
+    return (
+      <div style={{ marginLeft: '1.5em', marginBottom: '0.5em' }}>
+        <div style={{
+          background: 'var(--tool-bg)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius)',
+          padding: '0.5em 0.75em',
+          fontSize: '0.78em',
+          fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap',
+          maxHeight: '200px',
+          overflow: 'auto',
+          color: 'var(--muted)',
+        }}>
+          {truncated}
+        </div>
+      </div>
+    );
+  }
+
   // Anything else we don't know how to render — skip
   return null;
 }
@@ -158,6 +189,7 @@ export default function SessionsPage() {
   const [loadingTranscript, setLoadingTranscript] = useState(false);
   const [loading, setLoading] = useState(true);
   const [titleSearch, setTitleSearch] = useState('');
+  const [transcriptView, setTranscriptView] = useState('messages');
   const transcriptRef = useRef(null);
 
   const LIMIT = 50;
@@ -332,15 +364,13 @@ export default function SessionsPage() {
   const tabStyle = (active) => ({
     padding: '0.5em 1.5em',
     cursor: 'pointer',
-    borderBottom: active ? '2px solid var(--accent)' : '2px solid transparent',
     fontWeight: active ? 600 : 400,
     color: active ? 'var(--text)' : 'var(--muted)',
     background: 'none',
     border: 'none',
-    borderBottomWidth: '2px',
-    borderBottomStyle: 'solid',
-    borderBottomColor: active ? 'var(--accent)' : 'transparent',
+    borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
     fontSize: '0.9em',
+    transition: 'color 0.12s, border-color 0.12s',
   });
 
   // Client-side title filter over the loaded page of sessions. (Server-side
@@ -506,9 +536,34 @@ export default function SessionsPage() {
           {selectedId && (
             <div className="card" style={{ marginTop: '1em' }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75em' }}>
-                <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--muted)' }}>
-                  Transcript
-                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75em' }}>
+                  <button
+                    className="btn"
+                    onClick={() => setTranscriptView('messages')}
+                    style={{
+                      fontSize: '0.8em', padding: '0.2em 0.6em',
+                      background: transcriptView === 'messages' ? 'var(--accent)' : undefined,
+                      color: transcriptView === 'messages' ? '#fff' : undefined,
+                      borderColor: transcriptView === 'messages' ? 'var(--accent)' : undefined,
+                    }}
+                  >
+                    <FiMessageSquare size={11} style={{ marginRight: 3, verticalAlign: '-1px' }} />
+                    Messages
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => setTranscriptView('changes')}
+                    style={{
+                      fontSize: '0.8em', padding: '0.2em 0.6em',
+                      background: transcriptView === 'changes' ? 'var(--accent)' : undefined,
+                      color: transcriptView === 'changes' ? '#fff' : undefined,
+                      borderColor: transcriptView === 'changes' ? 'var(--accent)' : undefined,
+                    }}
+                  >
+                    <FiCode size={11} style={{ marginRight: 3, verticalAlign: '-1px' }} />
+                    Changes
+                  </button>
+                </div>
                 <button
                   className="btn"
                   title="Re-read from disk (picks up CLI activity)"
@@ -523,6 +578,8 @@ export default function SessionsPage() {
                 <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>Loading transcript...</div>
               ) : transcript.length === 0 ? (
                 <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>No messages in this session.</div>
+              ) : transcriptView === 'changes' ? (
+                <SessionDiff transcript={transcript} />
               ) : (
                 <ErrorBoundary label="Failed to render this transcript.">
                   <div ref={transcriptRef} style={{ maxHeight: '500px', overflowY: 'auto', padding: '0.5em' }}>

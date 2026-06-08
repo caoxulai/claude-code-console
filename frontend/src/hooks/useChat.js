@@ -5,6 +5,7 @@ export function useChat() {
   const [messages, setMessages] = useState([]);
   const [streaming, setStreaming] = useState(false);
   const [sessionId, setSessionId] = useState(null);
+  const [slashCommands, setSlashCommands] = useState([]);
   // Holds the AbortController for the in-flight turn so stop() can cancel it.
   const abortRef = useRef(null);
 
@@ -23,6 +24,7 @@ export function useChat() {
       for await (const evt of streamChat(prompt, { cwd, resume: sessionId, signal: controller.signal })) {
         if (evt.type === 'system' && evt.session_id) {
           setSessionId(evt.session_id);
+          if (evt.slash_commands) setSlashCommands(evt.slash_commands);
         } else if (evt.type === 'assistant' && evt.message) {
           for (const c of evt.message.content || []) {
             if (c.type === 'text') {
@@ -99,5 +101,5 @@ export function useChat() {
     setSessionId(id);
   }, []);
 
-  return { messages, streaming, sessionId, send, stop, reset, resume, setMessages };
+  return { messages, streaming, sessionId, slashCommands, send, stop, reset, resume, setMessages };
 }
