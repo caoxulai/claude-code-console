@@ -51,7 +51,28 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
    binary on your `PATH`). Install Claude Code first:
    <https://docs.claude.com/en/docs/claude-code>.
 
-### Option A — Install via Builder Toolbox (recommended)
+### Option A — One-command install (recommended)
+
+The install script checks all prerequisites (Midway, Builder Toolbox, Claude
+Code) and installs anything missing, then installs claude-web itself:
+
+```bash
+bash <(curl -fsSL https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh)
+```
+
+Or if you already have the repo cloned:
+```bash
+bash scripts/install.sh
+```
+
+**Updating later:**
+```bash
+bash scripts/install.sh --update
+# or simply:
+toolbox update claude-web
+```
+
+### Option A (manual) — Install via Builder Toolbox step by step
 
 No code checkout required — the tool ships as a fully self-contained bundle
 (its own Python + the web UI + all dependencies).

@@ -110,6 +110,9 @@ def _extract_title(path: Path) -> str | None:
     return custom_title or ai_title
 
 
+_project_label_cache: dict[str, str] = {}
+
+
 def _project_label(dirname: str) -> str:
     """Convert project dir name back to a real filesystem path.
 
@@ -119,9 +122,16 @@ def _project_label(dirname: str) -> str:
 
     The trick: we can't just replace all - with / because directory names
     contain hyphens. Instead, greedily match path segments against the real
-    filesystem starting from /.
+    filesystem starting from /. Results are cached for the process lifetime
+    since directories don't typically get renamed while the server is running,
+    avoiding hundreds of redundant stat() calls on every page load.
     """
+    cached = _project_label_cache.get(dirname)
+    if cached is not None:
+        return cached
+
     if not dirname.startswith("-"):
+        _project_label_cache[dirname] = dirname
         return dirname
     parts = dirname[1:].split("-")
     # Greedily reconstruct the path by testing which combinations are real dirs
@@ -142,6 +152,8 @@ def _project_label(dirname: str) -> str:
             # Fallback: treat single part as a path segment
             path = path.rstrip("/") + "/" + parts[i]
             i += 1
+
+    _project_label_cache[dirname] = path
     return path
 
 
@@ -295,7 +307,7 @@ def _collect_memory_files(session_dir: Path | None) -> list[dict]:
 
 # Matches a GitFarm package remote, e.g.
 #   ssh://git.amazon.com/pkg/ClaudeCodeConsole
-#   https://git.amazon.com/pkg/GlennBlackFalconOncallDashboard
+#   https://git.amazon.com/pkg/OncallAgent
 # and captures the package name. A trailing .git suffix (if present) is stripped.
 _GITFARM_PKG_RE = re.compile(r"git\.amazon\.com/pkg/(?P<pkg>[^/\s]+?)(?:\.git)?/?$")
 

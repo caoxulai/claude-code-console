@@ -654,20 +654,20 @@ async def test_projects_code_url_present_on_every_project(client, projects_layou
 async def test_projects_code_url_maps_gitfarm_remote(client, projects_layout):
     """A git.amazon.com/pkg/<Pkg> origin maps to the code.amazon.com URL.
 
-    Mirrors the real claude-web (ClaudeCodeConsole) and oncall-kpi
-    (GlennBlackFalconOncallDashboard) mappings the UAT checks.
+    Mirrors the real claude-web (ClaudeCodeConsole) and oncall-agent
+    (OncallAgent) mappings the UAT checks.
     """
     workspace = projects_layout["workspace"]
     _write_git_remote(workspace / "alpha", "ssh://git.amazon.com/pkg/ClaudeCodeConsole")
     _write_git_remote(
-        workspace / "beta", "https://git.amazon.com/pkg/GlennBlackFalconOncallDashboard"
+        workspace / "beta", "https://git.amazon.com/pkg/OncallAgent"
     )
 
     projects = await _get_projects(client)
     assert projects["alpha"]["codeUrl"] == "https://code.amazon.com/packages/ClaudeCodeConsole"
     assert (
         projects["beta"]["codeUrl"]
-        == "https://code.amazon.com/packages/GlennBlackFalconOncallDashboard"
+        == "https://code.amazon.com/packages/OncallAgent"
     )
 
 
