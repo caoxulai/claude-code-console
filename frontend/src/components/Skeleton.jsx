@@ -7,11 +7,11 @@ export function SkeletonLine({ width = '100%', height = '16px' }) {
   );
 }
 
-export function SkeletonCard() {
+export function SkeletonCard({ style }) {
   return (
     <div
       className="skeleton"
-      style={{ width: '100%', height: '80px' }}
+      style={{ width: '100%', height: '80px', ...style }}
     />
   );
 }

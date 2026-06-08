@@ -82,18 +82,18 @@ export default function SettingsPage() {
 
       <div className="card">
         <div className="card-title">UI Preferences</div>
-        <div className="form-group" style={{ display: 'flex', gap: '2em', flexWrap: 'wrap' }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5em', fontSize: '0.88em' }}>
-            <input type="checkbox" checked={data?.verbose || false} onChange={e => handleChange('verbose', e.target.checked)} />
-            Verbose
+        <div className="form-group" style={{ display: 'flex', flexDirection: 'column', gap: '0.75em' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.6em', fontSize: '0.88em', cursor: 'pointer' }}>
+            <input type="checkbox" checked={data?.verbose || false} onChange={e => handleChange('verbose', e.target.checked)} style={{ width: 16, height: 16, accentColor: 'var(--accent)' }} />
+            <span>Verbose output</span>
           </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5em', fontSize: '0.88em' }}>
-            <input type="checkbox" checked={data?.includeCoAuthoredBy || false} onChange={e => handleChange('includeCoAuthoredBy', e.target.checked)} />
-            Include Co-authored-by
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.6em', fontSize: '0.88em', cursor: 'pointer' }}>
+            <input type="checkbox" checked={data?.includeCoAuthoredBy || false} onChange={e => handleChange('includeCoAuthoredBy', e.target.checked)} style={{ width: 16, height: 16, accentColor: 'var(--accent)' }} />
+            <span>Include Co-authored-by in commits</span>
           </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5em', fontSize: '0.88em' }}>
-            <input type="checkbox" checked={data?.skipDangerousModePermissionPrompt || false} onChange={e => handleChange('skipDangerousModePermissionPrompt', e.target.checked)} />
-            Skip dangerous-mode prompt
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.6em', fontSize: '0.88em', cursor: 'pointer' }}>
+            <input type="checkbox" checked={data?.skipDangerousModePermissionPrompt || false} onChange={e => handleChange('skipDangerousModePermissionPrompt', e.target.checked)} style={{ width: 16, height: 16, accentColor: 'var(--accent)' }} />
+            <span>Skip dangerous-mode prompt</span>
           </label>
         </div>
       </div>

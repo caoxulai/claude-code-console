@@ -308,17 +308,17 @@ export default function ProjectsPage() {
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: '0.3em',
-                  background: u.type === 'deployed' ? '#1a2a3a' : '#1a2f2a',
-                  color: u.type === 'deployed' ? '#7ab8e6' : '#6dab8a',
+                  background: u.type === 'deployed' ? 'var(--pill-deployed-bg)' : 'var(--pill-local-bg)',
+                  color: u.type === 'deployed' ? 'var(--pill-deployed-text)' : 'var(--pill-local-text)',
                   fontSize: '0.72em',
                   fontWeight: 600,
                   padding: '2px 8px',
                   borderRadius: '999px',
-                  border: `1px solid ${u.type === 'deployed' ? '#2a4a5a' : '#2a4a3a'}`,
+                  border: `1px solid ${u.type === 'deployed' ? 'var(--pill-deployed-border)' : 'var(--pill-local-border)'}`,
                   textDecoration: 'none',
                 }}
               >
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: u.type === 'deployed' ? '#7ab8e6' : '#6dab8a', display: 'inline-block' }} />
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: u.type === 'deployed' ? 'var(--pill-deployed-text)' : 'var(--pill-local-text)', display: 'inline-block' }} />
                 {u.label}
               </a>
             ))}
@@ -333,13 +333,13 @@ export default function ProjectsPage() {
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: '0.3em',
-                  background: '#2a2440',
-                  color: '#b39ddb',
+                  background: 'var(--pill-dev-bg)',
+                  color: 'var(--pill-dev-text)',
                   fontSize: '0.72em',
                   fontWeight: 600,
                   padding: '2px 8px',
                   borderRadius: '999px',
-                  border: '1px solid #443a5a',
+                  border: '1px solid var(--pill-dev-border)',
                   textDecoration: 'none',
                 }}
               >

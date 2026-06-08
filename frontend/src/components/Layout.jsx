@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Outlet } from 'react-router-dom';
 import NavBar from './NavBar';
 import TopBar from './TopBar';
+import CommandPalette from './CommandPalette';
 
 export default function Layout() {
   const [navOpen, setNavOpen] = useState(window.innerWidth > 768);
@@ -13,6 +14,7 @@ export default function Layout() {
       <main className="main-content">
         <Outlet />
       </main>
+      <CommandPalette />
     </div>
   );
 }

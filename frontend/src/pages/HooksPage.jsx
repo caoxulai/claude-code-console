@@ -247,11 +247,14 @@ export default function HooksPage() {
                                 placeholder='Mock input JSON (e.g. {"tool_name": "Bash"})'
                                 rows={3}
                               />
-                              <button className="btn btn-primary" onClick={() => handleTest(cmd)} style={{ alignSelf: 'flex-start' }}>
+                              <button className="btn btn-primary" onClick={() => {
+                                if (!confirm(`This will execute the command on your machine:\n\n${cmd}\n\nProceed?`)) return;
+                                handleTest(cmd);
+                              }} style={{ alignSelf: 'flex-start' }}>
                                 Run Test
                               </button>
                               {testResult && (
-                                <pre style={{ background: 'var(--bg-secondary, #1a1a1a)', padding: '0.75em', borderRadius: '4px', fontSize: '0.8em', overflow: 'auto', margin: 0 }}>
+                                <pre style={{ background: 'var(--bg)', padding: '0.75em', borderRadius: 'var(--radius)', fontSize: '0.8em', overflow: 'auto', margin: 0 }}>
                                   <div>exit_code: {testResult.exit_code}</div>
                                   {testResult.stdout && <div><strong>stdout:</strong>{'\n'}{testResult.stdout}</div>}
                                   {testResult.stderr && <div><strong>stderr:</strong>{'\n'}{testResult.stderr}</div>}

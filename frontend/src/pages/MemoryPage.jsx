@@ -224,8 +224,10 @@ export default function MemoryPage() {
               style={{
                 padding: '0.4em 0.6em', cursor: 'pointer', borderRadius: 'var(--radius)',
                 background: selected === f.name ? 'var(--user-bg)' : 'transparent',
+                borderLeft: selected === f.name ? '3px solid var(--accent)' : '3px solid transparent',
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 marginBottom: '2px',
+                transition: 'background 0.1s, border-color 0.1s',
               }}
             >
               <div style={{ overflow: 'hidden' }}>

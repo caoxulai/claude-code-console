@@ -1,4 +1,21 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
+
+// Track an element's content width so the chart can fill its container instead
+// of rendering at a fixed width and hugging the left edge.
+function useElementWidth() {
+  const ref = useRef(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const update = () => setWidth(el.clientWidth);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width];
+}
 
 // Dependency-free inline-SVG daily-trend chart. Renders one bar per day for the
 // selected metric, with a hover tooltip showing the exact breakdown. No
@@ -36,6 +53,7 @@ function shortDate(iso) {
 export default function UsageChart({ daily }) {
   const [metric, setMetric] = useState('tokens');
   const [hover, setHover] = useState(null);
+  const [containerRef, containerWidth] = useElementWidth();
 
   if (!daily || daily.length === 0) {
     return <div style={{ color: 'var(--muted)', fontSize: '0.85em', padding: 'var(--space-md)' }}>No daily activity yet.</div>;
@@ -45,15 +63,25 @@ export default function UsageChart({ daily }) {
   const values = daily.map(m.get);
   const max = Math.max(...values, 0) || 1;
 
-  // SVG geometry. Width scales with the number of days; height is fixed.
+  // SVG geometry. The chart fills the measured container width so it stays
+  // balanced (no left-hugging dead space) and auto-adapts to the number of
+  // days. Bars are evenly distributed across the full width; bar thickness is
+  // derived from the available space and capped so a handful of days don't
+  // render as absurdly wide columns. Fall back to a sensible width before the
+  // first measurement lands.
+  const padLeft = 8;
+  const padRight = 8;
+  const W = Math.max(containerWidth || 640, 280);
   const H = 200;
   const padTop = 12;
   const padBottom = 28;
   const chartH = H - padTop - padBottom;
-  const barGap = 6;
-  const minBar = 14;
-  const barW = Math.max(minBar, Math.min(48, Math.floor(640 / daily.length) - barGap));
-  const W = daily.length * (barW + barGap) + barGap;
+  const innerW = W - padLeft - padRight;
+  const slot = innerW / daily.length;          // horizontal space per day
+  const barW = Math.max(3, Math.min(48, slot * 0.7)); // thickness, capped both ways
+  // Show every Nth x-label so date labels (~38px wide) never collide; with
+  // wide slots every day is labelled, with narrow slots we thin them out.
+  const labelEvery = Math.max(1, Math.ceil(38 / Math.max(slot, 1)));
 
   // A few horizontal gridlines with value labels.
   const ticks = 4;
@@ -83,13 +111,13 @@ export default function UsageChart({ daily }) {
         ))}
       </div>
 
-      <div style={{ position: 'relative', overflowX: 'auto' }}>
+      <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
         <svg
           viewBox={`0 0 ${W} ${H}`}
           width="100%"
           height={H}
-          style={{ display: 'block', minWidth: Math.min(W, 320), maxWidth: W }}
-          preserveAspectRatio="xMinYMid meet"
+          preserveAspectRatio="none"
+          style={{ display: 'block' }}
         >
           {/* gridlines + y labels */}
           {gridlines.map((g, i) => (
@@ -102,7 +130,9 @@ export default function UsageChart({ daily }) {
           {daily.map((d, i) => {
             const v = m.get(d);
             const h = max > 0 ? (v / max) * chartH : 0;
-            const x = barGap + i * (barW + barGap);
+            // Center each bar within its evenly-sized slot across the full width.
+            const cx = padLeft + slot * (i + 0.5);
+            const x = cx - barW / 2;
             const y = padTop + (chartH - h);
             const isHover = hover === i;
             return (
@@ -118,8 +148,9 @@ export default function UsageChart({ daily }) {
                   onMouseLeave={() => setHover(null)}
                   style={{ cursor: 'pointer' }}
                 />
-                {/* x label: show every Nth to avoid crowding */}
-                {(daily.length <= 12 || i % Math.ceil(daily.length / 10) === 0) && (
+                {/* x label: show every Nth so labels never overlap. Density is
+                    derived from how many ~38px-wide date labels fit the slot. */}
+                {i % labelEvery === 0 && (
                   <text
                     x={x + barW / 2}
                     y={H - padBottom + 14}

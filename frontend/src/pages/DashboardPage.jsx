@@ -2,10 +2,15 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder, FiBarChart2 } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
+import BudgetAlert from '../components/BudgetAlert';
 
 function projectPathToSlug(path) {
   return '-' + path.replace(/^\//,'').replace(/\//g, '-');
 }
+
+// Fixed height for the dashboard stat cards so every card is the same size
+// regardless of whether it has a sub-line, and so the loading skeletons match.
+const STAT_CARD_HEIGHT = '120px';
 
 function fmtTokens(n) {
   if (n == null) return '—';
@@ -31,8 +36,7 @@ export default function DashboardPage() {
       fetch('/api/crons').then(r => r.json()),
       fetch('/api/sessions/live').then(r => r.json()),
       fetch('/api/projects').then(r => r.json()),
-      fetch('/api/usage').then(r => r.json()),
-    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData, usage]) => {
+    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData]) => {
       const projectsList = Array.isArray(projectsData) ? projectsData : [];
       setProjects(projectsList);
       setStats({
@@ -43,11 +47,7 @@ export default function DashboardPage() {
         crons: crons.jobs?.length || 0,
         live: live.length || 0,
         projects: projectsList.length,
-        usageCost: usage?.total?.cost ?? null,
-        usageTokens: usage?.total
-          ? (usage.total.inputTokens + usage.total.outputTokens
-             + usage.total.cacheReadTokens + usage.total.cacheWriteTokens)
-          : null,
+        usageTokens: null,  // loaded separately below to not block the dashboard
       });
     }).catch(() => {
       // Surface the failure instead of leaving cards blank with no explanation.
@@ -56,6 +56,24 @@ export default function DashboardPage() {
   };
 
   useEffect(() => { load(); }, []);
+
+  const [todayCost, setTodayCost] = useState(0);
+
+  // Load usage separately so the slow full-transcript scan doesn't block the
+  // other 7 cards. The token card shows "—" until this resolves.
+  useEffect(() => {
+    fetch('/api/usage').then(r => r.json()).then(usage => {
+      if (usage?.total) {
+        setStats(prev => prev ? { ...prev, usageTokens:
+          usage.total.inputTokens + usage.total.outputTokens
+          + usage.total.cacheReadTokens + usage.total.cacheWriteTokens
+        } : prev);
+      }
+      if (usage?.daily?.length) {
+        setTodayCost(usage.daily[usage.daily.length - 1].cost);
+      }
+    }).catch(() => {});
+  }, []);
 
   const cards = [
     { icon: FiList, label: 'Sessions', value: stats?.sessions, link: '/sessions' },
@@ -68,12 +86,9 @@ export default function DashboardPage() {
     {
       icon: FiBarChart2,
       label: 'Total Tokens',
-      // Headline is the total token count; the estimated cost rides along as a
-      // sub-line. Both come straight from the verified /api/usage totals.
+      // Total token count from the verified /api/usage totals. No cost line —
+      // keeps this card structurally identical to the others.
       value: fmtTokens(stats?.usageTokens),
-      sub: stats?.usageCost != null
-        ? `~$${stats.usageCost.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
-        : null,
       link: '/usage',
     },
   ];
@@ -94,27 +109,48 @@ export default function DashboardPage() {
 
   return (
     <div>
-      <div className="page-header"><h2>Dashboard</h2></div>
+      <div className="page-header">
+        <div>
+          <h2>Dashboard</h2>
+          <p style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginTop: '0.1em' }}>
+            Overview of your Claude Code environment
+          </p>
+        </div>
+      </div>
       {error && (
         <div className="conflict-banner" style={{ marginBottom: '1em' }}>
           <span>{error}</span>
           <button className="btn" onClick={load}>Retry</button>
         </div>
       )}
+      <BudgetAlert dailyCost={todayCost} />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1em' }}>
         {!stats ? (
           Array.from({ length: 8 }).map((_, i) => (
-            <SkeletonCard key={i} />
+            <SkeletonCard key={i} style={{ height: STAT_CARD_HEIGHT }} />
           ))
         ) : (
           cards.map(c => (
             <Link key={c.label} to={c.link} style={{ textDecoration: 'none' }}>
-              <div className="card" style={{ textAlign: 'center', cursor: 'pointer' }}>
-                <c.icon size={24} style={{ color: 'var(--accent)', marginBottom: '0.5em' }} />
-                <div style={{ fontSize: '1.8em', fontWeight: 700, color: 'var(--text)' }}>
+              <div
+                className="card card-interactive"
+                style={{
+                  margin: 0,
+                  height: STAT_CARD_HEIGHT,
+                  boxSizing: 'border-box',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  textAlign: 'center',
+                  cursor: 'pointer',
+                }}
+              >
+                <c.icon size={22} style={{ color: 'var(--accent)', marginBottom: '0.5em' }} />
+                <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)', lineHeight: 1.1 }}>
                   {c.value}
                 </div>
-                <div style={{ fontSize: '0.82em', color: 'var(--muted)' }}>{c.label}</div>
+                <div style={{ fontSize: '0.82em', color: 'var(--muted)', marginTop: '0.3em' }}>{c.label}</div>
                 {c.sub && (
                   <div style={{ fontSize: '0.72em', color: 'var(--muted)', marginTop: '0.15em' }}>{c.sub}</div>
                 )}
@@ -148,7 +184,10 @@ export default function DashboardPage() {
                       padding: '0.75em 1em',
                       borderBottom: i < recentProjects.length - 1 ? '1px solid var(--border)' : 'none',
                       cursor: 'pointer',
+                      transition: 'background 0.1s',
                     }}
+                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface2)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.background = ''; }}
                   >
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <div style={{ fontWeight: 700, fontSize: '0.95em', color: 'var(--text)' }}>
@@ -183,17 +222,17 @@ export default function DashboardPage() {
                               display: 'inline-flex',
                               alignItems: 'center',
                               gap: '0.3em',
-                              background: u.type === 'deployed' ? '#1a2a3a' : '#1a2f2a',
-                              color: u.type === 'deployed' ? '#7ab8e6' : '#6dab8a',
+                              background: u.type === 'deployed' ? 'var(--pill-deployed-bg)' : 'var(--pill-local-bg)',
+                              color: u.type === 'deployed' ? 'var(--pill-deployed-text)' : 'var(--pill-local-text)',
                               fontSize: '0.72em',
                               fontWeight: 600,
                               padding: '2px 8px',
                               borderRadius: '999px',
-                              border: `1px solid ${u.type === 'deployed' ? '#2a4a5a' : '#2a4a3a'}`,
+                              border: `1px solid ${u.type === 'deployed' ? 'var(--pill-deployed-border)' : 'var(--pill-local-border)'}`,
                               textDecoration: 'none',
                             }}
                           >
-                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: u.type === 'deployed' ? '#7ab8e6' : '#6dab8a', display: 'inline-block' }} />
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: u.type === 'deployed' ? 'var(--pill-deployed-text)' : 'var(--pill-local-text)', display: 'inline-block' }} />
                             {u.label}
                           </a>
                         ))

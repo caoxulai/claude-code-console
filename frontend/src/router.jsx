@@ -26,7 +26,11 @@ const UsagePage = lazy(() => import('./pages/UsagePage'));
 
 function lazyRoute(Component) {
   return (
-    <Suspense fallback={<div className="loading">Loading…</div>}>
+    <Suspense fallback={
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '40vh', color: 'var(--muted)', fontSize: '0.9em' }}>
+        Loading…
+      </div>
+    }>
       <Component />
     </Suspense>
   );

@@ -28,24 +28,35 @@ const NAV_ITEMS = [
 
 export default function NavBar({ onClose }) {
   return (
-    <nav className="navbar">
-      {NAV_ITEMS.map(group => (
-        <div key={group.group} className="nav-group">
-          <div className="nav-group-label">{group.group}</div>
-          {group.items.map(item => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.to === '/'}
-              className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
-              onClick={() => window.innerWidth <= 768 && onClose()}
-            >
-              <item.icon size={16} />
-              <span>{item.label}</span>
-            </NavLink>
-          ))}
-        </div>
-      ))}
+    <nav className="navbar" style={{ display: 'flex', flexDirection: 'column' }}>
+      <div style={{ flex: 1 }}>
+        {NAV_ITEMS.map(group => (
+          <div key={group.group} className="nav-group">
+            <div className="nav-group-label">{group.group}</div>
+            {group.items.map(item => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                end={item.to === '/'}
+                className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+                onClick={() => window.innerWidth <= 768 && onClose()}
+              >
+                <item.icon size={16} />
+                <span>{item.label}</span>
+              </NavLink>
+            ))}
+          </div>
+        ))}
+      </div>
+      <div style={{
+        padding: '0.75em var(--space-md)',
+        borderTop: '1px solid var(--border)',
+        fontSize: 'var(--fs-xs)',
+        color: 'var(--muted)',
+        opacity: 0.6,
+      }}>
+        Claude Code Console v0.1
+      </div>
     </nav>
   );
 }
