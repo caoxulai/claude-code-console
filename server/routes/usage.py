@@ -13,9 +13,12 @@ day, with estimated cost.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiohttp import web
@@ -23,10 +26,6 @@ from aiohttp import web
 
 CLAUDE_PROJECTS_BASE = Path.home() / ".claude" / "projects"
 
-# Per-model price per 1M tokens: (input, output). Cache reads bill at ~0.1x the
-# input rate and cache writes (5-minute TTL) at ~1.25x — the standard Claude
-# pricing multipliers. Unknown/unlisted models fall back to Opus-tier pricing
-# so cost is over- rather than under-estimated.
 _PRICING = {
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
@@ -44,6 +43,8 @@ _DEFAULT_PRICE = (5.0, 25.0)
 _CACHE_READ_MULT = 0.1
 _CACHE_WRITE_MULT = 1.25
 
+_CACHE_TTL = 60  # seconds
+
 
 def register(app: web.Application):
     app.router.add_get("/api/usage", get_usage)
@@ -56,11 +57,6 @@ def _price_for(model: str) -> tuple[float, float]:
 
 
 def _cost_for(model: str, inp: int, out: int, cache_read: int, cache_write: int) -> float:
-    """Estimated USD cost for one usage record.
-
-    Cache reads bill at 0.1x and cache writes at 1.25x the model's input rate;
-    output bills at the model's output rate.
-    """
     pin, pout = _price_for(model)
     return (
         inp * pin
@@ -90,18 +86,6 @@ def _add(bucket: dict, model: str, inp: int, out: int, cr: int, cw: int) -> None
     bucket["cost"] += _cost_for(model, inp, out, cr, cw)
 
 
-def _all_jsonl_files() -> list[Path]:
-    """Every transcript under ~/.claude/projects, recursively.
-
-    Includes main-thread project dirs, subagents/, transcripts/, and wf_* —
-    global uuid dedup (below) handles records that appear in more than one file,
-    so we don't have to guess which directories to include.
-    """
-    if not CLAUDE_PROJECTS_BASE.is_dir():
-        return []
-    return list(CLAUDE_PROJECTS_BASE.rglob("*.jsonl"))
-
-
 _PROJECT_ALIASES = {
     "blackfalcon-oncall-agent": "oncall-agent",
     "GlennBlackFalconOncallDashboard": "oncall-kpi",
@@ -110,13 +94,6 @@ _PROJECT_ALIASES = {
 
 
 def _project_from_cwd(cwd: str | None) -> str:
-    """Project label for a record, taken from its cwd basename.
-
-    Using the record's own cwd (rather than the containing directory) means
-    subagent and transcript records attribute to the right project regardless
-    of which folder they were written to. Renamed projects are mapped to their
-    current name via _PROJECT_ALIASES so old transcripts roll up correctly.
-    """
     if not cwd:
         return "(unknown)"
     name = os.path.basename(cwd.rstrip("/")) or cwd
@@ -131,174 +108,249 @@ def _round_map(m: dict) -> dict:
     return {k: _round_bucket(v) for k, v in m.items()}
 
 
-async def get_usage(request: web.Request) -> web.Response:
+# ---------------------------------------------------------------------------
+# Shared record cache — scan all files once, serve all 3 endpoints
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Record:
+    """Lightweight extracted fields from one assistant turn."""
+    timestamp: str
+    model: str
+    inp: int
+    out: int
+    cache_read: int
+    cache_write: int
+    cwd: str | None
+    is_sidechain: bool
+    agent: str | None
+    tool_names: list[str]
+    tool_input_sizes: list[int]
+
+
+@dataclass
+class _Cache:
+    records: list[_Record] = field(default_factory=list)
+    responses: dict = field(default_factory=dict)  # pre-computed endpoint responses
+    updated_at: float = 0.0
+
+
+_cache = _Cache()
+_cache_lock = asyncio.Lock()
+
+
+def _scan_all_files() -> list[_Record]:
+    """Parse all JSONL files and extract deduplicated assistant records."""
+    if not CLAUDE_PROJECTS_BASE.is_dir():
+        return []
+
+    records: list[_Record] = []
+    seen: set[str] = set()
+
+    for f in CLAUDE_PROJECTS_BASE.rglob("*.jsonl"):
+        try:
+            fh = open(f)
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+
+                uid = rec.get("uuid")
+                if uid is not None:
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+
+                model = msg.get("model") or "unknown"
+                if model == "<synthetic>":
+                    continue
+
+                usage = msg.get("usage")
+                inp = out = cr = cw = 0
+                if isinstance(usage, dict):
+                    inp = usage.get("input_tokens", 0) or 0
+                    out = usage.get("output_tokens", 0) or 0
+                    cr = usage.get("cache_read_input_tokens", 0) or 0
+                    cw = usage.get("cache_creation_input_tokens", 0) or 0
+
+                # Extract tool_use names for the tools endpoint
+                tool_names: list[str] = []
+                tool_input_sizes: list[int] = []
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tool_names.append(block.get("name", "unknown"))
+                            tool_inp = block.get("input")
+                            tool_input_sizes.append(len(json.dumps(tool_inp)) if tool_inp else 0)
+
+                records.append(_Record(
+                    timestamp=rec.get("timestamp") or "",
+                    model=model,
+                    inp=inp,
+                    out=out,
+                    cache_read=cr,
+                    cache_write=cw,
+                    cwd=rec.get("cwd"),
+                    is_sidechain=bool(rec.get("isSidechain")),
+                    agent=rec.get("attributionAgent") if rec.get("isSidechain") else None,
+                    tool_names=tool_names,
+                    tool_input_sizes=tool_input_sizes,
+                ))
+
+    return records
+
+
+def _compute_usage(records: list[_Record]) -> dict:
+    """Pre-compute the /api/usage response from cached records."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    seattle_tz = ZoneInfo("America/Los_Angeles")
+
     total = _empty_bucket()
     by_model: dict[str, dict] = defaultdict(_empty_bucket)
     by_agent: dict[str, dict] = defaultdict(_empty_bucket)
     by_project: dict[str, dict] = defaultdict(_empty_bucket)
     by_day: dict[str, dict] = defaultdict(_empty_bucket)
 
-    seen: set[str] = set()  # assistant-record uuids already counted
-
-    for f in _all_jsonl_files():
-        try:
-            fh = open(f)
-        except OSError:
+    for r in records:
+        if not (r.inp or r.out or r.cache_read or r.cache_write):
             continue
-        with fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") != "assistant":
-                    continue
-                msg = rec.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                usage = msg.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                model = msg.get("model") or "unknown"
-                if model == "<synthetic>":
-                    continue  # synthetic API-error placeholders carry no real usage
+        _add(total, r.model, r.inp, r.out, r.cache_read, r.cache_write)
+        _add(by_model[r.model], r.model, r.inp, r.out, r.cache_read, r.cache_write)
+        _add(by_agent[r.agent or "main"], r.model, r.inp, r.out, r.cache_read, r.cache_write)
+        _add(by_project[_project_from_cwd(r.cwd)], r.model, r.inp, r.out, r.cache_read, r.cache_write)
 
-                # Dedupe: the same turn can be written to multiple files.
-                uid = rec.get("uuid")
-                if uid is not None:
-                    if uid in seen:
-                        continue
-                    seen.add(uid)
+        ts = r.timestamp
+        if ts and len(ts) >= 16:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                day_str = dt.astimezone(seattle_tz).strftime("%Y-%m-%d")
+                _add(by_day[day_str], r.model, r.inp, r.out, r.cache_read, r.cache_write)
+            except ValueError:
+                pass
 
-                inp = usage.get("input_tokens", 0) or 0
-                out = usage.get("output_tokens", 0) or 0
-                cr = usage.get("cache_read_input_tokens", 0) or 0
-                cw = usage.get("cache_creation_input_tokens", 0) or 0
-
-                _add(total, model, inp, out, cr, cw)
-                _add(by_model[model], model, inp, out, cr, cw)
-
-                agent = rec.get("attributionAgent") if rec.get("isSidechain") else None
-                _add(by_agent[agent or "main"], model, inp, out, cr, cw)
-
-                _add(by_project[_project_from_cwd(rec.get("cwd"))], model, inp, out, cr, cw)
-
-                ts = rec.get("timestamp")
-                if isinstance(ts, str) and len(ts) >= 10:
-                    _add(by_day[ts[:10]], model, inp, out, cr, cw)
-
-    # Recent daily series (last 30 active days), oldest→newest.
     recent_days = sorted(by_day.keys())[-30:]
     daily = [{"date": day, **_round_bucket(by_day[day])} for day in recent_days]
 
-    return web.json_response({
+    return {
         "total": _round_bucket(total),
         "byModel": _round_map(by_model),
         "byAgent": _round_map(by_agent),
         "byProject": _round_map(by_project),
         "daily": daily,
-    })
+    }
 
 
-async def get_heatmap(request: web.Request) -> web.Response:
-    """Activity heatmap: messages per (day-of-week, hour) over the last 12 weeks.
-
-    Timestamps are converted to US/Pacific (Seattle) timezone so the heatmap
-    reflects the user's actual work hours regardless of where the server runs.
-    """
-    from datetime import datetime, timedelta, timezone
+def _compute_heatmap(records: list[_Record]) -> dict:
+    """Pre-compute the /api/usage/heatmap response from cached records."""
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
     seattle_tz = ZoneInfo("America/Los_Angeles")
     cutoff = datetime.now(seattle_tz) - timedelta(weeks=12)
-    # grid[dow][hour] = count; dow 0=Mon..6=Sun, hour 0..23
+
     grid = [[0] * 24 for _ in range(7)]
-    # Also track day-level data for the calendar strip
     day_counts: dict[str, int] = defaultdict(int)
-    seen: set[str] = set()
+    daily_hours: dict[str, list[int]] = defaultdict(lambda: [0] * 24)
 
-    for f in _all_jsonl_files():
-        try:
-            fh = open(f)
-        except OSError:
+    for r in records:
+        ts = r.timestamp
+        if not ts or len(ts) < 16:
             continue
-        with fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") != "assistant":
-                    continue
-                ts = rec.get("timestamp")
-                if not isinstance(ts, str) or len(ts) < 16:
-                    continue
-                uid = rec.get("uuid")
-                if uid is not None:
-                    if uid in seen:
-                        continue
-                    seen.add(uid)
-                try:
-                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                # Convert to Seattle timezone for accurate day-of-week/hour placement
-                local_dt = dt.astimezone(seattle_tz)
-                if local_dt < cutoff:
-                    continue
-                grid[local_dt.weekday()][local_dt.hour] += 1
-                day_counts[local_dt.strftime("%Y-%m-%d")] += 1
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        local_dt = dt.astimezone(seattle_tz)
+        if local_dt < cutoff:
+            continue
+        date_str = local_dt.strftime("%Y-%m-%d")
+        grid[local_dt.weekday()][local_dt.hour] += 1
+        day_counts[date_str] += 1
+        daily_hours[date_str][local_dt.hour] += 1
 
-    return web.json_response({
+    return {
         "grid": grid,
         "days": dict(day_counts),
-    })
+        "dailyHours": dict(daily_hours),
+    }
 
 
-async def get_tools(request: web.Request) -> web.Response:
-    """Tool usage leaderboard: count each tool_use invocation across all transcripts."""
+def _compute_tools(records: list[_Record]) -> dict:
+    """Pre-compute the /api/usage/tools response from cached records."""
     tool_stats: dict[str, dict] = defaultdict(lambda: {"calls": 0, "totalInputSize": 0})
-    seen: set[str] = set()
 
-    for f in _all_jsonl_files():
-        try:
-            fh = open(f)
-        except OSError:
-            continue
-        with fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") != "assistant":
-                    continue
-                uid = rec.get("uuid")
-                if uid is not None:
-                    if uid in seen:
-                        continue
-                    seen.add(uid)
-                msg = rec.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                content = msg.get("content")
-                if not isinstance(content, list):
-                    continue
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") != "tool_use":
-                        continue
-                    name = block.get("name", "unknown")
-                    tool_stats[name]["calls"] += 1
-                    inp = block.get("input")
-                    if inp:
-                        tool_stats[name]["totalInputSize"] += len(json.dumps(inp))
+    for r in records:
+        for i, name in enumerate(r.tool_names):
+            tool_stats[name]["calls"] += 1
+            tool_stats[name]["totalInputSize"] += r.tool_input_sizes[i]
 
     rows = [
         {"name": name, "calls": s["calls"], "avgInputSize": round(s["totalInputSize"] / s["calls"]) if s["calls"] else 0}
         for name, s in tool_stats.items()
     ]
-    rows.sort(key=lambda r: r["calls"], reverse=True)
+    rows.sort(key=lambda x: x["calls"], reverse=True)
 
-    return web.json_response({"tools": rows})
+    return {"tools": rows}
+
+
+def _build_all_responses(records: list[_Record]) -> dict:
+    """Compute all endpoint responses in one pass over the thread."""
+    return {
+        "usage": _compute_usage(records),
+        "heatmap": _compute_heatmap(records),
+        "tools": _compute_tools(records),
+    }
+
+
+async def _ensure_cache() -> dict:
+    """Return pre-computed responses, refreshing if stale."""
+    global _cache
+    now = time.monotonic()
+    if now - _cache.updated_at < _CACHE_TTL and _cache.responses:
+        return _cache.responses
+
+    async with _cache_lock:
+        # Double-check after acquiring lock
+        now = time.monotonic()
+        if now - _cache.updated_at < _CACHE_TTL and _cache.responses:
+            return _cache.responses
+
+        def _scan_and_compute():
+            records = _scan_all_files()
+            return records, _build_all_responses(records)
+
+        records, responses = await asyncio.to_thread(_scan_and_compute)
+        _cache = _Cache(records=records, responses=responses, updated_at=time.monotonic())
+        return responses
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — return pre-computed cached responses
+# ---------------------------------------------------------------------------
+
+async def get_usage(request: web.Request) -> web.Response:
+    responses = await _ensure_cache()
+    return web.json_response(responses["usage"])
+
+
+async def get_heatmap(request: web.Request) -> web.Response:
+    responses = await _ensure_cache()
+    return web.json_response(responses["heatmap"])
+
+
+async def get_tools(request: web.Request) -> web.Response:
+    responses = await _ensure_cache()
+    return web.json_response(responses["tools"])

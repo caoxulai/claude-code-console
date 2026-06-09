@@ -350,7 +350,7 @@ export default function UsagePage() {
             <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>last 12 weeks · Pacific Time</span>
           </div>
           <div className="card" style={{ padding: 'var(--space-md)' }}>
-            <ActivityHeatmap grid={heatmap.grid} days={heatmap.days} />
+            <ActivityHeatmap grid={heatmap.grid} days={heatmap.days} dailyHours={heatmap.dailyHours} />
           </div>
         </div>
       )}
