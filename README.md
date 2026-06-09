@@ -31,6 +31,16 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 
 ## Installation
 
+> **TL;DR for consumers** — on an Amazon Linux Cloud Desktop, run:
+> ```bash
+> mwinit   # if you haven't authenticated today
+> bash <(curl -fsSL https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh)
+> claude-web
+> ```
+> That's the whole thing — the script checks every prerequisite and installs
+> what's missing. The detailed steps below are only if you want to do it by hand
+> or something goes wrong.
+
 > **New here?** Follow Option A. It's the fastest path and needs nothing but a
 > Cloud Desktop. You do **not** need to check out any code or know anything
 > about how the console is built.
@@ -85,7 +95,7 @@ mwinit
 toolbox registry add s3://buildertoolbox-registry-claude-code-console-us-west-2/tools.json
 
 # 3. Install the tool
-toolbox install claude-web --channel head
+toolbox install claude-web
 
 # 4. Start the console
 claude-web
@@ -95,8 +105,8 @@ claude-web
 browser opens to it. Leave the terminal running — closing it stops the server.
 To stop, press `Ctrl-C` in that terminal.
 
-> The tool is currently published on the `head` channel. Once it's promoted to
-> `stable`, you can drop the `--channel head` flag in step 3.
+> The tool is published on the `stable` channel, so `toolbox install claude-web`
+> just works. (Early/preview builds go to `head` — add `--channel head` to opt in.)
 
 **Updating later:**
 ```bash
