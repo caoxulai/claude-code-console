@@ -1330,6 +1330,14 @@ def test_cmd_start_loopback_does_not_require_flag(monkeypatch):
 import server.routes.usage as usage_mod  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _reset_usage_cache(monkeypatch):
+    """The usage endpoints share a module-level, time-cached response object.
+    Reset it before every test so one test's scan can't serve another's
+    request (e.g. a populated scan leaking into the empty-projects test)."""
+    monkeypatch.setattr(usage_mod, "_cache", usage_mod._Cache())
+
+
 @pytest.fixture
 def usage_projects(tmp_path: Path, monkeypatch) -> Path:
     base = tmp_path / "claude_projects"
