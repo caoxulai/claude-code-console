@@ -85,7 +85,7 @@ function DailyBarChart({ daily, metric, setMetric }) {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5em' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em' }}>
           <FiTrendingUp size={15} style={{ color: 'var(--accent)' }} />
-          <h3 style={{ fontSize: '1em', fontWeight: 600, margin: 0 }}>Daily trend</h3>
+          <span style={{ fontSize: 'var(--fs-sm)', fontWeight: 600 }}>Daily trend</span>
           <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>
             {daily.length} active day{daily.length === 1 ? '' : 's'}
           </span>
@@ -109,7 +109,7 @@ function DailyBarChart({ daily, metric, setMetric }) {
         </div>
       </div>
 
-      <div style={{ position: 'relative' }}>
+      <div className="card" style={{ padding: 'var(--space-md) var(--space-md) var(--space-sm)', position: 'relative' }}>
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} preserveAspectRatio="xMidYMid meet" style={{ display: 'block' }}>
           {gridlines.map((g, i) => (
             <g key={i}>
@@ -215,8 +215,8 @@ function BreakdownPanel({ icon: Icon, title, rows, modalOpen, onOpenModal }) {
   const top = rows.slice(0, 5);
 
   return (
-    <div style={{ flex: 1, minWidth: 240, padding: 'var(--space-sm) 0' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.6em' }}>
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5em' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
           <Icon size={13} style={{ color: 'var(--accent)' }} />
           <span style={{ fontSize: 'var(--fs-sm)', fontWeight: 600 }}>{title}</span>
@@ -230,8 +230,10 @@ function BreakdownPanel({ icon: Icon, title, rows, modalOpen, onOpenModal }) {
           </button>
         )}
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.15em' }}>
-        {top.map(r => <BreakdownRow key={r.label} label={r.label} cost={r.cost} maxCost={maxCost} />)}
+      <div className="card" style={{ padding: 'var(--space-md)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.15em' }}>
+          {top.map(r => <BreakdownRow key={r.label} label={r.label} cost={r.cost} maxCost={maxCost} />)}
+        </div>
       </div>
     </div>
   );
@@ -332,15 +334,15 @@ export default function UsagePage() {
         />
       </div>
 
-      {/* Full-width stacked area chart */}
+      {/* Daily trend chart */}
       {daily.length > 0 && (
-        <div className="card" style={{ marginBottom: 'var(--space-lg)', padding: 'var(--space-md) var(--space-md) var(--space-sm)' }}>
+        <div style={{ marginBottom: 'var(--space-lg)' }}>
           <DailyBarChart daily={daily} metric={chartMetric} setMetric={setChartMetric} />
         </div>
       )}
 
-      {/* Compact heatmap */}
-      {heatmap?.grid && (
+      {/* Activity heatmap */}
+      {heatmap?.days && Object.keys(heatmap.days).length > 0 && (
         <div style={{ marginBottom: 'var(--space-lg)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em', marginBottom: '0.5em' }}>
             <FiGrid size={13} style={{ color: 'var(--accent)' }} />
@@ -348,31 +350,21 @@ export default function UsagePage() {
             <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>last 12 weeks · Pacific Time</span>
           </div>
           <div className="card" style={{ padding: 'var(--space-md)' }}>
-            <ActivityHeatmap grid={heatmap.grid} />
+            <ActivityHeatmap grid={heatmap.grid} days={heatmap.days} />
           </div>
         </div>
       )}
 
-      {/* 3-column breakdown grid — each panel is a cohesive section */}
+      {/* 3-column breakdown — each with title outside, card inside */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-        gap: '1px',
-        background: 'var(--border)',
-        border: '1px solid var(--border)',
-        borderRadius: 'var(--radius)',
+        gap: 'var(--space-md)',
         marginBottom: 'var(--space-lg)',
-        overflow: 'hidden',
       }}>
-        <div style={{ background: 'var(--surface)', padding: 'var(--space-md)' }}>
-          <BreakdownPanel icon={FiCpu} title="By model" rows={toRows(data.byModel)} onOpenModal={() => setModal({ title: 'By model', rows: toRows(data.byModel) })} />
-        </div>
-        <div style={{ background: 'var(--surface)', padding: 'var(--space-md)' }}>
-          <BreakdownPanel icon={FiFolder} title="By project" rows={toRows(data.byProject)} onOpenModal={() => setModal({ title: 'By project', rows: toRows(data.byProject) })} />
-        </div>
-        <div style={{ background: 'var(--surface)', padding: 'var(--space-md)' }}>
-          <BreakdownPanel icon={FiUsers} title="By agent" rows={toRows(data.byAgent)} onOpenModal={() => setModal({ title: 'By agent', rows: toRows(data.byAgent) })} />
-        </div>
+        <BreakdownPanel icon={FiCpu} title="By model" rows={toRows(data.byModel)} onOpenModal={() => setModal({ title: 'By model', rows: toRows(data.byModel) })} />
+        <BreakdownPanel icon={FiFolder} title="By project" rows={toRows(data.byProject)} onOpenModal={() => setModal({ title: 'By project', rows: toRows(data.byProject) })} />
+        <BreakdownPanel icon={FiUsers} title="By agent" rows={toRows(data.byAgent)} onOpenModal={() => setModal({ title: 'By agent', rows: toRows(data.byAgent) })} />
       </div>
 
       {/* Tool leaderboard — clean ranked table */}
