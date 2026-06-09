@@ -219,6 +219,14 @@ def _collect_sop_files(project_path: Path) -> list[dict]:
     results: list[dict] = []
     seen_paths: set[str] = set()
 
+    # .claude/commands/*.md — project-scoped skills/commands
+    commands_dir = project_path / ".claude" / "commands"
+    if commands_dir.is_dir():
+        for md in sorted(commands_dir.glob("*.md")):
+            if md.is_file() and str(md) not in seen_paths:
+                seen_paths.add(str(md))
+                results.append({"name": md.name, "path": str(md)})
+
     # agent-sops — recursive
     agent_sops_dir = project_path / "agent-sops"
     if agent_sops_dir.is_dir():
