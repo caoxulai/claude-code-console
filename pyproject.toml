@@ -1,6 +1,6 @@
 [project]
 name = "claude-web"
-version = "0.1.0"
+version = "0.2.0"
 description = "Web UI for managing Claude Code sessions, memory, skills, and projects"
 requires-python = ">=3.10"
 # scripts (console entry points) and dependencies are declared in setup.py so

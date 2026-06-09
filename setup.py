@@ -122,7 +122,7 @@ class ToolboxBundlerCommand(Command):
 
 setup(
     name="claude-web",
-    version="0.1.0",
+    version="0.2.0",
     description="Web UI for managing Claude Code sessions, memory, skills, and projects",
     packages=find_packages(include=["server", "server.*"]),
     include_package_data=True,
