@@ -34,7 +34,7 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 
 > **TL;DR for consumers** — on an Amazon Linux Cloud Desktop, run:
 > ```bash
-> mwinit   # if you haven't authenticated today
+> mwinit   # or `mwinit -o` if it says "WebAuthn is not supported on this platform"
 > bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
 > claude-web
 > ```
@@ -42,16 +42,19 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 > what's missing. The detailed steps below are only if you want to do it by hand
 > or something goes wrong.
 
-> **New here?** Follow Option A. It's the fastest path and needs nothing but a
-> Cloud Desktop. You do **not** need to check out any code or know anything
-> about how the console is built.
+> **New here?** Do the **Prerequisites** once, then use **Option A** (one
+> command). You do **not** need to check out any code or know anything about how
+> the console is built.
 
 ### Prerequisites
 
+Do these once on your Cloud Desktop, in order:
+
 1. **An Amazon Cloud Desktop** running Amazon Linux (x86_64 or ARM/aarch64).
    This is where the console runs. (macOS is not yet supported.)
-2. **Midway credentials.** Run `mwinit` if you haven't authenticated today —
-   `toolbox` needs it to download the tool.
+2. **Midway credentials.** Run `mwinit` (you'll need this within the last ~20h).
+   - If it says *"WebAuthn is not supported on this platform"*, run `mwinit -o`
+     instead: enter your PIN, then touch your security key.
 3. **Builder Toolbox installed.** Check with `toolbox --version`. If the command
    is not found, install it from
    <https://builderhub.corp.amazon.com/docs/builder-toolbox/user-guide/getting-started.html>,
@@ -62,91 +65,41 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
    binary on your `PATH`). Install Claude Code first:
    <https://docs.claude.com/en/docs/claude-code>.
 
-### Option A — One-command install (recommended)
+### Install it — pick one
 
-The install script checks all prerequisites (Midway, Builder Toolbox, Claude
-Code) and installs anything missing, then installs claude-web itself:
+The tool ships as a fully self-contained bundle (its own Python + the web UI +
+all dependencies), so no code checkout is needed for Options A or B.
+
+#### Option A — One command (recommended)
+
+Runs a script that checks every prerequisite, installs anything missing, then
+installs claude-web:
 
 ```bash
 bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
 ```
 
-> The `-b ~/.midway/cookie` sends your Midway session (run `mwinit` first, or
-> you'll get a `401`), and `?raw=1` fetches the raw script instead of the HTML
-> Code Browser page. Both are required.
+> Both flags are required: `-b ~/.midway/cookie` sends your Midway session
+> (without it you get a `401`), and `?raw=1` fetches the raw script instead of
+> the HTML Code Browser page. Keep the URL in quotes.
 
-Or if you already have the repo cloned:
-```bash
-bash scripts/install.sh
-```
+#### Option B — Manual, step by step
 
-**Updating later:**
-```bash
-bash scripts/install.sh --update
-# or simply:
-toolbox update claude-web
-```
-
-### Option A (manual) — Install via Builder Toolbox step by step
-
-No code checkout required — the tool ships as a fully self-contained bundle
-(its own Python + the web UI + all dependencies).
+Prefer to run each step yourself (or Option A failed)? Run these in order:
 
 ```bash
-# 1. Authenticate with Midway (skip if you've already run it today)
-mwinit
-
-# 2. Register the tool's registry (one time, ever)
+# 1. Register the tool registry (one time, ever)
 toolbox registry add s3://buildertoolbox-registry-claude-code-console-us-west-2/tools.json
 
-# 3. Install the tool
+# 2. Install the tool
 toolbox install claude-web
-
-# 4. Start the console
-claude-web
 ```
 
-**What happens on step 4:** the server starts on `http://127.0.0.1:7780` and your
-browser opens to it. Leave the terminal running — closing it stops the server.
-To stop, press `Ctrl-C` in that terminal.
-
-> **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
-> `127.0.0.1` there, so opening `127.0.0.1:7780` on your Mac won't reach it. Run
-> the console with `claude-web start --no-browser`, then forward the port over
-> SSH from your Mac and open the link locally — see
-> [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
-
-> The tool is published on the `stable` channel, so `toolbox install claude-web`
-> just works. (Early/preview builds go to `head` — add `--channel head` to opt in.)
-
-**Updating later:**
-```bash
-toolbox update claude-web
-```
-
-**Other commands:**
-```bash
-claude-web                      # start on :7780 and open the browser
-claude-web start --port 8888    # use a different port
-claude-web start --no-browser   # don't auto-open a browser (e.g. on a headless/remote host)
-claude-web setup                # create the optional config file (see Configuration)
-```
-
-#### Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| `toolbox: command not found` | Builder Toolbox isn't installed — see Prerequisite 3, then open a new terminal. |
-| `AccessDenied` / registry add fails | Run `mwinit` and retry. |
-| `claude-web: command not found` after install | Open a new terminal so `~/.toolbox/bin` is on your `PATH`, or run `~/.toolbox/bin/claude-web`. |
-| Browser doesn't open (remote/headless) | Use `claude-web start --no-browser`, then open `http://127.0.0.1:7780` yourself (tunnel/port-forward if remote — see [Accessing from other devices](#accessing-from-other-devices)). |
-| Pages are empty | You haven't used Claude Code yet, or your projects live somewhere other than `~/workspace/projects` — set `CLAUDE_WEB_WORKSPACE` (see [Configuration](#configuration)). |
-| Chat page errors | The `claude` binary isn't on your `PATH`. Install Claude Code (Prerequisite 4). |
-
-### Option B — Install from source (for development)
+#### Option C — From source (for development only)
 
 Use this only if you're modifying the console itself. Requires Python ≥ 3.10,
-Node.js, and GitFarm access.
+Node.js, and GitFarm access. (You then run with `.venv/bin/claude-web` instead
+of the steps below.)
 
 ```bash
 # 1. Clone
@@ -159,18 +112,59 @@ cd frontend && npm install && npm run build && cd ..
 # 3. Install the package (editable)
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-
-# 4. Run
-.venv/bin/claude-web start --port 7780
 ```
 
-Open <http://127.0.0.1:7780>.
-
-For frontend hot-reload during development, run the Vite dev server (proxies `/api` to the backend):
+For frontend hot-reload during development, run the Vite dev server (proxies
+`/api` to the backend) alongside the backend:
 ```bash
 .venv/bin/claude-web start --no-browser   # backend on :7780
 cd frontend && npm run dev                 # frontend on :5173
 ```
+
+### Run it
+
+```bash
+claude-web
+```
+
+The server starts on `http://127.0.0.1:7780` and your browser opens to it. Leave
+the terminal running — closing it (or pressing `Ctrl-C`) stops the server.
+
+> **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
+> `127.0.0.1` there, so opening `127.0.0.1:7780` on your Mac won't reach it.
+> Instead run `claude-web start --no-browser`, then forward the port over SSH —
+> see [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
+
+**Other useful commands:**
+```bash
+claude-web start --port 8888    # use a different port
+claude-web start --no-browser   # don't auto-open a browser (headless/remote host)
+claude-web setup                # create the optional config file (see Configuration)
+```
+
+### Updating
+
+```bash
+toolbox update claude-web
+# or, if you used the Option A script: bash scripts/install.sh --update
+```
+
+> claude-web is published on the `stable` channel, so `toolbox install` /
+> `toolbox update` just work. Preview builds go to `head` — add `--channel head`
+> to opt in.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `toolbox: command not found` | Builder Toolbox isn't installed — see Prerequisite 3, then open a new terminal. |
+| `mwinit`: *"WebAuthn is not supported on this platform"* | Use the OTP/security-key flow instead: `mwinit -o` (enter PIN, then touch your security key). |
+| Install `curl: ... 401` | Your Midway session isn't being sent. Run `mwinit` (or `mwinit -o`), and make sure the curl includes `-b ~/.midway/cookie` and the URL ends in `?raw=1`. |
+| `AccessDenied` / registry add fails | Run `mwinit` (or `mwinit -o`) and retry. |
+| `claude-web: command not found` after install | Open a new terminal so `~/.toolbox/bin` is on your `PATH`, or run `~/.toolbox/bin/claude-web`. |
+| Browser doesn't open (remote/headless) | Use `claude-web start --no-browser`, then open `http://127.0.0.1:7780` yourself (tunnel/port-forward if remote — see [Accessing from other devices](#accessing-from-other-devices)). |
+| Pages are empty | You haven't used Claude Code yet, or your projects live somewhere other than `~/workspace/projects` — set `CLAUDE_WEB_WORKSPACE` (see [Configuration](#configuration)). |
+| Chat page errors | The `claude` binary isn't on your `PATH`. Install Claude Code (Prerequisite 4). |
 
 ---
 
@@ -241,9 +235,10 @@ to the network.
    You're now using the console running on your Cloud Desktop.
 
 > **Tip:** if you connect through Midway/PCSK, make sure your SSH session is
-> authenticated (`mwinit` / `mwinit -s`) before step 2, or the tunnel will fail
-> to establish. The forward adds no new auth of its own — anyone who can SSH to
-> your desktop can already reach the port.
+> authenticated (`mwinit`, or `mwinit -o` if WebAuthn isn't supported on your
+> platform) before step 2, or the tunnel will fail to establish. The forward
+> adds no new auth of its own — anyone who can SSH to your desktop can already
+> reach the port.
 
 ### Binding to a routable interface (not recommended)
 
