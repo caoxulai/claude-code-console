@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FiBarChart2, FiCpu, FiFolder, FiUsers, FiTrendingUp, FiGrid, FiTool, FiArrowUp, FiArrowDown } from 'react-icons/fi';
+import { FiBarChart2, FiCpu, FiFolder, FiUsers, FiTrendingUp, FiGrid, FiTool } from 'react-icons/fi';
 import { SkeletonLine } from '../components/Skeleton';
 import ActivityHeatmap from '../components/ActivityHeatmap';
 import BudgetAlert, { BudgetSetupButton } from '../components/BudgetAlert';
@@ -23,7 +23,7 @@ function shortDate(iso) {
   return `${months[parseInt(m, 10)] || m} ${d}`;
 }
 
-function HeroCard({ label, value, sub, delta }) {
+function HeroCard({ label, value, sub }) {
   return (
     <div style={{
       padding: 'var(--space-lg) var(--space-md)',
@@ -37,12 +37,6 @@ function HeroCard({ label, value, sub, delta }) {
       <div style={{ fontSize: '1.8em', fontWeight: 700, color: 'var(--text)', lineHeight: 1.1 }}>{value}</div>
       <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.4em', letterSpacing: '0.03em' }}>{label}</div>
       {sub && <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', marginTop: '0.15em' }}>{sub}</div>}
-      {delta != null && delta !== 0 && (
-        <div style={{ fontSize: 'var(--fs-xs)', marginTop: '0.3em', color: delta > 0 ? 'var(--warning)' : 'var(--accent2)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 2 }}>
-          {delta > 0 ? <FiArrowUp size={10} /> : <FiArrowDown size={10} />}
-          {Math.abs(delta).toFixed(0)}% vs prev period
-        </div>
-      )}
     </div>
   );
 }
@@ -294,15 +288,6 @@ export default function UsagePage() {
   const avgCostPerDay = activeDays > 0 ? windowCost / activeDays : 0;
   const todayCost = daily.length > 0 ? daily[daily.length - 1].cost : 0;
 
-  // Compute period-over-period delta for the hero stat
-  const half = Math.floor(daily.length / 2);
-  let costDelta = null;
-  if (half > 0) {
-    const recentHalf = daily.slice(half).reduce((s, d) => s + d.cost, 0);
-    const olderHalf = daily.slice(0, half).reduce((s, d) => s + d.cost, 0);
-    if (olderHalf > 0) costDelta = ((recentHalf - olderHalf) / olderHalf) * 100;
-  }
-
   return (
     <div>
       <div className="page-header">
@@ -324,7 +309,7 @@ export default function UsagePage() {
         marginBottom: 'var(--space-lg)',
         overflow: 'hidden',
       }}>
-        <HeroCard label="Total cost" value={fmtCost(t.cost)} sub="all-time" delta={costDelta} />
+        <HeroCard label="Total cost" value={fmtCost(t.cost)} sub="all-time" />
         <HeroCard label="Total tokens" value={fmtTokens(totalTokens)} sub={`${t.messages.toLocaleString()} messages`} />
         <HeroCard label="Avg / day" value={fmtCost(avgCostPerDay)} sub={`${activeDays} active day${activeDays === 1 ? '' : 's'}`} />
         <HeroCard
