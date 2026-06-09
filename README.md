@@ -106,6 +106,12 @@ claude-web
 browser opens to it. Leave the terminal running — closing it stops the server.
 To stop, press `Ctrl-C` in that terminal.
 
+> **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
+> `127.0.0.1` there, so opening `127.0.0.1:7780` on your Mac won't reach it. Run
+> the console with `claude-web start --no-browser`, then forward the port over
+> SSH from your Mac and open the link locally — see
+> [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
+
 > The tool is published on the `stable` channel, so `toolbox install claude-web`
 > just works. (Early/preview builds go to `head` — add `--channel head` to opt in.)
 
@@ -199,6 +205,43 @@ your `~/.claude` files and run shell commands. The recommended way to reach it
 from a phone or laptop is to keep it on loopback and forward the port over a
 trusted channel: expose `:7780` through a tunnel from your Cloud Desktop (e.g.
 AWS Tunnels + AEA) or an SSH port-forward, then open the tunnel URL.
+
+### Accessing from a Mac (Cloud Desktop → laptop)
+
+This is the common setup: the console runs on your Cloud Desktop, but you want
+to use it in your Mac's browser. Because the server stays on `127.0.0.1` of the
+Cloud Desktop, you reach it with an **SSH port-forward** — a secure tunnel that
+maps a port on your Mac to `127.0.0.1:7780` on the desktop. Nothing is exposed
+to the network.
+
+1. **On the Cloud Desktop**, start the console without trying to open a browser
+   there:
+   ```bash
+   claude-web start --no-browser
+   ```
+   Leave this terminal running.
+
+2. **On your Mac**, open a second terminal and forward the port. Use the same
+   host you normally SSH to your Cloud Desktop with:
+   ```bash
+   ssh -N -L 7780:127.0.0.1:7780 <your-cloud-desktop-host>
+   ```
+   - `<your-cloud-desktop-host>` is whatever you use today, e.g.
+     `dev-dsk-$USER-...amazon.com` or an alias from your `~/.ssh/config`.
+   - `-N` means "just forward, don't open a shell." Leave it running while you
+     use the console; press `Ctrl-C` to disconnect.
+   - If port `7780` is already taken on your Mac, map a different local port:
+     `-L 9000:127.0.0.1:7780`, then use `:9000` in step 3.
+
+3. **On your Mac**, open <http://127.0.0.1:7780> (or `:9000` if you remapped).
+   You're now using the console running on your Cloud Desktop.
+
+> **Tip:** if you connect through Midway/PCSK, make sure your SSH session is
+> authenticated (`mwinit` / `mwinit -s`) before step 2, or the tunnel will fail
+> to establish. The forward adds no new auth of its own — anyone who can SSH to
+> your desktop can already reach the port.
+
+### Binding to a routable interface (not recommended)
 
 Binding directly to a routable interface (`--host 0.0.0.0`) is refused by
 default, because an unauthenticated server that can execute shell commands is
