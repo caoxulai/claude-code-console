@@ -35,7 +35,7 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 > **TL;DR for consumers** — on an Amazon Linux Cloud Desktop, run:
 > ```bash
 > mwinit   # if you haven't authenticated today
-> bash <(curl -fsSL https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh)
+> bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
 > claude-web
 > ```
 > That's the whole thing — the script checks every prerequisite and installs
@@ -68,8 +68,12 @@ The install script checks all prerequisites (Midway, Builder Toolbox, Claude
 Code) and installs anything missing, then installs claude-web itself:
 
 ```bash
-bash <(curl -fsSL https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh)
+bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
 ```
+
+> The `-b ~/.midway/cookie` sends your Midway session (run `mwinit` first, or
+> you'll get a `401`), and `?raw=1` fetches the raw script instead of the HTML
+> Code Browser page. Both are required.
 
 Or if you already have the repo cloned:
 ```bash
