@@ -15,6 +15,7 @@ A sidebar-navigated single-page app backed by a small aiohttp server. Each page 
 | **Dashboard** | At-a-glance counts (sessions, live sessions, memory files, skills, MCP servers, cron jobs, projects) + recent projects with quick links |
 | **Projects** | Every project in your workspace with its session/memory counts, CLAUDE.md, memory files, and SOP/skill docs — plus configurable live/deployed app URLs |
 | **Sessions** | All Claude Code sessions across projects — browse, view transcripts, rename, resume, or delete |
+| **Usage** | Token/cost analytics across all transcripts — totals, daily trend, a GitHub-style activity heatmap with week drill-down, and breakdowns by model, project, and agent (all day boundaries in Pacific time) |
 | **Chat** | Send a prompt to `claude` and stream the response (SSE), with per-request working-directory selection |
 | **Memory** | Browse and edit `~/.claude` memory files (typed: feedback / user / project / reference) with rendered markdown |
 | **Skills** | List installed skills and read their `SKILL.md` content |
