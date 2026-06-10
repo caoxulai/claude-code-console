@@ -1,6 +1,6 @@
 # Claude Code Console (`claude-web`)
 
-A web GUI for managing your [Claude Code](https://docs.claude.com/en/docs/claude-code) setup — sessions, memory, skills, projects, MCP servers, hooks, cron jobs, and more — all from a browser, reachable from any device.
+A web GUI for managing your [Claude Code](https://docs.hub.amazon.dev/claude-code) setup — sessions, memory, skills, projects, MCP servers, hooks, cron jobs, and more — all from a browser, reachable from any device.
 
 Claude Code stores everything on disk under `~/.claude/` (session transcripts, memory files, skills, settings). This console reads and manages that data through a clean web interface instead of the CLI and a text editor.
 
@@ -80,8 +80,10 @@ Option B (manual).
 4. **Claude Code** *(auto-installed by Option A)*. The console is a *viewer and
    manager* for the data Claude Code stores in `~/.claude/`. If you've never run
    `claude`, the pages will simply be empty (and the Chat page needs the `claude`
-   binary on your `PATH`). For Option B, install it from
-   <https://docs.claude.com/en/docs/claude-code>.
+   binary on your `PATH`). For Option B, install the **Amazon internal
+   distribution** via Builder Toolbox (`toolbox install claude-code`) — do *not*
+   use npm/Homebrew/public installers. See
+   <https://docs.hub.amazon.dev/docs/claude-code/user-guide/getting-started.html>.
 
 ### Install it — pick one
 
