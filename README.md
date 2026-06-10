@@ -32,6 +32,9 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 
 ## Installation
 
+> Looking for a standalone, wiki-ready install guide to share? See
+> [`docs/INSTALL.md`](docs/INSTALL.md).
+
 > **TL;DR for consumers** — on an Amazon Linux Cloud Desktop, run:
 > ```bash
 > mwinit   # required first — or `mwinit -o` if it says "WebAuthn is not supported on this platform"
