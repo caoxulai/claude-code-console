@@ -34,13 +34,26 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 
 > **TL;DR for consumers** — on an Amazon Linux Cloud Desktop, run:
 > ```bash
-> mwinit   # or `mwinit -o` if it says "WebAuthn is not supported on this platform"
+> mwinit   # required first — or `mwinit -o` if it says "WebAuthn is not supported on this platform"
 > bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
 > claude-web
 > ```
 > That's the whole thing — the script checks every prerequisite and installs
-> what's missing. The detailed steps below are only if you want to do it by hand
-> or something goes wrong.
+> what's missing. (`mwinit` is still required first: the curl reads your existing
+> Midway cookie, it can't create one.)
+>
+> **Using it from a Mac?** Start the console without a browser, then tunnel to it:
+> ```bash
+> # on the Cloud Desktop:
+> claude-web start --no-browser
+> # on your Mac (new terminal, leave running) — use YOUR desktop's hostname:
+> ssh -N -L 7780:127.0.0.1:7780 dev-dsk-<you>-....amazon.com
+> ```
+> Then open <http://127.0.0.1:7780> in your Mac's browser. (Find your hostname by
+> running `hostname -f` on the Cloud Desktop.)
+>
+> The detailed steps below are only if you want to do it by hand or something
+> goes wrong.
 
 > **New here?** Do the **Prerequisites** once, then use **Option A** (one
 > command). You do **not** need to check out any code or know anything about how
@@ -132,8 +145,17 @@ the terminal running — closing it (or pressing `Ctrl-C`) stops the server.
 
 > **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
 > `127.0.0.1` there, so opening `127.0.0.1:7780` on your Mac won't reach it.
-> Instead run `claude-web start --no-browser`, then forward the port over SSH —
-> see [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
+> Instead, on the Cloud Desktop run:
+> ```bash
+> claude-web start --no-browser
+> ```
+> then on your Mac (new terminal, leave it running) forward the port over SSH —
+> use your own desktop's hostname (`hostname -f` shows it):
+> ```bash
+> ssh -N -L 7780:127.0.0.1:7780 dev-dsk-<you>-....amazon.com
+> ```
+> and open <http://127.0.0.1:7780> in your Mac's browser. More detail and
+> options in [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
 
 **Other useful commands:**
 ```bash
