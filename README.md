@@ -45,9 +45,9 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 > what's missing. (`mwinit` is still required first: the curl reads your existing
 > Midway cookie, it can't create one.)
 >
-> **Using it from a Mac?** Start the console without a browser, then tunnel to it:
+> **Using it from a Mac?** Start the console on the desktop, then tunnel to it:
 > ```bash
-> # on the Cloud Desktop:
+> # on the Cloud Desktop (`--no-browser` skips the no-op browser attempt; plain `claude-web` is fine too):
 > claude-web start --no-browser
 > # on your Mac (new terminal, leave running) — use YOUR desktop's hostname:
 > ssh -N -L 7780:127.0.0.1:7780 dev-dsk-<you>-....amazon.com
@@ -148,7 +148,8 @@ the terminal running — closing it (or pressing `Ctrl-C`) stops the server.
 
 > **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
 > `127.0.0.1` there, so opening `127.0.0.1:7780` on your Mac won't reach it.
-> Instead, on the Cloud Desktop run:
+> Instead, on the Cloud Desktop run (`--no-browser` skips the no-op browser
+> attempt on the headless host; plain `claude-web` works too):
 > ```bash
 > claude-web start --no-browser
 > ```
@@ -237,8 +238,9 @@ Cloud Desktop, you reach it with an **SSH port-forward** — a secure tunnel tha
 maps a port on your Mac to `127.0.0.1:7780` on the desktop. Nothing is exposed
 to the network.
 
-1. **On the Cloud Desktop**, start the console without trying to open a browser
-   there:
+1. **On the Cloud Desktop**, start the console. `--no-browser` skips the
+   browser-open attempt (which no-ops on a headless host anyway — plain
+   `claude-web` works the same for tunneling):
    ```bash
    claude-web start --no-browser
    ```
