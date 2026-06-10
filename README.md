@@ -64,21 +64,23 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 
 ### Prerequisites
 
-Do these once on your Cloud Desktop, in order:
+Do these once on your Cloud Desktop, in order. **For Option A you only need #1
+and #2** — the script installs #3 and #4 for you; do them by hand only for
+Option B (manual).
 
 1. **An Amazon Cloud Desktop** running Amazon Linux (x86_64 or ARM/aarch64).
    This is where the console runs. (macOS is not yet supported.)
 2. **Midway credentials.** Run `mwinit` (you'll need this within the last ~20h).
    - If it says *"WebAuthn is not supported on this platform"*, run `mwinit -o`
      instead: enter your PIN, then touch your security key.
-3. **Builder Toolbox installed.** Check with `toolbox --version`. If the command
-   is not found, install it from
+3. **Builder Toolbox** *(auto-installed by Option A)*. For Option B, check with
+   `toolbox --version`; if not found, install it from
    <https://builderhub.corp.amazon.com/docs/builder-toolbox/user-guide/getting-started.html>,
    then open a new terminal.
-4. **Claude Code installed and used at least once.** The console is a *viewer and
+4. **Claude Code** *(auto-installed by Option A)*. The console is a *viewer and
    manager* for the data Claude Code stores in `~/.claude/`. If you've never run
    `claude`, the pages will simply be empty (and the Chat page needs the `claude`
-   binary on your `PATH`). Install Claude Code first:
+   binary on your `PATH`). For Option B, install it from
    <https://docs.claude.com/en/docs/claude-code>.
 
 ### Install it — pick one
@@ -88,8 +90,10 @@ all dependencies), so no code checkout is needed for Options A or B.
 
 #### Option A — One command (recommended)
 
-Runs a script that checks every prerequisite, installs anything missing, then
-installs claude-web:
+The one-liner downloads and runs a script that does the real work: it checks
+every prerequisite, installs anything missing (including Builder Toolbox and
+Claude Code), then runs `toolbox install claude-web` for you — which is why you
+don't type `toolbox` yourself here.
 
 ```bash
 bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
