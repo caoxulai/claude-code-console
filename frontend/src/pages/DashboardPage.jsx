@@ -51,7 +51,6 @@ export default function DashboardPage() {
         projects: projectsList.length,
         // Open tasks = anything not completed (in_progress + pending + other).
         tasksOpen: tasksList.filter(t => t.status !== 'completed').length,
-        tasksInProgress: tasksList.filter(t => t.status === 'in_progress').length,
         usageTokens: null,  // loaded separately below to not block the dashboard
       });
     }).catch(() => {
@@ -83,14 +82,7 @@ export default function DashboardPage() {
   const cards = [
     { icon: FiList, label: 'Sessions', value: stats?.sessions, link: '/sessions' },
     { icon: FiMessageSquare, label: 'Live', value: stats?.live, link: '/sessions' },
-    {
-      icon: FiCheckSquare,
-      label: 'Open Tasks',
-      value: stats?.tasksOpen,
-      // Sub-line surfaces how many of the open tasks are actively in progress.
-      sub: stats?.tasksInProgress ? `${stats.tasksInProgress} in progress` : undefined,
-      link: '/tasks',
-    },
+    { icon: FiCheckSquare, label: 'Open Tasks', value: stats?.tasksOpen, link: '/tasks' },
     { icon: FiBookOpen, label: 'Memory Files', value: stats?.memory, link: '/memory' },
     { icon: FiZap, label: 'Skills', value: stats?.skills, link: '/skills' },
     { icon: FiServer, label: 'MCP Servers', value: stats?.mcp, link: '/mcp' },
