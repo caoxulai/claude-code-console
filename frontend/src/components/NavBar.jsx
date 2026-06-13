@@ -5,24 +5,26 @@ import {
 } from 'react-icons/fi';
 
 const NAV_ITEMS = [
-  { group: 'Main', items: [
+  { group: 'Overview', items: [
     { to: '/', icon: FiHome, label: 'Dashboard' },
-    { to: '/projects', icon: FiFolder, label: 'Projects' },
-    { to: '/chat', icon: FiMessageSquare, label: 'Chat' },
     { to: '/usage', icon: FiBarChart2, label: 'Usage' },
   ]},
-  { group: 'Config', items: [
-    { to: '/settings', icon: FiSettings, label: 'Settings' },
-    { to: '/memory', icon: FiBookOpen, label: 'Memory' },
-    { to: '/skills', icon: FiZap, label: 'Skills' },
-    { to: '/hooks', icon: FiGitBranch, label: 'Hooks' },
-  ]},
-  { group: 'System', items: [
-    { to: '/mcp', icon: FiServer, label: 'MCP Servers' },
-    { to: '/crons', icon: FiClock, label: 'Cron Jobs' },
+  { group: 'Work', items: [
+    { to: '/projects', icon: FiFolder, label: 'Projects' },
+    { to: '/chat', icon: FiMessageSquare, label: 'Chat' },
     { to: '/sessions', icon: FiList, label: 'Sessions' },
     { to: '/tasks', icon: FiCheckSquare, label: 'Tasks' },
+  ]},
+  { group: 'Extend', items: [
+    { to: '/skills', icon: FiZap, label: 'Skills' },
+    { to: '/mcp', icon: FiServer, label: 'MCP Servers' },
     { to: '/plugins', icon: FiPackage, label: 'Plugins' },
+    { to: '/hooks', icon: FiGitBranch, label: 'Hooks' },
+  ]},
+  { group: 'Configure', items: [
+    { to: '/memory', icon: FiBookOpen, label: 'Memory' },
+    { to: '/crons', icon: FiClock, label: 'Cron Jobs' },
+    { to: '/settings', icon: FiSettings, label: 'Settings' },
   ]},
 ];
 
