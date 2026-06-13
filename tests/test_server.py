@@ -497,6 +497,24 @@ async def test_projects_claude_md_and_settings(client, projects_layout):
     assert projects["beta"]["claudeMd"] is None
 
 
+async def test_project_id_path_traversal_rejected(client, projects_layout):
+    """Regression: a URL-encoded ..%2f.. project_id must NOT escape the
+    workspace. Before the _validate_project_id guard, this wrote a CLAUDE.md
+    outside WORKSPACE_DIR (verified live). It must now 400 and write nothing.
+    """
+    workspace = projects_layout["workspace"]
+    escaped = workspace.parent.parent / "CLAUDE.md"
+    assert not escaped.exists()
+    resp = await client.put(
+        "/api/projects/..%2f../claude-md", json={"content": "PWNED"}
+    )
+    assert resp.status == 400
+    assert not escaped.exists()
+    # The read/SOP/memory project endpoints share the guard.
+    assert (await client.get("/api/projects/..%2f../sop/x.md")).status == 400
+    assert (await client.get("/api/projects/..%2f../memory/x.md")).status == 400
+
+
 async def test_projects_readme_inlined(client, projects_layout):
     """A root README is inlined as `readme` with its filename in `readmeName`;
     projects without one report null for both (field always present)."""

@@ -553,9 +553,22 @@ async def list_projects(request: web.Request) -> web.Response:
     return web.json_response(projects)
 
 
+def _validate_project_id(project_id: str) -> None:
+    """Reject project ids containing path-traversal characters.
+
+    project_id comes from the URL and is joined as WORKSPACE_DIR / project_id,
+    then used to derive write/read paths. Without this guard a URL-encoded
+    "..%2f.." escapes the workspace (the segment reaches the handler decoded as
+    "../.."), turning the project endpoints into write/read-anywhere primitives.
+    """
+    if not project_id or ".." in project_id or "/" in project_id or "\\" in project_id:
+        raise web.HTTPBadRequest(reason="invalid project id")
+
+
 async def save_project_claude_md(request: web.Request) -> web.Response:
     """Write content to a project's CLAUDE.md file."""
     project_id = request.match_info["project_id"]
+    _validate_project_id(project_id)
     body = await request.json()
     content = body.get("content")
     if content is None:
@@ -582,6 +595,7 @@ async def get_project_sop(request: web.Request) -> web.Response:
     # Validate filename: no path traversal
     if ".." in filename or "/" in filename or "\\" in filename:
         raise web.HTTPBadRequest(reason="invalid filename")
+    _validate_project_id(project_id)
 
     project_dir = WORKSPACE_DIR / project_id
     if not project_dir.is_dir():
@@ -611,6 +625,7 @@ async def get_project_memory(request: web.Request) -> web.Response:
     # Validate filename: no path traversal
     if ".." in filename or "/" in filename or "\\" in filename:
         raise web.HTTPBadRequest(reason="invalid filename")
+    _validate_project_id(project_id)
 
     project_dir = WORKSPACE_DIR / project_id
     if not project_dir.is_dir():
@@ -639,6 +654,7 @@ async def save_project_memory(request: web.Request) -> web.Response:
     # Validate filename: no path traversal
     if ".." in filename or "/" in filename or "\\" in filename:
         raise web.HTTPBadRequest(reason="invalid filename")
+    _validate_project_id(project_id)
 
     project_dir = WORKSPACE_DIR / project_id
     if not project_dir.is_dir():
