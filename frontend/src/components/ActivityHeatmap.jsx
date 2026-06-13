@@ -226,7 +226,11 @@ function WeekGrid({ week, dailyHours }) {
 }
 
 export default function ActivityHeatmap({ grid, days, dailyHours }) {
+  // All hooks must run before any early return (Rules of Hooks): if `days`
+  // ever flips between empty and populated on a mounted instance, a hook after
+  // the early return would change the hook count and crash the subtree.
   const [monthHover, setMonthHover] = useState(null);
+  const [selectedWeekIdx, setSelectedWeekIdx] = useState(null);
 
   if (!days || Object.keys(days).length === 0) {
     return <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>No activity data.</div>;
@@ -237,8 +241,9 @@ export default function ActivityHeatmap({ grid, days, dailyHours }) {
   const max = Math.max(...allCounts, 1);
   const monthLabels = getMonthLabels(weeks);
 
-  const [selectedWeekIdx, setSelectedWeekIdx] = useState(weeks.length - 1);
-  const selectedWeek = weeks[selectedWeekIdx];
+  // Default to the latest week until the user picks one (null → last week).
+  const effectiveWeekIdx = selectedWeekIdx ?? weeks.length - 1;
+  const selectedWeek = weeks[effectiveWeekIdx];
   const weekTotal = selectedWeek ? selectedWeek.reduce((s, d) => s + d.count, 0) : 0;
 
   return (
@@ -265,7 +270,7 @@ export default function ActivityHeatmap({ grid, days, dailyHours }) {
             monthLabels={monthLabels}
             hover={monthHover}
             setHover={setMonthHover}
-            selectedWeekIdx={selectedWeekIdx}
+            selectedWeekIdx={effectiveWeekIdx}
             setSelectedWeekIdx={setSelectedWeekIdx}
           />
         </div>

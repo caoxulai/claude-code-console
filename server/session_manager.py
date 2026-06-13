@@ -61,6 +61,7 @@ class PersistentSession:
         self._stdout_reader: asyncio.StreamReader | None = None
         self._lock = asyncio.Lock()
         self._started = False
+        self._stderr_task: asyncio.Task | None = None
         # Bounded tail of recent stderr lines, used to classify auth failures
         # (some credential errors surface on stderr rather than as a result event).
         self._stderr_tail: list[str] = []
@@ -88,8 +89,9 @@ class PersistentSession:
         )
         self._started = True
 
-        # Drain stderr in background
-        asyncio.create_task(self._drain_stderr())
+        # Drain stderr in background. Keep the handle so stop() can cancel it
+        # rather than orphaning one task per session/respawn.
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
         return None
 
@@ -163,14 +165,31 @@ class PersistentSession:
                     break
 
     async def stop(self):
-        """Terminate the Claude process."""
+        """Terminate the Claude process, escalating SIGTERM→SIGKILL.
+
+        Each wait is bounded so a process that ignores stdin-close or SIGTERM
+        can't hang stop() (and thus stop_all() on shutdown, or respawn())
+        forever. The background stderr-drain task is cancelled so it isn't
+        orphaned across respawns.
+        """
         if self._proc and self._proc.returncode is None:
             self._proc.stdin.close()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 self._proc.terminate()
-                await self._proc.wait()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    # Last resort: SIGKILL and a final bounded wait.
+                    self._proc.kill()
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+        self._stderr_task = None
         self._started = False
 
 

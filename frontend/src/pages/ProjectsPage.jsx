@@ -107,6 +107,22 @@ function projectPathToSlug(path) {
   return path.replace(/\//g, "-");
 }
 
+// Make a clickable <span> badge behave like a button for keyboard users:
+// focusable + Enter/Space activates it. `activate` receives the keyboard event
+// (it already calls stopPropagation/navigates). Spread onto the span.
+function clickableBadgeProps(activate) {
+  return {
+    role: 'button',
+    tabIndex: 0,
+    onKeyDown: (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        activate(e);
+      }
+    },
+  };
+}
+
 // Format a raw epoch timestamp (seconds or ms) into a compact relative-time
 // label like "3d ago". Returns null when the value is missing/unparseable so
 // callers can fall back to an em-dash.
@@ -437,6 +453,7 @@ export default function ProjectsPage() {
               const slug = projectPathToSlug(project.path);
               navigate(`/sessions?project=${slug}`);
             }}
+            {...clickableBadgeProps(() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`))}
             style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
             onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
             onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
@@ -450,6 +467,7 @@ export default function ProjectsPage() {
               setExpandedId(project.id);
               setActiveTab('Memory');
             }}
+            {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Memory'); })}
             style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
             onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
             onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
@@ -464,6 +482,7 @@ export default function ProjectsPage() {
                 setExpandedId(project.id);
                 setActiveTab('Skills/SOPs');
               }}
+              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Skills/SOPs'); })}
               style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
               onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
               onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
@@ -479,6 +498,7 @@ export default function ProjectsPage() {
                 setExpandedId(project.id);
                 setActiveTab('Tasks');
               }}
+              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Tasks'); })}
               style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
               onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
               onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
@@ -498,6 +518,7 @@ export default function ProjectsPage() {
                 const slug = projectPathToSlug(project.path);
                 navigate(`/sessions?project=${slug}`);
               }}
+              {...clickableBadgeProps(() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`))}
               style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
               onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
               onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}

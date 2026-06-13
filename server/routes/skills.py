@@ -5,6 +5,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server import filestore
 
 
@@ -39,7 +41,12 @@ def _list_local_skills() -> list[dict]:
         for d in sorted(SKILLS_DIR.iterdir()):
             skill_file = d / "SKILL.md" if d.is_dir() else None
             if skill_file and skill_file.exists():
-                content = skill_file.read_text(encoding="utf-8")
+                # A single unreadable/non-UTF-8 SKILL.md must not 500 the whole
+                # inventory — skip it.
+                try:
+                    content = skill_file.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
                 meta = _parse_frontmatter(content)
                 skills.append({
                     "name": d.name,
@@ -50,7 +57,10 @@ def _list_local_skills() -> list[dict]:
                 })
     if COMMANDS_DIR.is_dir():
         for f in sorted(COMMANDS_DIR.glob("*.md")):
-            content = f.read_text(encoding="utf-8")
+            try:
+                content = f.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
             meta = _parse_frontmatter(content)
             skills.append({
                 "name": f.stem,
@@ -80,7 +90,7 @@ async def get_skill(request: web.Request) -> web.Response:
 
 async def put_skill(request: web.Request) -> web.Response:
     name = request.match_info["name"]
-    body = await request.json()
+    body = await read_json_body(request)
     content = body.get("content", "")
     expected_etag = body.get("etag")
 
@@ -104,7 +114,7 @@ async def put_skill(request: web.Request) -> web.Response:
 
 
 async def create_skill(request: web.Request) -> web.Response:
-    body = await request.json()
+    body = await read_json_body(request)
     name = body.get("name", "").strip()
     content = body.get("content", "")
     if not name or "/" in name or ".." in name:

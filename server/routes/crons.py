@@ -8,6 +8,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server import filestore
 
 
@@ -36,7 +38,7 @@ async def list_crons(request: web.Request) -> web.Response:
 
 
 async def create_cron(request: web.Request) -> web.Response:
-    body = await request.json()
+    body = await read_json_body(request)
     cron_expr = body.get("cron", "").strip()
     prompt = body.get("prompt", "").strip()
     recurring = body.get("recurring", True)
@@ -67,7 +69,7 @@ async def create_cron(request: web.Request) -> web.Response:
 
 async def update_cron(request: web.Request) -> web.Response:
     job_id = request.match_info["job_id"]
-    body = await request.json()
+    body = await read_json_body(request)
     expected_etag = body.get("etag")
 
     data, current_etag = _load()
@@ -94,7 +96,13 @@ async def update_cron(request: web.Request) -> web.Response:
 
 async def delete_cron(request: web.Request) -> web.Response:
     job_id = request.match_info["job_id"]
-    body = await request.json() if request.content_length else {}
+    # Read the body whether or not Content-Length is set (chunked bodies report
+    # content_length=None) so the optimistic-concurrency etag is always honored.
+    # An empty body is fine — it just means no etag was supplied.
+    if request.can_read_body:
+        body = await read_json_body(request)
+    else:
+        body = {}
     expected_etag = body.get("etag")
 
     data, current_etag = _load()

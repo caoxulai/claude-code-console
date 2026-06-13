@@ -149,23 +149,19 @@ export default function ChatPage() {
   };
 
   const textareaRef = useRef(null);
+  const slashMenuRef = useRef(null);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
 
-  const slashMenu = SlashCommandMenu({
-    commands: slashCommands,
-    input,
-    visible: showSlashMenu,
-    onSelect: (cmd) => {
-      if (cmd) {
-        setInput(`/${cmd} `);
-        textareaRef.current?.focus();
-      }
-      setShowSlashMenu(false);
-    },
-  });
+  const onSlashSelect = (cmd) => {
+    if (cmd) {
+      setInput(`/${cmd} `);
+      textareaRef.current?.focus();
+    }
+    setShowSlashMenu(false);
+  };
 
   const handleKeyDown = (e) => {
-    if (showSlashMenu && slashMenu?.handleKeyDown(e)) return;
+    if (showSlashMenu && slashMenuRef.current?.handleKeyDown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmit(e);
@@ -253,7 +249,13 @@ export default function ChatPage() {
       </div>
 
       <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '0.5em', paddingTop: '1em', borderTop: '1px solid var(--border)', position: 'relative' }}>
-        {slashMenu?.element}
+        <SlashCommandMenu
+          ref={slashMenuRef}
+          commands={slashCommands}
+          input={input}
+          visible={showSlashMenu}
+          onSelect={onSlashSelect}
+        />
         <textarea
           ref={textareaRef}
           value={input}

@@ -14,7 +14,7 @@ export default function SessionPickerModal({ picker, onClose }) {
       <div className="card" onClick={e => e.stopPropagation()} style={{ maxWidth: 480, width: '90%', maxHeight: '70vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75em' }}>
           <h3 style={{ margin: 0, fontSize: '1em' }}>Pick a session for the goal</h3>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: '1.2em', lineHeight: 1 }}>×</button>
+          <button onClick={onClose} aria-label="Close" title="Close" style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: '1.2em', lineHeight: 1 }}>×</button>
         </div>
         <p style={{ fontSize: '0.82em', color: 'var(--muted)', marginTop: 0 }}>
           <strong>{task.project}</strong> has multiple sessions. Choose which one to open in Chat with the goal pre-filled.

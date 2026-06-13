@@ -28,34 +28,47 @@ export default function DashboardPage() {
 
   const load = () => {
     setError(null);
-    Promise.all([
-      fetch('/api/sessions').then(r => r.json()),
-      fetch('/api/memory/files').then(r => r.json()),
-      fetch('/api/skills').then(r => r.json()),
-      fetch('/api/mcp').then(r => r.json()),
-      fetch('/api/crons').then(r => r.json()),
-      fetch('/api/sessions/live').then(r => r.json()),
-      fetch('/api/projects').then(r => r.json()),
-      fetch('/api/tasks').then(r => r.json()),
-    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData, tasksData]) => {
+    // Fetch each card's data independently so ONE failing endpoint doesn't blank
+    // the whole dashboard. A failed/non-OK fetch yields null and that card shows
+    // "—"; only if everything fails do we show the error banner.
+    const getJson = (url) =>
+      fetch(url).then(r => (r.ok ? r.json() : null)).catch(() => null);
+
+    Promise.allSettled([
+      getJson('/api/sessions'),
+      getJson('/api/memory/files'),
+      getJson('/api/skills'),
+      getJson('/api/mcp'),
+      getJson('/api/crons'),
+      getJson('/api/sessions/live'),
+      getJson('/api/projects'),
+      getJson('/api/tasks'),
+    ]).then((results) => {
+      const [sessions, memory, skills, mcp, crons, live, projectsData, tasksData] =
+        results.map(r => (r.status === 'fulfilled' ? r.value : null));
+
+      if (results.every(r => r.status !== 'fulfilled' || r.value === null)) {
+        setError('Could not load dashboard data. Is the server still running?');
+      }
+
       const projectsList = Array.isArray(projectsData) ? projectsData : [];
       setProjects(projectsList);
       const tasksList = Array.isArray(tasksData?.tasks) ? tasksData.tasks : [];
+      // null (failed fetch) → undefined value so the card renders "—" rather
+      // than a misleading 0.
+      const count = (v) => (v == null ? undefined : v);
       setStats({
-        sessions: sessions.total || sessions.sessions?.length || 0,
-        memory: memory.length || 0,
-        skills: skills.length || 0,
-        mcp: mcp.servers?.length || 0,
-        crons: crons.jobs?.length || 0,
-        live: live.length || 0,
-        projects: projectsList.length,
+        sessions: count(sessions && (sessions.total ?? sessions.sessions?.length ?? 0)),
+        memory: count(memory && memory.length),
+        skills: count(skills && skills.length),
+        mcp: count(mcp && (mcp.servers?.length ?? 0)),
+        crons: count(crons && (crons.jobs?.length ?? 0)),
+        live: count(live && live.length),
+        projects: projectsData ? projectsList.length : undefined,
         // Open tasks = anything not completed (in_progress + pending + other).
-        tasksOpen: tasksList.filter(t => t.status !== 'completed').length,
+        tasksOpen: tasksData ? tasksList.filter(t => t.status !== 'completed').length : undefined,
         usageTokens: null,  // loaded separately below to not block the dashboard
       });
-    }).catch(() => {
-      // Surface the failure instead of leaving cards blank with no explanation.
-      setError('Could not load dashboard data. Is the server still running?');
     });
   };
 
@@ -153,7 +166,7 @@ export default function DashboardPage() {
               >
                 <c.icon size={22} style={{ color: 'var(--accent)', marginBottom: '0.5em' }} />
                 <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)', lineHeight: 1.1 }}>
-                  {c.value}
+                  {c.value == null ? '—' : c.value}
                 </div>
                 <div style={{ fontSize: '0.82em', color: 'var(--muted)', marginTop: '0.3em' }}>{c.label}</div>
                 {c.sub && (

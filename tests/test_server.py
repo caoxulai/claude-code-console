@@ -503,6 +503,8 @@ async def test_project_id_path_traversal_rejected(client, projects_layout):
     outside WORKSPACE_DIR (verified live). It must now 400 and write nothing.
     """
     workspace = projects_layout["workspace"]
+    # ..%2f.. decodes to "../.." as one path segment → would resolve to
+    # workspace.parent.parent. Assert the write is refused and nothing lands.
     escaped = workspace.parent.parent / "CLAUDE.md"
     assert not escaped.exists()
     resp = await client.put(
@@ -1953,3 +1955,183 @@ async def test_usage_endpoint_matches_independent_recompute(client, usage_projec
     assert sum(v["messages"] for v in data["byProject"].values()) == t["messages"]
     assert sum(v["messages"] for v in data["daily"]) == t["messages"]
 
+
+# --------------------------------------------------------------------------- #
+# Previously-untested registered endpoints (added by the codebase review pass):
+# /api/usage/heatmap, /api/usage/tools, /api/plugins, /api/settings/local,
+# /api/chat/stop. These pin the contracts of endpoints that had zero coverage.
+# --------------------------------------------------------------------------- #
+from datetime import datetime, timezone  # noqa: E402
+
+import server.routes.plugins as plugins_mod  # noqa: E402
+
+
+@pytest.fixture
+def recent_usage(tmp_path: Path, monkeypatch) -> Path:
+    """A projects tree with one recent assistant turn (inside the heatmap's
+    12-week window) plus a tool_use, so heatmap + tools have data to aggregate.
+    Reset the shared usage cache so the scan re-runs against this tree."""
+    base = tmp_path / "claude_projects"
+    proj = base / "-home-alice-proj"
+    proj.mkdir(parents=True)
+    # "Now" in UTC, ISO with Z — guaranteed within the 12-week cutoff.
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    _write_jsonl(proj / "s1.jsonl", [
+        {
+            "type": "assistant", "uuid": "h1", "timestamp": ts, "isSidechain": False,
+            "cwd": "/home/alice/proj",
+            "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 100, "output_tokens": 50,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                "content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/y"}},
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+                ],
+            },
+        },
+    ])
+    monkeypatch.setattr(usage_mod, "CLAUDE_PROJECTS_BASE", base)
+    monkeypatch.setattr(usage_mod, "_cache", usage_mod._Cache())
+    return base
+
+
+async def test_usage_heatmap_shape(client, recent_usage):
+    resp = await client.get("/api/usage/heatmap")
+    assert resp.status == 200
+    data = await resp.json()
+    # 7 day-of-week rows x 24 hours; days map + per-date hourly breakdown.
+    assert len(data["grid"]) == 7 and all(len(row) == 24 for row in data["grid"])
+    assert isinstance(data["days"], dict) and isinstance(data["dailyHours"], dict)
+    # The one recent turn registers exactly one message somewhere in the grid.
+    assert sum(sum(row) for row in data["grid"]) == 1
+    assert sum(data["days"].values()) == 1
+
+
+async def test_usage_tools_leaderboard(client, recent_usage):
+    resp = await client.get("/api/usage/tools")
+    assert resp.status == 200
+    rows = (await resp.json())["tools"]
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["Read"]["calls"] == 2
+    assert by_name["Bash"]["calls"] == 1
+    # Sorted by calls descending (Read before Bash).
+    assert rows[0]["calls"] >= rows[-1]["calls"]
+    assert by_name["Read"]["avgInputSize"] > 0
+
+
+async def test_plugins_listing(client, tmp_path, monkeypatch):
+    plugins_path = tmp_path / "installed_plugins.json"
+    settings_path = tmp_path / "settings.json"
+    plugins_path.write_text(json.dumps({"plugins": {
+        "alpha": [{"scope": "user", "version": "1.0", "installPath": "/a", "installedAt": 1}],
+        "beta": [{"scope": "user", "version": "2.0", "installPath": "/b", "installedAt": 2}],
+    }}))
+    settings_path.write_text(json.dumps({"enabledPlugins": {"beta": False}}))
+    monkeypatch.setattr(plugins_mod, "PLUGINS_PATH", plugins_path)
+    monkeypatch.setattr(plugins_mod, "SETTINGS_PATH", settings_path)
+
+    rows = await (await client.get("/api/plugins")).json()
+    by_name = {p["name"]: p for p in rows}
+    assert by_name["alpha"]["enabled"] is True   # default-enabled when unlisted
+    assert by_name["beta"]["enabled"] is False    # explicitly disabled
+    assert by_name["alpha"]["version"] == "1.0"
+
+
+async def test_plugins_tolerates_malformed_file(client, tmp_path, monkeypatch):
+    """A malformed installed_plugins.json must not 500 the endpoint."""
+    bad = tmp_path / "installed_plugins.json"
+    bad.write_text(json.dumps({"plugins": "not-a-dict"}))
+    monkeypatch.setattr(plugins_mod, "PLUGINS_PATH", bad)
+    monkeypatch.setattr(plugins_mod, "SETTINGS_PATH", tmp_path / "nope.json")
+    resp = await client.get("/api/plugins")
+    assert resp.status == 200
+    assert await resp.json() == []
+
+
+async def test_settings_local_endpoint(client, tmp_path, monkeypatch):
+    p = tmp_path / "settings.local.json"
+    p.write_text(json.dumps({"localKey": "v"}))
+    monkeypatch.setattr(settings_mod, "SETTINGS_LOCAL_PATH", p)
+    data = await (await client.get("/api/settings/local")).json()
+    assert data["data"]["localKey"] == "v" and data["etag"]
+
+
+async def test_settings_local_missing_is_empty(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings_mod, "SETTINGS_LOCAL_PATH", tmp_path / "absent.json")
+    data = await (await client.get("/api/settings/local")).json()
+    assert data["data"] == {} and data["etag"] is None
+
+
+async def test_chat_stop_requires_session_id(client):
+    assert (await client.post("/api/chat/stop", json={})).status == 400
+
+
+async def test_chat_stop_calls_manager(client):
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.post("/api/chat/stop", json={"session_id": "sess-1"})
+    assert resp.status == 200
+    assert (await resp.json())["stopped"] == "sess-1"
+    fake_manager.stop.assert_awaited_once_with("sess-1")
+
+
+# --------------------------------------------------------------------------- #
+# Robustness hardening added by the codebase-review follow-up:
+# - malformed JSON bodies → 400 (not 500) via read_json_body (B12)
+# - MCP secret masking covers http/sse `headers`; config must be a dict (B2/B3)
+# - complete_task conflict → 409 (B1)
+# --------------------------------------------------------------------------- #
+
+async def test_malformed_json_body_returns_400(client, settings_file):
+    """A non-JSON body to a JSON endpoint is a clean 400, not a 500."""
+    resp = await client.put("/api/settings", data="this is not json",
+                            headers={"Content-Type": "application/json"})
+    assert resp.status == 400
+
+
+async def test_non_object_json_body_returns_400(client, settings_file):
+    """A JSON body that isn't an object (e.g. a list) is rejected with 400."""
+    resp = await client.put("/api/settings", json=[1, 2, 3])
+    assert resp.status == 400
+
+
+async def test_mcp_masks_header_secrets(client, mcp_files):
+    """http/sse server tokens in `headers` are masked in GET (B2)."""
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {
+        "remote": {
+            "type": "http", "url": "https://x",
+            "headers": {"Authorization": "Bearer SECRET", "X-Trace": "ok"},
+        },
+    }}), encoding="utf-8")
+    data = await (await client.get("/api/mcp")).json()
+    srv = next(s for s in data["servers"] if s["name"] == "remote")
+    assert srv["headers"]["Authorization"] == "***"   # secret masked
+    assert srv["headers"]["X-Trace"] == "ok"           # non-secret kept
+
+
+async def test_mcp_unmasks_header_on_write(client, mcp_files):
+    """A round-tripped masked header is restored to the stored secret (B2)."""
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {
+        "remote": {"type": "http", "url": "https://x",
+                   "headers": {"Authorization": "Bearer REAL"}},
+    }}), encoding="utf-8")
+    etag = (await (await client.get("/api/mcp")).json())["etag"]
+    # Client sends back the masked value — server must not clobber the secret.
+    resp = await client.put("/api/mcp/remote", json={
+        "config": {"type": "http", "url": "https://x",
+                   "headers": {"Authorization": "***"}},
+        "etag": etag,
+    })
+    assert resp.status == 200
+    stored = json.loads(mcp_files["standard"].read_text())
+    assert stored["mcpServers"]["remote"]["headers"]["Authorization"] == "Bearer REAL"
+
+
+async def test_mcp_rejects_non_dict_config(client, mcp_files):
+    """A non-object config is rejected with 400 (B3)."""
+    mcp_files["standard"].write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    resp = await client.post("/api/mcp", json={"name": "x", "config": "not-a-dict"})
+    assert resp.status == 400

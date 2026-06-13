@@ -31,7 +31,9 @@ async def list_plugins(request: web.Request) -> web.Response:
                         "installPath": entry.get("installPath", ""),
                         "installedAt": entry.get("installedAt"),
                     })
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            # Tolerate a malformed installed_plugins.json (non-dict/non-list
+            # shapes) rather than 500 the endpoint.
             pass
 
     # Enabled state from settings.json

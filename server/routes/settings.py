@@ -5,6 +5,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server import filestore
 
 
@@ -24,7 +26,7 @@ async def get_settings(request: web.Request) -> web.Response:
 
 
 async def put_settings(request: web.Request) -> web.Response:
-    body = await request.json()
+    body = await read_json_body(request)
     data = body.get("data")
     expected_etag = body.get("etag")
 

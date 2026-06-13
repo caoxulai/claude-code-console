@@ -81,7 +81,9 @@ class ToolboxBundlerCommand(Command):
             import pkg_resources
             version = pkg_resources.require("claude-web")[0].version
         except Exception:
-            version = "0.1.0"
+            # Keep this fallback in sync with the version= below. A stale value
+            # would mis-tag a published bundle (toolbox caches by version).
+            version = "0.2.0"
 
         output_dir = "./build/private/tool-bundle"
         shutil.rmtree(output_dir, ignore_errors=True)

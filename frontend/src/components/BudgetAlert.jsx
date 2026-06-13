@@ -131,7 +131,7 @@ export function BudgetSetupButton() {
           }
           setEditing(false);
         }}>Set</button>
-        <button className="btn" style={{ fontSize: '0.75em', padding: '0.2em 0.5em' }} onClick={() => setEditing(false)}>×</button>
+        <button className="btn" aria-label="Cancel" title="Cancel" style={{ fontSize: '0.75em', padding: '0.2em 0.5em' }} onClick={() => setEditing(false)}>×</button>
       </div>
     );
   }

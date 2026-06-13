@@ -7,6 +7,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server.session_manager import SessionManager
 
 
@@ -48,7 +50,7 @@ def _resolve_cwd(raw: str | None, app: web.Application) -> str:
 
 
 async def chat_handler(request: web.Request) -> web.StreamResponse:
-    body = await request.json()
+    body = await read_json_body(request)
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise web.HTTPBadRequest(reason="prompt required")
@@ -115,7 +117,7 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
 
 
 async def stop_session_handler(request: web.Request) -> web.Response:
-    body = await request.json()
+    body = await read_json_body(request)
     session_id = body.get("session_id")
     if not session_id:
         raise web.HTTPBadRequest(reason="session_id required")
@@ -132,7 +134,7 @@ async def restart_session_handler(request: web.Request) -> web.Response:
     it down and start a fresh one (resuming the same session). The next /api/chat
     call then runs against the new process. Scoped to one session.
     """
-    body = await request.json()
+    body = await read_json_body(request)
     session_id = body.get("session_id")
     if not session_id:
         raise web.HTTPBadRequest(reason="session_id required")

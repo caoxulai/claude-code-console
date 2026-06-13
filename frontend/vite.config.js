@@ -10,9 +10,12 @@ export default defineConfig({
         target: 'http://127.0.0.1:7780',
         changeOrigin: true,
       },
-      '/auth': {
+      // The live-update WebSocket (settings_changed / hooks_changed broadcasts).
+      // Without this, file-change events don't reach the UI under `npm run dev`.
+      '/ws': {
         target: 'http://127.0.0.1:7780',
         changeOrigin: true,
+        ws: true,
       },
       '/healthz': {
         target: 'http://127.0.0.1:7780',

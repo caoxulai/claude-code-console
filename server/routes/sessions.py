@@ -9,6 +9,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 
 def _resolve_workspace_dir() -> Path:
     """Resolve the workspace directory from config or environment.
@@ -569,7 +571,7 @@ async def save_project_claude_md(request: web.Request) -> web.Response:
     """Write content to a project's CLAUDE.md file."""
     project_id = request.match_info["project_id"]
     _validate_project_id(project_id)
-    body = await request.json()
+    body = await read_json_body(request)
     content = body.get("content")
     if content is None:
         raise web.HTTPBadRequest(reason="content field required")
@@ -660,7 +662,7 @@ async def save_project_memory(request: web.Request) -> web.Response:
     if not project_dir.is_dir():
         raise web.HTTPNotFound(reason="project directory not found")
 
-    body = await request.json()
+    body = await read_json_body(request)
     content = body.get("content")
     if content is None:
         raise web.HTTPBadRequest(reason="content field required")
@@ -887,7 +889,7 @@ async def set_session_title(request: web.Request) -> web.Response:
     if not path:
         raise web.HTTPNotFound(reason="session not found")
 
-    body = await request.json()
+    body = await read_json_body(request)
     title = body.get("title", "").strip()
     if not title:
         raise web.HTTPBadRequest(reason="title required")

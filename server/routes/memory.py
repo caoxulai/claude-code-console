@@ -6,6 +6,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server import filestore
 
 
@@ -95,7 +97,9 @@ async def list_files(request: web.Request) -> web.Response:
     for f in sorted(MEMORY_DIR.glob("*.md")):
         try:
             files.append(_file_meta(f))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # A vanished/unreadable or non-UTF-8 file must not 500 the whole
+            # listing — skip it rather than fail the endpoint.
             continue
     return web.json_response(files)
 
@@ -112,7 +116,7 @@ async def get_file(request: web.Request) -> web.Response:
 async def put_file(request: web.Request) -> web.Response:
     name = _safe_name(request.match_info["name"])
     path = MEMORY_DIR / name
-    body = await request.json()
+    body = await read_json_body(request)
     content = body.get("content", "")
     expected_etag = body.get("etag")
 
@@ -131,7 +135,7 @@ async def put_file(request: web.Request) -> web.Response:
 
 
 async def create_file(request: web.Request) -> web.Response:
-    body = await request.json()
+    body = await read_json_body(request)
     name = _safe_name(body.get("name", ""))
     content = body.get("content", "")
     path = MEMORY_DIR / name

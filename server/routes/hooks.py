@@ -7,6 +7,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server import filestore
 
 
@@ -27,7 +29,7 @@ async def get_hooks(request: web.Request) -> web.Response:
 
 async def put_hooks(request: web.Request) -> web.Response:
     """Replace the entire hooks section in settings.json."""
-    body = await request.json()
+    body = await read_json_body(request)
     new_hooks = body.get("hooks", {})
     expected_etag = body.get("etag")
 
@@ -49,7 +51,7 @@ async def put_hooks(request: web.Request) -> web.Response:
 
 async def test_hook(request: web.Request) -> web.Response:
     """Execute a hook command with a mock payload to test it."""
-    body = await request.json()
+    body = await read_json_body(request)
     command = body.get("command", "")
     mock_input = body.get("input", "{}")
 
@@ -62,10 +64,18 @@ async def test_hook(request: web.Request) -> web.Response:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(
-        proc.communicate(input=mock_input.encode()),
-        timeout=10,
-    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=mock_input.encode()),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        # wait_for cancels communicate() but leaves the shell process running;
+        # kill it so a hanging command (e.g. `sleep 999`) doesn't orphan a
+        # process + its pipes on every test.
+        proc.kill()
+        await proc.wait()
+        raise web.HTTPRequestTimeout(reason="hook command timed out after 10s")
     return web.json_response({
         "exit_code": proc.returncode,
         "stdout": stdout.decode(errors="replace")[:5000],

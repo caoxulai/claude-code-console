@@ -140,7 +140,7 @@ For frontend hot-reload during development, run the Vite dev server (proxies
 `/api` to the backend) alongside the backend:
 ```bash
 .venv/bin/claude-web start --no-browser   # backend on :7780
-cd frontend && npm run dev                 # frontend on :5173
+cd frontend && npm run dev                 # frontend on :9000
 ```
 
 ### Run it

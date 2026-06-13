@@ -193,7 +193,7 @@ function ViewAllModal({ title, rows, onClose }) {
       <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 480, maxHeight: '70vh', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', boxShadow: '0 16px 48px rgba(0,0,0,0.4)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         <div style={{ padding: '0.75em 1em', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <span style={{ fontWeight: 600, fontSize: 'var(--fs-sm)' }}>{title}</span>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: '1.2em', lineHeight: 1 }}>×</button>
+          <button onClick={onClose} aria-label="Close" title="Close" style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: '1.2em', lineHeight: 1 }}>×</button>
         </div>
         <div style={{ padding: '0.75em 1em', overflowY: 'auto', flex: 1 }}>
           {rows.map(r => <BreakdownRow key={r.label} label={r.label} cost={r.cost} maxCost={maxCost} />)}
@@ -418,7 +418,7 @@ export default function UsagePage() {
           <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 520, maxHeight: '70vh', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', boxShadow: '0 16px 48px rgba(0,0,0,0.4)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             <div style={{ padding: '0.75em 1em', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <span style={{ fontWeight: 600, fontSize: 'var(--fs-sm)' }}>{modal.title}</span>
-              <button onClick={() => setModal(null)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: '1.2em', lineHeight: 1 }}>×</button>
+              <button onClick={() => setModal(null)} aria-label="Close" title="Close" style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: '1.2em', lineHeight: 1 }}>×</button>
             </div>
             <div style={{ overflowY: 'auto', flex: 1 }}>
               <table className="data-table" style={{ fontSize: 'var(--fs-sm)' }}>

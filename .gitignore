@@ -11,3 +11,7 @@ frontend/dist/
 # Brazil build artifacts
 /build/
 *.egg-info/
+
+# Local per-instance state (Vite dep cache, Claude Code agent worktrees)
+.vite/
+.claude/
