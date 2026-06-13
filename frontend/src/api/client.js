@@ -52,3 +52,19 @@ export async function stopChat(sessionId) {
     /* best-effort; the abort already stopped the client-side stream */
   }
 }
+
+// Respawn a session's Claude process so it picks up freshly-authenticated
+// credentials (the long-lived process caches the creds it started with). Used
+// by auth-error recovery before re-sending the prompt. Throws on failure so the
+// caller can surface it rather than silently re-sending against a stale process.
+export async function restartChat(sessionId, cwd) {
+  if (!sessionId) return;
+  const body = { session_id: sessionId };
+  if (cwd) body.cwd = cwd;
+  const resp = await fetch(`${BASE}/api/chat/restart`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`restart failed: ${resp.status}`);
+}

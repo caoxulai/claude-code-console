@@ -6,7 +6,7 @@ import { MessageBubble } from '../components/MessageBubble';
 import { ToolCallPanel } from '../components/ToolCallPanel';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import SlashCommandMenu from '../components/SlashCommandMenu';
-import { FiSend, FiPlus, FiEdit3, FiCheck, FiSquare, FiMessageSquare } from 'react-icons/fi';
+import { FiSend, FiPlus, FiEdit3, FiCheck, FiSquare, FiMessageSquare, FiAlertTriangle, FiRefreshCw } from 'react-icons/fi';
 
 function parseTranscriptToMessages(records) {
   const msgs = [];
@@ -55,7 +55,7 @@ function parseTranscriptToMessages(records) {
 }
 
 export default function ChatPage() {
-  const { messages, streaming, sessionId, slashCommands, send, stop, reset, resume, setMessages } = useChat();
+  const { messages, streaming, sessionId, slashCommands, send, stop, retry, reset, resume, setMessages } = useChat();
   const ensureConfig = useConfigStore(s => s.ensure);
   const [input, setInput] = useState('');
   const [cwd, setCwd] = useState(localStorage.getItem('claude_web_cwd') || '');
@@ -235,9 +235,11 @@ export default function ChatPage() {
         )}
         {messages.map((msg, i) => (
           <ErrorBoundary key={i} label="Failed to render this message.">
-            {msg.toolCall
-              ? <ToolCallPanel toolCall={msg.toolCall} />
-              : <MessageBubble message={msg} />}
+            {msg.role === 'auth-error'
+              ? <AuthErrorBanner message={msg} onRetry={retry} disabled={streaming} />
+              : msg.toolCall
+                ? <ToolCallPanel toolCall={msg.toolCall} />
+                : <MessageBubble message={msg} />}
           </ErrorBoundary>
         ))}
         {streaming && (
@@ -273,6 +275,51 @@ export default function ChatPage() {
           </button>
         )}
       </form>
+    </div>
+  );
+}
+
+// Distinct, actionable banner for credential/auth failures. Explains the fix
+// (re-run mwinit) and offers a bounded one-click retry that respawns the
+// backend subprocess with fresh credentials and re-sends the last prompt once.
+function AuthErrorBanner({ message, onRetry, disabled }) {
+  const [details, setDetails] = useState(false);
+  return (
+    <div
+      data-role="auth-error"
+      style={{
+        border: '1px solid var(--warning, #d9a400)',
+        background: 'color-mix(in srgb, var(--warning, #d9a400) 12%, transparent)',
+        borderRadius: 'var(--radius)',
+        padding: '0.9em 1em',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.6em' }}>
+        <FiAlertTriangle size={18} style={{ color: 'var(--warning, #d9a400)', flexShrink: 0, marginTop: '0.1em' }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 600, marginBottom: '0.25em' }}>Authentication failed</div>
+          <div style={{ fontSize: '0.9em', lineHeight: 1.5 }}>
+            {message.content}
+          </div>
+          <div style={{ display: 'flex', gap: '0.5em', marginTop: '0.7em', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button className="btn btn-primary" onClick={onRetry} disabled={disabled} title="Respawn the session with fresh credentials and retry">
+              <FiRefreshCw size={14} /> Retry
+            </button>
+            {message.detail && (
+              <button className="btn" onClick={() => setDetails(d => !d)} style={{ fontSize: 'var(--fs-xs)' }}>
+                {details ? 'Hide details' : 'Show details'}
+              </button>
+            )}
+          </div>
+          {details && message.detail && (
+            <pre style={{
+              marginTop: '0.6em', fontSize: '0.75em', whiteSpace: 'pre-wrap',
+              color: 'var(--muted)', background: 'var(--bg)', padding: '0.6em',
+              borderRadius: 'var(--radius)', overflow: 'auto', maxHeight: 160,
+            }}>{message.detail}</pre>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

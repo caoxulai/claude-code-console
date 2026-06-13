@@ -12,6 +12,42 @@ from pathlib import Path
 from typing import AsyncIterator
 
 
+# Explicit, unambiguous credential phrases → definitely an auth failure. The
+# claude subprocess routes through Bedrock, so expired AWS/Midway creds surface
+# as these. Matched case-insensitively against result-event text and stderr.
+_AUTH_EXPLICIT = (
+    "security token included in the request is invalid",
+    "security token included in the request is expired",
+    "unrecognizedclientexception",
+    "expiredtoken",
+    "expired token",
+    "invalidsignatureexception",
+    "unable to locate credentials",
+    "could not load credentials",
+)
+
+# Auth-ish HTTP status markers; only treated as auth when paired with a
+# credential keyword (below), so generic 403s from tools aren't misclassified.
+_AUTH_STATUS = ("403", "401", "accessdenied", "not authorized", "unauthorized")
+
+
+def is_auth_error(text: str | None) -> bool:
+    """Classify whether an error string is a credential/auth failure.
+
+    Conservative by design: matches either an explicit token/credential phrase,
+    or a 403/401-style status combined with a credential keyword. Ordinary
+    model/tool errors carry none of these, so they are NOT misclassified.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    if any(p in t for p in _AUTH_EXPLICIT):
+        return True
+    has_status = any(s in t for s in _AUTH_STATUS)
+    has_cred = "credential" in t or "token" in t or "authenticat" in t
+    return has_status and has_cred
+
+
 class PersistentSession:
     """A long-lived Claude process that accepts multiple turns."""
 
@@ -25,6 +61,9 @@ class PersistentSession:
         self._stdout_reader: asyncio.StreamReader | None = None
         self._lock = asyncio.Lock()
         self._started = False
+        # Bounded tail of recent stderr lines, used to classify auth failures
+        # (some credential errors surface on stderr rather than as a result event).
+        self._stderr_tail: list[str] = []
 
     async def start(self) -> str | None:
         """Start the Claude process. Returns session_id from init event."""
@@ -55,9 +94,20 @@ class PersistentSession:
         return None
 
     async def _drain_stderr(self):
+        """Drain stderr, keeping a bounded tail for auth-error classification."""
         if self._proc and self._proc.stderr:
-            async for _ in self._proc.stderr:
-                pass
+            async for raw in self._proc.stderr:
+                line = raw.decode(errors="replace").rstrip("\n")
+                if not line:
+                    continue
+                self._stderr_tail.append(line)
+                # Keep only the last 50 lines — enough context for an error,
+                # bounded so a chatty process can't grow this without limit.
+                if len(self._stderr_tail) > 50:
+                    self._stderr_tail = self._stderr_tail[-50:]
+
+    def _recent_stderr(self) -> str:
+        return "\n".join(self._stderr_tail)
 
     @property
     def alive(self) -> bool:
@@ -93,6 +143,18 @@ class PersistentSession:
                 # Capture session_id from init
                 if evt.get("type") == "system" and evt.get("session_id"):
                     self.session_id = evt["session_id"]
+
+                # Tag auth/credential failures so the client can show actionable
+                # guidance + a bounded retry, instead of a raw 403. We classify
+                # using the result text plus recent stderr (some credential
+                # errors only appear on stderr).
+                if evt.get("type") == "result" and evt.get("is_error"):
+                    blob = " ".join(filter(None, [
+                        str(evt.get("result", "")),
+                        self._recent_stderr(),
+                    ]))
+                    if is_auth_error(blob):
+                        evt = {**evt, "errorKind": "auth"}
 
                 yield evt
 
@@ -149,6 +211,34 @@ class SessionManager:
         if session_id in self._sessions:
             await self._sessions[session_id].stop()
             del self._sessions[session_id]
+
+    async def respawn(self, session_id: str, cwd: str | None = None,
+                      permission_mode: str = "default") -> PersistentSession:
+        """Tear down a session's stale subprocess and start a fresh one.
+
+        Used to recover from credential expiry: the long-lived `claude` process
+        caches the env/credentials it had at spawn time, so after the user
+        re-authenticates we must replace the process to pick up new creds. Scoped
+        to the one session — other sessions and their SSE streams are untouched.
+
+        Reuses the existing session's cwd (so --resume lands in the right dir)
+        unless an explicit cwd is given. The fresh process resumes the same
+        session_id, preserving conversation history.
+        """
+        existing = self._sessions.get(session_id)
+        resume_cwd = cwd or (existing.cwd if existing else None)
+        if existing:
+            await existing.stop()
+            del self._sessions[session_id]
+
+        session = PersistentSession(
+            session_id=session_id,
+            cwd=resume_cwd,
+            permission_mode=permission_mode,
+        )
+        await session.start()
+        self._sessions[session_id] = session
+        return session
 
     async def stop_all(self):
         """Stop all sessions (for shutdown)."""

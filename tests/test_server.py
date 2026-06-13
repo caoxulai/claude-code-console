@@ -863,6 +863,111 @@ async def test_send_releases_lock_on_aclose_after_abandon():
 
 
 # --------------------------------------------------------------------------- #
+# Auth-error classification + recovery
+#
+# The claude subprocess routes through Bedrock; expired AWS/Midway creds surface
+# as a 403 "security token ... invalid". We classify those distinctly (so the UI
+# can show actionable guidance + a bounded retry) and support respawning the
+# subprocess to pick up fresh credentials.
+# --------------------------------------------------------------------------- #
+
+def test_is_auth_error_matches_credential_failures():
+    assert session_mod.is_auth_error("API Error: 403 The security token included in the request is invalid")
+    assert session_mod.is_auth_error("ExpiredToken: token has expired")
+    assert session_mod.is_auth_error("UnrecognizedClientException: invalid security token")
+    assert session_mod.is_auth_error("403 Forbidden — credentials could not be verified")
+
+
+def test_is_auth_error_ignores_generic_errors():
+    # Generic tool/model errors must NOT be misclassified as auth.
+    assert not session_mod.is_auth_error("Tool execution failed: file not found")
+    assert not session_mod.is_auth_error("rate limit exceeded")
+    assert not session_mod.is_auth_error("500 Internal Server Error")
+    # A 403 with no credential/token/auth keyword (e.g. an S3 object ACL denial)
+    # is not treated as a session-credential failure.
+    assert not session_mod.is_auth_error("403: you lack permission to write that object")
+    assert not session_mod.is_auth_error(None)
+    assert not session_mod.is_auth_error("")
+
+
+async def test_send_tags_auth_error_on_result(monkeypatch):
+    """A result error matching auth patterns is tagged errorKind='auth'."""
+    s = session_mod.PersistentSession(session_id="sess-auth")
+    lines = [
+        (json.dumps({"type": "system", "session_id": "sess-auth"}) + "\n").encode(),
+        (json.dumps({"type": "result", "is_error": True,
+                     "result": "API Error: 403 The security token included in the request is invalid"}) + "\n").encode(),
+    ]
+    s._proc = _FakeProc(lines)
+    s._started = True
+
+    got = [evt async for evt in s.send("hi")]
+    result_evt = next(e for e in got if e.get("type") == "result")
+    assert result_evt.get("errorKind") == "auth"
+
+
+async def test_send_does_not_tag_generic_result_error():
+    """A non-auth result error is left untagged (generic error path)."""
+    s = session_mod.PersistentSession(session_id="sess-gen")
+    lines = [
+        (json.dumps({"type": "result", "is_error": True, "result": "tool failed: timeout"}) + "\n").encode(),
+    ]
+    s._proc = _FakeProc(lines)
+    s._started = True
+
+    got = [evt async for evt in s.send("hi")]
+    result_evt = next(e for e in got if e.get("type") == "result")
+    assert "errorKind" not in result_evt
+
+
+async def test_manager_respawn_replaces_subprocess(monkeypatch):
+    """respawn tears down the old session and starts a fresh one, same id."""
+    mgr = session_mod.SessionManager()
+
+    # Register a fake live session.
+    old = session_mod.PersistentSession(session_id="sess-x", cwd="/tmp")
+    old._proc = _FakeProc([])
+    old._started = True
+    stopped = {"v": False}
+    async def fake_stop():
+        stopped["v"] = True
+        old._proc.returncode = 0
+    old.stop = fake_stop
+    mgr._sessions["sess-x"] = old
+
+    # Patch start() so respawn doesn't actually exec `claude`.
+    started = {"v": False}
+    async def fake_start(self):
+        self._proc = _FakeProc([])
+        self._started = True
+        started["v"] = True
+    monkeypatch.setattr(session_mod.PersistentSession, "start", fake_start)
+
+    fresh = await mgr.respawn("sess-x")
+    assert stopped["v"] is True            # old subprocess torn down
+    assert started["v"] is True            # new subprocess started
+    assert fresh.session_id == "sess-x"    # same session id (history preserved)
+    assert fresh.cwd == "/tmp"             # cwd carried over
+    assert mgr._sessions["sess-x"] is fresh
+
+
+async def test_restart_endpoint_respawns(client, tmp_path):
+    """POST /api/chat/restart calls manager.respawn for the session."""
+    fake_manager = AsyncMock()
+    fake_manager.respawn = AsyncMock(return_value=None)
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.post("/api/chat/restart", json={"session_id": "sess-1", "cwd": str(tmp_path)})
+    assert resp.status == 200
+    assert (await resp.json())["restarted"] == "sess-1"
+    fake_manager.respawn.assert_awaited_once()
+
+
+async def test_restart_endpoint_requires_session_id(client):
+    resp = await client.post("/api/chat/restart", json={})
+    assert resp.status == 400
+
+
+# --------------------------------------------------------------------------- #
 # Memory routes (/api/memory/files)
 #
 # The memory route reads/writes ~/.claude/projects/<home-slug>/memory. The

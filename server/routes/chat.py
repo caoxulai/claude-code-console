@@ -16,6 +16,7 @@ PROJECTS_BASE = Path.home() / ".claude" / "projects"
 def register(app: web.Application):
     app.router.add_post("/api/chat", chat_handler)
     app.router.add_post("/api/chat/stop", stop_session_handler)
+    app.router.add_post("/api/chat/restart", restart_session_handler)
 
     # Create session manager and attach to app
     if "session_manager" not in app:
@@ -121,6 +122,24 @@ async def stop_session_handler(request: web.Request) -> web.Response:
     manager: SessionManager = request.app["session_manager"]
     await manager.stop(session_id)
     return web.json_response({"stopped": session_id})
+
+
+async def restart_session_handler(request: web.Request) -> web.Response:
+    """Respawn a session's claude subprocess to pick up refreshed credentials.
+
+    This is the server-side half of auth-error recovery: after the user
+    re-runs mwinit, the long-lived process still holds stale creds, so we tear
+    it down and start a fresh one (resuming the same session). The next /api/chat
+    call then runs against the new process. Scoped to one session.
+    """
+    body = await request.json()
+    session_id = body.get("session_id")
+    if not session_id:
+        raise web.HTTPBadRequest(reason="session_id required")
+    cwd = _resolve_cwd(body.get("cwd"), request.app)
+    manager: SessionManager = request.app["session_manager"]
+    await manager.respawn(session_id, cwd=cwd)
+    return web.json_response({"restarted": session_id})
 
 
 def _mark_session_interactive(session_id: str, title: str) -> None:
