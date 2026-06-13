@@ -687,22 +687,62 @@ async def test_projects_code_url_null_without_gitfarm_remote(client, projects_la
     assert projects["alpha"]["codeUrl"] is None
 
 
-def test_code_url_for_project_strips_dot_git_suffix(tmp_path):
+def test_code_url_strips_dot_git_suffix(tmp_path):
     """A trailing .git on the package segment is stripped from the package name."""
     proj = tmp_path / "proj"
     proj.mkdir()
     _write_git_remote(proj, "ssh://git.amazon.com/pkg/ClaudeCodeConsole.git")
-    assert (
-        sessions_mod._code_url_for_project(proj)
-        == "https://code.amazon.com/packages/ClaudeCodeConsole"
-    )
+    urls = sessions_mod._code_urls_for_project(proj)
+    assert urls == [{"name": "ClaudeCodeConsole",
+                     "url": "https://code.amazon.com/packages/ClaudeCodeConsole"}]
 
 
-def test_code_url_for_project_non_git_dir_is_none(tmp_path):
-    """A directory that isn't a git repo yields codeUrl None."""
+def test_code_url_matches_remote_with_port(tmp_path):
+    """A git.amazon.com:2222/pkg/<Pkg> remote (ssh-with-port) still maps."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _write_git_remote(proj, "ssh://git.amazon.com:2222/pkg/XiaoGeLao")
+    urls = sessions_mod._code_urls_for_project(proj)
+    assert urls == [{"name": "XiaoGeLao",
+                     "url": "https://code.amazon.com/packages/XiaoGeLao"}]
+
+
+def test_code_urls_scans_nested_brazil_repos(tmp_path):
+    """When the project root isn't a git repo, nested package repos are found.
+
+    Mirrors a Brazil workspace wrapper: <project>/workspace_<ts>/src/<Pkg>/.git.
+    Multiple nested repos all surface, deduped, as {name, url} entries.
+    """
+    proj = tmp_path / "agentify-xiaogelao"
+    src = proj / "workspace_2026" / "src"
+    src.mkdir(parents=True)
+    _write_git_remote(src / "XiaoGeLao", "ssh://git.amazon.com:2222/pkg/XiaoGeLao")
+    _write_git_remote(src / "XiaoGeLaoFrontend", "ssh://git.amazon.com:2222/pkg/XiaoGeLaoFrontend")
+
+    urls = sessions_mod._code_urls_for_project(proj)
+    names = {u["name"] for u in urls}
+    assert names == {"XiaoGeLao", "XiaoGeLaoFrontend"}
+    assert all(u["url"].startswith("https://code.amazon.com/packages/") for u in urls)
+
+
+async def test_projects_code_urls_field_present(client, projects_layout):
+    """Every project carries codeUrls (list) and codeUrl (first/back-compat)."""
+    workspace = projects_layout["workspace"]
+    _write_git_remote(workspace / "alpha", "ssh://git.amazon.com/pkg/ClaudeCodeConsole")
+    projects = await _get_projects(client)
+    for name in ("alpha", "beta", "gamma"):
+        assert "codeUrls" in projects[name]
+        assert isinstance(projects[name]["codeUrls"], list)
+    # alpha's single repo: codeUrl mirrors codeUrls[0].
+    assert projects["alpha"]["codeUrl"] == "https://code.amazon.com/packages/ClaudeCodeConsole"
+    assert projects["alpha"]["codeUrls"][0]["url"] == projects["alpha"]["codeUrl"]
+
+
+def test_code_urls_for_non_git_dir_is_empty(tmp_path):
+    """A directory that isn't a git repo (and has no nested repos) yields []."""
     proj = tmp_path / "plain"
     proj.mkdir()
-    assert sessions_mod._code_url_for_project(proj) is None
+    assert sessions_mod._code_urls_for_project(proj) == []
 
 
 # --------------------------------------------------------------------------- #

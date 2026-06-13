@@ -375,12 +375,16 @@ export default function ProjectsPage() {
                 {u.label}
               </a>
             ))}
-            {project.codeUrl && (
+            {(project.codeUrls && project.codeUrls.length > 0
+              ? project.codeUrls
+              : project.codeUrl ? [{ name: 'Code Repo', url: project.codeUrl }] : []
+            ).map((repo) => (
               <a
-                href={project.codeUrl}
+                key={repo.url}
+                href={repo.url}
                 target="_blank"
                 rel="noopener noreferrer"
-                title={project.codeUrl}
+                title={repo.url}
                 onClick={(e) => e.stopPropagation()}
                 style={{
                   display: 'inline-flex',
@@ -397,9 +401,11 @@ export default function ProjectsPage() {
                 }}
               >
                 <FiCode size={11} />
-                Code Repo
+                {/* Label with the repo name when there are several; a single
+                    repo keeps the familiar "Code Repo" label. */}
+                {(project.codeUrls && project.codeUrls.length > 1) ? repo.name : 'Code Repo'}
               </a>
-            )}
+            ))}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.25em', marginTop: '0.2em', minWidth: 0 }}>
             <span style={{

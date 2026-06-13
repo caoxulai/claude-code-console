@@ -315,17 +315,19 @@ def _collect_memory_files(session_dir: Path | None) -> list[dict]:
 
 # Matches a GitFarm package remote, e.g.
 #   ssh://git.amazon.com/pkg/ClaudeCodeConsole
+#   ssh://git.amazon.com:2222/pkg/XiaoGeLao   (host may carry a :port)
 #   https://git.amazon.com/pkg/OncallAgent
 # and captures the package name. A trailing .git suffix (if present) is stripped.
-_GITFARM_PKG_RE = re.compile(r"git\.amazon\.com/pkg/(?P<pkg>[^/\s]+?)(?:\.git)?/?$")
+_GITFARM_PKG_RE = re.compile(r"git\.amazon\.com(?::\d+)?/pkg/(?P<pkg>[^/\s]+?)(?:\.git)?/?$")
 
 
 def _git_remote_url(project_path: Path) -> str | None:
-    """Read the origin remote URL from a project's .git/config, if any.
+    """Read the origin remote URL from a git checkout's .git/config, if any.
 
-    Parses the config file directly rather than shelling out to git so the call
-    is cheap and side-effect free. Returns None when the directory is not a git
-    repo, has no [remote "origin"] section, or the file is unreadable.
+    `project_path` is the directory that directly contains `.git`. Parses the
+    config file directly rather than shelling out to git so the call is cheap
+    and side-effect free. Returns None when the directory is not a git repo, has
+    no [remote "origin"] section, or the file is unreadable.
     """
     config_path = project_path / ".git" / "config"
     if not config_path.is_file():
@@ -348,20 +350,56 @@ def _git_remote_url(project_path: Path) -> str | None:
     return None
 
 
-def _code_url_for_project(project_path: Path) -> str | None:
-    """Map a project's GitFarm remote to its code.amazon.com package URL.
-
-    Returns None for projects whose origin remote is not a
-    git.amazon.com/pkg/<Package> URL (including non-git directories), so the
-    field is always present but null when there's nothing to link to.
-    """
-    remote = _git_remote_url(project_path)
+def _gitfarm_code_url(remote: str | None) -> str | None:
+    """code.amazon.com package URL for a GitFarm remote, else None."""
     if not remote:
         return None
     match = _GITFARM_PKG_RE.search(remote)
     if not match:
         return None
     return f"https://code.amazon.com/packages/{match.group('pkg')}"
+
+
+# Where to look for git checkouts when the project root itself isn't one.
+# Brazil workspaces nest the real package(s) under workspace_<ts>/src/<Pkg>/,
+# so a project dir may contain zero, one, or several GitFarm repos. These
+# bounded glob patterns cover the common layouts without an expensive deep walk
+# (list_projects runs for every project on each page load).
+_NESTED_GIT_GLOBS = (
+    "*/.git",            # <project>/<repo>/.git
+    "src/*/.git",        # <project>/src/<Pkg>/.git
+    "*/src/*/.git",      # <project>/workspace_<ts>/src/<Pkg>/.git  (Brazil)
+)
+
+
+def _code_urls_for_project(project_path: Path) -> list[dict]:
+    """All GitFarm code.amazon.com repos reachable from a project.
+
+    Checks the project root's own remote first; if the root isn't a GitFarm
+    checkout (e.g. a Brazil workspace wrapper), scans a bounded set of nested
+    locations for package repos. Returns a deduped list of {name, url}, ordered
+    with the root repo (if any) first. Empty when nothing GitFarm-shaped is
+    found, so the field is always present.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    def add(checkout_dir: Path):
+        url = _gitfarm_code_url(_git_remote_url(checkout_dir))
+        if url and url not in seen:
+            seen.add(url)
+            found.append({"name": url.rsplit("/", 1)[-1], "url": url})
+
+    # 1. The project root itself.
+    add(project_path)
+
+    # 2. Nested package repos (Brazil workspace layout, etc.).
+    for pattern in _NESTED_GIT_GLOBS:
+        for git_dir in project_path.glob(pattern):
+            if git_dir.is_dir():
+                add(git_dir.parent)
+
+    return found
 
 
 def _project_path_to_claude_slug(project_path: str) -> str:
@@ -476,8 +514,10 @@ async def list_projects(request: web.Request) -> web.Response:
         # h. Memory files from Claude's project memory dir
         memory_files = _collect_memory_files(session_dir)
 
-        # i. code.amazon.com package URL derived from the git origin remote.
-        code_url = _code_url_for_project(d)
+        # i. code.amazon.com package URL(s) derived from git origin remote(s).
+        #    Scans the project root and (for Brazil-style wrappers) nested
+        #    package repos, so a workspace with multiple repos links them all.
+        code_urls = _code_urls_for_project(d)
 
         # j. task counts (open/total) for this project, by name.
         tc = task_counts.get(project_name, {"total": 0, "open": 0})
@@ -498,7 +538,10 @@ async def list_projects(request: web.Request) -> web.Response:
             "hasSettings": has_settings,
             "appUrl": app_urls[0]["url"] if app_urls else None,
             "appUrls": app_urls,
-            "codeUrl": code_url,
+            # codeUrls: every GitFarm repo found; codeUrl kept as the first for
+            # backward compatibility with any existing consumer.
+            "codeUrls": code_urls,
+            "codeUrl": code_urls[0]["url"] if code_urls else None,
             "sopFiles": sop_files,
             "memoryFiles": memory_files,
         })
