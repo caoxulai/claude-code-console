@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { FiCheckCircle, FiCircle, FiLoader, FiList, FiX, FiRotateCcw, FiTrash2, FiZap } from 'react-icons/fi';
+import { FiCheckCircle, FiCircle, FiLoader, FiList, FiX, FiRotateCcw, FiTrash2, FiZap, FiPlus, FiSave, FiEdit3, FiChevronRight, FiChevronDown } from 'react-icons/fi';
 import { SkeletonLine } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
 import SessionPickerModal from '../components/SessionPickerModal';
@@ -34,9 +34,30 @@ export default function TasksPage() {
   const [showCompleted, setShowCompleted] = useState(true);
   const [showDismissed, setShowDismissed] = useState(false);
 
+  // Which status groups are collapsed. Completed starts folded (it's usually
+  // noise); the user expands it by clicking the group header.
+  const [collapsedGroups, setCollapsedGroups] = useState({ completed: true });
+  const toggleGroup = (status) =>
+    setCollapsedGroups(prev => ({ ...prev, [status]: !prev[status] }));
+
   // Multi-session picker for "trigger goal" (when a project has >1 session).
   const [picker, setPicker] = useState(null); // { task, prompt, sessions, resume }
   const triggerGoal = useTriggerGoal({ onPickSession: setPicker });
+
+  // Create-task form state. The project dropdown uses the workspace project
+  // list from /api/projects (names), separate from the filter's project set.
+  const [showNew, setShowNew] = useState(false);
+  const [allProjects, setAllProjects] = useState([]);
+  const [newSubject, setNewSubject] = useState('');
+  const [newDescription, setNewDescription] = useState('');
+  const [newProject, setNewProject] = useState('');
+
+  useEffect(() => {
+    fetch('/api/projects')
+      .then(r => r.json())
+      .then(data => setAllProjects(Array.isArray(data) ? data.map(p => p.name) : []))
+      .catch(() => {});
+  }, []);
 
   // `silent` skips the loading skeleton so background polls don't flicker the view.
   const fetchTasks = useCallback(async ({ silent = false } = {}) => {
@@ -119,6 +140,31 @@ export default function TasksPage() {
     }
   }, [fetchTasks]);
 
+  // Create a console task (stored in ~/.claude-web, not ~/.claude/tasks).
+  const createUserTask = useCallback(async () => {
+    if (!newSubject.trim()) return;
+    try {
+      const res = await fetch('/api/tasks/user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subject: newSubject.trim(),
+          description: newDescription.trim(),
+          project: newProject,
+        }),
+      });
+      if (!res.ok) { setError('Failed to create task.'); return; }
+      setShowNew(false);
+      setNewSubject('');
+      setNewDescription('');
+      setNewProject('');
+      setError(null);
+      fetchTasks({ silent: true });
+    } catch {
+      setError('Failed to create task.');
+    }
+  }, [newSubject, newDescription, newProject, fetchTasks]);
+
   // Client-side "hide completed" toggle (the server still returns them so the
   // count stays accurate; we just filter the rendered list).
   const visible = (tasks || []).filter(t => showCompleted || t.status !== 'completed');
@@ -140,42 +186,85 @@ export default function TasksPage() {
       }
     : null;
 
-  const selectStyle = {
-    fontSize: '0.78em', padding: '0.25em 0.5em',
-    background: 'var(--bg)', color: 'var(--text)',
-    border: '1px solid var(--border)', borderRadius: 4,
-  };
-
   return (
     <div>
       <div className="page-header">
-        <h2>Tasks</h2>
-        {counts && (
-          <span style={{ fontSize: '0.82em', color: 'var(--muted)' }}>
-            {counts.total} shown · {counts.in_progress} in progress · {counts.completed} done
-          </span>
-        )}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-md)' }}>
+          <h2>Tasks</h2>
+          {counts && (
+            <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>
+              {counts.total} shown · {counts.in_progress} in progress · {counts.completed} done
+            </span>
+          )}
+        </div>
+        <button className="btn btn-primary" onClick={() => { setShowNew(!showNew); setError(null); }}>
+          <FiPlus size={14} /> New Task
+        </button>
       </div>
 
+      {error && <div className="conflict-banner"><span>{error}</span></div>}
+
+      {/* Create-task form */}
+      {showNew && (
+        <div className="card" style={{ marginBottom: 'var(--space-md)' }}>
+          <div className="card-title">New Task</div>
+          <div className="form-group">
+            <label className="form-label">Subject</label>
+            <input
+              className="form-input"
+              placeholder="What needs doing?"
+              value={newSubject}
+              onChange={e => setNewSubject(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Description <span style={{ color: 'var(--muted)', fontWeight: 400 }}>(optional)</span></label>
+            <textarea
+              className="form-textarea"
+              placeholder="More detail — this becomes the /goal body when you trigger it."
+              value={newDescription}
+              onChange={e => setNewDescription(e.target.value)}
+              style={{ minHeight: '70px' }}
+            />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Project <span style={{ color: 'var(--muted)', fontWeight: 400 }}>(optional)</span></label>
+            <select className="form-select" value={newProject} onChange={e => setNewProject(e.target.value)}>
+              <option value="">No project (global)</option>
+              {allProjects.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
+            <button className="btn btn-primary" onClick={createUserTask} disabled={!newSubject.trim()}>
+              <FiSave size={14} /> Save
+            </button>
+            <button className="btn" onClick={() => { setShowNew(false); setNewSubject(''); setNewDescription(''); setNewProject(''); }}>
+              <FiX size={14} /> Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Filter bar */}
-      <div className="card" style={{ padding: '0.6em 0.9em', marginBottom: '1em', display: 'flex', flexWrap: 'wrap', gap: '0.9em', alignItems: 'center' }}>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4em', fontSize: '0.8em', color: 'var(--muted)' }}>
+      <div className="card" style={{ padding: 'var(--space-sm) var(--space-md)', marginBottom: 'var(--space-md)', display: 'flex', flexWrap: 'wrap', gap: 'var(--space-md)', alignItems: 'center' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', fontSize: 'var(--fs-sm)', color: 'var(--muted)' }}>
           Project
-          <select value={projectFilter} onChange={e => setProjectFilter(e.target.value)} style={selectStyle}>
+          <select className="form-select" value={projectFilter} onChange={e => setProjectFilter(e.target.value)} style={{ width: 'auto', fontSize: 'var(--fs-sm)', padding: 'var(--space-xs) var(--space-sm)' }}>
             <option value="all">All projects</option>
             {projects.map(p => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.3em' }}>
-          <span style={{ fontSize: '0.8em', color: 'var(--muted)' }}>Range</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)' }}>
+          <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--muted)' }}>Range</span>
           {TIME_RANGES.map(r => (
             <button
               key={r.key}
               className="btn"
               onClick={() => setTimeRange(r.key)}
               style={{
-                fontSize: '0.72em', padding: '0.2em 0.6em',
+                fontSize: 'var(--fs-xs)', padding: 'var(--space-xs) var(--space-sm)',
                 background: timeRange === r.key ? 'var(--accent)' : undefined,
                 color: timeRange === r.key ? '#fff' : undefined,
                 borderColor: timeRange === r.key ? 'var(--accent)' : undefined,
@@ -186,72 +275,84 @@ export default function TasksPage() {
           ))}
         </div>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4em', fontSize: '0.8em', color: 'var(--muted)', cursor: 'pointer' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', fontSize: 'var(--fs-sm)', color: 'var(--muted)', cursor: 'pointer' }}>
           <input type="checkbox" checked={showCompleted} onChange={e => setShowCompleted(e.target.checked)} />
           Show completed
         </label>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4em', fontSize: '0.8em', color: 'var(--muted)', cursor: 'pointer' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', fontSize: 'var(--fs-sm)', color: 'var(--muted)', cursor: 'pointer' }}>
           <input type="checkbox" checked={showDismissed} onChange={e => setShowDismissed(e.target.checked)} />
           Show dismissed{dismissedCount ? ` (${dismissedCount})` : ''}
         </label>
       </div>
-
-      {error && <div className="conflict-banner"><span>{error}</span></div>}
 
       {!tasks ? (
         <div className="card">{Array.from({ length: 4 }).map((_, i) => <SkeletonLine key={i} />)}</div>
       ) : visible.length === 0 ? (
         <div className="card">
           <div className="empty-state">
-            <FiList size={32} style={{ color: 'var(--muted)', marginBottom: '0.5em' }} />
+            <FiList size={32} style={{ color: 'var(--muted)', marginBottom: 'var(--space-sm)' }} />
             <h3>No tasks tracked</h3>
-            <p>Tasks created by Claude Code sessions appear here. Try widening the filters above.</p>
+            <p>Tasks from Claude Code sessions appear here, or create your own with <strong>New Task</strong>. Try widening the filters above.</p>
           </div>
         </div>
       ) : (
         grouped.map(group => {
           const meta = statusMeta(group.status);
           const Icon = meta.icon;
+          const collapsed = !!collapsedGroups[group.status];
           return (
-            <div key={group.status} style={{ marginBottom: '1.5em' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em', marginBottom: '0.5em' }}>
+            <div key={group.status} style={{ marginBottom: 'var(--space-lg)' }}>
+              <button
+                onClick={() => toggleGroup(group.status)}
+                title={collapsed ? 'Expand' : 'Collapse'}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
+                  marginBottom: 'var(--space-sm)', background: 'none', border: 'none',
+                  padding: 0, cursor: 'pointer', color: 'var(--text)',
+                }}
+              >
+                {collapsed ? <FiChevronRight size={14} style={{ color: 'var(--muted)' }} /> : <FiChevronDown size={14} style={{ color: 'var(--muted)' }} />}
                 <Icon size={15} style={{ color: 'var(--accent)' }} />
-                <h3 style={{ fontSize: '1em', fontWeight: 600, margin: 0 }}>{meta.label}</h3>
-                <span style={{ fontSize: '0.78em', color: 'var(--muted)' }}>({group.items.length})</span>
-              </div>
+                <h3 style={{ fontSize: 'var(--fs-base)', fontWeight: 600, margin: 0 }}>{meta.label}</h3>
+                <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>({group.items.length})</span>
+              </button>
+              {!collapsed && (
               <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
                 {group.items.map((t, i) => (
                   <div
                     key={`${t._sessionId}-${t.id}`}
                     style={{
-                      padding: '0.75em 1em',
+                      padding: 'var(--space-sm) var(--space-md)',
                       borderBottom: i < group.items.length - 1 ? '1px solid var(--border)' : 'none',
                       opacity: t.dismissed ? 0.5 : t.status === 'completed' ? 0.65 : 1,
                     }}
                   >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1em', alignItems: 'flex-start' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-md)', alignItems: 'flex-start' }}>
                       <div style={{ minWidth: 0, flex: 1 }}>
                         <div style={{
-                          fontWeight: 600, fontSize: '0.92em',
+                          fontWeight: 600, fontSize: 'var(--fs-sm)',
                           textDecoration: t.status === 'completed' ? 'line-through' : 'none',
                         }}>
                           {t.subject || `Task ${t.id}`}
                         </div>
                         {t.description && (
-                          <div style={{ fontSize: '0.8em', color: 'var(--muted)', marginTop: '0.25em', lineHeight: 1.5 }}>
+                          <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginTop: 'var(--space-xs)', lineHeight: 1.5 }}>
                             {t.description}
                           </div>
                         )}
                         {(t.blockedBy?.length > 0) && (
-                          <div style={{ fontSize: '0.75em', color: 'var(--muted)', marginTop: '0.3em' }}>
+                          <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginTop: 'var(--space-xs)' }}>
                             Blocked by: {t.blockedBy.join(', ')}
                           </div>
                         )}
                       </div>
-                      <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.3em' }}>
+                      <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 'var(--space-xs)' }}>
                         <span className={`badge ${meta.cls}`}>{meta.label}</span>
-                        <span className="badge" style={{ fontSize: '0.68em' }}>{t.project}</span>
+                        <span className="badge">{t.project}</span>
+                        {t.source === 'user' && (
+                          <span className="badge badge-user" title="Created in the console">added</span>
+                        )}
                         <TaskActions
                           task={t}
                           onComplete={completeTask}
@@ -264,6 +365,7 @@ export default function TasksPage() {
                   </div>
                 ))}
               </div>
+              )}
             </div>
           );
         })
@@ -282,7 +384,7 @@ function actionBtn(extra = {}) {
   return {
     background: 'none', border: 'none', cursor: 'pointer',
     color: 'var(--muted)', display: 'flex', alignItems: 'center',
-    gap: '0.25em', fontSize: '0.7em', padding: '0.1em 0', ...extra,
+    gap: 'var(--space-xs)', fontSize: 'var(--fs-xs)', padding: '0.1em 0', ...extra,
   };
 }
 

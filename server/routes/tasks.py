@@ -19,25 +19,39 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import time
 from pathlib import Path
 
 from aiohttp import web
 
+from server.routes import read_json_body
+
 from server import filestore
-from server.routes.sessions import _project_label
+from server.routes.sessions import _project_label, WORKSPACE_DIR
 
 
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 CLAUDE_PROJECTS_BASE = Path.home() / ".claude" / "projects"
 
-# The dismissed-task list lives alongside the claude-web config file (default
-# ~/.claude-web/config.json), so it follows CLAUDE_WEB_CONFIG if overridden.
+# The dismissed-task list and the user-created task store live alongside the
+# claude-web config file (default ~/.claude-web/config.json), so they follow
+# CLAUDE_WEB_CONFIG if overridden.
 _CONFIG_PATH = Path(os.environ.get(
     "CLAUDE_WEB_CONFIG",
     Path.home() / ".claude-web" / "config.json",
 ))
 DISMISSED_PATH = _CONFIG_PATH.parent / "dismissed_tasks.json"
+# Console-created tasks live here — NEVER in ~/.claude/tasks (that is Claude
+# Code's own state, which we keep read-only except for the explicit
+# complete/delete actions on its files).
+USER_TASKS_PATH = _CONFIG_PATH.parent / "tasks.json"
+
+# Synthetic _sessionId used for all console-created tasks, so they flow through
+# the same list/complete/delete/dismiss/trigger-goal plumbing as Claude tasks
+# without special-casing every call site. It is NOT a real session id; the
+# user-task endpoints route on the "user:" id prefix instead of the filesystem.
+USER_SESSION_ID = "claude-web-user"
 
 # Dirs under ~/.claude/projects that are not real projects (mirrors
 # sessions.EXCLUDED_DIRS / the wf_ + "--" filtering there).
@@ -53,6 +67,9 @@ def register(app: web.Application):
     app.router.add_post("/api/tasks/undismiss", undismiss_task)
     app.router.add_post("/api/tasks/complete", complete_task)
     app.router.add_post("/api/tasks/delete", delete_task)
+    # Console-created (user) tasks — stored in ~/.claude-web/tasks.json.
+    app.router.add_post("/api/tasks/user", create_user_task)
+    app.router.add_put("/api/tasks/user", update_user_task)
 
 
 def _validate_id(value: str, label: str) -> None:
@@ -176,6 +193,54 @@ def _save_dismissed(keys: set[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# User-created task store (~/.claude-web/tasks.json) — claude-web's own data
+# ---------------------------------------------------------------------------
+#
+# These are ideas/TODOs captured from the console. They are NOT written into
+# ~/.claude/tasks. Each carries an explicit project name + path (so the list,
+# filters, and trigger-goal work just like Claude tasks) and a stable id of the
+# form "user:<token>". They are surfaced with _sessionId = USER_SESSION_ID and
+# source = "user" so the UI can badge them and the existing actions can route.
+
+def _load_user_tasks() -> list[dict]:
+    data, _etag = filestore.read_json(USER_TASKS_PATH)
+    items = data.get("tasks") if isinstance(data, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _save_user_tasks(tasks: list[dict]) -> None:
+    filestore.write_json(USER_TASKS_PATH, {"tasks": tasks})
+
+
+def _known_projects() -> dict[str, str]:
+    """Map of project name -> real path for projects under the workspace dir.
+
+    Used to validate the project a user assigns to a task and to resolve its
+    path (for trigger-goal). Mirrors how list_projects enumerates WORKSPACE_DIR.
+    """
+    projects: dict[str, str] = {}
+    if WORKSPACE_DIR.is_dir():
+        for d in WORKSPACE_DIR.iterdir():
+            if d.is_dir() and not d.name.startswith("."):
+                projects[d.name] = str(d)
+    return projects
+
+
+def _user_task_view(t: dict) -> dict:
+    """Shape a stored user task into the same record shape list_tasks emits."""
+    return {
+        **t,
+        "_sessionId": USER_SESSION_ID,
+        "_mtime": t.get("updatedAt") or t.get("createdAt") or 0,
+        "source": "user",
+        # A user task with no project is a global task (not "unknown" — that
+        # label is reserved for Claude tasks whose session can't be mapped).
+        "project": t.get("project") or "(global)",
+        "projectPath": t.get("projectPath"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -238,17 +303,25 @@ async def list_tasks(request: web.Request) -> web.Response:
     since_days = request.query.get("sinceDays")
     include_dismissed = request.query.get("includeDismissed") == "1"
 
-    tasks, mapping, dismissed = await asyncio.gather(
+    claude_tasks, mapping, dismissed, user_tasks = await asyncio.gather(
         asyncio.to_thread(_scan_tasks),
         _session_project_map(),
         asyncio.to_thread(_load_dismissed),
+        asyncio.to_thread(_load_user_tasks),
     )
 
-    # Enrich every task with its project (name + path) + dismissed flag.
-    for t in tasks:
+    # Enrich Claude Code tasks with their project (name + path) from the map.
+    for t in claude_tasks:
         proj = mapping.get(t["_sessionId"])
         t["project"] = proj["name"] if proj else "(unknown)"
         t["projectPath"] = proj["path"] if proj else None
+        t["source"] = "claude"
+
+    # User tasks already carry their own project; shape them to match.
+    tasks = claude_tasks + [_user_task_view(u) for u in user_tasks]
+
+    # Dismissed flag applies uniformly (key = "<sessionId>/<id>").
+    for t in tasks:
         t["dismissed"] = _task_key(t["_sessionId"], str(t.get("id", ""))) in dismissed
 
     # Distinct projects (before per-request filtering) for the filter dropdown.
@@ -300,7 +373,7 @@ async def dismiss_task(request: web.Request) -> web.Response:
 
     View-state only — the underlying ~/.claude/tasks file is untouched.
     """
-    body = await request.json()
+    body = await read_json_body(request)
     session_id = body.get("sessionId")
     task_id = body.get("taskId")
     if not session_id or task_id is None:
@@ -318,7 +391,7 @@ async def dismiss_task(request: web.Request) -> web.Response:
 
 async def undismiss_task(request: web.Request) -> web.Response:
     """Un-hide a previously dismissed task. Body: {sessionId, taskId}."""
-    body = await request.json()
+    body = await read_json_body(request)
     session_id = body.get("sessionId")
     task_id = body.get("taskId")
     if not session_id or task_id is None:
@@ -343,15 +416,33 @@ async def undismiss_task(request: web.Request) -> web.Response:
 # the named task file is touched, and only after path-traversal validation.
 
 async def complete_task(request: web.Request) -> web.Response:
-    """Mark a task complete by writing status:"completed" to its source file.
+    """Mark a task complete.
 
-    Body: {sessionId, taskId}. Preserves all other fields. 404 if absent.
+    Body: {sessionId, taskId}. For Claude Code tasks, writes status:"completed"
+    to the source ~/.claude/tasks file. For console-created tasks (sessionId ==
+    USER_SESSION_ID), updates the entry in ~/.claude-web/tasks.json. 404 if absent.
     """
-    body = await request.json()
+    body = await read_json_body(request)
     session_id = body.get("sessionId")
     task_id = body.get("taskId")
     if not session_id or task_id is None:
         raise web.HTTPBadRequest(reason="sessionId and taskId required")
+
+    # Console-created task → mutate the user store, not the filesystem.
+    if str(session_id) == USER_SESSION_ID:
+        def _do_user() -> dict | None:
+            tasks = _load_user_tasks()
+            for t in tasks:
+                if str(t.get("id")) == str(task_id):
+                    t["status"] = "completed"
+                    t["updatedAt"] = int(time.time() * 1000)
+                    _save_user_tasks(tasks)
+                    return t
+            return None
+        updated = await asyncio.to_thread(_do_user)
+        if not updated:
+            raise web.HTTPNotFound(reason="task not found")
+        return web.json_response({"ok": True, "task": _user_task_view(updated)})
 
     path = _task_file(str(session_id), str(task_id))
 
@@ -360,28 +451,54 @@ async def complete_task(request: web.Request) -> web.Response:
         if not isinstance(data, dict) or not data:
             return {}
         data["status"] = "completed"
-        # Keep activeForm coherent if present (Claude uses it for in-progress
-        # phrasing); it's harmless to leave, so we only update status.
+        # Only update status (other fields preserved). The etag read just above
+        # guards against a concurrent CLI write between read and write.
         filestore.write_json(path, data, etag)
         return data
 
-    updated = await asyncio.to_thread(_do)
+    try:
+        updated = await asyncio.to_thread(_do)
+    except filestore.ConflictError as e:
+        # A concurrent writer (e.g. the CLI) changed the file between our read
+        # and write — surface 409 like the other write endpoints, not 500.
+        return web.json_response({"error": "conflict", "message": str(e)}, status=409)
     if not updated:
         raise web.HTTPNotFound(reason="task not found")
     return web.json_response({"ok": True, "task": updated})
 
 
 async def delete_task(request: web.Request) -> web.Response:
-    """Delete a single task's source JSON file. Body: {sessionId, taskId}.
+    """Delete a single task. Body: {sessionId, taskId}.
 
-    Removes only that one file — never the session directory. Also drops any
-    dismissed-list entry for it so stale view-state doesn't linger. 404 if absent.
+    For Claude Code tasks, removes only that one ~/.claude/tasks JSON file (never
+    the session directory). For console-created tasks (sessionId ==
+    USER_SESSION_ID), removes the entry from ~/.claude-web/tasks.json. Also drops
+    any dismissed-list entry so stale view-state doesn't linger. 404 if absent.
     """
-    body = await request.json()
+    body = await read_json_body(request)
     session_id = body.get("sessionId")
     task_id = body.get("taskId")
     if not session_id or task_id is None:
         raise web.HTTPBadRequest(reason="sessionId and taskId required")
+
+    # Console-created task → remove from the user store, not the filesystem.
+    if str(session_id) == USER_SESSION_ID:
+        def _do_user() -> bool:
+            tasks = _load_user_tasks()
+            kept = [t for t in tasks if str(t.get("id")) != str(task_id)]
+            if len(kept) == len(tasks):
+                return False
+            _save_user_tasks(kept)
+            dismissed = _load_dismissed()
+            key = _task_key(USER_SESSION_ID, str(task_id))
+            if key in dismissed:
+                dismissed.discard(key)
+                _save_dismissed(dismissed)
+            return True
+        deleted = await asyncio.to_thread(_do_user)
+        if not deleted:
+            raise web.HTTPNotFound(reason="task not found")
+        return web.json_response({"ok": True, "deleted": _task_key(USER_SESSION_ID, str(task_id))})
 
     path = _task_file(str(session_id), str(task_id))
 
@@ -401,3 +518,112 @@ async def delete_task(request: web.Request) -> web.Response:
     if not deleted:
         raise web.HTTPNotFound(reason="task not found")
     return web.json_response({"ok": True, "deleted": _task_key(str(session_id), str(task_id))})
+
+
+# ---------------------------------------------------------------------------
+# Console-created task CRUD (~/.claude-web/tasks.json)
+# ---------------------------------------------------------------------------
+
+def _validate_user_task_body(body: dict) -> tuple[str, str, str | None, str | None]:
+    """Validate + normalize a create/update body.
+
+    Returns (subject, description, project_name, project_path). project_name/path
+    are None for a global (no-project) task. Raises HTTPBadRequest on a missing
+    subject or a non-empty project that isn't a known workspace project.
+    """
+    subject = (body.get("subject") or "").strip()
+    if not subject:
+        raise web.HTTPBadRequest(reason="subject required")
+    description = (body.get("description") or "").strip()
+
+    # Project is OPTIONAL — an empty value means a global task (no project).
+    project = (body.get("project") or "").strip()
+    if not project:
+        return subject, description, None, None
+    # A non-empty project must be a known workspace project — this both validates
+    # input and resolves the real path (rejects traversal / unknown names).
+    known = _known_projects()
+    if project not in known:
+        raise web.HTTPBadRequest(reason="unknown project")
+    return subject, description, project, known[project]
+
+
+async def create_user_task(request: web.Request) -> web.Response:
+    """Create a console task. Body: {subject, description?, project}.
+
+    Stored in ~/.claude-web/tasks.json with a "user:<token>" id and status
+    "pending". Returns the created task in the standard list record shape.
+    """
+    body = await read_json_body(request)
+    subject, description, project, project_path = _validate_user_task_body(body)
+
+    def _do() -> dict:
+        tasks = _load_user_tasks()
+        now = int(time.time() * 1000)
+        task = {
+            "id": f"user:{secrets.token_hex(4)}",
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "project": project,
+            "projectPath": project_path,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        tasks.append(task)
+        _save_user_tasks(tasks)
+        return task
+
+    task = await asyncio.to_thread(_do)
+    return web.json_response({"ok": True, "task": _user_task_view(task)}, status=201)
+
+
+async def update_user_task(request: web.Request) -> web.Response:
+    """Edit a console task. Body: {id, subject?, description?, project?}.
+
+    Only console-created tasks can be edited. 404 if the id isn't in the store.
+    """
+    body = await read_json_body(request)
+    task_id = body.get("id")
+    if not task_id:
+        raise web.HTTPBadRequest(reason="id required")
+
+    # Re-validate any provided fields. subject/project are validated only when
+    # present (partial edit); but subject can never be blanked to empty.
+    subject = body.get("subject")
+    if subject is not None and not str(subject).strip():
+        raise web.HTTPBadRequest(reason="subject cannot be empty")
+    # project provided: "" clears to global; a name must be a known project.
+    project_provided = body.get("project") is not None
+    project_name = None
+    project_path = None
+    if project_provided:
+        project_name = str(body["project"]).strip()
+        if project_name:
+            known = _known_projects()
+            if project_name not in known:
+                raise web.HTTPBadRequest(reason="unknown project")
+            project_path = known[project_name]
+        else:
+            project_name = None  # empty → global
+
+    def _do() -> dict | None:
+        tasks = _load_user_tasks()
+        for t in tasks:
+            if str(t.get("id")) == str(task_id):
+                if subject is not None:
+                    t["subject"] = str(subject).strip()
+                if body.get("description") is not None:
+                    t["description"] = str(body["description"]).strip()
+                if project_provided:
+                    t["project"] = project_name
+                    t["projectPath"] = project_path
+                t["updatedAt"] = int(time.time() * 1000)
+                _save_user_tasks(tasks)
+                return t
+        return None
+
+    updated = await asyncio.to_thread(_do)
+    if not updated:
+        raise web.HTTPNotFound(reason="task not found")
+    return web.json_response({"ok": True, "task": _user_task_view(updated)})

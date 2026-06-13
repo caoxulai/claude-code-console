@@ -1455,10 +1455,15 @@ def tasks_layout(tmp_path: Path, monkeypatch) -> Path:
     _write_json(so / "1.json", {"id": "1", "subject": "Mystery", "status": "pending"})
 
     dismissed = tmp_path / ".claude-web" / "dismissed_tasks.json"
+    user_tasks = tmp_path / ".claude-web" / "tasks.json"
 
     monkeypatch.setattr(tasks_mod, "TASKS_DIR", tasks_dir)
     monkeypatch.setattr(tasks_mod, "CLAUDE_PROJECTS_BASE", projects)
     monkeypatch.setattr(tasks_mod, "DISMISSED_PATH", dismissed)
+    monkeypatch.setattr(tasks_mod, "USER_TASKS_PATH", user_tasks)
+    # _known_projects() reads WORKSPACE_DIR (imported into tasks at load time);
+    # point it at the fixture's workspace/projects so "myproj" is a valid target.
+    monkeypatch.setattr(tasks_mod, "WORKSPACE_DIR", real_proj.parent)
     # _project_label scans the real filesystem from "/"; point its base at our
     # fake projects dir and clear its process-wide cache between tests.
     monkeypatch.setattr(sessions_mod, "_project_label_cache", {})
@@ -1598,6 +1603,94 @@ async def test_tasks_carry_project_path(client, tasks_layout):
     data = await (await client.get("/api/tasks")).json()
     bf = next(t for t in data["tasks"] if t["subject"] == "Build feature")
     assert bf["projectPath"] and bf["projectPath"].endswith("/myproj")
+
+
+# --- Console-created (user) tasks ----------------------------------------- #
+
+async def test_user_task_create_and_appears_in_list(client, tasks_layout):
+    """Creating a user task stores it in ~/.claude-web and merges into /api/tasks."""
+    resp = await client.post("/api/tasks/user", json={
+        "subject": "My idea", "description": "flesh out later", "project": "myproj",
+    })
+    assert resp.status == 201
+    created = (await resp.json())["task"]
+    assert created["source"] == "user"
+    assert created["project"] == "myproj"
+    assert created["projectPath"].endswith("/myproj")
+    assert created["id"].startswith("user:")
+    assert created["status"] == "pending"
+
+    # It shows up in the list, tagged source=user, and the Claude tasks remain.
+    data = await (await client.get("/api/tasks")).json()
+    subjects = {t["subject"] for t in data["tasks"]}
+    assert "My idea" in subjects
+    assert "Build feature" in subjects  # Claude tasks unaffected
+    mine = next(t for t in data["tasks"] if t["subject"] == "My idea")
+    assert mine["source"] == "user" and mine["_sessionId"] == tasks_mod.USER_SESSION_ID
+
+
+async def test_user_task_not_written_to_claude_tasks(client, tasks_layout):
+    """User tasks live in ~/.claude-web/tasks.json, never in ~/.claude/tasks."""
+    await client.post("/api/tasks/user", json={"subject": "Idea", "project": "myproj"})
+    # The store file exists; the Claude tasks dir gained no new session dir.
+    assert tasks_mod.USER_TASKS_PATH.is_file()
+    session_dirs = {p.name for p in tasks_layout.iterdir() if p.is_dir()}
+    assert session_dirs == {"sess-proj", "sess-orphan"}  # unchanged
+
+
+async def test_user_task_create_requires_subject_and_valid_project(client, tasks_layout):
+    # Missing subject → 400.
+    assert (await client.post("/api/tasks/user", json={"project": "myproj"})).status == 400
+    # Unknown project → 400 (also rejects traversal-y names).
+    assert (await client.post("/api/tasks/user", json={"subject": "x", "project": "../etc"})).status == 400
+
+
+async def test_user_task_global_no_project(client, tasks_layout):
+    """A task created with no project is global, labeled (global), path null."""
+    # Omitted project.
+    resp = await client.post("/api/tasks/user", json={"subject": "Loose idea"})
+    assert resp.status == 201
+    t = (await resp.json())["task"]
+    assert t["project"] == "(global)" and t["projectPath"] is None
+
+    # Explicit empty string also means global.
+    resp = await client.post("/api/tasks/user", json={"subject": "Another", "project": ""})
+    assert resp.status == 201
+    assert (await resp.json())["task"]["project"] == "(global)"
+
+    # Both appear in the list.
+    data = await (await client.get("/api/tasks")).json()
+    globals_ = [t for t in data["tasks"] if t.get("source") == "user" and t["project"] == "(global)"]
+    assert len(globals_) == 2
+
+
+async def test_user_task_complete_and_delete(client, tasks_layout):
+    created = (await (await client.post("/api/tasks/user", json={"subject": "Idea", "project": "myproj"})).json())["task"]
+    tid = created["id"]
+
+    # Complete updates the store entry's status.
+    resp = await client.post("/api/tasks/complete", json={"sessionId": tasks_mod.USER_SESSION_ID, "taskId": tid})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["status"] == "completed"
+
+    # Delete removes it from the store.
+    resp = await client.post("/api/tasks/delete", json={"sessionId": tasks_mod.USER_SESSION_ID, "taskId": tid})
+    assert resp.status == 200
+    data = await (await client.get("/api/tasks?includeDismissed=1")).json()
+    assert tid not in {t["id"] for t in data["tasks"]}
+
+
+async def test_user_task_edit(client, tasks_layout):
+    created = (await (await client.post("/api/tasks/user", json={"subject": "Old", "project": "myproj"})).json())["task"]
+    tid = created["id"]
+    resp = await client.put("/api/tasks/user", json={"id": tid, "subject": "New title", "description": "added"})
+    assert resp.status == 200
+    t = (await resp.json())["task"]
+    assert t["subject"] == "New title" and t["description"] == "added"
+    # Empty subject on edit is rejected.
+    assert (await client.put("/api/tasks/user", json={"id": tid, "subject": "  "})).status == 400
+    # Unknown id → 404.
+    assert (await client.put("/api/tasks/user", json={"id": "user:nope", "subject": "x"})).status == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -1841,3 +1934,4 @@ async def test_usage_endpoint_matches_independent_recompute(client, usage_projec
     assert sum(v["messages"] for v in data["byAgent"].values()) == t["messages"]
     assert sum(v["messages"] for v in data["byProject"].values()) == t["messages"]
     assert sum(v["messages"] for v in data["daily"]) == t["messages"]
+
