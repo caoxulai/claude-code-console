@@ -1263,6 +1263,199 @@ async def test_crons_update_unknown_is_404(client, crons_file):
 
 
 # --------------------------------------------------------------------------- #
+# Tasks routes (/api/tasks)
+#
+# Read-only view of ~/.claude/tasks/<sessionId>/<taskId>.json, enriched with a
+# project name (mapped via the session's transcript under ~/.claude/projects)
+# and the file mtime. Dismissal is claude-web view-state in ~/.claude-web; the
+# source task files are never modified.
+# --------------------------------------------------------------------------- #
+import time as _time  # noqa: E402
+
+import server.routes.tasks as tasks_mod  # noqa: E402
+import server.routes.sessions as sessions_mod  # noqa: E402
+
+
+@pytest.fixture
+def tasks_layout(tmp_path: Path, monkeypatch) -> Path:
+    """Build a fake ~/.claude tree: a task dir + a matching project transcript.
+
+    Two sessions:
+      - sess-proj  → has a transcript under a real project slug (→ "myproj")
+      - sess-orphan → no transcript anywhere (→ "(unknown)")
+    """
+    claude = tmp_path / ".claude"
+    tasks_dir = claude / "tasks"
+    projects = claude / "projects"
+    tasks_dir.mkdir(parents=True)
+    projects.mkdir(parents=True)
+
+    # A real project dir on disk so _project_label can reconstruct the path.
+    real_proj = tmp_path / "workspace" / "projects" / "myproj"
+    real_proj.mkdir(parents=True)
+    slug = "-" + str(real_proj).lstrip("/").replace("/", "-")
+    proj_transcript_dir = projects / slug
+    proj_transcript_dir.mkdir()
+    (proj_transcript_dir / "sess-proj.jsonl").write_text('{"type":"user"}\n')
+
+    # Task files for the attributed session.
+    sp = tasks_dir / "sess-proj"
+    sp.mkdir()
+    _write_json(sp / "1.json", {"id": "1", "subject": "Build feature", "status": "in_progress"})
+    _write_json(sp / "2.json", {"id": "2", "subject": "Old done task", "status": "completed"})
+
+    # Orphan session: tasks exist but no transcript maps it to a project.
+    so = tasks_dir / "sess-orphan"
+    so.mkdir()
+    _write_json(so / "1.json", {"id": "1", "subject": "Mystery", "status": "pending"})
+
+    dismissed = tmp_path / ".claude-web" / "dismissed_tasks.json"
+
+    monkeypatch.setattr(tasks_mod, "TASKS_DIR", tasks_dir)
+    monkeypatch.setattr(tasks_mod, "CLAUDE_PROJECTS_BASE", projects)
+    monkeypatch.setattr(tasks_mod, "DISMISSED_PATH", dismissed)
+    # _project_label scans the real filesystem from "/"; point its base at our
+    # fake projects dir and clear its process-wide cache between tests.
+    monkeypatch.setattr(sessions_mod, "_project_label_cache", {})
+    # Reset the sessionId→project map cache so each test rebuilds it.
+    monkeypatch.setattr(tasks_mod, "_map_cache", {})
+    monkeypatch.setattr(tasks_mod, "_map_updated_at", 0.0)
+    return tasks_dir
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data))
+
+
+async def test_tasks_empty_when_no_dir(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(tasks_mod, "TASKS_DIR", tmp_path / "nonexistent")
+    monkeypatch.setattr(tasks_mod, "CLAUDE_PROJECTS_BASE", tmp_path / "noprojects")
+    monkeypatch.setattr(tasks_mod, "_map_cache", {})
+    monkeypatch.setattr(tasks_mod, "_map_updated_at", 0.0)
+    resp = await client.get("/api/tasks")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["tasks"] == []
+    assert data["projects"] == []
+
+
+async def test_tasks_project_attribution(client, tasks_layout):
+    data = await (await client.get("/api/tasks")).json()
+    by_subject = {t["subject"]: t for t in data["tasks"]}
+    # Session with a transcript maps to its project name (dir basename).
+    assert by_subject["Build feature"]["project"] == "myproj"
+    # Orphan session (no transcript) falls back to a clear sentinel.
+    assert by_subject["Mystery"]["project"] == "(unknown)"
+    # Distinct projects surfaced for the filter dropdown.
+    assert "myproj" in data["projects"]
+
+
+async def test_tasks_project_filter(client, tasks_layout):
+    data = await (await client.get("/api/tasks?project=myproj")).json()
+    assert {t["subject"] for t in data["tasks"]} == {"Build feature", "Old done task"}
+    assert all(t["project"] == "myproj" for t in data["tasks"])
+
+
+async def test_tasks_time_filter_excludes_old(client, tasks_layout):
+    # Backdate the orphan task file well beyond a 1-day window.
+    old = tasks_layout / "sess-orphan" / "1.json"
+    old_ts = _time.time() - 10 * 86400
+    os.utime(old, (old_ts, old_ts))
+    data = await (await client.get("/api/tasks?sinceDays=1")).json()
+    subjects = {t["subject"] for t in data["tasks"]}
+    assert "Mystery" not in subjects          # too old
+    assert "Build feature" in subjects        # recent
+
+
+async def test_tasks_dismiss_hides_and_persists(client, tasks_layout):
+    # Dismiss the completed task.
+    resp = await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+    assert resp.status == 200
+
+    # Default list excludes it; the count reflects it.
+    data = await (await client.get("/api/tasks")).json()
+    assert "Old done task" not in {t["subject"] for t in data["tasks"]}
+    assert data["dismissedCount"] == 1
+
+    # includeDismissed=1 brings it back, flagged dismissed.
+    data = await (await client.get("/api/tasks?includeDismissed=1")).json()
+    old = next(t for t in data["tasks"] if t["subject"] == "Old done task")
+    assert old["dismissed"] is True
+
+    # Undismiss restores it to the default view.
+    resp = await client.post("/api/tasks/undismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+    assert resp.status == 200
+    data = await (await client.get("/api/tasks")).json()
+    assert "Old done task" in {t["subject"] for t in data["tasks"]}
+
+
+async def test_tasks_dismiss_does_not_touch_source_file(client, tasks_layout):
+    """Dismissal is view-state only — the ~/.claude/tasks JSON is untouched."""
+    src = tasks_layout / "sess-proj" / "2.json"
+    before = src.read_text()
+    await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+    assert src.read_text() == before  # unchanged on disk
+
+
+async def test_tasks_dismiss_requires_fields(client, tasks_layout):
+    resp = await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj"})
+    assert resp.status == 400
+
+
+async def test_tasks_complete_writes_source_file(client, tasks_layout):
+    """Mark-complete writes status:'completed' to the source task JSON."""
+    src = tasks_layout / "sess-proj" / "1.json"
+    assert json.loads(src.read_text())["status"] == "in_progress"
+
+    resp = await client.post("/api/tasks/complete", json={"sessionId": "sess-proj", "taskId": "1"})
+    assert resp.status == 200
+
+    # The on-disk file now reflects the new status, other fields preserved.
+    written = json.loads(src.read_text())
+    assert written["status"] == "completed"
+    assert written["subject"] == "Build feature"
+
+
+async def test_tasks_complete_unknown_is_404(client, tasks_layout):
+    resp = await client.post("/api/tasks/complete", json={"sessionId": "sess-proj", "taskId": "999"})
+    assert resp.status == 404
+
+
+async def test_tasks_delete_removes_only_target_file(client, tasks_layout):
+    """Delete removes exactly the named task file — no sibling, no directory."""
+    target = tasks_layout / "sess-proj" / "2.json"
+    sibling = tasks_layout / "sess-proj" / "1.json"
+    assert target.is_file() and sibling.is_file()
+
+    resp = await client.post("/api/tasks/delete", json={"sessionId": "sess-proj", "taskId": "2"})
+    assert resp.status == 200
+
+    assert not target.exists()          # gone
+    assert sibling.is_file()            # untouched
+    assert target.parent.is_dir()       # session dir preserved
+
+
+async def test_tasks_delete_unknown_is_404(client, tasks_layout):
+    resp = await client.post("/api/tasks/delete", json={"sessionId": "sess-proj", "taskId": "999"})
+    assert resp.status == 404
+
+
+async def test_tasks_complete_rejects_traversal(client, tasks_layout):
+    """Path-traversal in ids is rejected before touching the filesystem."""
+    resp = await client.post("/api/tasks/complete", json={"sessionId": "../../etc", "taskId": "1"})
+    assert resp.status == 400
+    resp = await client.post("/api/tasks/delete", json={"sessionId": "sess-proj", "taskId": "../1"})
+    assert resp.status == 400
+
+
+async def test_tasks_carry_project_path(client, tasks_layout):
+    """Tasks expose projectPath so the UI can build a session slug for trigger-goal."""
+    data = await (await client.get("/api/tasks")).json()
+    bf = next(t for t in data["tasks"] if t["subject"] == "Build feature")
+    assert bf["projectPath"] and bf["projectPath"].endswith("/myproj")
+
+
+# --------------------------------------------------------------------------- #
 # CLI bind safety
 #
 # The server has no auth and can run shell commands (POST /api/hooks/test), so

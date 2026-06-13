@@ -414,6 +414,15 @@ async def list_projects(request: web.Request) -> web.Response:
     if not WORKSPACE_DIR.is_dir():
         return web.json_response([])
 
+    # Per-project task counts (keyed by project name). Imported lazily to avoid a
+    # circular import (tasks imports sessions._project_label). Failures here must
+    # not break the projects listing, so guard defensively.
+    try:
+        from server.routes.tasks import project_task_counts
+        task_counts = project_task_counts()
+    except Exception:
+        task_counts = {}
+
     for d in WORKSPACE_DIR.iterdir():
         if not d.is_dir():
             continue
@@ -470,12 +479,17 @@ async def list_projects(request: web.Request) -> web.Response:
         # i. code.amazon.com package URL derived from the git origin remote.
         code_url = _code_url_for_project(d)
 
+        # j. task counts (open/total) for this project, by name.
+        tc = task_counts.get(project_name, {"total": 0, "open": 0})
+
         projects.append({
             "id": project_name,
             "name": project_name,
             "path": project_path,
             "sessionCount": session_count,
             "memoryCount": memory_count,
+            "taskCount": tc["total"],
+            "openTaskCount": tc["open"],
             "lastActivity": last_activity,
             "lastActivityTs": last_mtime,
             "claudeMd": claude_md_content,

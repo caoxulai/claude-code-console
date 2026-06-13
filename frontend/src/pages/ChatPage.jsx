@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useLocation } from 'react-router-dom';
 import { useChat } from '../hooks/useChat';
 import { useConfigStore } from '../stores/configStore';
 import { MessageBubble } from '../components/MessageBubble';
@@ -70,6 +70,7 @@ export default function ChatPage() {
     });
   }, [cwd, ensureConfig]);
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
   const [sessionTitle, setSessionTitle] = useState('');
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
@@ -107,6 +108,18 @@ export default function ChatPage() {
         .catch(() => {});
     }
   }, [sessionId, searchParams]);
+
+  // Seed the input box from a pre-fill prompt passed via navigation state
+  // (e.g. "trigger goal" from the Tasks/Projects pages). We do NOT auto-send —
+  // the user reviews and presses send. Clear the history state afterward so a
+  // refresh or back-nav doesn't re-seed it.
+  useEffect(() => {
+    const prefill = location.state?.prefillPrompt;
+    if (prefill) {
+      setInput(prefill);
+      window.history.replaceState({}, document.title);
+    }
+  }, [location.state]);
 
   const saveTitle = () => {
     const newTitle = titleDraft.trim();

@@ -3,8 +3,10 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiCopy, FiCheck } from 'react-icons/fi';
+import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiCopy, FiCheck, FiZap, FiCheckCircle, FiTrash2 } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
+import { useTriggerGoal } from '../hooks/useTriggerGoal';
+import SessionPickerModal from '../components/SessionPickerModal';
 
 // Small copy-to-clipboard icon button matching the app's icon-btn style.
 // Shows a brief check-mark confirmation after a successful copy. Stops click
@@ -44,7 +46,7 @@ function CopyButton({ text, title = 'Copy' }) {
   );
 }
 
-const TABS = ['Overview', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs'];
+const TABS = ['Overview', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs', 'Tasks'];
 
 function parseFrontmatter(content) {
   if (!content) return { meta: null, body: content };
@@ -167,6 +169,12 @@ export default function ProjectsPage() {
   const [selectedSop, setSelectedSop] = useState(null);
   const [sopContent, setSopContent] = useState('');
 
+  // Tasks state (loaded per-project when the Tasks tab opens)
+  const [projectTasks, setProjectTasks] = useState([]);
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [picker, setPicker] = useState(null);
+  const triggerGoal = useTriggerGoal({ onPickSession: setPicker });
+
   const fetchProjects = async () => {
     try {
       const res = await fetch('/api/projects');
@@ -177,6 +185,13 @@ export default function ProjectsPage() {
   };
 
   useEffect(() => { fetchProjects(); }, []);
+
+  // Load the expanded project's tasks whenever the Tasks tab is active.
+  useEffect(() => {
+    if (activeTab !== 'Tasks' || !expandedId) return;
+    const project = projects.find(p => p.id === expandedId);
+    if (project) loadProjectTasks(project);
+  }, [activeTab, expandedId, projects]);
 
   const toggleCard = (projectId) => {
     if (expandedId === projectId) {
@@ -190,6 +205,7 @@ export default function ProjectsPage() {
       setEditingMemory(false);
       setSelectedSop(null);
       setSopContent('');
+      setProjectTasks([]);
     }
   };
 
@@ -270,6 +286,43 @@ export default function ProjectsPage() {
     } catch {
       setSopContent('Failed to load SOP file.');
     }
+  };
+
+  // --- Tasks actions ---
+
+  // Tasks are filtered by project NAME (how /api/tasks attributes them). A
+  // project's directory name is its project name, so project.name is the key.
+  const loadProjectTasks = async (project, { silent = false } = {}) => {
+    if (!silent) setTasksLoading(true);
+    try {
+      const res = await fetch(`/api/tasks?project=${encodeURIComponent(project.name)}&includeDismissed=1`);
+      const json = await res.json();
+      setProjectTasks(Array.isArray(json.tasks) ? json.tasks : []);
+    } catch {
+      if (!silent) setProjectTasks([]);
+    }
+    if (!silent) setTasksLoading(false);
+  };
+
+  const completeProjectTask = async (project, task) => {
+    try {
+      await fetch('/api/tasks/complete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: task._sessionId, taskId: task.id }),
+      });
+      loadProjectTasks(project, { silent: true });
+    } catch { /* ignore */ }
+  };
+
+  const deleteProjectTask = async (project, task) => {
+    if (!window.confirm(`Delete task "${task.subject || task.id}"?\n\nThis permanently removes the task file.`)) return;
+    try {
+      await fetch('/api/tasks/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: task._sessionId, taskId: task.id }),
+      });
+      loadProjectTasks(project, { silent: true });
+    } catch { /* ignore */ }
   };
 
   // --- Render helpers ---
@@ -412,6 +465,21 @@ export default function ProjectsPage() {
               {(project.sopFiles || []).length} {(project.sopFiles || []).length === 1 ? 'SOP' : 'SOPs'}
             </span>
           )}
+          {project.taskCount > 0 && (
+            <span
+              className={`badge ${project.openTaskCount > 0 ? 'badge-warn' : ''}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setExpandedId(project.id);
+                setActiveTab('Tasks');
+              }}
+              style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
+              onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
+            >
+              {project.openTaskCount > 0 ? `${project.openTaskCount} open tasks` : `${project.taskCount} tasks`}
+            </span>
+          )}
           {project.hasSettings && (
             <span className="badge badge-ok">has settings</span>
           )}
@@ -515,6 +583,17 @@ export default function ProjectsPage() {
         >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{(project.sopFiles || []).length}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Skills/SOPs</div>
+        </div>
+        <div
+          onClick={() => setActiveTab('Tasks')}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.taskCount ?? 0}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
+            Tasks{project.openTaskCount ? ` · ${project.openTaskCount} open` : ''}
+          </div>
         </div>
         <div
           onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
@@ -774,6 +853,69 @@ export default function ProjectsPage() {
     );
   };
 
+  const renderTasksTab = (project) => {
+    if (tasksLoading) {
+      return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading tasks…</div>;
+    }
+    if (projectTasks.length === 0) {
+      return (
+        <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
+          <h3>No tasks</h3>
+          <p style={{ color: 'var(--muted)' }}>
+            Tasks Claude Code creates in this project&apos;s sessions appear here.
+          </p>
+        </div>
+      );
+    }
+
+    const statusBadge = (s) => {
+      if (s === 'completed') return 'badge-ok';
+      if (s === 'in_progress') return 'badge-warn';
+      return '';
+    };
+
+    return (
+      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+        {projectTasks.map((t, i) => (
+          <div
+            key={`${t._sessionId}-${t.id}`}
+            style={{
+              padding: '0.7em 1em',
+              borderBottom: i < projectTasks.length - 1 ? '1px solid var(--border)' : 'none',
+              opacity: t.dismissed ? 0.5 : t.status === 'completed' ? 0.7 : 1,
+              display: 'flex', justifyContent: 'space-between', gap: '1em', alignItems: 'flex-start',
+            }}
+          >
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: '0.9em', textDecoration: t.status === 'completed' ? 'line-through' : 'none' }}>
+                {t.subject || `Task ${t.id}`}
+              </div>
+              {t.description && (
+                <div style={{ fontSize: '0.78em', color: 'var(--muted)', marginTop: '0.2em', lineHeight: 1.5 }}>{t.description}</div>
+              )}
+            </div>
+            <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.3em' }}>
+              <span className={`badge ${statusBadge(t.status)}`}>{t.status}</span>
+              <div style={{ display: 'flex', gap: '0.6em', alignItems: 'center' }}>
+                <button onClick={() => triggerGoal(t)} title="Trigger a /goal in this project" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}>
+                  <FiZap size={11} /> goal
+                </button>
+                {t.status !== 'completed' && (
+                  <button onClick={() => completeProjectTask(project, t)} title="Mark complete" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--muted)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}>
+                    <FiCheckCircle size={11} /> done
+                  </button>
+                )}
+                <button onClick={() => deleteProjectTask(project, t)} title="Delete task file" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--danger, #d9534f)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}>
+                  <FiTrash2 size={11} /> delete
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   const renderExpandedContent = (project) => {
     if (expandedId !== project.id) return null;
 
@@ -789,6 +931,7 @@ export default function ProjectsPage() {
         {activeTab === 'CLAUDE.md' && renderClaudeMdTab(project)}
         {activeTab === 'Memory' && renderMemoryTab(project)}
         {activeTab === 'Skills/SOPs' && renderSopsTab(project)}
+        {activeTab === 'Tasks' && renderTasksTab(project)}
       </div>
     );
   };
@@ -828,6 +971,10 @@ export default function ProjectsPage() {
             </div>
           ))}
         </div>
+      )}
+
+      {picker && (
+        <SessionPickerModal picker={picker} onClose={() => setPicker(null)} />
       )}
     </div>
   );

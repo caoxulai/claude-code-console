@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder, FiBarChart2 } from 'react-icons/fi';
+import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder, FiBarChart2, FiCheckSquare } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 import BudgetAlert from '../components/BudgetAlert';
 
@@ -36,9 +36,11 @@ export default function DashboardPage() {
       fetch('/api/crons').then(r => r.json()),
       fetch('/api/sessions/live').then(r => r.json()),
       fetch('/api/projects').then(r => r.json()),
-    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData]) => {
+      fetch('/api/tasks').then(r => r.json()),
+    ]).then(([sessions, memory, skills, mcp, crons, live, projectsData, tasksData]) => {
       const projectsList = Array.isArray(projectsData) ? projectsData : [];
       setProjects(projectsList);
+      const tasksList = Array.isArray(tasksData?.tasks) ? tasksData.tasks : [];
       setStats({
         sessions: sessions.total || sessions.sessions?.length || 0,
         memory: memory.length || 0,
@@ -47,6 +49,9 @@ export default function DashboardPage() {
         crons: crons.jobs?.length || 0,
         live: live.length || 0,
         projects: projectsList.length,
+        // Open tasks = anything not completed (in_progress + pending + other).
+        tasksOpen: tasksList.filter(t => t.status !== 'completed').length,
+        tasksInProgress: tasksList.filter(t => t.status === 'in_progress').length,
         usageTokens: null,  // loaded separately below to not block the dashboard
       });
     }).catch(() => {
@@ -78,6 +83,14 @@ export default function DashboardPage() {
   const cards = [
     { icon: FiList, label: 'Sessions', value: stats?.sessions, link: '/sessions' },
     { icon: FiMessageSquare, label: 'Live', value: stats?.live, link: '/sessions' },
+    {
+      icon: FiCheckSquare,
+      label: 'Open Tasks',
+      value: stats?.tasksOpen,
+      // Sub-line surfaces how many of the open tasks are actively in progress.
+      sub: stats?.tasksInProgress ? `${stats.tasksInProgress} in progress` : undefined,
+      link: '/tasks',
+    },
     { icon: FiBookOpen, label: 'Memory Files', value: stats?.memory, link: '/memory' },
     { icon: FiZap, label: 'Skills', value: stats?.skills, link: '/skills' },
     { icon: FiServer, label: 'MCP Servers', value: stats?.mcp, link: '/mcp' },
@@ -126,7 +139,7 @@ export default function DashboardPage() {
       <BudgetAlert dailyCost={todayCost} />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1em' }}>
         {!stats ? (
-          Array.from({ length: 8 }).map((_, i) => (
+          Array.from({ length: 9 }).map((_, i) => (
             <SkeletonCard key={i} style={{ height: STAT_CARD_HEIGHT }} />
           ))
         ) : (
