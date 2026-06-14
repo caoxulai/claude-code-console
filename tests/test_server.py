@@ -1965,6 +1965,191 @@ async def test_crons_update_unknown_is_404(client, crons_file):
     assert resp.status == 404
 
 
+def test_resolve_tasks_path_prefers_env_override(tmp_path, monkeypatch):
+    override = tmp_path / "custom" / "scheduled_tasks.json"
+    monkeypatch.setenv("CLAUDE_WEB_TASKS_PATH", str(override))
+    assert crons_mod._resolve_tasks_path() == override
+
+
+def test_resolve_tasks_path_defaults_to_cwd_relative(tmp_path, monkeypatch):
+    # No override → cwd-relative .claude/scheduled_tasks.json (where the harness
+    # scheduler writes durable tasks). This is the alignment the fix guarantees.
+    monkeypatch.delenv("CLAUDE_WEB_TASKS_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert crons_mod._resolve_tasks_path() == tmp_path / ".claude" / "scheduled_tasks.json"
+
+
+async def test_crons_reads_harness_written_file(client, crons_file):
+    """A task written by the harness scheduler (richer schema, extra fields) must
+    surface verbatim through GET /api/crons — the GUI is a view, not a parallel list.
+    """
+    crons_file.parent.mkdir(parents=True, exist_ok=True)
+    crons_file.write_text(json.dumps({"tasks": [{
+        "id": "abc12345",
+        "cron": "37 23 * * *",
+        "prompt": "daily health check",
+        "recurring": True,
+        "createdAt": 1781426694506,
+        # Fields the harness writes that the GUI doesn't author:
+        "createdBySessionId": "sess-1",
+        "createdByPid": 184139,
+    }]}), encoding="utf-8")
+
+    jobs = (await (await client.get("/api/crons")).json())["jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == "abc12345"
+    # Harness-only fields are preserved, not dropped.
+    assert jobs[0]["createdBySessionId"] == "sess-1"
+
+
+async def test_crons_update_preserves_harness_fields(client, crons_file):
+    """Editing a harness-created job from the GUI must not strip the scheduler's
+    own fields (they live in the same dict that gets rewritten)."""
+    crons_file.parent.mkdir(parents=True, exist_ok=True)
+    crons_file.write_text(json.dumps({"tasks": [{
+        "id": "abc12345", "cron": "37 23 * * *", "prompt": "old",
+        "recurring": True, "createdAt": 1, "createdBySessionId": "sess-1",
+    }]}), encoding="utf-8")
+
+    upd = await client.put("/api/crons/abc12345", json={"prompt": "new"})
+    assert upd.status == 200
+    saved = json.loads(crons_file.read_text(encoding="utf-8"))["tasks"][0]
+    assert saved["prompt"] == "new"
+    assert saved["createdBySessionId"] == "sess-1"  # preserved
+
+
+# --------------------------------------------------------------------------- #
+# Cron run-history store (/api/crons/{id}/runs)
+#
+# Run history lives in a *separate sidecar* file (cron_runs.json) so the harness's
+# scheduled_tasks.json is never polluted with GUI-authored fields. The store only
+# ever displays runs that were actually recorded — an empty store yields an honest
+# empty list, never fabricated history.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def cron_runs_file(tmp_path: Path, monkeypatch):
+    """Point the run-history sidecar at a tmp file (mirrors crons_file for TASKS_PATH)."""
+    p = tmp_path / "cron_runs.json"
+    monkeypatch.setattr(crons_mod, "RUNS_PATH", p)
+    return p
+
+
+async def test_cron_runs_empty_returns_empty_list(client, cron_runs_file):
+    """No runs file → honest empty state, not fabricated history."""
+    resp = await client.get("/api/crons/abc12345/runs")
+    assert resp.status == 200
+    assert (await resp.json())["runs"] == []
+    # Honest empty state must not have created the sidecar as a side effect of a read.
+    assert not cron_runs_file.exists()
+
+
+async def test_cron_run_append_then_list(client, cron_runs_file):
+    """POST a run → 201 with id+ts; GET returns it; multiple runs are newest-first."""
+    first = await client.post(
+        "/api/crons/abc12345/runs", json={"outcome": "success", "result": "did the thing"}
+    )
+    assert first.status == 201
+    run = (await first.json())["run"]
+    assert run["id"]  # carries a generated id
+    assert run["ts"]  # carries a timestamp
+    assert run["outcome"] == "success"
+    assert run["result"] == "did the thing"
+
+    # A small gap so the second run sorts strictly after the first.
+    import time as _t
+    _t.sleep(0.01)
+    second = await client.post(
+        "/api/crons/abc12345/runs", json={"outcome": "failure", "result": "broke"}
+    )
+    assert second.status == 201
+
+    runs = (await (await client.get("/api/crons/abc12345/runs")).json())["runs"]
+    assert len(runs) == 2
+    # Newest-first ordering: the failure (posted second) leads.
+    assert runs[0]["outcome"] == "failure"
+    assert runs[1]["outcome"] == "success"
+    assert runs[0]["ts"] >= runs[1]["ts"]
+
+
+async def test_cron_run_append_defaults_outcome_unknown(client, cron_runs_file):
+    """POST with no outcome defaults to an allowlisted value (unknown)."""
+    resp = await client.post("/api/crons/abc12345/runs", json={"result": "no outcome given"})
+    assert resp.status == 201
+    run = (await resp.json())["run"]
+    assert run["outcome"] in {"success", "failure", "unknown"}
+    assert run["outcome"] == "unknown"
+
+
+async def test_cron_runs_scoped_per_job(client, cron_runs_file):
+    """Runs are keyed by job id — one job's history never leaks into another's."""
+    await client.post("/api/crons/job-a/runs", json={"outcome": "success", "result": "a"})
+    await client.post("/api/crons/job-b/runs", json={"outcome": "failure", "result": "b"})
+
+    runs_a = (await (await client.get("/api/crons/job-a/runs")).json())["runs"]
+    runs_b = (await (await client.get("/api/crons/job-b/runs")).json())["runs"]
+    assert [r["result"] for r in runs_a] == ["a"]
+    assert [r["result"] for r in runs_b] == ["b"]
+
+
+async def test_cron_runs_do_not_touch_scheduled_tasks(client, crons_file, cron_runs_file):
+    """Appending a run must not pollute the harness's scheduled_tasks.json.
+
+    The run store is a separate sidecar; recording a run must never write a `runs`
+    key onto the task, set lastFiredAt, or otherwise mutate the harness file.
+    """
+    crons_file.parent.mkdir(parents=True, exist_ok=True)
+    crons_file.write_text(json.dumps({"tasks": [{
+        "id": "abc12345", "cron": "37 23 * * *", "prompt": "health check",
+        "recurring": True, "createdAt": 1, "lastFiredAt": None,
+    }]}), encoding="utf-8")
+    before = crons_file.read_text(encoding="utf-8")
+
+    resp = await client.post(
+        "/api/crons/abc12345/runs", json={"outcome": "success", "result": "ran"}
+    )
+    assert resp.status == 201
+
+    # The harness file is byte-for-byte unchanged — no runs key, no lastFiredAt edit.
+    after = crons_file.read_text(encoding="utf-8")
+    assert after == before
+    task = json.loads(after)["tasks"][0]
+    assert "runs" not in task
+    assert task["lastFiredAt"] is None
+
+
+async def test_cron_run_job_id_is_a_key_not_a_filename(client, cron_runs_file):
+    """The job id is a JSON dict key in ONE fixed sidecar, never a path component.
+
+    Because the id never touches the filesystem, a traversal-shaped id can't escape:
+    it just becomes a key. We confirm the id is stored verbatim as a key and the only
+    file written is the monkeypatched sidecar (nothing leaked to a sibling/parent).
+    """
+    weird_id = "..weird..id.."  # dots, but no slashes (slashes break URL routing)
+    resp = await client.post(
+        f"/api/crons/{weird_id}/runs", json={"outcome": "success", "result": "x"}
+    )
+    assert resp.status == 201
+    stored = json.loads(cron_runs_file.read_text(encoding="utf-8"))
+    assert weird_id in stored["runs"]  # stored as a key, not interpreted as a path
+    assert list(cron_runs_file.parent.iterdir()) == [cron_runs_file]
+
+
+def test_resolve_runs_path_prefers_env_override(tmp_path, monkeypatch):
+    override = tmp_path / "custom" / "cron_runs.json"
+    monkeypatch.setenv("CLAUDE_WEB_CRON_RUNS_PATH", str(override))
+    assert crons_mod._resolve_runs_path() == override
+
+
+def test_resolve_runs_path_defaults_beside_tasks(tmp_path, monkeypatch):
+    # No override → the sidecar sits beside the harness scheduled_tasks.json, in the
+    # same .claude dir. Derived from TASKS_PATH so the two files always stay aligned.
+    monkeypatch.delenv("CLAUDE_WEB_CRON_RUNS_PATH", raising=False)
+    monkeypatch.setattr(crons_mod, "TASKS_PATH", tmp_path / ".claude" / "scheduled_tasks.json")
+    resolved = crons_mod._resolve_runs_path()
+    assert resolved == tmp_path / ".claude" / "cron_runs.json"
+    assert resolved == crons_mod.TASKS_PATH.parent / "cron_runs.json"
+
+
 # --------------------------------------------------------------------------- #
 # Tasks routes (/api/tasks)
 #
