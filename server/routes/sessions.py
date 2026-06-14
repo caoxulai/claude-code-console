@@ -63,6 +63,26 @@ def _is_interactive_session(path: Path) -> bool:
         return False
 
 
+def _is_print_mode_session(path: Path) -> bool:
+    """True if the session was started in print mode (first record = queue-operation).
+
+    Print-mode sessions are non-interactive one-off invocations (e.g. `claude -p`,
+    queued prompts). `claude --resume` never lists them, so neither should we —
+    in EVERY project bucket, not just the home one. They are detected by their
+    first JSONL record having type 'queue-operation'; such a session can still
+    contain real user/assistant turns, so _has_real_turn alone won't catch it.
+    """
+    try:
+        with open(path) as fh:
+            first_line = fh.readline()
+            if not first_line:
+                return False
+            rec = json.loads(first_line)
+            return rec.get("type") == "queue-operation"
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def _has_real_turn(path: Path) -> bool:
     """True if the session contains at least one actual user or assistant turn.
 
@@ -772,6 +792,13 @@ async def list_sessions(request: web.Request) -> web.Response:
             # Home bucket: always apply interactive filter to hide print-mode sessions
             if not _is_interactive_session(f):
                 continue
+        # Print-mode sessions (first record = queue-operation) are non-interactive
+        # one-off invocations that `claude --resume` never lists. Hide them in EVERY
+        # bucket, not just home — a non-home dir (e.g. a Brazil workspace) can hold
+        # a print-mode session that still has real user/assistant turns, so the
+        # _has_real_turn guard below would otherwise let it leak through.
+        elif _is_print_mode_session(f):
+            continue
         # Hide orphaned/empty sessions (started but never had a real exchange) in
         # every bucket — these are noise (e.g. an interrupted one-off invocation).
         if not _has_real_turn(f):

@@ -118,7 +118,10 @@ def projects_base(tmp_path: Path, monkeypatch) -> Path:
           renamed.jsonl             (first line type=custom-title) -> kept
           printmode.jsonl           (first line type=queue-operation) -> filtered
       <base>/-some-other-proj/      <- a non-home project dir
-          other.jsonl               (first line type=queue-operation) -> NOT filtered
+          other.jsonl               (first line type=queue-operation) -> filtered
+                                      (print-mode is hidden in every bucket, like
+                                       claude --resume — even with real turns)
+          real.jsonl                (first line type=mode, has a real turn) -> kept
     """
     base = tmp_path / "claude_projects"
     base.mkdir()
@@ -154,9 +157,17 @@ def projects_base(tmp_path: Path, monkeypatch) -> Path:
 
     other_dir = base / "-some-other-proj"
     other_dir.mkdir()
+    # Print-mode session in a NON-home dir, WITH a real turn: must still be
+    # filtered (matches claude --resume, which never lists print-mode sessions).
     _write_jsonl(other_dir / "other.jsonl", [
         {"type": "queue-operation"},
         {"type": "user", "message": {"content": "hi"}},
+    ])
+    # Genuine interactive session in the same non-home dir: kept.
+    _write_jsonl(other_dir / "real.jsonl", [
+        {"type": "mode", "mode": "default"},
+        {"type": "user", "message": {"content": "hi"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "yo"}]}},
     ])
 
     return base
@@ -179,8 +190,11 @@ async def test_list_sessions_shape_and_home_bucket_filter(client, projects_base)
     # ...but interactive + renamed home sessions (with a real turn) are kept...
     assert "interactive" in ids
     assert "renamed" in ids
-    # ...and the print-mode session in a NON-home dir is NOT filtered.
-    assert "other" in ids
+    # ...the print-mode session in a NON-home dir is ALSO filtered (even though it
+    # has a real turn) — claude --resume never lists print-mode sessions...
+    assert "other" not in ids
+    # ...and a genuine interactive session in that non-home dir is kept.
+    assert "real" in ids
 
     # total counts only the files that survived filtering (3 here).
     assert data["total"] == 3
