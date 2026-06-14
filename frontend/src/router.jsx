@@ -23,6 +23,7 @@ const SessionsPage = lazy(() => import('./pages/SessionsPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const PluginsPage = lazy(() => import('./pages/PluginsPage'));
 const UsagePage = lazy(() => import('./pages/UsagePage'));
+const AgentsPage = lazy(() => import('./pages/AgentsPage'));
 
 function lazyRoute(Component) {
   return (
@@ -54,6 +55,7 @@ export const router = createBrowserRouter([
       { path: 'tasks', element: lazyRoute(TasksPage) },
       { path: 'plugins', element: lazyRoute(PluginsPage) },
       { path: 'usage', element: lazyRoute(UsagePage) },
+      { path: 'agents', element: lazyRoute(AgentsPage) },
     ],
   },
 ]);

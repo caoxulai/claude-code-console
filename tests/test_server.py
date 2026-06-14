@@ -395,6 +395,12 @@ def projects_layout(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", claude_base)
     monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(config_path))
 
+    # Isolate the global ("universal") agents dir so tests don't pick up the
+    # developer's real ~/.claude/agents/ contents.
+    import server.routes.agents as agents_mod
+    global_agents = tmp_path / "dot_claude" / "agents"
+    monkeypatch.setattr(agents_mod, "GLOBAL_AGENTS_DIR", global_agents)
+
     def slug_for(p: Path) -> str:
         return "-" + str(p).lstrip("/").replace("/", "-")
 
@@ -515,6 +521,466 @@ async def test_project_id_path_traversal_rejected(client, projects_layout):
     # The read/SOP/memory project endpoints share the guard.
     assert (await client.get("/api/projects/..%2f../sop/x.md")).status == 400
     assert (await client.get("/api/projects/..%2f../memory/x.md")).status == 400
+
+
+# ── Design decisions (.claude/DESIGN.md) — Phase 1 of the Role Agents framework ──
+
+_DESIGN_SAMPLE = """# alpha — design decisions
+
+Some preamble that is not a decision and must be ignored.
+
+## D-002: Use append-only context  (2026-06-13, accepted)
+**Decision:** Agents only append.
+**Why:** Can't corrupt existing notes.
+
+## D-001: Native subagents  (2026-06-12, proposed)
+**Decision:** Roles are .claude/agents/*.md.
+"""
+
+
+def test_parse_adrs_extracts_entries_and_metadata():
+    from server.routes.agents import parse_adrs
+    adrs = parse_adrs(_DESIGN_SAMPLE)
+    assert [a["id"] for a in adrs] == ["D-002", "D-001"]
+    assert adrs[0]["title"] == "Use append-only context"
+    assert adrs[0]["date"] == "2026-06-13"
+    assert adrs[0]["status"] == "accepted"
+    assert "Agents only append." in adrs[0]["body"]
+    # Preamble before the first header is not captured as a decision.
+    assert "preamble" not in adrs[0]["body"].lower()
+    # Status is lower-cased; proposed entries are detectable.
+    assert adrs[1]["status"] == "proposed"
+
+
+def test_parse_adrs_empty_and_headerless():
+    from server.routes.agents import parse_adrs
+    assert parse_adrs("") == []
+    assert parse_adrs("# Just a title\n\nNo ADR headers here.") == []
+
+
+async def test_get_project_design_returns_parsed_adrs(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    (workspace / "alpha" / ".claude").mkdir(parents=True, exist_ok=True)
+    (workspace / "alpha" / ".claude" / "DESIGN.md").write_text(_DESIGN_SAMPLE, encoding="utf-8")
+
+    resp = await client.get("/api/projects/alpha/design")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["exists"] is True
+    assert data["etag"] is not None
+    assert [d["id"] for d in data["decisions"]] == ["D-002", "D-001"]
+
+
+async def test_get_project_design_absent_is_empty_not_404(client, projects_layout):
+    """A project with no DESIGN.md is a valid empty state, not an error."""
+    resp = await client.get("/api/projects/beta/design")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["exists"] is False
+    assert data["decisions"] == []
+
+
+async def test_get_project_design_unknown_project_404(client, projects_layout):
+    resp = await client.get("/api/projects/nope/design")
+    assert resp.status == 404
+
+
+async def test_get_project_design_traversal_rejected(client, projects_layout):
+    resp = await client.get("/api/projects/..%2f../design")
+    assert resp.status == 400
+
+
+async def test_projects_listing_surfaces_design_summary(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    (workspace / "alpha" / ".claude").mkdir(parents=True, exist_ok=True)
+    (workspace / "alpha" / ".claude" / "DESIGN.md").write_text(_DESIGN_SAMPLE, encoding="utf-8")
+
+    projects = await _get_projects(client)
+    # alpha has a DESIGN.md with one proposed (D-001) decision.
+    assert projects["alpha"]["hasDesignDoc"] is True
+    assert projects["alpha"]["proposedDecisionCount"] == 1
+    # beta has none — fields always present.
+    assert projects["beta"]["hasDesignDoc"] is False
+    assert projects["beta"]["proposedDecisionCount"] == 0
+
+
+# ── Role agents (.claude/agents/*.md) — Phase 2 of the Role Agents framework ──
+
+_AGENT_SAMPLE = """---
+name: backend-dev
+description: Backend developer for alpha.
+tools: Read, Edit, Bash
+model: opus
+---
+You are the backend developer.
+"""
+
+
+def _seed_agent(workspace: Path, project: str, name: str, content: str = _AGENT_SAMPLE):
+    agents_dir = workspace / project / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / f"{name}.md").write_text(content, encoding="utf-8")
+
+
+async def test_list_agents_parses_frontmatter(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+
+    resp = await client.get("/api/projects/alpha/agents")
+    assert resp.status == 200
+    agents = await resp.json()
+    assert len(agents) == 1
+    a = agents[0]
+    assert a["name"] == "backend-dev"
+    assert a["description"] == "Backend developer for alpha."
+    assert a["model"] == "opus"
+    assert a["tools"] == ["Read", "Edit", "Bash"]
+    assert a["contextExists"] is False
+
+
+async def test_list_agents_empty_when_none(client, projects_layout):
+    resp = await client.get("/api/projects/beta/agents")
+    assert resp.status == 200
+    assert await resp.json() == []
+
+
+async def test_list_agents_skips_unreadable_file(client, projects_layout):
+    """A non-UTF-8 agent file must be skipped, not 500 the whole listing."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "good", "---\nname: good\ndescription: ok\n---\nbody\n")
+    bad = workspace / "alpha" / ".claude" / "agents" / "bad.md"
+    bad.write_bytes(b"\xff\xfe\x00bad")
+
+    resp = await client.get("/api/projects/alpha/agents")
+    assert resp.status == 200
+    names = {a["name"] for a in await resp.json()}
+    assert "good" in names  # the readable one survives the unreadable sibling
+
+
+async def test_get_agent_returns_content_and_etag(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+
+    resp = await client.get("/api/projects/alpha/agents/backend-dev")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["name"] == "backend-dev"
+    assert data["tools"] == ["Read", "Edit", "Bash"]
+    assert data["etag"] is not None
+    assert "You are the backend developer." in data["content"]
+
+
+async def test_get_agent_unknown_404(client, projects_layout):
+    resp = await client.get("/api/projects/alpha/agents/nope")
+    assert resp.status == 404
+
+
+async def test_agents_traversal_rejected(client, projects_layout):
+    # Bad project id.
+    assert (await client.get("/api/projects/..%2f../agents")).status == 400
+    # Bad agent name.
+    assert (await client.get("/api/projects/alpha/agents/..%2f..%2fsecret")).status == 400
+
+
+async def test_projects_listing_surfaces_agent_count(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_agent(workspace, "alpha", "qa")
+
+    projects = await _get_projects(client)
+    assert projects["alpha"]["agentCount"] == 2
+    assert projects["beta"]["agentCount"] == 0
+
+
+# ── Dual-scope agents: project + global ("universal") ────────────────────────
+
+def _seed_global_agent(name: str, content: str = _AGENT_SAMPLE):
+    import server.routes.agents as agents_mod
+    agents_mod.GLOBAL_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    (agents_mod.GLOBAL_AGENTS_DIR / f"{name}.md").write_text(content, encoding="utf-8")
+
+
+async def test_global_agents_visible_in_every_project(client, projects_layout):
+    _seed_global_agent("universal-helper")
+    # A global agent shows up for a project with no project agents of its own.
+    resp = await client.get("/api/projects/beta/agents")
+    assert resp.status == 200
+    agents = {a["slug"]: a for a in await resp.json()}
+    assert "universal-helper" in agents
+    assert agents["universal-helper"]["scope"] == "global"
+
+
+async def test_project_agent_shadows_global_same_name(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_global_agent("backend-dev")
+    resp = await client.get("/api/projects/alpha/agents")
+    agents = [a for a in await resp.json() if a["slug"] == "backend-dev"]
+    # Only one entry, and the project one wins.
+    assert len(agents) == 1
+    assert agents[0]["scope"] == "project"
+
+
+async def test_agent_count_counts_project_and_global_union(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_global_agent("backend-dev")  # shadowed — counts once
+    _seed_global_agent("universal-helper")
+    projects = await _get_projects(client)
+    # alpha sees: backend-dev (project, shadows global) + universal-helper = 2
+    assert projects["alpha"]["agentCount"] == 2
+    # beta has no project agents: sees both globals = 2
+    assert projects["beta"]["agentCount"] == 2
+
+
+async def test_promote_agent_to_global(client, projects_layout):
+    import server.routes.agents as agents_mod
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+
+    resp = await client.post("/api/projects/alpha/agents/backend-dev/scope", json={"scope": "global"})
+    assert resp.status == 200
+    assert (await resp.json())["moved"] is True
+    # File moved out of the project, into global.
+    assert not (workspace / "alpha" / ".claude" / "agents" / "backend-dev.md").exists()
+    assert (agents_mod.GLOBAL_AGENTS_DIR / "backend-dev.md").is_file()
+    # Now it lists as global for the project.
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["backend-dev"]["scope"] == "global"
+
+
+async def test_demote_global_agent_to_project(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_global_agent("universal-helper")
+
+    resp = await client.post("/api/projects/alpha/agents/universal-helper/scope", json={"scope": "project"})
+    assert resp.status == 200
+    assert (workspace / "alpha" / ".claude" / "agents" / "universal-helper.md").is_file()
+
+
+async def test_scope_move_conflict_when_dest_exists(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_global_agent("backend-dev")
+    # Promoting the project agent would collide with the existing global one.
+    resp = await client.post("/api/projects/alpha/agents/backend-dev/scope", json={"scope": "global"})
+    assert resp.status == 409
+
+
+async def test_scope_rejects_bad_value_and_traversal(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    assert (await client.post("/api/projects/alpha/agents/backend-dev/scope", json={"scope": "nope"})).status == 400
+    assert (await client.post("/api/projects/..%2f../agents/x/scope", json={"scope": "global"})).status == 400
+
+
+# ── Append-only context layer + conflict review — Phase 3 ────────────────────
+
+_CONTEXT_SAMPLE = """# backend-dev — project context
+
+- 2026-06-01: Use the read_json_body helper for body parsing; raw request.json() returns 500. (B12)
+- 2026-06-05: Tests share a module-level cache; reset it in an autouse fixture.
+- 2026-06-12: filestore.write_text takes an expected_etag for optimistic concurrency.
+- 2026-06-13: Supersedes the 2026-06-05 note — the cache reset must use a fresh _Cache() instance, not clear. (correction)
+"""
+
+
+def _seed_context(workspace: Path, project: str, name: str, content: str = _CONTEXT_SAMPLE):
+    ctx_dir = workspace / project / ".claude" / "agent-context"
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+    (ctx_dir / f"{name}.md").write_text(content, encoding="utf-8")
+
+
+def test_parse_context_entries_dates_and_text():
+    from server.routes.agents import parse_context_entries
+    entries = parse_context_entries(_CONTEXT_SAMPLE)
+    assert len(entries) == 4
+    assert entries[0]["date"] == "2026-06-01"
+    assert "read_json_body" in entries[0]["text"]
+    # Heading line is not an entry.
+    assert all("project context" not in e["text"] for e in entries)
+
+
+def test_detect_conflicts_clusters_supersede_and_redundancy():
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    entries = parse_context_entries(_CONTEXT_SAMPLE)
+    clusters = detect_conflicts(entries)
+    # The 06-05 "cache/autouse/reset" note and the 06-13 correction about the
+    # cache must cluster together, flagged as superseded (explicit marker).
+    assert any(
+        c["reason"] == "superseded" and 1 in c["entryIndices"] and 3 in c["entryIndices"]
+        for c in clusters
+    ), clusters
+
+
+def test_detect_conflicts_none_when_unrelated():
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = "# x\n- 2026-01-01: Frontend uses Vite.\n- 2026-01-02: Database is Postgres.\n"
+    assert detect_conflicts(parse_context_entries(txt)) == []
+
+
+async def test_get_agent_context_reports_new_entries(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    resp = await client.get("/api/projects/alpha/agents/backend-dev/context")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["exists"] is True
+    assert len(data["entries"]) == 4
+    # Never reviewed → all entries are new.
+    assert data["newEntryCount"] == 4
+
+
+async def test_context_conflicts_endpoint(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    resp = await client.get("/api/projects/alpha/agents/backend-dev/context/conflicts")
+    assert resp.status == 200
+    clusters = (await resp.json())["clusters"]
+    assert len(clusters) >= 1
+    assert "entries" in clusters[0]  # embedded for the UI
+
+
+async def test_reconcile_keep_removes_others(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    # Keep entry 1, drop entry 3 (the cache cluster).
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["removed"] == 1
+    # The correction line is gone; the kept note remains; unrelated entries stay.
+    text = ctx_path.read_text(encoding="utf-8")
+    assert "fresh _Cache() instance" not in text
+    assert "autouse fixture" in text
+    assert "read_json_body" in text
+
+
+async def test_reconcile_merge_replaces_cluster(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reset the cache with a fresh _Cache() in an autouse fixture."},
+    )
+    assert resp.status == 200
+    text = ctx_path.read_text(encoding="utf-8")
+    assert "Reset the cache with a fresh _Cache() in an autouse fixture." in text
+    # Two entries collapsed into one → 3 entries remain.
+    from server.routes.agents import parse_context_entries
+    assert len(parse_context_entries(text)) == 3
+
+
+async def test_reconcile_dismiss_removes_nothing(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["removed"] == 0
+    assert ctx_path.read_text(encoding="utf-8") == before  # untouched
+
+
+async def test_dismiss_persists_so_cluster_stops_flagging(client, projects_layout):
+    """Regression: 'Keep all' must remember the cluster so it doesn't re-flag.
+
+    Previously dismiss returned ok but recorded nothing, so the same conflict
+    re-appeared on every reload.
+    """
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    # Detect the cluster, then dismiss it.
+    clusters = (await (await client.get("/api/projects/alpha/agents/backend-dev/context/conflicts")).json())["clusters"]
+    assert len(clusters) >= 1
+    target = clusters[0]
+    await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": target["entryIndices"]},
+    )
+
+    # The dismissed cluster no longer appears, and the agent's conflict count drops.
+    after = (await (await client.get("/api/projects/alpha/agents/backend-dev/context/conflicts")).json())["clusters"]
+    assert all(c["entryIndices"] != target["entryIndices"] for c in after)
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["backend-dev"]["conflictClusterCount"] == len(after)
+
+
+async def test_reconcile_rejects_bad_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "nuke", "entryIndices": [0]},
+    )
+    assert resp.status == 400
+
+
+async def test_mark_reviewed_clears_new_count(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    assert (await client.post("/api/projects/alpha/agents/backend-dev/context/mark-reviewed")).status == 200
+    resp = await client.get("/api/projects/alpha/agents/backend-dev/context")
+    assert (await resp.json())["newEntryCount"] == 0
+
+
+async def test_context_traversal_rejected(client, projects_layout):
+    assert (await client.get("/api/projects/alpha/agents/..%2f..%2fx/context")).status == 400
+    assert (await client.post("/api/projects/..%2f../agents/x/context/mark-reviewed")).status == 400
+
+
+async def test_put_design_accepts_proposed_adr(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    (workspace / "alpha" / ".claude").mkdir(parents=True, exist_ok=True)
+    design_path = workspace / "alpha" / ".claude" / "DESIGN.md"
+    design_path.write_text(_DESIGN_SAMPLE, encoding="utf-8")
+
+    # Read to get etag, flip D-001 proposed → accepted, PUT back.
+    get = await (await client.get("/api/projects/alpha/design")).json()
+    new_content = get["content"].replace("2026-06-12, proposed", "2026-06-12, accepted")
+    resp = await client.put("/api/projects/alpha/design", json={"content": new_content, "etag": get["etag"]})
+    assert resp.status == 200
+    decisions = {d["id"]: d for d in (await resp.json())["decisions"]}
+    assert decisions["D-001"]["status"] == "accepted"
+
+
+async def test_put_design_etag_conflict(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    (workspace / "alpha" / ".claude").mkdir(parents=True, exist_ok=True)
+    (workspace / "alpha" / ".claude" / "DESIGN.md").write_text(_DESIGN_SAMPLE, encoding="utf-8")
+    resp = await client.put("/api/projects/alpha/design", json={"content": "x", "etag": "stale-etag-value"})
+    assert resp.status == 409
+
+
+async def test_projects_listing_surfaces_unreviewed_entries(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    projects = await _get_projects(client)
+    assert projects["alpha"]["unreviewedAgentEntries"] == 4
 
 
 async def test_projects_readme_inlined(client, projects_layout):

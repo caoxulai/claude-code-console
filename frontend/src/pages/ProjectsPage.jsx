@@ -3,10 +3,11 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiCopy, FiCheck, FiZap, FiCheckCircle, FiTrash2 } from 'react-icons/fi';
+import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiCopy, FiCheck, FiZap, FiCheckCircle, FiTrash2, FiUser, FiGlobe, FiFolder, FiCpu, FiArrowUpCircle, FiArrowDownCircle, FiAlertTriangle } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
 import SessionPickerModal from '../components/SessionPickerModal';
+import AgentContextPanel from '../components/AgentContextPanel';
 
 // Small copy-to-clipboard icon button matching the app's icon-btn style.
 // Shows a brief check-mark confirmation after a successful copy. Stops click
@@ -46,7 +47,15 @@ function CopyButton({ text, title = 'Copy' }) {
   );
 }
 
-const TABS = ['Overview', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs', 'Tasks'];
+const TABS = ['Overview', 'Design', 'Agents', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs', 'Tasks'];
+
+// Map an ADR status to a badge class. `accepted` reads as success, `proposed`
+// as needs-attention (it's awaiting Xulai's review), `superseded` as muted.
+function adrStatusBadgeClass(status) {
+  if (status === 'accepted') return 'badge-ok';
+  if (status === 'proposed') return 'badge-warn';
+  return '';
+}
 
 function parseFrontmatter(content) {
   if (!content) return { meta: null, body: content };
@@ -185,6 +194,18 @@ export default function ProjectsPage() {
   const [selectedSop, setSelectedSop] = useState(null);
   const [sopContent, setSopContent] = useState('');
 
+  // Design decisions state (loaded per-project when the Design tab opens)
+  const [design, setDesign] = useState(null);
+  const [designLoading, setDesignLoading] = useState(false);
+
+  // Agents state (loaded per-project when the Agents tab opens)
+  const [agents, setAgents] = useState([]);
+  const [agentsLoading, setAgentsLoading] = useState(false);
+  const [agentBusy, setAgentBusy] = useState(null); // slug currently moving scope
+  const [expandedAgent, setExpandedAgent] = useState(null); // slug whose detail is open
+  const [agentDetail, setAgentDetail] = useState(null); // loaded definition of expandedAgent
+  const [agentView, setAgentView] = useState('definition'); // 'definition' | 'context'
+
   // Tasks state (loaded per-project when the Tasks tab opens)
   const [projectTasks, setProjectTasks] = useState([]);
   const [tasksLoading, setTasksLoading] = useState(false);
@@ -209,6 +230,18 @@ export default function ProjectsPage() {
     if (project) loadProjectTasks(project);
   }, [activeTab, expandedId, projects]);
 
+  // Load the expanded project's design decisions when the Design tab is active.
+  useEffect(() => {
+    if (activeTab !== 'Design' || !expandedId) return;
+    loadProjectDesign(expandedId);
+  }, [activeTab, expandedId]);
+
+  // Load the expanded project's agents when the Agents tab is active.
+  useEffect(() => {
+    if (activeTab !== 'Agents' || !expandedId) return;
+    loadProjectAgents(expandedId);
+  }, [activeTab, expandedId]);
+
   const toggleCard = (projectId) => {
     if (expandedId === projectId) {
       setExpandedId(null);
@@ -222,7 +255,113 @@ export default function ProjectsPage() {
       setSelectedSop(null);
       setSopContent('');
       setProjectTasks([]);
+      setDesign(null);
+      setAgents([]);
+      setExpandedAgent(null);
+      setAgentDetail(null);
     }
+  };
+
+  // --- Design decisions actions ---
+
+  // Fetch the parsed ADR list for a project. The endpoint returns
+  // {exists, content, etag, decisions:[{id,title,date,status,body}]}.
+  const loadProjectDesign = async (projectId) => {
+    setDesignLoading(true);
+    setDesign(null);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/design`);
+      const json = await res.json();
+      setDesign(json);
+    } catch {
+      setDesign({ exists: false, decisions: [] });
+    }
+    setDesignLoading(false);
+  };
+
+  // Accept (proposed → accepted) or reject (remove) a proposed ADR. Both are
+  // text edits to DESIGN.md, PUT back etag-guarded. We rewrite just the matching
+  // `## D-NNN: ... (date, status)` header line (accept) or drop the whole entry
+  // block (reject), preserving everything else in the file.
+  const updateProposedAdr = async (projectId, adrId, mode) => {
+    if (!design?.content) return;
+    const lines = design.content.split('\n');
+    const headerIdx = lines.findIndex(l => new RegExp(`^##\\s+${adrId}:`).test(l));
+    if (headerIdx === -1) return;
+    let next;
+    if (mode === 'accept') {
+      next = [...lines];
+      next[headerIdx] = next[headerIdx].replace(/\bproposed\b/, 'accepted');
+    } else {
+      // reject: drop from this header to the line before the next "## " header.
+      let end = headerIdx + 1;
+      while (end < lines.length && !/^##\s/.test(lines[end])) end++;
+      next = [...lines.slice(0, headerIdx), ...lines.slice(end)];
+    }
+    const content = next.join('\n');
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/design`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, etag: design.etag }),
+      });
+      if (res.status === 409) { alert('DESIGN.md changed externally. Reload and retry.'); return; }
+    } catch { /* ignore */ }
+    await loadProjectDesign(projectId);
+    fetchProjects();
+  };
+
+  // --- Agents actions ---
+
+  const loadProjectAgents = async (projectId) => {
+    setAgentsLoading(true);
+    setAgents([]);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/agents`);
+      const json = await res.json();
+      setAgents(Array.isArray(json) ? json : []);
+    } catch {
+      setAgents([]);
+    }
+    setAgentsLoading(false);
+  };
+
+  // Expand/collapse an agent row in place to reveal its definition + context.
+  // The context (self-appended entries + conflict review) is reached HERE, via
+  // the agent entry itself — no jumping to a separate page.
+  const toggleAgent = async (project, slug) => {
+    if (expandedAgent === slug) { setExpandedAgent(null); return; }
+    setExpandedAgent(slug);
+    setAgentView('definition');
+    setAgentDetail(null);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(project.id)}/agents/${encodeURIComponent(slug)}`);
+      setAgentDetail(await res.json());
+    } catch {
+      setAgentDetail({ content: 'Failed to load agent.' });
+    }
+  };
+
+  // Promote a project agent to global (universal) or demote a global one into
+  // this project. The backend moves the .md file; 409 means a same-named agent
+  // already exists at the destination.
+  const moveAgentScope = async (projectId, agent, targetScope) => {
+    const verb = targetScope === 'global' ? 'make this agent universal (global)' : 'move this agent into this project';
+    if (!window.confirm(`${agent.name}: ${verb}?`)) return;
+    setAgentBusy(agent.slug);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agent.slug)}/scope`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: targetScope }),
+      });
+      if (res.status === 409) {
+        alert(`An agent named "${agent.slug}" already exists in ${targetScope} scope.`);
+      }
+    } catch { /* ignore */ }
+    setAgentBusy(null);
+    await loadProjectAgents(projectId);
+    fetchProjects();
   };
 
   // --- CLAUDE.md actions ---
@@ -506,6 +645,57 @@ export default function ProjectsPage() {
               {project.openTaskCount > 0 ? `${project.openTaskCount} open tasks` : `${project.taskCount} tasks`}
             </span>
           )}
+          {project.agentCount > 0 && (
+            <span
+              className="badge"
+              title={`${project.agentCount} role agent(s)`}
+              onClick={(e) => {
+                e.stopPropagation();
+                navigate(`/agents?project=${encodeURIComponent(project.id)}`);
+              }}
+              {...clickableBadgeProps(() => navigate(`/agents?project=${encodeURIComponent(project.id)}`))}
+              style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
+              onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
+            >
+              {project.agentCount} {project.agentCount === 1 ? 'agent' : 'agents'}
+            </span>
+          )}
+          {project.unreviewedAgentEntries > 0 && (
+            <span
+              className="badge badge-warn"
+              title={`${project.unreviewedAgentEntries} new agent context entr(ies) to review`}
+              onClick={(e) => {
+                e.stopPropagation();
+                navigate(`/agents?project=${encodeURIComponent(project.id)}`);
+              }}
+              {...clickableBadgeProps(() => navigate(`/agents?project=${encodeURIComponent(project.id)}`))}
+              style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
+              onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
+            >
+              {project.unreviewedAgentEntries} to review
+            </span>
+          )}
+          {project.hasDesignDoc && (
+            <span
+              className={`badge ${project.proposedDecisionCount > 0 ? 'badge-warn' : ''}`}
+              title={project.proposedDecisionCount > 0
+                ? `${project.proposedDecisionCount} design decision(s) awaiting review`
+                : 'Design decisions'}
+              onClick={(e) => {
+                e.stopPropagation();
+                setExpandedId(project.id);
+                setActiveTab('Design');
+              }}
+              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Design'); })}
+              style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
+              onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
+            >
+              {project.proposedDecisionCount > 0 ? `${project.proposedDecisionCount} decisions to review` : 'design'}
+            </span>
+          )}
           {project.hasSettings && (
             <span className="badge badge-ok">has settings</span>
           )}
@@ -620,6 +810,28 @@ export default function ProjectsPage() {
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.taskCount ?? 0}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
             Tasks{project.openTaskCount ? ` · ${project.openTaskCount} open` : ''}
+          </div>
+        </div>
+        <div
+          onClick={() => setActiveTab('Design')}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.hasDesignDoc ? (project.designDecisionCount ?? '✓') : '—'}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
+            Design{project.proposedDecisionCount ? ` · ${project.proposedDecisionCount} to review` : ''}
+          </div>
+        </div>
+        <div
+          onClick={() => setActiveTab('Agents')}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.agentCount ?? 0}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
+            Agents{project.unreviewedAgentEntries ? ` · ${project.unreviewedAgentEntries} to review` : ''}
           </div>
         </div>
         <div
@@ -880,6 +1092,252 @@ export default function ProjectsPage() {
     );
   };
 
+  const renderDesignTab = (project) => {
+    if (designLoading) {
+      return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading design decisions…</div>;
+    }
+
+    const decisions = design?.decisions || [];
+
+    if (decisions.length === 0) {
+      return (
+        <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
+          <h3>No design decisions</h3>
+          <p style={{ color: 'var(--muted)' }}>
+            Key architectural decisions for this project will appear here once a
+            <code style={{ margin: '0 0.3em' }}>.claude/DESIGN.md</code> exists.
+            It&apos;s an append-only ADR log — each entry records a decision, its rationale,
+            and the alternatives rejected.
+          </p>
+        </div>
+      );
+    }
+
+    const proposedCount = decisions.filter(d => d.status === 'proposed').length;
+
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em', marginBottom: 'var(--space-sm)', flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 600, fontSize: 'var(--fs-sm)', fontFamily: 'monospace', color: 'var(--muted)' }}>
+            .claude/DESIGN.md
+          </span>
+          <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>
+            {decisions.length} {decisions.length === 1 ? 'decision' : 'decisions'}
+          </span>
+          {proposedCount > 0 && (
+            <span className="badge badge-warn" title="Proposed decisions awaiting your review">
+              {proposedCount} to review
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: 'grid', gap: 'var(--space-sm)' }}>
+          {decisions.map((d, i) => (
+            <div
+              key={`${d.id}-${i}`}
+              className="card"
+              style={{
+                padding: 'var(--space-md)',
+                // Highlight proposed entries — they're the ones needing a decision.
+                borderColor: d.status === 'proposed' ? 'var(--warning, #d9a400)' : undefined,
+                opacity: d.status === 'superseded' ? 0.6 : 1,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5em', flexWrap: 'wrap', marginBottom: '0.3em' }}>
+                <span style={{ fontFamily: 'monospace', fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>{d.id}</span>
+                <span style={{ fontWeight: 700, fontSize: 'var(--fs-sm)' }}>{d.title}</span>
+                {d.status && <span className={`badge ${adrStatusBadgeClass(d.status)}`}>{d.status}</span>}
+                {d.date && <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>{d.date}</span>}
+                {d.status === 'proposed' && (
+                  <span style={{ display: 'inline-flex', gap: '0.4em', marginLeft: 'auto' }}>
+                    <button className="btn" style={{ fontSize: 'var(--fs-xs)', padding: '0.2em 0.6em' }}
+                      title="Accept this decision (proposed → accepted)"
+                      onClick={() => updateProposedAdr(project.id, d.id, 'accept')}>
+                      <FiCheckCircle size={12} /> Accept
+                    </button>
+                    <button className="btn" style={{ fontSize: 'var(--fs-xs)', padding: '0.2em 0.6em', color: 'var(--danger, #d9534f)' }}
+                      title="Reject and remove this proposed decision"
+                      onClick={() => { if (window.confirm(`Reject and remove ${d.id}?`)) updateProposedAdr(project.id, d.id, 'reject'); }}>
+                      <FiTrash2 size={12} /> Reject
+                    </button>
+                  </span>
+                )}
+              </div>
+              {d.body && (
+                <div className="markdown-body" style={{ fontSize: 'var(--fs-sm)', lineHeight: 1.55 }}>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+                    {d.body}
+                  </ReactMarkdown>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderAgentsTab = (project) => {
+    if (agentsLoading) {
+      return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading agents…</div>;
+    }
+
+    const projectAgents = agents.filter(a => a.scope === 'project');
+    const globalAgents = agents.filter(a => a.scope === 'global');
+
+    const agentRow = (a) => {
+      const isOpen = expandedAgent === a.slug;
+      return (
+      <div key={`${a.scope}-${a.slug}`} style={{ borderBottom: '1px solid var(--border)' }}>
+        {/* Clickable row header — toggles the inline definition + context */}
+        <div
+          onClick={() => toggleAgent(project, a.slug)}
+          style={{ padding: '0.7em 1em', display: 'flex', justifyContent: 'space-between', gap: '1em', alignItems: 'flex-start', cursor: 'pointer' }}
+        >
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em', flexWrap: 'wrap' }}>
+              <span style={{ color: 'var(--muted)', flexShrink: 0 }}>
+                {isOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+              </span>
+              <FiUser size={13} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+              <span style={{ fontWeight: 600, fontSize: '0.9em' }}>{a.name}</span>
+              <span className="badge" title={a.scope === 'global' ? 'Universal — available in every project' : 'Project-level'}>
+                {a.scope === 'global'
+                  ? <><FiGlobe size={9} style={{ marginRight: 3 }} />universal</>
+                  : <><FiFolder size={9} style={{ marginRight: 3 }} />project</>}
+              </span>
+              {a.model && <span className="badge" style={{ fontSize: '0.7em' }}><FiCpu size={9} style={{ marginRight: 3 }} />{a.model}</span>}
+              {a.newEntryCount > 0 && <span className="badge badge-warn">{a.newEntryCount} new</span>}
+              {a.conflictClusterCount > 0 && (
+                <span className="badge" title="Context conflicts to reconcile"><FiAlertTriangle size={9} style={{ marginRight: 3 }} />{a.conflictClusterCount}</span>
+              )}
+              {a.contextExists && a.newEntryCount === 0 && a.conflictClusterCount === 0 && (
+                <span className="badge" title="Append-only context entries">{a.contextEntryCount} {a.contextEntryCount === 1 ? 'entry' : 'entries'}</span>
+              )}
+            </div>
+            {a.description && (
+              <div style={{ fontSize: '0.78em', color: 'var(--muted)', marginTop: '0.2em', lineHeight: 1.5, marginLeft: '1.4em' }}>{a.description}</div>
+            )}
+          </div>
+          <div style={{ flexShrink: 0 }}>
+            {a.scope === 'project' ? (
+              <button
+                onClick={(e) => { e.stopPropagation(); moveAgentScope(project.id, a, 'global'); }}
+                disabled={agentBusy === a.slug}
+                title="Make this agent universal (move to ~/.claude/agents, available in every project)"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}
+              >
+                <FiArrowUpCircle size={12} /> make universal
+              </button>
+            ) : (
+              <button
+                onClick={(e) => { e.stopPropagation(); moveAgentScope(project.id, a, 'project'); }}
+                disabled={agentBusy === a.slug}
+                title="Move this universal agent into this project only"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--muted)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}
+              >
+                <FiArrowDownCircle size={12} /> move to project
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Inline detail: definition / context toggle + the shared context panel */}
+        {isOpen && (
+          <div style={{ padding: '0 1em 1em 2.4em', background: 'var(--surface2)' }}>
+            <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid var(--border)', marginBottom: 'var(--space-sm)' }}>
+              {[['definition', 'Definition'], ['context', 'Context']].map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setAgentView(key)}
+                  style={{
+                    padding: '0.35em 0.8em', fontSize: 'var(--fs-xs)',
+                    fontWeight: agentView === key ? 600 : 400,
+                    color: agentView === key ? 'var(--accent)' : 'var(--muted)',
+                    background: 'none', border: 'none',
+                    borderBottom: agentView === key ? '2px solid var(--accent)' : '2px solid transparent',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {label}
+                  {key === 'context' && a.newEntryCount > 0 ? ` (${a.newEntryCount})` : ''}
+                </button>
+              ))}
+            </div>
+            {agentView === 'definition' ? (
+              !agentDetail ? (
+                <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)' }}>Loading…</div>
+              ) : (
+                <div>
+                  {agentDetail.tools && agentDetail.tools.length > 0 && (
+                    <div style={{ display: 'flex', gap: '0.3em', flexWrap: 'wrap', marginBottom: '0.5em' }}>
+                      {agentDetail.tools.map(t => <span key={t} className="badge" style={{ fontSize: '0.65em' }}>{t}</span>)}
+                    </div>
+                  )}
+                  <div className="markdown-body" style={{ fontSize: 'var(--fs-sm)', lineHeight: 1.55 }}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+                      {(agentDetail.content || '').replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '').trim()}
+                    </ReactMarkdown>
+                  </div>
+                </div>
+              )
+            ) : (
+              <AgentContextPanel
+                projectId={project.id}
+                slug={a.slug}
+                onChanged={() => loadProjectAgents(project.id)}
+              />
+            )}
+          </div>
+        )}
+      </div>
+      );
+    };
+
+    if (agents.length === 0) {
+      return (
+        <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
+          <h3>No agents</h3>
+          <p style={{ color: 'var(--muted)' }}>
+            Role agents are native Claude Code subagents — add <code>.claude/agents/&lt;role&gt;.md</code>
+            files to this project, or define universal ones in <code>~/.claude/agents/</code> to use
+            them everywhere.
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div style={{ fontSize: 'var(--fs-sm)' }}>
+        <div style={{ marginBottom: 'var(--space-sm)', color: 'var(--muted)', fontSize: 'var(--fs-xs)' }}>
+          Project agents live in this repo&apos;s <code>.claude/agents/</code>. Universal agents
+          live in <code>~/.claude/agents/</code> and appear in every project. Promote a project
+          agent to universal, or pull a universal one into this project.
+        </div>
+        {projectAgents.length > 0 && (
+          <>
+            <div style={{ fontWeight: 600, fontSize: 'var(--fs-xs)', textTransform: 'uppercase', color: 'var(--muted)', margin: '0.5em 0 0.3em' }}>
+              <FiFolder size={11} style={{ marginRight: 4 }} />Project
+            </div>
+            <div className="card" style={{ padding: 0, overflow: 'hidden', marginBottom: 'var(--space-md)' }}>
+              {projectAgents.map(agentRow)}
+            </div>
+          </>
+        )}
+        {globalAgents.length > 0 && (
+          <>
+            <div style={{ fontWeight: 600, fontSize: 'var(--fs-xs)', textTransform: 'uppercase', color: 'var(--muted)', margin: '0.5em 0 0.3em' }}>
+              <FiGlobe size={11} style={{ marginRight: 4 }} />Universal
+            </div>
+            <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+              {globalAgents.map(agentRow)}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
+
   const renderTasksTab = (project) => {
     if (tasksLoading) {
       return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading tasks…</div>;
@@ -954,6 +1412,8 @@ export default function ProjectsPage() {
       }}>
         {renderTabBar()}
         {activeTab === 'Overview' && renderOverviewTab(project)}
+        {activeTab === 'Design' && renderDesignTab(project)}
+        {activeTab === 'Agents' && renderAgentsTab(project)}
         {activeTab === 'README' && renderReadmeTab(project)}
         {activeTab === 'CLAUDE.md' && renderClaudeMdTab(project)}
         {activeTab === 'Memory' && renderMemoryTab(project)}

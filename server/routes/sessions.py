@@ -524,6 +524,19 @@ async def list_projects(request: web.Request) -> web.Response:
         # j. task counts (open/total) for this project, by name.
         tc = task_counts.get(project_name, {"total": 0, "open": 0})
 
+        # k. design-decisions summary (.claude/DESIGN.md) + role-agent count.
+        #    Lazy import + guard so a parse error here can never break the
+        #    projects listing.
+        try:
+            from server.routes.agents import design_summary, agent_count, unreviewed_entry_total
+            design = design_summary(d)
+            agents_n = agent_count(d)
+            unreviewed_entries = unreviewed_entry_total(d)
+        except Exception:
+            design = {"hasDesignDoc": False, "proposedDecisionCount": 0, "designDecisionCount": 0}
+            agents_n = 0
+            unreviewed_entries = 0
+
         projects.append({
             "id": project_name,
             "name": project_name,
@@ -546,6 +559,11 @@ async def list_projects(request: web.Request) -> web.Response:
             "codeUrl": code_urls[0]["url"] if code_urls else None,
             "sopFiles": sop_files,
             "memoryFiles": memory_files,
+            "hasDesignDoc": design["hasDesignDoc"],
+            "proposedDecisionCount": design["proposedDecisionCount"],
+            "designDecisionCount": design.get("designDecisionCount", 0),
+            "agentCount": agents_n,
+            "unreviewedAgentEntries": unreviewed_entries,
         })
 
     # Sort by lastActivity (most recent first), nulls at the end.

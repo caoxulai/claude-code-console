@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom';
 import {
   FiHome, FiMessageSquare, FiSettings, FiBookOpen, FiZap,
-  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2
+  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers
 } from 'react-icons/fi';
 
 const NAV_ITEMS = [
@@ -16,6 +16,7 @@ const NAV_ITEMS = [
     { to: '/tasks', icon: FiCheckSquare, label: 'Tasks' },
   ]},
   { group: 'Extend', items: [
+    { to: '/agents', icon: FiUsers, label: 'Agents' },
     { to: '/skills', icon: FiZap, label: 'Skills' },
     { to: '/mcp', icon: FiServer, label: 'MCP Servers' },
     { to: '/plugins', icon: FiPackage, label: 'Plugins' },
