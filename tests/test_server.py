@@ -29,6 +29,10 @@ def app(tmp_path: Path, monkeypatch) -> web.Application:
     # Also patch the runtime copy stored in app state
     application["allowed_cwd_roots"] = [tmp_path, Path("/etc/__never__")]
     application["default_cwd"] = tmp_path
+    # Pin a deterministic permission mode so the chat/restart threading tests can
+    # assert the spawn sites forward exactly this value (create_app resolves it
+    # from config/env, which would otherwise vary by environment).
+    application["permission_mode"] = "bypassPermissions"
     return application
 
 
@@ -82,6 +86,34 @@ async def test_chat_streams_sse(client, tmp_path):
     assert "data: [DONE]" in body
     assert '"type":"system"' in body or '"type": "system"' in body
     assert '"type":"assistant"' in body or '"type": "assistant"' in body
+
+
+async def test_chat_threads_app_permission_mode_into_get_or_create(client, tmp_path):
+    """The chat route must spawn the session with the app's resolved permission
+    mode, not a hardcoded value. Regression guard: a session created via the web
+    UI keeps write ability (bypassPermissions) rather than silently dropping to
+    'default'.
+    """
+    async def fake_send(prompt):
+        yield {"type": "system", "session_id": "abc"}
+        yield {"type": "result", "is_error": False, "result": "ok"}
+
+    fake_session = AsyncMock()
+    fake_session.session_id = "abc"
+    fake_session.send = fake_send
+
+    fake_manager = AsyncMock()
+    fake_manager.get_or_create = AsyncMock(return_value=fake_session)
+    fake_manager.register = lambda s: None
+
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.post("/api/chat", json={"prompt": "hi", "cwd": str(tmp_path)})
+    assert resp.status == 200
+    await resp.text()  # drain the stream so the handler runs to completion
+    # The app fixture pins permission_mode to 'bypassPermissions'; the spawn site
+    # must forward exactly that.
+    _, kwargs = fake_manager.get_or_create.await_args
+    assert kwargs["permission_mode"] == "bypassPermissions"
 
 
 # --------------------------------------------------------------------------- #
@@ -1500,11 +1532,37 @@ async def test_restart_endpoint_respawns(client, tmp_path):
     assert resp.status == 200
     assert (await resp.json())["restarted"] == "sess-1"
     fake_manager.respawn.assert_awaited_once()
+    # Regression guard: a credential-recovered (respawned) session must keep the
+    # app's permission mode, not silently fall back to 'default'. Otherwise the
+    # process that comes back after re-auth would lose write ability.
+    _, kwargs = fake_manager.respawn.await_args
+    assert kwargs["permission_mode"] == "bypassPermissions"
 
 
 async def test_restart_endpoint_requires_session_id(client):
     resp = await client.post("/api/chat/restart", json={})
     assert resp.status == 400
+
+
+async def test_start_builds_permission_mode_arg(monkeypatch):
+    """PersistentSession.start must pass its permission_mode straight through to
+    the claude CLI as `--permission-mode <mode>`. We capture the exec argv via a
+    stubbed create_subprocess_exec (reusing _FakeProc) rather than execing claude.
+    """
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc([])
+
+    monkeypatch.setattr(session_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    s = session_mod.PersistentSession(permission_mode="bypassPermissions")
+    await s.start()
+
+    argv = list(captured["args"])
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
 
 
 # --------------------------------------------------------------------------- #
@@ -2249,6 +2307,92 @@ def test_cmd_start_loopback_does_not_require_flag(monkeypatch):
     args = SimpleNamespace(host="127.0.0.1", port=7780, no_browser=True, allow_remote=False)
     cli_mod.cmd_start(args)
     assert started.get("host") == "127.0.0.1"
+
+
+# --------------------------------------------------------------------------- #
+# Permission-mode resolution (resolve_permission_mode)
+#
+# The web UI runs claude unattended, so it spawns with a permission mode rather
+# than prompting. The mode is resolved from (in precedence order):
+#   1. CLAUDE_WEB_PERMISSION_MODE env override
+#   2. 'permissionMode' in ~/.claude-web/config.json (CLAUDE_WEB_CONFIG points
+#      at it; honored at call time so tests can swap configs)
+#   3. the safe default, 'bypassPermissions'
+# Any value not in the CLI's accepted token set falls back to the default
+# (we must never hand the claude CLI an invalid --permission-mode token).
+# --------------------------------------------------------------------------- #
+
+# The valid --permission-mode tokens accepted by the installed claude CLI.
+_VALID_PERMISSION_MODES = (
+    "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan",
+)
+
+
+def _write_config(tmp_path, monkeypatch, payload):
+    """Write a config.json and point cli at it.
+
+    cli.CONFIG_PATH is captured from CLAUDE_WEB_CONFIG at import time, so setting
+    the env var alone wouldn't be seen by the already-imported module. We set
+    both: the env var (documents the supported override) and the module attr that
+    load_config actually reads.
+    """
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(config_path))
+    monkeypatch.setattr(cli_mod, "CONFIG_PATH", config_path)
+
+
+def test_resolve_permission_mode_env_override_wins(monkeypatch, tmp_path):
+    """The env override beats config.json."""
+    _write_config(tmp_path, monkeypatch, {"permissionMode": "plan"})
+    monkeypatch.setenv("CLAUDE_WEB_PERMISSION_MODE", "acceptEdits")
+    assert cli_mod.resolve_permission_mode() == "acceptEdits"
+
+
+def test_resolve_permission_mode_uses_config_when_no_env(monkeypatch, tmp_path):
+    """With no env override, the config.json 'permissionMode' is used."""
+    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    _write_config(tmp_path, monkeypatch, {"permissionMode": "plan"})
+    assert cli_mod.resolve_permission_mode() == "plan"
+
+
+def test_resolve_permission_mode_missing_config_falls_back(monkeypatch, tmp_path):
+    """No env and no config file -> safe default 'bypassPermissions'."""
+    missing = tmp_path / "does-not-exist.json"
+    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(missing))
+    monkeypatch.setattr(cli_mod, "CONFIG_PATH", missing)
+    assert cli_mod.resolve_permission_mode() == "bypassPermissions"
+
+
+def test_resolve_permission_mode_missing_key_falls_back(monkeypatch, tmp_path):
+    """A config that exists but has no 'permissionMode' key -> default."""
+    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    _write_config(tmp_path, monkeypatch, {"projectUrls": {}})
+    assert cli_mod.resolve_permission_mode() == "bypassPermissions"
+
+
+def test_resolve_permission_mode_invalid_config_value_falls_back(monkeypatch, tmp_path):
+    """A garbage configured value must fall back to the default, NOT raise and
+    NOT be passed through to the CLI (an invalid token would break the spawn)."""
+    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    _write_config(tmp_path, monkeypatch, {"permissionMode": "yolo-mode"})
+    assert cli_mod.resolve_permission_mode() == "bypassPermissions"
+
+
+def test_resolve_permission_mode_invalid_env_value_falls_back(monkeypatch, tmp_path):
+    """A garbage env override also falls back rather than reaching the CLI."""
+    _write_config(tmp_path, monkeypatch, {"permissionMode": "plan"})
+    monkeypatch.setenv("CLAUDE_WEB_PERMISSION_MODE", "definitely-not-valid")
+    assert cli_mod.resolve_permission_mode() == "bypassPermissions"
+
+
+@pytest.mark.parametrize("mode", _VALID_PERMISSION_MODES)
+def test_resolve_permission_mode_accepts_each_valid_value(monkeypatch, tmp_path, mode):
+    """Each of the 6 CLI-accepted tokens is passed through unchanged."""
+    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    _write_config(tmp_path, monkeypatch, {"permissionMode": mode})
+    assert cli_mod.resolve_permission_mode() == mode
 
 
 # --------------------------------------------------------------------------- #

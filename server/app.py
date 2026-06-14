@@ -6,6 +6,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.cli import resolve_permission_mode
 from server.ws import WebSocketManager
 from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, tasks, plugins, usage, agents
 
@@ -39,6 +40,9 @@ def create_app() -> web.Application:
         os.environ.get("CLAUDE_WEB_CWD", str(Path.home()))
     ).expanduser().resolve()
     app["allowed_cwd_roots"] = ALLOWED_CWD_ROOTS
+    # Resolve the permission mode once at startup so chat.py can read it
+    # per-request without re-parsing config (env > config.json > bypassPermissions).
+    app["permission_mode"] = resolve_permission_mode()
 
     # WebSocket
     app.router.add_get("/ws", app["ws_manager"].handle)

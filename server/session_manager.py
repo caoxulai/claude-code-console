@@ -232,7 +232,7 @@ class SessionManager:
             del self._sessions[session_id]
 
     async def respawn(self, session_id: str, cwd: str | None = None,
-                      permission_mode: str = "default") -> PersistentSession:
+                      permission_mode: str | None = None) -> PersistentSession:
         """Tear down a session's stale subprocess and start a fresh one.
 
         Used to recover from credential expiry: the long-lived `claude` process
@@ -241,11 +241,15 @@ class SessionManager:
         to the one session — other sessions and their SSE streams are untouched.
 
         Reuses the existing session's cwd (so --resume lands in the right dir)
-        unless an explicit cwd is given. The fresh process resumes the same
-        session_id, preserving conversation history.
+        unless an explicit cwd is given. Likewise, the existing session's
+        permission_mode is preserved unless the caller passes one, so a
+        credential-recovered session keeps its write ability instead of
+        silently reverting to the interactive "default" mode. The fresh process
+        resumes the same session_id, preserving conversation history.
         """
         existing = self._sessions.get(session_id)
         resume_cwd = cwd or (existing.cwd if existing else None)
+        resume_mode = permission_mode or (existing.permission_mode if existing else "default")
         if existing:
             await existing.stop()
             del self._sessions[session_id]
@@ -253,7 +257,7 @@ class SessionManager:
         session = PersistentSession(
             session_id=session_id,
             cwd=resume_cwd,
-            permission_mode=permission_mode,
+            permission_mode=resume_mode,
         )
         await session.start()
         self._sessions[session_id] = session

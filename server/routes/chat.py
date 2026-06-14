@@ -3,16 +3,45 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from aiohttp import web
 
+from server.cli import load_config
 from server.routes import read_json_body
 
 from server.session_manager import SessionManager
 
 
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
+
+# Valid --permission-mode tokens accepted by the installed claude CLI. Anything
+# outside this set must NOT be passed through (the CLI rejects it), so we fall
+# back to a safe default instead.
+_VALID_PERMISSION_MODES = frozenset(
+    {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
+)
+# Web sessions run unattended (no terminal to approve prompts), so default to
+# bypassPermissions rather than the CLI's interactive "default".
+_DEFAULT_PERMISSION_MODE = "bypassPermissions"
+
+
+def _resolve_permission_mode(app: web.Application) -> str:
+    """Resolve the configured permission mode, validated against the CLI tokens.
+
+    Prefers a value already resolved onto the app (populated at startup);
+    otherwise reads CLAUDE_WEB_PERMISSION_MODE / config.json's permissionMode.
+    Invalid or missing values fall back to bypassPermissions so we never hand
+    the CLI a token it would reject. Kept overridable via app state and env so
+    tests can pin a mode without touching the process environment.
+    """
+    mode = app.get("permission_mode")
+    if mode is None:
+        mode = os.environ.get("CLAUDE_WEB_PERMISSION_MODE") or load_config().get("permissionMode")
+    if mode in _VALID_PERMISSION_MODES:
+        return mode
+    return _DEFAULT_PERMISSION_MODE
 
 
 def register(app: web.Application):
@@ -68,7 +97,7 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
     session = await manager.get_or_create(
         session_id=resume,
         cwd=cwd,
-        permission_mode="default",
+        permission_mode=_resolve_permission_mode(request.app),
         name=session_name,
     )
 
@@ -140,7 +169,13 @@ async def restart_session_handler(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="session_id required")
     cwd = _resolve_cwd(body.get("cwd"), request.app)
     manager: SessionManager = request.app["session_manager"]
-    await manager.respawn(session_id, cwd=cwd)
+    # Use the same resolved mode as the initial spawn so a credential-recovered
+    # session keeps its write ability instead of reverting to "default".
+    await manager.respawn(
+        session_id,
+        cwd=cwd,
+        permission_mode=_resolve_permission_mode(request.app),
+    )
     return web.json_response({"restarted": session_id})
 
 

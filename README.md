@@ -217,6 +217,31 @@ Optional config at `~/.claude-web/config.json` (or set `CLAUDE_WEB_CONFIG` to po
 
 `projectUrls` keys are matched as substrings against project names; matched projects show clickable URL pills on the Dashboard and Projects pages.
 
+### Permission mode (no per-edit approval prompt)
+
+The web console has no interactive approval channel, so console-driven sessions
+run without the per-edit confirmation prompt you'd see in the CLI — Claude
+executes tool calls, including file edits and writes, without asking. The mode
+is configurable via the `permissionMode` config key or the
+`CLAUDE_WEB_PERMISSION_MODE` environment variable (the env var takes
+precedence):
+
+```json
+{
+  "permissionMode": "bypassPermissions"
+}
+```
+
+Allowed values are `acceptEdits`, `auto`, `bypassPermissions`, `default`,
+`dontAsk`, and `plan`. The default is **`bypassPermissions`**; a missing or
+unrecognized value falls back to `bypassPermissions` rather than being passed
+through to the CLI.
+
+> **Safety caveat:** with the default `bypassPermissions`, the console makes
+> changes to your filesystem (and runs commands) without prompting. Only run
+> goals you trust, and prefer a more restrictive mode (e.g. `plan` or
+> `acceptEdits`) if you want a tighter blast radius.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -225,6 +250,7 @@ Optional config at `~/.claude-web/config.json` (or set `CLAUDE_WEB_CONFIG` to po
 | `CLAUDE_WEB_WORKSPACE` | `~/workspace/projects` | Where to look for projects (symlink-resolved) |
 | `CLAUDE_WEB_CONFIG` | `~/.claude-web/config.json` | Config file location |
 | `CLAUDE_WEB_CWD` | `$HOME` | Default working directory for chat |
+| `CLAUDE_WEB_PERMISSION_MODE` | `bypassPermissions` | Tool-call approval mode for console runs (see [Permission mode](#permission-mode-no-per-edit-approval-prompt)) |
 
 ---
 

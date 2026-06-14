@@ -21,6 +21,36 @@ def load_config() -> dict:
     return {}
 
 
+# Valid --permission-mode tokens accepted by the installed claude CLI. Passing
+# anything outside this set makes the subprocess fail to spawn, so we validate
+# resolved values against it and fall back to a safe default rather than crash.
+ALLOWED_PERMISSION_MODES = {
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "default",
+    "dontAsk",
+    "plan",
+}
+
+DEFAULT_PERMISSION_MODE = "bypassPermissions"
+
+
+def resolve_permission_mode() -> str:
+    """Resolve the console's permission mode from env then config.
+
+    Read order: CLAUDE_WEB_PERMISSION_MODE env var first, then the
+    'permissionMode' key in config.json (~/.claude-web/config.json). A missing
+    or invalid value falls back to 'bypassPermissions' — a bad config string
+    must never crash the server, so this never raises. Pure/importable so it
+    can be unit-tested directly.
+    """
+    mode = os.environ.get("CLAUDE_WEB_PERMISSION_MODE") or load_config().get("permissionMode")
+    if mode in ALLOWED_PERMISSION_MODES:
+        return mode
+    return DEFAULT_PERMISSION_MODE
+
+
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"}
 
 

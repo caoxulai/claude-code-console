@@ -277,6 +277,14 @@ export default function ChatPage() {
           </button>
         )}
       </form>
+      {/* The console has no interactive approval channel, so runs execute tool
+          calls (including file edits) without per-edit confirmation. */}
+      <div
+        style={{ fontSize: '0.72em', color: 'var(--muted)', paddingTop: '0.5em', textAlign: 'center' }}
+        title="Mode is configurable via ~/.claude-web/config.json 'permissionMode' or CLAUDE_WEB_PERMISSION_MODE (default: bypassPermissions)."
+      >
+        Console runs execute tool calls, including file edits, without per-edit confirmation.
+      </div>
     </div>
   );
 }
