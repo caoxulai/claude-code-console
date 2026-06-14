@@ -128,6 +128,11 @@ function decodeCron(expr) {
 
 // Compute the next Date (from now) that matches the expression, scanning forward
 // minute-by-minute up to ~366 days. Returns null if it can't parse or find one.
+//
+// Cron fields are matched against UTC components, because the harness scheduler
+// runs on the server (a UTC host) and fires on the server's wall clock — NOT the
+// viewer's local time. The returned Date is a real instant, so toLocaleString()
+// at the call site converts it to the viewer's timezone (e.g. Seattle) for display.
 function nextFire(expr) {
   const c = parseCron(expr);
   if (!c) return null;
@@ -140,13 +145,13 @@ function nextFire(expr) {
   const everyDow = c.raw.dow === '*';
 
   const d = new Date();
-  d.setSeconds(0, 0);
-  d.setMinutes(d.getMinutes() + 1); // strictly after now
+  d.setUTCSeconds(0, 0);
+  d.setUTCMinutes(d.getUTCMinutes() + 1); // strictly after now
   const limit = 366 * 24 * 60; // minutes to scan before giving up
   for (let i = 0; i < limit; i++) {
-    const month = d.getMonth() + 1;
-    const dom = d.getDate();
-    const dow = d.getDay();
+    const month = d.getUTCMonth() + 1;
+    const dom = d.getUTCDate();
+    const dow = d.getUTCDay();
     // Standard cron: when both DOM and DOW are restricted, either may match.
     let dayOk;
     if (everyDom && everyDow) dayOk = true;
@@ -154,10 +159,10 @@ function nextFire(expr) {
     else if (everyDow) dayOk = domSet.has(dom);
     else dayOk = domSet.has(dom) || dowSet.has(dow);
 
-    if (monthSet.has(month) && dayOk && hourSet.has(d.getHours()) && minuteSet.has(d.getMinutes())) {
+    if (monthSet.has(month) && dayOk && hourSet.has(d.getUTCHours()) && minuteSet.has(d.getUTCMinutes())) {
       return new Date(d);
     }
-    d.setMinutes(d.getMinutes() + 1);
+    d.setUTCMinutes(d.getUTCMinutes() + 1);
   }
   return null;
 }
@@ -366,12 +371,12 @@ export default function CronsPage() {
           <div style={{ fontSize: '0.85em', lineHeight: 1.6 }}>
             <div>
               <span style={{ fontFamily: 'monospace', color: 'var(--accent)' }}>{job.cron}</span>
-              {decoded && <span style={{ color: 'var(--muted)' }}> — {decoded}</span>}
+              {decoded && <span style={{ color: 'var(--muted)' }}> — {decoded} (UTC)</span>}
               {!decoded && <span style={{ color: 'var(--muted)' }}> — (could not decode this expression)</span>}
             </div>
             <div style={{ color: 'var(--muted)', marginTop: '0.2em' }}>
               Next fire (estimated): {next
-                ? <>{next.toLocaleString()} <span>({untilLabel(next)})</span></>
+                ? <>{next.toLocaleString(undefined, { timeZoneName: 'short' })} <span>({untilLabel(next)})</span></>
                 : 'unknown'}
             </div>
           </div>
