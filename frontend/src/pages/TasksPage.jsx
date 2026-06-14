@@ -208,6 +208,11 @@ export default function TasksPage() {
       {showNew && (
         <div className="card" style={{ marginBottom: 'var(--space-md)' }}>
           <div className="card-title">New Task</div>
+          <p style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginTop: 0, marginBottom: 'var(--space-md)', lineHeight: 1.5 }}>
+            Console tasks live in claude-web and appear here in the Tasks tab — they won&apos;t
+            show up in the Claude Code CLI&apos;s <code>tasks</code> list (the CLI keeps its own
+            per-session store).
+          </p>
           <div className="form-group">
             <label className="form-label">Subject</label>
             <input

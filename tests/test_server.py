@@ -2223,6 +2223,9 @@ def _write_json(path: Path, data: dict) -> None:
 async def test_tasks_empty_when_no_dir(client, tmp_path, monkeypatch):
     monkeypatch.setattr(tasks_mod, "TASKS_DIR", tmp_path / "nonexistent")
     monkeypatch.setattr(tasks_mod, "CLAUDE_PROJECTS_BASE", tmp_path / "noprojects")
+    # Isolate console-created user tasks too, otherwise the test leaks the
+    # developer's real ~/.claude-web/tasks.json and sees stray tasks.
+    monkeypatch.setattr(tasks_mod, "USER_TASKS_PATH", tmp_path / "notasks.json")
     monkeypatch.setattr(tasks_mod, "_map_cache", {})
     monkeypatch.setattr(tasks_mod, "_map_updated_at", 0.0)
     resp = await client.get("/api/tasks")
