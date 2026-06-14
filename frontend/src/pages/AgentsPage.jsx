@@ -6,6 +6,14 @@ import rehypeHighlight from 'rehype-highlight';
 import { FiUser, FiCpu, FiTool, FiBookOpen, FiAlertTriangle, FiGlobe, FiFolder } from 'react-icons/fi';
 import AgentContextPanel from '../components/AgentContextPanel';
 
+// Static scope filter options — fixed set, not derived from agent data, so the
+// control is stable regardless of which agents a project happens to expose.
+const SCOPE_OPTIONS = [
+  ['all', 'All'],
+  ['universal', 'Universal'],
+  ['project', 'Project'],
+];
+
 // Strip YAML frontmatter from an agent .md for cleaner body rendering — the
 // parsed fields (name/description/model/tools) are shown as chips above.
 function stripFrontmatter(content) {
@@ -20,6 +28,7 @@ export default function AgentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState(searchParams.get('project') || '');
+  const [scope, setScope] = useState(searchParams.get('scope') || 'all'); // 'all' | 'universal' | 'project'
   const [agents, setAgents] = useState([]);
   const [loadingAgents, setLoadingAgents] = useState(false);
   const [selected, setSelected] = useState(null); // role slug (filename stem)
@@ -41,13 +50,21 @@ export default function AgentsPage() {
       .catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keep the URL in sync with both project and scope so either can be deep-linked
+  // and neither clobbers the other when one changes.
+  useEffect(() => {
+    const next = {};
+    if (projectId) next.project = projectId;
+    if (scope && scope !== 'all') next.scope = scope;
+    setSearchParams(next, { replace: true });
+  }, [projectId, scope, setSearchParams]);
+
   // Load agents whenever the selected project changes.
   useEffect(() => {
     if (!projectId) return;
     setLoadingAgents(true);
     setSelected(null);
     setDetail(null);
-    setSearchParams(projectId ? { project: projectId } : {}, { replace: true });
     fetch(`/api/projects/${encodeURIComponent(projectId)}/agents`)
       .then(r => (r.ok ? r.json() : []))
       .then(list => setAgents(Array.isArray(list) ? list : []))
@@ -69,6 +86,16 @@ export default function AgentsPage() {
     }
   };
 
+  // Client-side scope filter over the loaded agents state:
+  //   all       → everything
+  //   universal → global-scope agents (available in every project)
+  //   project   → project-scoped agents
+  const visibleAgents = agents.filter(a => {
+    if (scope === 'universal') return a.scope === 'global';
+    if (scope === 'project') return a.scope === 'project';
+    return true;
+  });
+
   const refreshAgents = () => {
     if (!projectId) return;
     fetch(`/api/projects/${encodeURIComponent(projectId)}/agents`)
@@ -81,6 +108,31 @@ export default function AgentsPage() {
     <div>
       <div className="page-header">
         <h2>Agents</h2>
+        <div
+          role="radiogroup"
+          aria-label="Scope filter"
+          style={{ display: 'inline-flex', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}
+        >
+          {SCOPE_OPTIONS.map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="radio"
+              aria-checked={scope === value}
+              aria-label={label}
+              onClick={() => setScope(value)}
+              style={{
+                padding: '0.35em 0.85em', fontSize: 'var(--fs-sm)', cursor: 'pointer',
+                fontWeight: scope === value ? 600 : 400,
+                color: scope === value ? 'var(--accent)' : 'var(--muted)',
+                background: scope === value ? 'var(--user-bg)' : 'transparent',
+                border: 'none', borderRight: '1px solid var(--border)',
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <select
           className="form-input"
           value={projectId}
@@ -109,8 +161,15 @@ export default function AgentsPage() {
                 files (native Claude Code subagents) to give it a team.
               </p>
             </div>
+          ) : visibleAgents.length === 0 ? (
+            <div className="empty-state">
+              <h3>No {scope === 'universal' ? 'universal' : 'project'} agents</h3>
+              <p style={{ color: 'var(--muted)' }}>
+                No agents match the <strong>{scope}</strong> scope. Switch the filter to <strong>All</strong> to see every agent.
+              </p>
+            </div>
           ) : (
-            agents.map(a => {
+            visibleAgents.map(a => {
               const slug = a.slug || a.name;
               return (
               <div
