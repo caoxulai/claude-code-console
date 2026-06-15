@@ -22,19 +22,25 @@ async def list_plugins(request: web.Request) -> web.Response:
         try:
             data = json.loads(PLUGINS_PATH.read_text())
             plugins = data.get("plugins", {})
-            for name, entries in plugins.items():
-                for entry in entries:
-                    installed.append({
-                        "name": name,
-                        "scope": entry.get("scope", ""),
-                        "version": entry.get("version", ""),
-                        "installPath": entry.get("installPath", ""),
-                        "installedAt": entry.get("installedAt"),
-                    })
-        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
-            # Tolerate a malformed installed_plugins.json (non-dict/non-list
-            # shapes) rather than 500 the endpoint.
-            pass
+        except (OSError, json.JSONDecodeError, AttributeError):
+            # Tolerate a malformed installed_plugins.json (unreadable or a
+            # non-dict top level) rather than 500 the endpoint.
+            plugins = {}
+        for name, entries in (plugins.items() if isinstance(plugins, dict) else []):
+            # Skip a single malformed entry (non-list value, non-dict entry)
+            # instead of truncating every plugin listed after it.
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                installed.append({
+                    "name": name,
+                    "scope": entry.get("scope", ""),
+                    "version": entry.get("version", ""),
+                    "installPath": entry.get("installPath", ""),
+                    "installedAt": entry.get("installedAt"),
+                })
 
     # Enabled state from settings.json
     enabled_map = {}

@@ -149,7 +149,7 @@ def _scan_all_files() -> list[_Record]:
 
     for f in CLAUDE_PROJECTS_BASE.rglob("*.jsonl"):
         try:
-            fh = open(f)
+            fh = open(f, encoding="utf-8", errors="replace")
         except OSError:
             continue
         with fh:
