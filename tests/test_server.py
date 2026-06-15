@@ -569,6 +569,15 @@ async def test_project_id_path_traversal_rejected(client, projects_layout):
     assert (await client.get("/api/projects/..%2f../memory/x.md")).status == 400
 
 
+async def test_sop_memory_filename_traversal_rejected(client, projects_layout):
+    """The sop/memory routes also guard the FILENAME segment independently of
+    project_id. With a VALID project, a traversal filename must still 400 — the
+    project_id test above can't prove this since it escapes on project_id."""
+    # alpha is a real seeded project, so this isolates the filename guard.
+    assert (await client.get("/api/projects/alpha/sop/..%2f..%2fevil.md")).status == 400
+    assert (await client.get("/api/projects/alpha/memory/..%2f..%2fevil.md")).status == 400
+
+
 # ── Design decisions (.claude/DESIGN.md) — Phase 1 of the Role Agents framework ──
 
 _DESIGN_SAMPLE = """# alpha — design decisions
@@ -1566,6 +1575,119 @@ async def test_start_builds_permission_mode_arg(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# SessionManager manager-level concurrency (B2 + F5/F6/F7)
+#
+# Lifecycle ops on the SAME session_id must serialize via a per-id lock so two
+# near-simultaneous requests can't double-spawn a subprocess and orphan one
+# outside _sessions. Different ids must stay parallel. stop_all must tolerate
+# one session's stop() raising. These use the existing _FakeProc fakes so no
+# real `claude` binary is spawned.
+# --------------------------------------------------------------------------- #
+
+
+async def test_get_or_create_serializes_same_id_no_double_spawn(monkeypatch):
+    """Two concurrent get_or_create for the SAME id must not both spawn.
+
+    The per-id lock serializes them: the first stores a live session, the second
+    sees it alive and returns it — exactly one start() runs.
+    """
+    mgr = session_mod.SessionManager()
+
+    starts = {"n": 0}
+
+    async def fake_start(self):
+        # Yield so a second concurrent call can interleave if unserialized.
+        await asyncio.sleep(0.01)
+        self._proc = _FakeProc([])
+        self._started = True
+        starts["n"] += 1
+
+    monkeypatch.setattr(session_mod.PersistentSession, "start", fake_start)
+
+    a, b = await asyncio.gather(
+        mgr.get_or_create(session_id="sess-dup"),
+        mgr.get_or_create(session_id="sess-dup"),
+    )
+    # Exactly one subprocess started, both callers see the same session, and it
+    # is the one stored (reachable by stop_all()).
+    assert starts["n"] == 1
+    assert a is b
+    assert mgr._sessions["sess-dup"] is a
+
+
+async def test_get_or_create_different_ids_run_in_parallel(monkeypatch):
+    """Different session_ids must NOT serialize against each other — both spawn,
+    and both are stored. Guards against a regression to a single global lock.
+    """
+    mgr = session_mod.SessionManager()
+
+    async def fake_start(self):
+        self._proc = _FakeProc([])
+        self._started = True
+
+    monkeypatch.setattr(session_mod.PersistentSession, "start", fake_start)
+
+    a, b = await asyncio.gather(
+        mgr.get_or_create(session_id="sess-a"),
+        mgr.get_or_create(session_id="sess-b"),
+    )
+    assert a is not b
+    assert mgr._sessions["sess-a"] is a
+    assert mgr._sessions["sess-b"] is b
+
+
+async def test_get_or_create_start_failure_cleans_up(monkeypatch):
+    """If start() raises after spawning, the half-started session is stopped (F5)
+    and nothing is left registered.
+    """
+    mgr = session_mod.SessionManager()
+    stopped = {"v": False}
+
+    async def boom_start(self):
+        self._proc = _FakeProc([])  # subprocess spawned...
+        raise RuntimeError("spawn-time failure")  # ...then start blows up
+
+    async def fake_stop(self):
+        stopped["v"] = True
+
+    monkeypatch.setattr(session_mod.PersistentSession, "start", boom_start)
+    monkeypatch.setattr(session_mod.PersistentSession, "stop", fake_stop)
+
+    with pytest.raises(RuntimeError):
+        await mgr.get_or_create(session_id="sess-fail")
+    # The half-started session was stopped and never registered.
+    assert stopped["v"] is True
+    assert "sess-fail" not in mgr._sessions
+
+
+async def test_stop_all_continues_when_one_stop_raises():
+    """stop_all gathers with return_exceptions, so one raising stop() doesn't
+    prevent the others from being stopped (F6).
+    """
+    mgr = session_mod.SessionManager()
+    calls = []
+
+    def make_session(sid, raises=False):
+        s = session_mod.PersistentSession(session_id=sid)
+
+        async def stop():
+            calls.append(sid)
+            if raises:
+                raise RuntimeError(f"{sid} stop failed")
+
+        s.stop = stop
+        return s
+
+    mgr._sessions["bad"] = make_session("bad", raises=True)
+    mgr._sessions["good"] = make_session("good")
+
+    await mgr.stop_all()  # must not raise
+    # Both stops were attempted despite one raising, and the registry is cleared.
+    assert set(calls) == {"bad", "good"}
+    assert mgr._sessions == {}
+
+
+# --------------------------------------------------------------------------- #
 # Memory routes (/api/memory/files)
 #
 # The memory route reads/writes ~/.claude/projects/<home-slug>/memory. The
@@ -1649,6 +1771,18 @@ async def test_memory_put_succeeds_with_current_etag(client, memory_dir):
     )
     assert resp.status == 200
     assert (memory_dir / "feedback_principle_x.md").read_text() == "fresh edit"
+
+
+async def test_memory_list_skips_unreadable_file(client, memory_dir):
+    """A non-UTF-8 memory file must be skipped, not 500 the whole listing
+    (mirrors test_list_agents_skips_unreadable_file)."""
+    (memory_dir / "bad.md").write_bytes(b"\xff\xfe\x00bad")
+
+    resp = await client.get("/api/memory/files")
+    assert resp.status == 200
+    names = {f["name"] for f in await resp.json()}
+    # The readable seed files survive the unreadable sibling.
+    assert "feedback_principle_x.md" in names
 
 
 async def test_memory_delete_protects_index(client, memory_dir):
@@ -1849,6 +1983,20 @@ async def test_skills_list_includes_both_sources(client, skills_dirs):
     assert by_name["greet"]["source"] == "command"
 
 
+async def test_skills_list_skips_unreadable_file(client, skills_dirs):
+    """A non-UTF-8 SKILL.md must be skipped, not 500 the listing
+    (mirrors test_list_agents_skips_unreadable_file)."""
+    bad = skills_dirs["skills"] / "broken"
+    bad.mkdir()
+    (bad / "SKILL.md").write_bytes(b"\xff\xfe\x00bad")
+
+    resp = await client.get("/api/skills")
+    assert resp.status == 200
+    names = {s["name"] for s in await resp.json()}
+    # The readable skill survives the unreadable sibling.
+    assert "deploy" in names
+
+
 async def test_skills_create_get_delete(client, skills_dirs):
     create = await client.post("/api/skills", json={"name": "newskill", "content": "body"})
     assert create.status == 201
@@ -1915,6 +2063,62 @@ async def test_settings_put_etag_conflict(client, settings_file):
     assert resp.status == 409
     body = await resp.json()
     assert body["current"]["theme"] == "externally-set"
+
+
+# --------------------------------------------------------------------------- #
+# Hooks routes (/api/hooks)
+# --------------------------------------------------------------------------- #
+import server.routes.hooks as hooks_mod  # noqa: E402
+
+
+@pytest.fixture
+def hooks_file(tmp_path: Path, monkeypatch):
+    p = tmp_path / "settings.json"
+    monkeypatch.setattr(hooks_mod, "SETTINGS_PATH", p)
+    return p
+
+
+async def test_hooks_get_absent_file(client, hooks_file):
+    got = await (await client.get("/api/hooks")).json()
+    assert got["hooks"] == {}
+    assert got["etag"] is None
+
+
+async def test_hooks_put_round_trips(client, hooks_file):
+    new_hooks = {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}]}
+    resp = await client.put("/api/hooks", json={"hooks": new_hooks, "etag": None})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["hooks"] == new_hooks
+    assert body["etag"]
+
+    got = await (await client.get("/api/hooks")).json()
+    assert got["hooks"] == new_hooks
+    assert got["etag"] == body["etag"]
+
+
+async def test_hooks_put_with_current_etag_succeeds(client, hooks_file):
+    hooks_file.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    got = await (await client.get("/api/hooks")).json()
+    resp = await client.put("/api/hooks", json={"hooks": {"PostToolUse": []}, "etag": got["etag"]})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["hooks"] == {"PostToolUse": []}
+    # Unrelated settings keys must be preserved.
+    assert json.loads(hooks_file.read_text())["theme"] == "dark"
+
+
+async def test_hooks_put_etag_conflict(client, hooks_file):
+    hooks_file.write_text(json.dumps({"hooks": {"PreToolUse": []}}), encoding="utf-8")
+    got = await (await client.get("/api/hooks")).json()
+    import time as _t
+    _t.sleep(0.01)
+    hooks_file.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "X"}]}}), encoding="utf-8")
+    resp = await client.put("/api/hooks", json={"hooks": {"PostToolUse": []}, "etag": got["etag"]})
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "current" in body
 
 
 # --------------------------------------------------------------------------- #
@@ -2147,7 +2351,6 @@ def test_resolve_runs_path_defaults_beside_tasks(tmp_path, monkeypatch):
     monkeypatch.setattr(crons_mod, "TASKS_PATH", tmp_path / ".claude" / "scheduled_tasks.json")
     resolved = crons_mod._resolve_runs_path()
     assert resolved == tmp_path / ".claude" / "cron_runs.json"
-    assert resolved == crons_mod.TASKS_PATH.parent / "cron_runs.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -2947,3 +3150,79 @@ async def test_mcp_rejects_non_dict_config(client, mcp_files):
     mcp_files["standard"].write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
     resp = await client.post("/api/mcp", json={"name": "x", "config": "not-a-dict"})
     assert resp.status == 400
+
+
+# --------------------------------------------------------------------------- #
+# B2: SessionManager per-session-id locking + stop_all robustness (F6)
+#
+# get_or_create/respawn/register/stop mutate self._sessions across await points.
+# Without a manager-level lock, two near-simultaneous requests for the SAME
+# session could each spawn a `claude` subprocess and the second store would
+# orphan the first (never stop()'d, surviving until server exit). The fix
+# serializes same-id lifecycle ops via a per-id lock map (_lock_for); different
+# ids stay parallel. stop_all() must also be exception-safe (F6): one raising
+# stop() can't prevent the rest from being stopped on shutdown. These tests
+# reuse the _FakeProc fakes from above — no real `claude` binary is spawned.
+# (The B1 /api/hooks etag tests already live near the other route tests.)
+# --------------------------------------------------------------------------- #
+
+async def test_manager_concurrent_same_id_no_duplicate_spawn(monkeypatch):
+    """Two concurrent get_or_create for the SAME id must not spawn duplicate live
+    processes. We seed one alive session under 'dup'; the per-id lock serializes
+    the two calls so both observe it already alive in _sessions, return that same
+    object, and neither calls start()."""
+    mgr = session_mod.SessionManager()
+
+    alive = session_mod.PersistentSession(session_id="dup", cwd="/tmp")
+    alive._proc = _FakeProc([])  # returncode is None -> .alive is True
+    alive._started = True
+    mgr._sessions["dup"] = alive
+
+    spawns = {"n": 0}
+
+    async def fake_start(self):
+        spawns["n"] += 1
+        await asyncio.sleep(0)  # force interleaving between the two coroutines
+        self._proc = _FakeProc([])
+        self._started = True
+
+    monkeypatch.setattr(session_mod.PersistentSession, "start", fake_start)
+
+    a, b = await asyncio.gather(
+        mgr.get_or_create(session_id="dup"),
+        mgr.get_or_create(session_id="dup"),
+    )
+
+    assert spawns["n"] == 0           # the already-alive session was reused
+    assert a is alive and b is alive  # both calls returned the same live object
+    # No orphan: exactly one session is tracked for this id.
+    assert mgr._sessions["dup"] is alive
+
+
+async def test_manager_stop_all_is_exception_safe(monkeypatch):
+    """stop_all() must stop every session even if one raises, then clear the dict
+    (F6: asyncio.gather(..., return_exceptions=True)). A serial loop would let the
+    first raising stop() abort the rest and leave _sessions populated."""
+    mgr = session_mod.SessionManager()
+
+    s_bad = session_mod.PersistentSession(session_id="bad")
+    s_good = session_mod.PersistentSession(session_id="good")
+
+    async def bad_stop():
+        raise RuntimeError("boom during shutdown")
+
+    good_called = {"v": False}
+
+    async def good_stop():
+        good_called["v"] = True
+
+    s_bad.stop = bad_stop
+    s_good.stop = good_stop
+    mgr._sessions["bad"] = s_bad
+    mgr._sessions["good"] = s_good
+
+    # Must not raise despite s_bad.stop() blowing up.
+    await mgr.stop_all()
+
+    assert good_called["v"] is True   # the non-raising session was still stopped
+    assert mgr._sessions == {}        # dict cleared regardless of the exception
