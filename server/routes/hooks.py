@@ -33,16 +33,17 @@ async def put_hooks(request: web.Request) -> web.Response:
     new_hooks = body.get("hooks", {})
     expected_etag = body.get("etag")
 
-    data, current_etag = filestore.read_json(SETTINGS_PATH)
+    data, _current_etag = filestore.read_json(SETTINGS_PATH)
+    data["hooks"] = new_hooks
 
-    if expected_etag and current_etag and expected_etag != current_etag:
+    try:
+        new_etag = filestore.write_json(SETTINGS_PATH, data, expected_etag)
+    except filestore.ConflictError as e:
+        current_data, current_etag = filestore.read_json(SETTINGS_PATH)
         return web.json_response(
-            {"error": "conflict", "hooks": data.get("hooks", {}), "etag": current_etag},
+            {"error": "conflict", "message": str(e), "current": current_data, "etag": current_etag},
             status=409,
         )
-
-    data["hooks"] = new_hooks
-    new_etag = filestore.write_json(SETTINGS_PATH, data, current_etag)
 
     ws = request.app["ws_manager"]
     await ws.broadcast("hooks_changed", {"etag": new_etag})
