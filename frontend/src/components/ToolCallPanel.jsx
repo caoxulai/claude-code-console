@@ -26,7 +26,19 @@ export function ToolCallPanel({ toolCall }) {
           <Icon size={14} />
         </div>
         <div className="chat-msg-content">
-          <div className="tool-call-header" onClick={() => setExpanded(!expanded)}>
+          <div
+            className="tool-call-header"
+            role="button"
+            tabIndex={0}
+            aria-expanded={expanded}
+            onClick={() => setExpanded(!expanded)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                setExpanded(!expanded);
+              }
+            }}
+          >
             {expanded ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
             <span className="tool-call-name">{toolCall.name}</span>
             {!expanded && <span className="tool-call-preview">{inputPreview}</span>}

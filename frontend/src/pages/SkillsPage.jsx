@@ -174,7 +174,10 @@ export default function SkillsPage() {
   const [newName, setNewName] = useState('');
   const [newContent, setNewContent] = useState(FRONTMATTER_TEMPLATE);
 
-  const refresh = () => fetch('/api/skills').then(r => r.json()).then(setSkills);
+  const refresh = () => fetch('/api/skills')
+    .then(r => r.json())
+    .then(json => setSkills(Array.isArray(json) ? json : []))
+    .catch(() => setSkills([]));
   useEffect(() => { refresh(); }, []);
   // Live-sync the skill list when skills change on disk, unless mid-edit/create.
   useLiveUpdates(['skill_changed', 'skill_deleted'], () => {

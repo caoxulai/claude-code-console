@@ -87,7 +87,10 @@ export default function MemoryPage() {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
 
-  const refresh = () => fetch('/api/memory/files').then(r => r.json()).then(setFiles);
+  const refresh = () => fetch('/api/memory/files')
+    .then(r => r.json())
+    .then(json => setFiles(Array.isArray(json) ? json : []))
+    .catch(() => setFiles([]));
   useEffect(() => { refresh(); }, []);
 
   // Stay in sync when memory files change on disk (CLI, another tab, agents).

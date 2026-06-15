@@ -216,7 +216,7 @@ export default function ProjectsPage() {
     try {
       const res = await fetch('/api/projects');
       const json = await res.json();
-      setProjects(json);
+      setProjects(Array.isArray(json) ? json : []);
     } catch { /* ignore */ }
     setLoading(false);
   };
