@@ -129,8 +129,9 @@ class PersistentSession:
         })
 
         async with self._lock:
-            self._proc.stdin.write((msg + "\n").encode())
-            await self._proc.stdin.drain()
+            if self._proc and self._proc.stdin:
+                self._proc.stdin.write((msg + "\n").encode())
+                await self._proc.stdin.drain()
 
             # Read response lines until we get a "result" event
             async for raw in self._proc.stdout:
@@ -173,7 +174,8 @@ class PersistentSession:
         orphaned across respawns.
         """
         if self._proc and self._proc.returncode is None:
-            self._proc.stdin.close()
+            if self._proc.stdin:
+                self._proc.stdin.close()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except asyncio.TimeoutError:
@@ -198,38 +200,96 @@ class SessionManager:
 
     def __init__(self):
         self._sessions: dict[str, PersistentSession] = {}
+        # Per-session-id locks serialize lifecycle ops (get_or_create / respawn /
+        # stop) on the SAME id, while leaving DIFFERENT ids free to proceed in
+        # parallel (a single global lock would needlessly serialize every chat
+        # turn's session lookup). asyncio.Lock is NOT reentrant, so a per-id lock
+        # must never be held while awaiting another method that needs the same
+        # id's lock.
+        self._mgr_locks: dict[str, asyncio.Lock] = {}
+        # Brand-new sessions arrive with session_id=None (no resume id), so there
+        # is no id to key a lock on at creation time. Concurrent no-id creates are
+        # serialized by this single creation lock; each produces its own session
+        # that register() later keys by the discovered id.
+        self._create_lock = asyncio.Lock()
+
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        """Get-or-create the per-session-id lifecycle lock."""
+        lock = self._mgr_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mgr_locks[session_id] = lock
+        return lock
+
+    @staticmethod
+    async def _start_or_cleanup(session: PersistentSession) -> None:
+        """Start a fresh session; if start() raises after spawning, stop the
+        half-started session (so no subprocess + stderr task is orphaned) and
+        re-raise. (F5)
+        """
+        try:
+            await session.start()
+        except BaseException:
+            await session.stop()
+            raise
 
     async def get_or_create(self, session_id: str | None = None,
                             cwd: str | None = None,
                             permission_mode: str = "default",
                             name: str | None = None) -> PersistentSession:
         """Get an existing session or create a new one."""
-        if session_id and session_id in self._sessions:
-            session = self._sessions[session_id]
-            if session.alive:
+        # No id to resume: a brand-new session whose real id is unknown until the
+        # system event. Serialize no-id creates under the dedicated creation lock;
+        # register() (also lock-guarded) stores it once the id is discovered.
+        if not session_id:
+            async with self._create_lock:
+                session = PersistentSession(
+                    session_id=session_id,
+                    cwd=cwd,
+                    permission_mode=permission_mode,
+                    name=name,
+                )
+                await self._start_or_cleanup(session)
                 return session
-            # Dead session — remove and recreate
-            del self._sessions[session_id]
 
-        session = PersistentSession(
-            session_id=session_id,
-            cwd=cwd,
-            permission_mode=permission_mode,
-            name=name,
-        )
-        await session.start()
-        return session
+        # Resuming a known id: serialize the read-then-mutate critical section so
+        # two concurrent requests for the same id can't both spawn a subprocess.
+        async with self._lock_for(session_id):
+            if session_id in self._sessions:
+                session = self._sessions[session_id]
+                if session.alive:
+                    return session
+                # Dead session — remove and recreate.
+                del self._sessions[session_id]
+
+            session = PersistentSession(
+                session_id=session_id,
+                cwd=cwd,
+                permission_mode=permission_mode,
+                name=name,
+            )
+            await self._start_or_cleanup(session)
+            # Store atomically with creation so a spawned subprocess is always
+            # reachable by stop_all().
+            self._sessions[session_id] = session
+            return session
 
     def register(self, session: PersistentSession):
-        """Register a session after we know its ID."""
+        """Register a session after we know its ID.
+
+        A single dict assignment is atomic across asyncio await points, so this
+        stays synchronous (chat.py calls it without await). The real double-spawn
+        race lives in get_or_create, which _create_lock / _lock_for serialize.
+        """
         if session.session_id:
             self._sessions[session.session_id] = session
 
     async def stop(self, session_id: str):
         """Stop a specific session."""
-        if session_id in self._sessions:
-            await self._sessions[session_id].stop()
-            del self._sessions[session_id]
+        async with self._lock_for(session_id):
+            if session_id in self._sessions:
+                await self._sessions[session_id].stop()
+                del self._sessions[session_id]
 
     async def respawn(self, session_id: str, cwd: str | None = None,
                       permission_mode: str | None = None) -> PersistentSession:
@@ -247,26 +307,38 @@ class SessionManager:
         silently reverting to the interactive "default" mode. The fresh process
         resumes the same session_id, preserving conversation history.
         """
-        existing = self._sessions.get(session_id)
-        resume_cwd = cwd or (existing.cwd if existing else None)
-        resume_mode = permission_mode or (existing.permission_mode if existing else "default")
-        if existing:
-            await existing.stop()
-            del self._sessions[session_id]
+        # Serialize the whole read-existing/stop/del/construct/start/store
+        # sequence on this id so a concurrent get_or_create/stop/respawn for the
+        # same id can't interleave. Do the start-failure cleanup inline rather
+        # than via self.stop() — asyncio.Lock is not reentrant and self.stop()
+        # would deadlock on this same per-id lock.
+        async with self._lock_for(session_id):
+            existing = self._sessions.get(session_id)
+            resume_cwd = cwd or (existing.cwd if existing else None)
+            resume_mode = permission_mode or (existing.permission_mode if existing else "default")
+            if existing:
+                await existing.stop()
+                del self._sessions[session_id]
 
-        session = PersistentSession(
-            session_id=session_id,
-            cwd=resume_cwd,
-            permission_mode=resume_mode,
-        )
-        await session.start()
-        self._sessions[session_id] = session
-        return session
+            session = PersistentSession(
+                session_id=session_id,
+                cwd=resume_cwd,
+                permission_mode=resume_mode,
+            )
+            await self._start_or_cleanup(session)
+            self._sessions[session_id] = session
+            return session
 
     async def stop_all(self):
-        """Stop all sessions (for shutdown)."""
-        for session in self._sessions.values():
-            await session.stop()
+        """Stop all sessions (for shutdown).
+
+        Stop concurrently and tolerate failures: one raising/slow stop() must not
+        prevent the rest from being stopped on shutdown. (F6)
+        """
+        await asyncio.gather(
+            *[s.stop() for s in self._sessions.values()],
+            return_exceptions=True,
+        )
         self._sessions.clear()
 
     @property
