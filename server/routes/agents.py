@@ -41,6 +41,7 @@ def register(app: web.Application):
     # Phase 3: append-only context layer + conflict-aware review.
     app.router.add_get("/api/projects/{project_id}/agents/{name}/context", get_agent_context)
     app.router.add_get("/api/projects/{project_id}/agents/{name}/context/conflicts", get_context_conflicts)
+    app.router.add_get("/api/projects/{project_id}/agents/{name}/context/ephemeral", get_context_ephemeral)
     app.router.add_post("/api/projects/{project_id}/agents/{name}/context/reconcile", reconcile_context)
     app.router.add_post("/api/projects/{project_id}/agents/{name}/context/mark-reviewed", mark_context_reviewed)
     # Phase 3: editable design doc (Accept/Reject proposed ADRs).
@@ -107,7 +108,7 @@ def _agent_record(agent_file: Path, project_dir: Path, scope: str) -> dict | Non
         summary = context_summary(project_dir, slug)
     else:
         context_path = GLOBAL_AGENTS_DIR.parent / "agent-context" / agent_file.name
-        summary = {"entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0}
+        summary = {"entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0, "oversized": False}
     try:
         context_bytes = context_path.stat().st_size if context_path.is_file() else 0
     except OSError:
@@ -123,6 +124,7 @@ def _agent_record(agent_file: Path, project_dir: Path, scope: str) -> dict | Non
         "contextEntryCount": summary["entryCount"],
         "newEntryCount": summary["newEntryCount"],
         "conflictClusterCount": summary["conflictClusterCount"],
+        "oversized": summary.get("oversized", False),
         "path": str(agent_file),
         "contextPath": str(context_path),
         "slug": slug,
@@ -197,6 +199,34 @@ not no do does done can could should would may might will shall must has have ha
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{2,}")
 _SUPERSEDE_RE = re.compile(r"supersed|correct|replaces?\b|instead of", re.IGNORECASE)
 
+# Clustering tuning (see spec item 1). Pure heuristic, deterministic, no LLM.
+#   - A token appearing in more than this fraction of entries is "ubiquitous"
+#     (e.g. test/etag/context on a real file) and is dropped from linking so it
+#     can't bind everything into one mega-cluster.
+#   - Linking requires >=2 discriminative (non-ubiquitous) shared tokens, OR a
+#     single shared dotted/underscored identifier that is itself low-DF.
+#   - A connected group larger than MAX_CLUSTER_SIZE is not a real near-duplicate
+#     set; it's dropped rather than emitted as one giant cluster.
+_DF_FRACTION_CAP = 0.4
+_MAX_CLUSTER_SIZE = 5
+
+# Size-ceiling nudge (design §4.4): a context file past these bounds is flagged
+# for reconciliation even with zero detected conflicts.
+_OVERSIZE_BYTES = 6 * 1024
+_OVERSIZE_LINES = 400
+
+# Durable-vs-ephemeral classifier (spec item 4): verification-ceremony phrase
+# families observed live in the qa context — point-in-time proof with no future
+# value. Case-insensitive, anchored at the start of an entry where the family is
+# a recurring prefix. Pure heuristic, no LLM.
+_EPHEMERAL_RES = [
+    re.compile(r"skeptic\s+sabotage\s+that\s+paid\s+off", re.IGNORECASE),
+    re.compile(r"live\s+in-?process\s+proof", re.IGNORECASE),
+    re.compile(r"unverified-by-design:\s*browser\s+pixel\s+render", re.IGNORECASE),
+    re.compile(r"scope\s+clean:\s*head\s+unchanged", re.IGNORECASE),
+    re.compile(r"re-?ran\s+the\s+full\s+uat\b.*\bsuite\s+\d+\s+green", re.IGNORECASE),
+]
+
 
 def parse_context_entries(content: str) -> list[dict]:
     """Parse an append-only context file into entries in document order.
@@ -234,15 +264,25 @@ def _tokens(text: str) -> set[str]:
 def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None) -> list[dict]:
     """Group entries that overlap or supersede each other (v1, pure-Python).
 
-    Two signals, no LLM:
-      1. An explicit supersede/correction marker in an entry's text links it to
-         every other entry it shares a key token with (a guaranteed cluster).
-      2. Strong lexical overlap: entries sharing >=2 key tokens (or >=1 dotted
-         identifier) are candidates for redundancy.
+    Pure heuristic, no LLM, deterministic. The hard part is NOT over-clustering:
+    on a real file a single ubiquitous word ("test"/"etag"/"context") or one
+    "supersedes" word must not bind every entry into one mega-cluster. So:
 
-    Returns clusters: [{ "reason", "entryIndices": [...] }] where reason is
-    "superseded" (an explicit marker is present) or "redundant". Singletons are
-    not returned. Clusters are merged transitively (A~B, B~C → {A,B,C}).
+      1. Document-frequency filter: tokens appearing in more than
+         `_DF_FRACTION_CAP` of entries are "ubiquitous" and dropped from linking
+         (TF-IDF spirit). What's left is the discriminative vocabulary.
+      2. Linking requires strong evidence: two entries link only when they share
+         >=2 discriminative tokens, OR a single shared dotted/underscored
+         identifier that is itself discriminative (low-DF).
+      3. A supersede/correction marker only labels a cluster "superseded" when
+         the marked entry actually links (by the rule above) to another member —
+         a stray marker word can't taint a transitively-merged blob.
+      4. Cluster-size cap: a connected group larger than `_MAX_CLUSTER_SIZE` is
+         not a genuine near-duplicate set, so it is dropped (no mega-cluster) —
+         a file with no real near-duplicates yields ZERO clusters.
+
+    Returns clusters: [{ "reason", "entryIndices": [...] }], reason
+    "superseded" or "redundant", smallest-index first. Singletons are skipped.
 
     `dismissed_keys`: content-hash keys of clusters the user chose "Keep all" on
     — those are filtered out so they don't re-flag every reload.
@@ -253,7 +293,16 @@ def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None
     toks = [_tokens(e["text"]) for e in entries]
     has_marker = [bool(_SUPERSEDE_RE.search(e["text"])) for e in entries]
 
-    # Union-find over entries that are "related".
+    # Document frequency per token, then the ubiquitous set to ignore.
+    df: dict[str, int] = {}
+    for ts in toks:
+        for t in ts:
+            df[t] = df.get(t, 0) + 1
+    df_cap = max(2, int(n * _DF_FRACTION_CAP))
+    ubiquitous = {t for t, c in df.items() if c > df_cap}
+    disc = [ts - ubiquitous for ts in toks]  # discriminative tokens per entry
+
+    # Union-find over entries that are strongly related.
     parent = list(range(n))
 
     def find(x):
@@ -267,16 +316,18 @@ def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None
         if ra != rb:
             parent[max(ra, rb)] = min(ra, rb)
 
-    marker_pairs: set[frozenset] = set()
+    # Pairs that link AND involve a supersede marker on a real topic overlap.
+    marker_linked: set[int] = set()
     for i in range(n):
         for j in range(i + 1, n):
-            shared = toks[i] & toks[j]
-            dotted = any("." in s or "_" in s for s in shared)
-            related = len(shared) >= 2 or dotted
+            shared = disc[i] & disc[j]
+            strong_id = any(("." in s or "_" in s) for s in shared)
+            related = len(shared) >= 2 or strong_id
             if related:
                 union(i, j)
                 if has_marker[i] or has_marker[j]:
-                    marker_pairs.add(frozenset((i, j)))
+                    marker_linked.add(i)
+                    marker_linked.add(j)
 
     groups: dict[int, list[int]] = {}
     for i in range(n):
@@ -284,19 +335,31 @@ def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None
 
     clusters: list[dict] = []
     for members in groups.values():
-        if len(members) < 2:
+        if len(members) < 2 or len(members) > _MAX_CLUSTER_SIZE:
             continue
         members.sort()
         # Skip clusters the user has explicitly dismissed ("Keep all"). The key
         # is content-based so it survives entry reordering/index shifts.
         if dismissed_keys is not None and _cluster_key([entries[i]["text"] for i in members]) in dismissed_keys:
             continue
-        reason = "superseded" if any(
-            has_marker[i] for i in members
-        ) else "redundant"
+        reason = "superseded" if any(i in marker_linked for i in members) else "redundant"
         clusters.append({"reason": reason, "entryIndices": members})
     clusters.sort(key=lambda c: c["entryIndices"][0])
     return clusters
+
+
+def classify_ephemeral(entries: list[dict]) -> list[bool]:
+    """Tag each entry as likely-ephemeral (verification-ceremony, no future value).
+
+    Pure heuristic, no LLM — matches the phrase families observed live in the qa
+    context (skeptic-sabotage / live-proof / unverified-by-design / scope-clean /
+    re-ran-UAT). Returns a per-entry boolean list parallel to `entries`. Nothing
+    is deleted here; the UI groups these for a human-gated bulk sweep.
+    """
+    return [
+        any(rx.search(e["text"]) for rx in _EPHEMERAL_RES)
+        for e in entries
+    ]
 
 
 def _cluster_key(texts: list[str]) -> str:
@@ -323,33 +386,82 @@ def _review_marker_path(project_dir: Path, name: str) -> Path:
     return project_dir / ".claude" / "agent-context" / ".reviewed" / f"{name}.txt"
 
 
+def _entry_hash(text: str) -> str:
+    """Content hash of one entry's text, normalized the same way as _cluster_key
+    (strip + lowercase + collapse whitespace) so trivial diffs don't churn it."""
+    norm = re.sub(r"\s+", " ", text).strip().lower()
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
 def _read_review_marker(project_dir: Path, name: str) -> int:
-    """Return the entry count recorded at last review (0 if never reviewed)."""
+    """Return the entry count recorded at last review (0 if never reviewed).
+
+    Backward-compatible reader for the legacy callers that only need the count.
+    The richer set-of-hashes form (see `_read_reviewed_hashes`) keeps the same
+    first line (`count:digest`) so this stays correct against new markers too.
+    """
     try:
         raw = _review_marker_path(project_dir, name).read_text(encoding="utf-8").strip()
-        return int(raw.split(":", 1)[0])
+        return int(raw.split("\n", 1)[0].split(":", 1)[0])
     except (OSError, ValueError):
         return 0
 
 
-def context_summary(project_dir: Path, name: str) -> dict:
-    """{entryCount, newEntryCount, conflictClusterCount} for a role's context.
+def _read_reviewed_hashes(project_dir: Path, name: str) -> set[str] | None:
+    """Return the set of reviewed entry-content hashes, or None for a legacy
+    (count-only) marker so callers can fall back to count-based detection."""
+    try:
+        raw = _review_marker_path(project_dir, name).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) <= 1:
+        return None  # legacy "count:digest" only → no content hashes recorded
+    return set(lines[1:])
 
-    Never raises.
+
+def _new_entry_indices(project_dir: Path, name: str, entries: list[dict]) -> list[int]:
+    """Indices of entries whose content was NOT present at last review.
+
+    Content-based, so an entry inserted mid-file (not appended at the tail) is
+    still counted as new. Falls back to count-based ("tail is new") when only a
+    legacy count marker is stored. Never-reviewed → every entry is new.
+    """
+    hashes = _read_reviewed_hashes(project_dir, name)
+    if hashes is None:
+        reviewed = _read_review_marker(project_dir, name)
+        return [e["index"] for e in entries if e["index"] >= reviewed]
+    return [e["index"] for e in entries if _entry_hash(e["text"]) not in hashes]
+
+
+def context_summary(project_dir: Path, name: str) -> dict:
+    """{entryCount, newEntryCount, conflictClusterCount, oversized, contextBytes,
+    lineCount} for a role's context. Never raises.
+
+    `oversized` (design §4.4): true when the file exceeds ~6KB OR ~400 lines,
+    even when conflictClusterCount == 0 — a size-ceiling nudge to reconcile.
     """
     try:
         content, _ = filestore.read_text(_context_path(project_dir, name))
         entries = parse_context_entries(content)
-        reviewed = _read_review_marker(project_dir, name)
-        new_count = max(0, len(entries) - reviewed)
+        new_count = len(_new_entry_indices(project_dir, name, entries))
         dismissed = _read_dismissed_keys(project_dir, name)
+        context_bytes = len(content.encode("utf-8"))
+        line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        oversized = context_bytes > _OVERSIZE_BYTES or line_count > _OVERSIZE_LINES
         return {
             "entryCount": len(entries),
             "newEntryCount": new_count,
             "conflictClusterCount": len(detect_conflicts(entries, dismissed)),
+            "oversized": oversized,
+            "contextBytes": context_bytes,
+            "lineCount": line_count,
         }
     except Exception:
-        return {"entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0}
+        return {
+            "entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0,
+            "oversized": False, "contextBytes": 0, "lineCount": 0,
+        }
 
 
 def unreviewed_entry_total(project_dir: Path) -> int:
@@ -568,13 +680,21 @@ async def get_agent_context(request: web.Request) -> web.Response:
     content, etag = filestore.read_text(path)
     entries = parse_context_entries(content)
     reviewed = _read_review_marker(project_dir, name)
+    new_indices = _new_entry_indices(project_dir, name, entries)
+    context_bytes = len(content.encode("utf-8"))
+    line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
     return web.json_response({
         "exists": path.is_file(),
         "content": content,
         "etag": etag,
         "entries": entries,
         "lastReviewedCount": reviewed,
-        "newEntryCount": max(0, len(entries) - reviewed),
+        # Kept for backward compat; newEntryIndices is the content-based signal.
+        "newEntryCount": len(new_indices),
+        "newEntryIndices": new_indices,
+        "contextBytes": context_bytes,
+        "lineCount": line_count,
+        "oversized": context_bytes > _OVERSIZE_BYTES or line_count > _OVERSIZE_LINES,
         "path": str(path),
     })
 
@@ -597,30 +717,65 @@ async def get_context_conflicts(request: web.Request) -> web.Response:
     return web.json_response({"clusters": clusters})
 
 
+async def get_context_ephemeral(request: web.Request) -> web.Response:
+    """Return every entry tagged durable-vs-ephemeral for the sweep review mode.
+
+    { entries: [{index, date, text, ephemeral}], ephemeralIndices: [...], etag }.
+    Classification only — nothing is removed. The UI groups the ephemeral ones
+    so the human can bulk-drop them via reconcile action "sweep".
+    """
+    project_dir, name = _resolve_context(request)
+    content, etag = filestore.read_text(_context_path(project_dir, name))
+    entries = parse_context_entries(content)
+    flags = classify_ephemeral(entries)
+    out = [
+        {"index": e["index"], "date": e["date"], "text": e["text"], "ephemeral": flags[i]}
+        for i, e in enumerate(entries)
+    ]
+    return web.json_response({
+        "entries": out,
+        "ephemeralIndices": [e["index"] for e, f in zip(entries, flags) if f],
+        "etag": etag,
+    })
+
+
 def _render_entries(entries: list[dict]) -> str:
     """Re-serialize entries back to append-only bullet lines (preserving raw)."""
     return "\n".join(e["raw"] for e in entries)
 
 
-async def reconcile_context(request: web.Request) -> web.Response:
-    """Apply a reconciliation. The ONLY endpoint that removes context entries.
+def _entry_prefix(entry: dict) -> str:
+    """The bullet prefix preserving the entry's date: '- {date}: ' or '- '."""
+    return f"- {entry['date']}: " if entry["date"] else "- "
 
-    Body: { action: "keep"|"merge"|"dismiss", entryIndices: [...],
-            mergedText?, etag }
-      - keep:    keep the FIRST index in entryIndices, drop the rest.
+
+async def reconcile_context(request: web.Request) -> web.Response:
+    """Apply a reconciliation. The ONLY endpoint that removes/rewrites entries.
+
+    Body: { action: "keep"|"merge"|"compact"|"dismiss"|"sweep", entryIndices: [...],
+            mergedText?, compactText?, keepIndex?, etag }
+      - keep:    keep ONE survivor, drop the rest. Survivor selection:
+                 explicit `keepIndex` if given, else superseded-cluster → the
+                 NEWEST (max index, the correction), plain redundancy → oldest
+                 (min index). Never silently drops the correcting entry.
       - merge:   replace the cluster with one new entry (mergedText) at the
                  position of the first index.
-      - dismiss: remove nothing (the cluster isn't actually redundant); just
-                 acknowledged. Returned so the UI can stop flagging it.
+      - compact: replace ONE over-long entry's text in place with compactText,
+                 preserving its date prefix. Needs exactly one index.
+      - dismiss: remove nothing; remember the cluster so it stops flagging.
+      - sweep:   bulk-drop the provided entryIndices in one write (the ephemeral
+                 sweep — the human supplies the indices; nothing else is touched).
 
-    Etag-guarded (409 on concurrent external edit), preserving the file's
-    non-entry lines (the `# Title` heading etc.).
+    Etag-guarded (409 on concurrent external edit, mirroring put_settings),
+    preserving the file's non-entry lines (the `# Title` heading etc.). The file
+    is re-read here at write time and the etag is the safety net: entries that
+    appeared after the panel loaded are never dropped.
     """
     project_dir, name = _resolve_context(request)
     body = await read_json_body(request)
     action = body.get("action")
-    if action not in ("keep", "merge", "dismiss"):
-        raise web.HTTPBadRequest(reason="action must be keep|merge|dismiss")
+    if action not in ("keep", "merge", "compact", "dismiss", "sweep"):
+        raise web.HTTPBadRequest(reason="action must be keep|merge|compact|dismiss|sweep")
     indices = body.get("entryIndices")
     if not isinstance(indices, list) or not indices:
         raise web.HTTPBadRequest(reason="entryIndices must be a non-empty list")
@@ -633,6 +788,9 @@ async def reconcile_context(request: web.Request) -> web.Response:
     valid = {e["index"] for e in entries}
     if not set(indices) <= valid:
         raise web.HTTPBadRequest(reason="entryIndices out of range")
+    # Heading / preamble = lines before the first entry's first raw line. Capture
+    # it now, before any in-place rewrite mutates entries[0]["raw"].
+    first_entry_line = lines.index(entries[0]["raw"].split("\n")[0]) if entries else len(lines)
 
     if action == "dismiss":
         # "Keep all": remove nothing, but remember this cluster (by content hash)
@@ -641,26 +799,35 @@ async def reconcile_context(request: web.Request) -> web.Response:
         _add_dismissed_key(project_dir, name, key)
         return web.json_response({"ok": True, "action": "dismiss", "removed": 0})
 
-    keep_first = min(indices)
-    drop = set(indices)
+    drop: set[int] = set(indices)
     if action == "keep":
-        drop.discard(keep_first)
+        survivor = _keep_survivor(body, indices, entries)
+        drop.discard(survivor)
     elif action == "merge":
         merged_text = (body.get("mergedText") or "").strip()
         if not merged_text:
             raise web.HTTPBadRequest(reason="mergedText required for merge")
         # Rewrite the first entry's line to the merged text (keep its date if any),
         # then drop the others.
+        keep_first = min(indices)
         e0 = next(e for e in entries if e["index"] == keep_first)
-        prefix = f"- {e0['date']}: " if e0["date"] else "- "
-        entries[keep_first]["raw"] = prefix + merged_text
+        entries[keep_first]["raw"] = _entry_prefix(e0) + merged_text
         drop.discard(keep_first)
+    elif action == "compact":
+        if len(indices) != 1:
+            raise web.HTTPBadRequest(reason="compact requires exactly one entryIndex")
+        compact_text = (body.get("compactText") or body.get("mergedText") or "").strip()
+        if not compact_text:
+            raise web.HTTPBadRequest(reason="compactText required for compact")
+        idx = indices[0]
+        e0 = next(e for e in entries if e["index"] == idx)
+        entries[idx]["raw"] = _entry_prefix(e0) + compact_text
+        drop.discard(idx)  # compact rewrites in place; drops nothing
+    # action == "sweep": drop is exactly the supplied indices (bulk delete).
 
     # Rebuild the file: keep every non-entry line in place; for entry lines, emit
     # the (possibly-rewritten) entry unless it's being dropped.
     kept_entries = [e for e in entries if e["index"] not in drop]
-    # Heading / preamble = lines before the first entry's first raw line.
-    first_entry_line = lines.index(entries[0]["raw"].split("\n")[0]) if entries else len(lines)
     head = "\n".join(lines[:first_entry_line]).rstrip()
     new_content = (head + "\n" + _render_entries(kept_entries)).strip() + "\n"
 
@@ -673,16 +840,46 @@ async def reconcile_context(request: web.Request) -> web.Response:
             status=409,
         )
 
-    # Reconciliation changed entry count → reset the review marker to the new
-    # total (these entries have just been reviewed by the human reconciling them).
+    # Reconciliation changed entry content → reset the review marker (these
+    # entries have just been reviewed by the human reconciling them).
     _write_review_marker(project_dir, name, len(kept_entries), new_content)
     return web.json_response({"ok": True, "action": action, "removed": len(drop), "etag": new_etag})
 
 
+def _keep_survivor(body: dict, indices: list[int], entries: list[dict]) -> int:
+    """Pick which entry survives a 'keep'.
+
+    Explicit `keepIndex` from the UI wins (the user picked the survivor). Else
+    fall back on cluster reason: a superseded cluster keeps the NEWEST entry (the
+    correction = max index); plain redundancy keeps the oldest (min index). The
+    reason is re-detected from the current entries so we never depend on a stale
+    client-side label.
+    """
+    keep_index = body.get("keepIndex")
+    if isinstance(keep_index, int) and keep_index in indices:
+        return keep_index
+    reason = body.get("reason")
+    if reason not in ("superseded", "redundant"):
+        reason = "redundant"
+        idxset = set(indices)
+        for c in detect_conflicts(entries):
+            if set(c["entryIndices"]) == idxset:
+                reason = c["reason"]
+                break
+    return max(indices) if reason == "superseded" else min(indices)
+
+
 def _write_review_marker(project_dir: Path, name: str, count: int, content: str) -> None:
+    """Persist the last-reviewed marker in the richer content-hash format.
+
+    Line 1 stays `count:digest` for backward compatibility (legacy readers).
+    Subsequent lines are the per-entry content hashes of every reviewed entry,
+    enabling content-based new-detection regardless of insertion position.
+    """
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-    path = _review_marker_path(project_dir, name)
-    filestore.write_text(path, f"{count}:{digest}\n")
+    entries = parse_context_entries(content)
+    lines = [f"{count}:{digest}"] + [_entry_hash(e["text"]) for e in entries]
+    filestore.write_text(_review_marker_path(project_dir, name), "\n".join(lines) + "\n")
 
 
 def _dismissed_path(project_dir: Path, name: str) -> Path:

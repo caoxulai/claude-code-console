@@ -205,6 +205,15 @@ export default function AgentsPage() {
                       <FiAlertTriangle size={9} style={{ marginRight: 3 }} />{a.conflictClusterCount}
                     </span>
                   )}
+                  {a.oversized && (
+                    <span
+                      className="badge badge-warn"
+                      title="Context file over the size ceiling (~6KB/400 lines) — reconcile to keep it lean"
+                      style={{ flexShrink: 0, color: 'var(--warning)' }}
+                    >
+                      <FiAlertTriangle size={9} style={{ marginRight: 3 }} />oversized
+                    </span>
+                  )}
                   {a.contextExists && a.newEntryCount === 0 && a.conflictClusterCount === 0 && (
                     <span className="badge" title="Append-only context entries" style={{ flexShrink: 0 }}>
                       <FiBookOpen size={9} style={{ marginRight: 3 }} />{a.contextEntryCount} {a.contextEntryCount === 1 ? 'entry' : 'entries'}
@@ -239,6 +248,15 @@ export default function AgentsPage() {
                 )}
                 {detail.model && (
                   <span className="badge" title="Model"><FiCpu size={10} style={{ marginRight: 3 }} />{detail.model}</span>
+                )}
+                {detail.oversized && (
+                  <span
+                    className="badge badge-warn"
+                    title="Context file over the size ceiling (~6KB/400 lines) — reconcile to keep it lean"
+                    style={{ color: 'var(--warning)' }}
+                  >
+                    <FiAlertTriangle size={10} style={{ marginRight: 3 }} />oversized — needs reconciliation
+                  </span>
                 )}
               </div>
 
