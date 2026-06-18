@@ -906,7 +906,8 @@ async def test_reconcile_keep_removes_others(client, projects_layout):
     _seed_context(workspace, "alpha", "backend-dev")
     ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
 
-    # Keep entry 1, drop entry 3 (the cache cluster).
+    # The [1,3] cache cluster is "superseded" → keep keeps the NEWEST/correction
+    # (entry 3), drops the stale entry 1. Never silently drop the correction.
     resp = await client.post(
         "/api/projects/alpha/agents/backend-dev/context/reconcile",
         json={"action": "keep", "entryIndices": [1, 3]},
@@ -914,11 +915,11 @@ async def test_reconcile_keep_removes_others(client, projects_layout):
     assert resp.status == 200
     body = await resp.json()
     assert body["removed"] == 1
-    # The correction line is gone; the kept note remains; unrelated entries stay.
     text = ctx_path.read_text(encoding="utf-8")
-    assert "fresh _Cache() instance" not in text
-    assert "autouse fixture" in text
-    assert "read_json_body" in text
+    assert "fresh _Cache() instance" in text  # the correction survives
+    assert "autouse fixture" not in text       # the superseded note is dropped
+    assert "read_json_body" in text            # unrelated entry untouched
+
 
 
 async def test_reconcile_merge_replaces_cluster(client, projects_layout):
@@ -3226,3 +3227,640 @@ async def test_manager_stop_all_is_exception_safe(monkeypatch):
 
     assert good_called["v"] is True   # the non-raising session was still stopped
     assert mgr._sessions == {}        # dict cleared regardless of the exception
+
+
+
+# ── Agent-context conservative-detection + reconcile tests ──
+
+
+_REALISTIC_CONTEXT = """# backend-dev — project context
+- 2026-06-01: Use read_json_body for body parsing; raw request.json returns 500 on a malformed test body.
+- 2026-06-02: Run pytest with the project venv; system python lacks pytest-aiohttp in this context.
+- 2026-06-03: etag optimistic concurrency uses write_text expected_etag; conflict tests need a sleep.
+- 2026-06-04: SessionManager serializes lifecycle ops per session id via a locks dict in this context.
+- 2026-06-05: PersistentSession stop must None-guard stdin before close in the shutdown test path.
+- 2026-06-06: oscron mirrors the OS scheduler without mutating it; the test monkeypatches the subprocess seams.
+- 2026-06-07: Cron run history is reconciled server-side; the harness writes lastFiredAt on the task.
+- 2026-06-08: Slack queue split into a fast list and a per-item regenerate to fit the test timeout.
+- 2026-06-09: The slack poller starts in every test but its first wait is a long sleep, inert.
+- 2026-06-10: Pipeline crontab format uses a CRON_TZ line; the warmup marker dedupes the cron entry.
+- 2026-06-11: Skills frontmatter parser tolerates a missing tools field in the test context.
+- 2026-06-12: Memory CRUD reuses the etag conflict pattern; the conflict test asserts a 409 status.
+- 2026-06-13: Supersedes the 2026-06-08 note — the slack regenerate action reuses the read tools only, not the write tool. (correction)
+- 2026-06-14: Design doc ADR parser ignores lines before the first header in the test fixture.
+- 2026-06-15: Settings put mirrors the etag handler; the conflict response shape is error conflict.
+"""
+
+
+_TEN_DISTINCT_CONTEXT = """# backend-dev -- project context
+- 2026-06-01: In this test context, the Vite bundler drives frontend hot reload.
+- 2026-06-02: In this test context, Postgres handles database connection pooling.
+- 2026-06-03: In this test context, Midway validates the upstream cookie session.
+- 2026-06-04: In this test context, CloudWatch ingests structured logging lines.
+- 2026-06-05: In this test context, Redis caches with a sliding expiration policy.
+- 2026-06-06: In this test context, Apollo promotes deployment artifacts onward.
+- 2026-06-07: In this test context, dashboards aggregate regional latency metrics.
+- 2026-06-08: In this test context, SES batches hourly email notification delivery.
+- 2026-06-09: In this test context, OpenSearch rebuilds the nightly search index.
+- 2026-06-10: In this test context, LaunchDarkly evaluates feature flag experiments.
+- 2026-06-11: In this test context, billing webhooks reconcile payment settlement.
+- 2026-06-12: In this test context, Lambda resizes media thumbnail images lazily.
+"""
+
+
+_REAL_CONTEXT_ROLES = ["backend-dev", "frontend-dev", "qa"]
+
+
+async def _conflict_cluster_indices(client, project, name):
+    """Helper: the first detected cluster's entryIndices for `name`."""
+    clusters = (await (await client.get(
+        f"/api/projects/{project}/agents/{name}/context/conflicts")).json())["clusters"]
+    assert clusters, "expected at least one conflict cluster"
+    return clusters[0]["entryIndices"]
+
+
+def test_detect_conflicts_no_mega_cluster_on_real_file():
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    entries = parse_context_entries(_REALISTIC_CONTEXT)
+    clusters = detect_conflicts(entries)
+    # No giant cluster — every emitted cluster is small (<= the size cap).
+    assert all(len(c["entryIndices"]) <= 5 for c in clusters), clusters
+    # The one genuine supersede pair (the 06-08 slack note + its 06-13 correction)
+    # surfaces as a 2-entry superseded cluster.
+    slack_pairs = [
+        c for c in clusters
+        if c["reason"] == "superseded" and 7 in c["entryIndices"] and 12 in c["entryIndices"]
+    ]
+    assert len(slack_pairs) == 1, clusters
+    assert len(slack_pairs[0]["entryIndices"]) == 2
+
+
+def test_detect_conflicts_distinct_but_related_one_shared_id_no_cluster():
+    """Two distinct decisions about the same subsystem that share a single
+    identifier (and little else) must NOT cluster — merging them would destroy
+    distinct knowledge. This is the Slack-timeline (D-010/D-014) failure mode."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# backend-dev -- project context\n"
+        "- 2026-06-10: Slack queue D-010: the in-process poller keeps slack_threads.json "
+        "warm via a background single-flight scan, gated on a readiness probe.\n"
+        "- 2026-06-14: Slack queue D-014: soft-dismiss flips slack_threads.json status in "
+        "place and approve forwards an expectedDraft baseline so a stale whole-file etag "
+        "still sends.\n"
+    )
+    assert detect_conflicts(parse_context_entries(txt)) == []
+
+
+def test_detect_conflicts_genuine_near_duplicate_clusters():
+    """A genuine near-duplicate pair (a high fraction of shared discriminative
+    vocabulary) clusters as one 'redundant' 2-entry group."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# qa -- project context\n"
+        "- 2026-06-01: Skeptic sabotage that paid off: backed up oscron.py to /tmp, broke "
+        "the croniter next-run guard, watched the test fail, restored, diff -q byte-identical.\n"
+        "- 2026-06-02: Sabotage that paid off: backed oscron.py to /tmp, broke the croniter "
+        "next-run guard, watched the test fail loud, restored, diff -q byte-identical after.\n"
+        "- 2026-06-03: Postgres handles the database connection pooling in this context.\n"
+    )
+    clusters = detect_conflicts(parse_context_entries(txt))
+    assert len(clusters) == 1, clusters
+    assert clusters[0]["reason"] == "redundant"
+    assert clusters[0]["entryIndices"] == [0, 1]
+
+
+def test_detect_conflicts_dated_supersede_labels_superseded():
+    """An explicit 'supersedes the YYYY-MM-DD note' reference links specifically to
+    the entry carrying that date (with >=1 shared discriminative token) and labels
+    the cluster 'superseded'."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# backend-dev -- project context\n"
+        "- 2026-06-05: Reset the module cache in an autouse fixture between tests.\n"
+        "- 2026-06-09: Frontend uses the Vite bundler for hot reload.\n"
+        "- 2026-06-13: Supersedes the 2026-06-05 note — the cache reset must use a fresh "
+        "_Cache() instance, not clear.\n"
+    )
+    clusters = detect_conflicts(parse_context_entries(txt))
+    assert len(clusters) == 1, clusters
+    assert clusters[0]["reason"] == "superseded"
+    assert clusters[0]["entryIndices"] == [0, 2]
+
+
+def test_detect_conflicts_bare_dated_supersede_no_overlap_does_not_link():
+    """A 'supersedes the YYYY-MM-DD note' marker with ZERO topic overlap must not
+    falsely bind to the dated entry — the dated-supersede rule requires at least
+    one shared discriminative token."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# backend-dev -- project context\n"
+        "- 2026-06-05: Postgres handles database connection pooling.\n"
+        "- 2026-06-13: Supersedes the 2026-06-05 note — actually the Vite bundler drives "
+        "frontend hot reload entirely.\n"
+    )
+    assert detect_conflicts(parse_context_entries(txt)) == []
+
+
+def test_classify_ephemeral_tags_ceremony_families():
+    from server.routes.agents import parse_context_entries, classify_ephemeral
+    txt = (
+        "# qa — project context\n"
+        "- 2026-06-01: Skeptic sabotage that PAID OFF: caught a 200 masking an empty body.\n"
+        "- 2026-06-02: LIVE in-process proof: hit the real endpoint and read it back.\n"
+        "- 2026-06-03: UNVERIFIED-by-design: browser pixel render not checked, out of scope.\n"
+        "- 2026-06-04: Scope clean: HEAD unchanged, no stray files after the run.\n"
+        "- 2026-06-05: Re-ran the full UAT regression suite 284 green, no flake.\n"
+        "- 2026-06-06: Use the project venv to run pytest; system python lacks the plugin.\n"
+    )
+    flags = classify_ephemeral(parse_context_entries(txt))
+    assert flags == [True, True, True, True, True, False]
+
+
+async def test_context_ephemeral_endpoint(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: hit the endpoint and read it back.\n"
+        "- 2026-06-02: Use the project venv to run pytest.\n",
+    )
+    resp = await client.get("/api/projects/alpha/agents/qa/context/ephemeral")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ephemeralIndices"] == [0]
+    assert data["entries"][0]["ephemeral"] is True
+    assert data["entries"][1]["ephemeral"] is False
+
+
+async def test_reconcile_sweep_bulk_drops_only_listed(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson worth keeping.\n"
+        "- 2026-06-03: Scope clean: HEAD unchanged after B.\n",
+    )
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0, 2]},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["removed"] == 2
+    text = ctx_path.read_text(encoding="utf-8")
+    assert "Durable lesson worth keeping." in text
+    assert "LIVE in-process proof" not in text
+    assert "Scope clean" not in text
+
+
+async def test_reconcile_compact_shortens_one_entry_in_place(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "compact", "entryIndices": [0], "compactText": "Use read_json_body for bodies."},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["removed"] == 0  # rewrite in place, nothing dropped
+    text = ctx_path.read_text(encoding="utf-8")
+    from server.routes.agents import parse_context_entries
+    entries = parse_context_entries(text)
+    assert len(entries) == 4  # no entry removed
+    assert entries[0]["text"] == "Use read_json_body for bodies."
+    assert entries[0]["date"] == "2026-06-01"  # date prefix preserved
+
+
+async def test_reconcile_compact_etag_conflict(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "compact", "entryIndices": [0], "compactText": "short", "etag": "stale-etag"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+
+
+async def test_reconcile_keep_superseded_keeps_newest(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    text = ctx_path.read_text(encoding="utf-8")
+    assert "fresh _Cache() instance" in text  # newest correction kept
+    assert "autouse fixture" not in text       # older superseded dropped
+
+
+async def test_reconcile_keep_redundant_keeps_oldest():
+    # Plain redundancy (no supersede marker) keeps the oldest (min index).
+    from server.routes.agents import _keep_survivor, parse_context_entries
+    entries = parse_context_entries(
+        "# x\n- 2026-01-01: Frontend build uses Vite bundler tool.\n"
+        "- 2026-01-02: Frontend build uses the Vite bundler tool here.\n"
+    )
+    assert _keep_survivor({}, [0, 1], entries) == 0
+
+
+async def test_reconcile_keep_index_overrides_survivor():
+    from server.routes.agents import _keep_survivor, parse_context_entries
+    entries = parse_context_entries(_CONTEXT_SAMPLE)
+    # Explicit keepIndex wins regardless of reason.
+    assert _keep_survivor({"keepIndex": 1}, [1, 3], entries) == 1
+
+
+async def test_oversized_context_signal(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    big = "# qa\n" + "".join(
+        f"- 2026-06-01: Lesson number {i} about a distinct topic with enough text to add bytes here.\n"
+        for i in range(500)
+    )
+    _seed_context(workspace, "alpha", "qa", big)
+    # Panel signal.
+    data = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert data["oversized"] is True
+    # Agent list badge signal.
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["qa"]["oversized"] is True
+
+
+async def test_small_context_not_oversized(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    data = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert data["oversized"] is False
+
+
+async def test_reconcile_success_shape_carries_etag_for_every_action(client, projects_layout):
+    """keep / merge / compact / sweep each return {ok, action, removed, etag} on
+    success — the etag the panel must adopt so a follow-up action stays guarded.
+    dismiss returns {ok, action, removed:0} (it writes no entries, so no etag)."""
+    workspace = projects_layout["workspace"]
+
+    # keep
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]})).json()
+    assert body["ok"] is True and body["action"] == "keep"
+    assert body["removed"] == 1 and isinstance(body["etag"], str) and body["etag"]
+
+    # merge (re-seed: the keep above mutated the file)
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Merged note."})).json()
+    assert body["ok"] is True and body["action"] == "merge" and body["etag"]
+
+    # compact (single entry, rewrites in place; removed == 0)
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "compact", "entryIndices": [0], "compactText": "Short."})).json()
+    assert body["ok"] is True and body["action"] == "compact"
+    assert body["removed"] == 0 and body["etag"]
+
+    # sweep (bulk drop)
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0]})).json()
+    assert body["ok"] is True and body["action"] == "sweep"
+    assert body["removed"] == 1 and body["etag"]
+
+    # dismiss writes nothing → no etag, removed 0.
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": [1, 3]})).json()
+    assert body["ok"] is True and body["action"] == "dismiss" and body["removed"] == 0
+
+
+async def test_reconcile_merge_and_compact_conflict_shape_on_stale_etag(client, projects_layout):
+    """A stale etag on merge OR compact must 409 with {error:'conflict', current,
+    etag} and write NOTHING — the exact shape the panel adopts to re-review. This
+    is the bug's heart: a 409 must be a distinguishable response, never a no-op."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    for payload in (
+        {"action": "merge", "entryIndices": [1, 3], "mergedText": "X", "etag": "stale"},
+        {"action": "compact", "entryIndices": [0], "compactText": "Y", "etag": "stale"},
+    ):
+        resp = await client.post(
+            "/api/projects/alpha/agents/backend-dev/context/reconcile", json=payload)
+        assert resp.status == 409, payload["action"]
+        body = await resp.json()
+        assert body["error"] == "conflict"
+        assert isinstance(body["current"], str) and isinstance(body["etag"], str) and body["etag"]
+        # Untouched: the rejected write never lands.
+        assert ctx_path.read_text(encoding="utf-8") == before, payload["action"]
+
+
+async def test_reconcile_second_click_succeeds_against_fresh_etag(client, projects_layout):
+    """End-to-end of the panel's 409 recovery: a stale-etag merge 409s and returns
+    the server's fresh etag; re-firing the SAME merge with that etag SUCCEEDS.
+    This is the 'click again to re-confirm' contract the inline banner promises."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    # First click: stale etag → 409 carrying the current etag.
+    first = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reconciled note.", "etag": "stale"})
+    assert first.status == 409
+    fresh_etag = (await first.json())["etag"]
+
+    # Second click: adopt the fresh etag → 200, the merge lands.
+    second = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reconciled note.", "etag": fresh_etag})
+    assert second.status == 200
+    assert (await second.json())["ok"] is True
+    assert "Reconciled note." in ctx_path.read_text(encoding="utf-8")
+
+
+async def test_reconcile_dismiss_then_other_action_no_silent_drop(client, projects_layout):
+    """dismiss returns a clear ok shape (removed:0) AND leaves the file byte-equal,
+    so the panel's 'Keep all' is never mistaken for a silent failure."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+    target = await _conflict_cluster_indices(client, "alpha", "backend-dev")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": target})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True and body["removed"] == 0
+    assert ctx_path.read_text(encoding="utf-8") == before
+
+
+def test_detect_conflicts_zero_on_ten_distinct_topics():
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    entries = parse_context_entries(_TEN_DISTINCT_CONTEXT)
+    assert len(entries) >= 10
+    # Despite the shared ubiquitous words, no genuine near-duplicates exist -> no
+    # clusters at all. The old code returned one 12-entry mega-cluster here.
+    assert detect_conflicts(entries) == []
+
+
+@pytest.mark.parametrize("role", _REAL_CONTEXT_ROLES)
+def test_detect_conflicts_no_blob_on_real_context_files(role):
+    from server.routes.agents import (
+        parse_context_entries,
+        detect_conflicts,
+        _MAX_CLUSTER_SIZE,
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    path = repo_root / ".claude" / "agent-context" / f"{role}.md"
+    if not path.is_file():
+        pytest.skip(f"{role} context file not present in this checkout")
+
+    entries = parse_context_entries(path.read_text(encoding="utf-8"))
+    clusters = detect_conflicts(entries)
+    # The hard invariant: no cluster exceeds the size cap. A distinct-but-related
+    # blob would surface as a large connected component; the conservative linker
+    # plus the cap must keep every offered cluster tight (~2 entries in practice).
+    oversized = [c for c in clusters if len(c["entryIndices"]) > _MAX_CLUSTER_SIZE]
+    assert not oversized, (
+        f"{role}: detect_conflicts emitted a blob cluster (> {_MAX_CLUSTER_SIZE} "
+        f"entries) that Merge would wrongly try to fuse: {oversized}"
+    )
+
+
+async def test_reconcile_sweep_etag_conflict(client, projects_layout):
+    """The ephemeral bulk-sweep must be etag-guarded: a stale etag yields a 409
+    with the conflict shape, never a silent destructive drop against a moved file.
+    """
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson worth keeping.\n",
+    )
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
+    before = ctx_path.read_text(encoding="utf-8")
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0], "etag": "stale-etag-value"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "current" in body and "etag" in body
+    # Nothing was removed -- the file is byte-identical after the rejected sweep.
+    assert ctx_path.read_text(encoding="utf-8") == before
+
+
+def test_context_summary_and_list_never_raise_on_oversized_garbage(tmp_path, monkeypatch):
+    """Defensive contract: context_summary and the agents listing must never throw,
+    so the Agents/Projects listings can't break -- on either (a) a malformed but
+    parseable oversized file (size signal still fires) or (b) a genuinely
+    unreadable (non-UTF-8) file that makes read_text raise (degrades to defaults).
+    Drives the helpers directly (no client) on an isolated tmp project.
+    """
+    import server.routes.agents as agents_mod
+    # Isolate the global agents dir so the developer's real ~/.claude/agents/ is
+    # not scanned by _list_agents during this unit-level check.
+    monkeypatch.setattr(agents_mod, "GLOBAL_AGENTS_DIR", tmp_path / "dot_claude" / "agents")
+
+    project_dir = tmp_path / "workspace" / "proj"
+    agents_d = project_dir / ".claude" / "agents"
+    ctx_d = project_dir / ".claude" / "agent-context"
+    agents_d.mkdir(parents=True)
+    ctx_d.mkdir(parents=True)
+    (agents_d / "qa.md").write_text("---\nname: qa\n---\nbody\n", encoding="utf-8")
+
+    # (a) Oversized (> ~6KB / 400 lines) AND malformed: stray headers, non-bullet
+    # lines, broken bullets -- must parse defensively, not raise, and still flag.
+    garbage = "# qa\n" + (
+        "garbled non-bullet line %s\n## stray header\n- - nested?? weird\n" % ("x" * 60)
+    ) * 200
+    (ctx_d / "qa.md").write_text(garbage, encoding="utf-8")
+    summary = agents_mod.context_summary(project_dir, "qa")  # must not raise
+    assert summary["oversized"] is True  # size signal fires even on garbage
+    recs = agents_mod._list_agents(project_dir)  # must not raise
+    qa = next(r for r in recs if r["slug"] == "qa")
+    assert qa["oversized"] is True
+
+    # (b) A non-UTF-8 (binary) context file makes filestore.read_text raise; the
+    # defensive except must swallow it and return the zeroed defaults, never throw.
+    (ctx_d / "qa.md").write_bytes(b"\xff\xfe\x00 not valid utf-8 " + b"x" * 7000)
+    summary2 = agents_mod.context_summary(project_dir, "qa")  # must not raise
+    assert summary2 == {
+        "entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0,
+        "oversized": False, "contextBytes": 0, "lineCount": 0,
+    }
+    # The listing still survives an unreadable context file (record is skipped or
+    # zeroed, but the call itself never raises).
+    agents_mod._list_agents(project_dir)
+
+
+async def test_reconcile_merge_success_shape_has_etag_and_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3],
+              "mergedText": "Reset the cache with a fresh _Cache() in an autouse fixture."},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["action"] == "merge"        # action echoed back for the UI
+    assert isinstance(body["removed"], int) and body["removed"] == 1
+    assert isinstance(body["etag"], str) and body["etag"]  # non-empty fresh etag
+    # The fresh etag the UI must adopt is the file's actual current etag.
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == after["etag"]
+
+
+async def test_reconcile_keep_success_shape_has_etag_and_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["action"] == "keep"
+    assert isinstance(body["removed"], int) and body["removed"] == 1
+    assert isinstance(body["etag"], str) and body["etag"]
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == after["etag"]
+
+
+async def test_reconcile_sweep_success_shape_has_etag_and_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson worth keeping.\n",
+    )
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["action"] == "sweep"
+    assert isinstance(body["removed"], int) and body["removed"] == 1
+    assert isinstance(body["etag"], str) and body["etag"]
+    after = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert body["etag"] == after["etag"]
+
+
+async def test_reconcile_dismiss_success_shape(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # dismiss records the cluster but removes nothing and rewrites nothing, so it
+    # carries no etag -- the UI's dismiss branch must NOT try to adopt one.
+    assert body == {"ok": True, "action": "dismiss", "removed": 0}
+
+
+async def test_reconcile_merge_etag_conflict_full_shape_no_write(client, projects_layout):
+    """The exact path 'Save merged got no response' routed through: a merge with a
+    stale etag -> 409 with the FULL documented body and a byte-IDENTICAL file. The
+    body etag is the real current one (differs from the stale etag, equals a fresh
+    GET) so the panel can adopt it and a second click can succeed."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    stale = "stale-etag-value"
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3],
+              "mergedText": "merged but stale", "etag": stale},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    # Full documented 409 contract.
+    assert body["error"] == "conflict"
+    assert isinstance(body["message"], str) and body["message"]
+    assert isinstance(body["current"], str)        # current file content for re-review
+    assert isinstance(body["etag"], str) and body["etag"]  # fresh etag to adopt
+    # The adopted etag is the REAL current etag: not the stale one, and it matches
+    # both the on-disk file and a fresh GET /context (the second-click etag source).
+    assert body["etag"] != stale
+    from server import filestore
+    assert body["etag"] == filestore.etag_for(ctx_path)
+    get = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == get["etag"]
+    assert body["current"] == get["content"]
+    # No destructive write on conflict -- the file is byte-identical.
+    assert ctx_path.read_text(encoding="utf-8") == before
+
+
+async def test_reconcile_keep_etag_conflict_full_shape_no_write(client, projects_layout):
+    """Keep (drop-the-rest) is etag-guarded identically: a stale etag -> 409 with
+    the full conflict body and a byte-identical file (no silent destructive drop)."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    stale = "stale-etag-value"
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3], "etag": stale},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert isinstance(body["message"], str) and body["message"]
+    assert isinstance(body["current"], str)
+    assert isinstance(body["etag"], str) and body["etag"]
+    assert body["etag"] != stale
+    from server import filestore
+    assert body["etag"] == filestore.etag_for(ctx_path)
+    get = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == get["etag"]
+    assert body["current"] == get["content"]
+    assert ctx_path.read_text(encoding="utf-8") == before
