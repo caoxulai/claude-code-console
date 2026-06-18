@@ -200,15 +200,41 @@ _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{2,}")
 _SUPERSEDE_RE = re.compile(r"supersed|correct|replaces?\b|instead of", re.IGNORECASE)
 
 # Clustering tuning (see spec item 1). Pure heuristic, deterministic, no LLM.
-#   - A token appearing in more than this fraction of entries is "ubiquitous"
-#     (e.g. test/etag/context on a real file) and is dropped from linking so it
-#     can't bind everything into one mega-cluster.
-#   - Linking requires >=2 discriminative (non-ubiquitous) shared tokens, OR a
-#     single shared dotted/underscored identifier that is itself low-DF.
-#   - A connected group larger than MAX_CLUSTER_SIZE is not a real near-duplicate
-#     set; it's dropped rather than emitted as one giant cluster.
+# The linking rule is deliberately CONSERVATIVE: on a real file of distinct-but-
+# related decisions about one subsystem (e.g. the Slack timeline D-010/D-014/
+# D-017/D-018, each mentioning shared identifiers like `register(app)` or
+# `slack_threads.json`) it yields ZERO clusters. Only a genuine duplicate pair or
+# an explicit correction pair clusters — and tightly (usually 2 entries).
+#   - _DF_FRACTION_CAP: a token appearing in more than this fraction of entries is
+#     "ubiquitous" (test/etag/context on a real file) and is dropped before
+#     linking, so it can't bind everything together. The remainder is each entry's
+#     discriminative vocabulary.
+#   - _OVERLAP_RATIO_MIN: two entries link only when the fraction of the smaller
+#     entry's discriminative vocabulary that is SHARED with the other meets this
+#     threshold — i.e. they are genuinely near-duplicate, not merely co-mentioning
+#     one identifier. (A single shared identifier no longer links anything; that
+#     shortcut was the mega-cluster root cause.)
+#   - _OVERLAP_MIN_DENOM: a floor on the smaller discriminative-token count so a
+#     1-token-vs-2-token coincidence can't trivially hit a high ratio.
+#   - Explicit dated supersede: an entry carrying a _SUPERSEDE_RE marker plus a
+#     referenced YYYY-MM-DD that matches ANOTHER entry's date (and at least one
+#     shared discriminative token) links specifically to that entry, labelled
+#     "superseded".
+#   - _MAX_CLUSTER_SIZE stays a backstop only; with the tight rule clusters are
+#     naturally ~2 entries, so the cap should rarely be the thing doing the work.
 _DF_FRACTION_CAP = 0.4
+# Tuned against the live qa.md (407 entries) + backend-dev.md/frontend-dev.md
+# timelines: 0.60 still linked one borderline distinct-but-related pair (a
+# launcher-env note vs a dedupe-rule note sharing the dedupe vocabulary at
+# exactly 0.60); 0.65 drops it while keeping the genuine ceremony-repetition
+# near-duplicates (which sit at 0.68–0.71). The two distinct-but-related
+# decision timelines yield ZERO clusters at every threshold.
+_OVERLAP_RATIO_MIN = 0.65
+_OVERLAP_MIN_DENOM = 3
 _MAX_CLUSTER_SIZE = 5
+# A YYYY-MM-DD date reference inside an entry's body (used to bind a dated
+# supersede marker to the specific entry it corrects).
+_DATE_REF_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
 # Size-ceiling nudge (design §4.4): a context file past these bounds is flagged
 # for reconciliation even with zero detected conflicts.
@@ -262,24 +288,31 @@ def _tokens(text: str) -> set[str]:
 
 
 def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None) -> list[dict]:
-    """Group entries that overlap or supersede each other (v1, pure-Python).
+    """Group entries that are genuinely redundant or explicitly superseding (pure-Python).
 
-    Pure heuristic, no LLM, deterministic. The hard part is NOT over-clustering:
-    on a real file a single ubiquitous word ("test"/"etag"/"context") or one
-    "supersedes" word must not bind every entry into one mega-cluster. So:
+    Pure heuristic, no LLM, deterministic, and deliberately CONSERVATIVE — Merge
+    must only ever see entries it can safely fuse into ONE non-colliding version.
+    A file of distinct-but-related decisions about one subsystem (each merely
+    co-mentioning a shared identifier) must yield ZERO clusters; a true duplicate
+    pair or an explicit correction pair yields exactly one tight (≈2-entry)
+    cluster. So:
 
       1. Document-frequency filter: tokens appearing in more than
-         `_DF_FRACTION_CAP` of entries are "ubiquitous" and dropped from linking
-         (TF-IDF spirit). What's left is the discriminative vocabulary.
-      2. Linking requires strong evidence: two entries link only when they share
-         >=2 discriminative tokens, OR a single shared dotted/underscored
-         identifier that is itself discriminative (low-DF).
-      3. A supersede/correction marker only labels a cluster "superseded" when
-         the marked entry actually links (by the rule above) to another member —
-         a stray marker word can't taint a transitively-merged blob.
-      4. Cluster-size cap: a connected group larger than `_MAX_CLUSTER_SIZE` is
-         not a genuine near-duplicate set, so it is dropped (no mega-cluster) —
-         a file with no real near-duplicates yields ZERO clusters.
+         `_DF_FRACTION_CAP` of entries are "ubiquitous" (test/etag/context on a
+         real file) and dropped before linking. What's left is each entry's
+         discriminative vocabulary `disc[i]`.
+      2. HIGH OVERLAP RATIO links two entries: with `lo = min(|disc[i]|,|disc[j]|)`
+         guarded at `>= _OVERLAP_MIN_DENOM`, they link when
+         `|disc[i] & disc[j]| / lo >= _OVERLAP_RATIO_MIN` — i.e. a large fraction
+         of the smaller entry's discriminative vocabulary is shared. Co-mentioning
+         a single identifier (the old mega-cluster shortcut) no longer links
+         anything.
+      3. EXPLICIT DATED SUPERSEDE links two entries: an entry carrying a
+         `_SUPERSEDE_RE` marker AND a referenced `YYYY-MM-DD` (not its own date)
+         that equals ANOTHER entry's date, with >=1 shared discriminative token,
+         links specifically to that entry and labels the cluster "superseded".
+      4. Cluster-size cap (`_MAX_CLUSTER_SIZE`) stays a backstop only — with the
+         tight rule clusters are naturally ~2 entries.
 
     Returns clusters: [{ "reason", "entryIndices": [...] }], reason
     "superseded" or "redundant", smallest-index first. Singletons are skipped.
@@ -291,7 +324,6 @@ def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None
     if n < 2:
         return []
     toks = [_tokens(e["text"]) for e in entries]
-    has_marker = [bool(_SUPERSEDE_RE.search(e["text"])) for e in entries]
 
     # Document frequency per token, then the ubiquitous set to ignore.
     df: dict[str, int] = {}
@@ -316,16 +348,35 @@ def detect_conflicts(entries: list[dict], dismissed_keys: set[str] | None = None
         if ra != rb:
             parent[max(ra, rb)] = min(ra, rb)
 
-    # Pairs that link AND involve a supersede marker on a real topic overlap.
-    marker_linked: set[int] = set()
+    # (a) High overlap ratio of discriminative vocabulary → genuine redundancy.
     for i in range(n):
         for j in range(i + 1, n):
-            shared = disc[i] & disc[j]
-            strong_id = any(("." in s or "_" in s) for s in shared)
-            related = len(shared) >= 2 or strong_id
-            if related:
+            lo = min(len(disc[i]), len(disc[j]))
+            if lo < _OVERLAP_MIN_DENOM:
+                continue
+            shared = len(disc[i] & disc[j])
+            if shared / lo >= _OVERLAP_RATIO_MIN:
                 union(i, j)
-                if has_marker[i] or has_marker[j]:
+
+    # (b) Explicit dated supersede: a marker-bearing entry that names another
+    # entry's date (and shares a discriminative token with it) links to exactly
+    # that entry and taints the resulting cluster "superseded".
+    by_date: dict[str, list[int]] = {}
+    for idx, e in enumerate(entries):
+        if e["date"]:
+            by_date.setdefault(e["date"], []).append(idx)
+    marker_linked: set[int] = set()
+    for i, e in enumerate(entries):
+        if not _SUPERSEDE_RE.search(e["text"]):
+            continue
+        for ref in set(_DATE_REF_RE.findall(e["text"])):
+            if ref == e["date"]:
+                continue  # the entry's own date is not a supersede reference
+            for j in by_date.get(ref, ()):
+                if j == i:
+                    continue
+                if disc[i] & disc[j]:  # require at least some topic overlap
+                    union(i, j)
                     marker_linked.add(i)
                     marker_linked.add(j)
 

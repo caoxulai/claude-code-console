@@ -344,8 +344,8 @@ export default function AgentContextPanel({ projectId, slug, onChanged }) {
                       <button
                         className="btn"
                         disabled={busy}
-                        title="Replace the cluster with one entry you edit (pre-filled with the newest)"
-                        onClick={() => { setMergeFor(ci); setMergeText((entryByIndex(newestIndex) || c.entries[c.entries.length - 1]).text); }}
+                        title="Replace the cluster with one entry you edit (pre-filled with all entries so you can combine them)"
+                        onClick={() => { setMergeFor(ci); setMergeText(c.entries.map((e) => e.text).join('\n')); }}
                       >
                         Merge…
                       </button>
