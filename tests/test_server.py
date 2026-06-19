@@ -6518,9 +6518,10 @@ def test_slack_mention_candidates_from_unreads():
 
 
 def test_slack_merge_appends_skeletons_for_new_channels():
-    """_merge_scan_candidates appends a needs-draft SKELETON for each genuinely-new
+    """_merge_scan_candidates appends a needs-classify SKELETON for each genuinely-new
     channelId; a group-DM 'C…' and a 1:1-DM 'D…' that share a participant are kept
-    DISTINCT (dedupe is EXACT channelId)."""
+    DISTINCT (dedupe is EXACT channelId). (D-025: fresh skeletons land in
+    'needs-classify' so the classify worker triages them before drafting.)"""
     items: list = []
     cands = [
         {"channelId": "D1", "channelType": "dm", "sender": "alice",
@@ -6534,8 +6535,8 @@ def test_slack_merge_appends_skeletons_for_new_channels():
     # Both appended as distinct skeletons (the shared participant does NOT collapse
     # the group DM into the 1:1 DM).
     assert set(by_id) == {"D1", "C1"}
-    assert by_id["D1"]["status"] == "needs-draft" and by_id["D1"]["channelType"] == "dm"
-    assert by_id["C1"]["status"] == "needs-draft" and by_id["C1"]["channelType"] == "group_dm"
+    assert by_id["D1"]["status"] == "needs-classify" and by_id["D1"]["channelType"] == "dm"
+    assert by_id["C1"]["status"] == "needs-classify" and by_id["C1"]["channelType"] == "group_dm"
     # Skeletons carry a fresh id and the candidate's routing/snippet fields.
     assert by_id["D1"]["id"] and by_id["D1"]["snippet"] == "hi"
 
@@ -6638,7 +6639,8 @@ def test_slack_merge_sent_item_suppresses_until_newer_activity():
                 "channel": "c", "snippet": "new message!", "ts": _MS_NEWER}]
     assert slack_mod._merge_scan_candidates(items_b, cands_b) is True
     statuses = sorted(it["status"] for it in items_b)
-    assert statuses == ["needs-draft", "sent"]  # the sent stays, a new skeleton joins
+    # D-025: a fresh skeleton lands in 'needs-classify'; the sent item stays.
+    assert statuses == ["needs-classify", "sent"]  # the sent stays, a new skeleton joins
 
 
 async def _run_one_scan_cycle(app, monkeypatch, *, unreads):
@@ -6691,8 +6693,9 @@ async def test_slack_scan_worker_writes_skeletons_for_new_conversations(
     saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
     by_id = {it["channelId"]: it for it in saved}
     assert set(by_id) == {"D_alice", "C_grp", "C_proj"}
-    # All written as needs-draft skeletons the _draft_worker will later draft.
-    assert all(it["status"] == "needs-draft" for it in saved)
+    # All written as needs-classify skeletons the _classify_worker triages first
+    # (D-025), then the _draft_worker drafts the needs-reply / actionable ones.
+    assert all(it["status"] == "needs-classify" for it in saved)
     assert by_id["D_alice"]["channelType"] == "dm"
     assert by_id["C_grp"]["channelType"] == "group_dm"
     assert by_id["C_proj"]["channelType"] == "mention"
@@ -6775,9 +6778,9 @@ async def test_slack_scan_worker_never_resurrects_dismissed_or_sent(
     # Sent-no-newer: still exactly the one sent item (no new skeleton).
     assert len(by_channel["D_sent_old"]) == 1
     assert by_channel["D_sent_old"][0]["status"] == "sent"
-    # Sent-with-newer: the sent item PLUS a fresh needs-draft skeleton.
+    # Sent-with-newer: the sent item PLUS a fresh needs-classify skeleton (D-025).
     statuses = sorted(it["status"] for it in by_channel["D_sent_new"])
-    assert statuses == ["needs-draft", "sent"]
+    assert statuses == ["needs-classify", "sent"]
 
 
 async def test_slack_scan_worker_read_failure_leaves_queue_untouched(
@@ -7988,3 +7991,634 @@ async def test_slack_regenerate_skips_history_fetch_when_already_present(
     # Already had history3d -> no redundant fetch.
     assert fetched_for == []
     assert captured.get("action") == "regenerate"
+
+
+# --------------------------------------------------------------------------- #
+# D-025: Slack pause toggle, classify worker, and thread muting.
+#
+# These tests are PURELY ADDITIVE — they reuse the existing slack_file / _stub_agent
+# / _run_one_scan_cycle / reset_scan_ts fixtures and the module-level slack_mod.
+# The pause/classify gates are checked INSIDE the worker loops (never by stopping
+# tasks); classification is a NEW worker between scan and draft; muting is a
+# channelId-scoped key in the existing slack_threads.json sidecar.
+# --------------------------------------------------------------------------- #
+
+
+# ── Feature 1: pause toggle ───────────────────────────────────────────────────
+
+
+async def test_slack_put_config_sets_paused_and_queue_reports_it(client, slack_file):
+    """PUT /api/slack/config {paused:true} persists the top-level flag and GET
+    /queue echoes it; absent on disk == unpaused (false)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    # Absent key -> unpaused.
+    body = await (await client.get("/api/slack/queue")).json()
+    assert body["paused"] is False
+
+    resp = await client.put("/api/slack/config", json={"paused": True})
+    assert resp.status == 200
+    assert (await resp.json())["paused"] is True
+
+    # Persisted on disk + reflected by GET /queue.
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    assert saved["paused"] is True
+    body = await (await client.get("/api/slack/queue")).json()
+    assert body["paused"] is True
+
+    # Toggling back off round-trips.
+    resp = await client.put("/api/slack/config", json={"paused": False})
+    assert resp.status == 200
+    assert (await resp.json())["paused"] is False
+
+
+async def test_slack_put_config_requires_paused_field(client, slack_file):
+    """PUT /api/slack/config without `paused` is a 400 (fail loud on missing input)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    resp = await client.put("/api/slack/config", json={"something": True})
+    assert resp.status == 400
+
+
+async def test_slack_put_config_conflict_returns_409(client, slack_file):
+    """PUT /api/slack/config is etag-guarded: a stale client etag → 409 with the
+    current state, mirroring save_draft's optimistic-concurrency contract."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    # Capture a now-stale etag, then move the file out-of-band so it no longer matches.
+    stale = (await (await client.get("/api/slack/queue")).json())["etag"]
+    _time.sleep(0.01)  # mtime_ns etags collide without a real-time gap
+    data, cur = slack_mod.filestore.read_json(slack_file)
+    data["items"].append({"id": "x", "status": "needs-review"})
+    slack_mod.filestore.write_json(slack_file, data, cur)
+
+    resp = await client.put("/api/slack/config", json={"paused": True, "etag": stale})
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "etag" in body
+
+
+async def test_slack_paused_skips_scan_cycle(client, slack_file, reset_scan_ts, monkeypatch):
+    """paused=true: a scan-worker cycle skips the scan entirely — _scan_read is NEVER
+    called and the queue file is byte-unchanged (the gate is INSIDE the loop, after
+    the readiness gate)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"paused": True, "items": []}), encoding="utf-8")
+    before = slack_file.read_text(encoding="utf-8")
+
+    called = []
+
+    async def spy_scan_read(name, arguments):
+        called.append(name)
+        return {}
+
+    monkeypatch.setattr(slack_mod, "_scan_read", spy_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.15)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # The paused gate fired before any MCP read; nothing scanned, file untouched.
+    assert called == []
+    assert slack_file.read_text(encoding="utf-8") == before
+
+
+async def test_slack_paused_skips_draft_cycle(client, slack_file, monkeypatch):
+    """paused=true: a draft-worker cycle skips drafting — the seam is NEVER called
+    and a needs-draft skeleton stays needs-draft (gate INSIDE the loop)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"paused": True, "items": [{
+        "id": "s1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "ping", "ts": 1, "status": "needs-draft",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "x"})
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    assert agent.calls == []
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-draft"
+
+
+async def test_slack_paused_skips_classify_cycle(client, slack_file, monkeypatch):
+    """paused=true: a classify-worker cycle skips classification — the seam is NEVER
+    called and a needs-classify skeleton stays needs-classify."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"paused": True, "items": [{
+        "id": "c1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "ping", "ts": 1, "status": "needs-classify",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "classifications": []})
+    await _run_one_classify_cycle(client.app, monkeypatch)
+
+    assert agent.calls == []
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-classify"
+
+
+async def _run_one_manual_scan(app, monkeypatch, *, unreads):
+    """Drive ONE MANUAL scan (D-026): set the worker's wake Event so the cycle takes
+    the manual (not periodic-timeout) path, then run the worker a moment and cancel.
+
+    Identical harness to ``_run_one_scan_cycle`` (canned _scan_read, forced
+    readiness) EXCEPT the wake Event is set so the loop treats this as a Refresh-
+    triggered manual scan — which must run even while paused AND chain the full
+    classify+draft pipeline. We keep SLACK_SCAN_INTERVAL_S long so the ONLY thing
+    that wakes the loop is our Event (no spurious periodic tick races in)."""
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            return unreads
+        if name == "get_messages":
+            return {"messages": []}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 30)
+    task = asyncio.create_task(slack_mod._scan_worker(app))
+    try:
+        await asyncio.sleep(0.02)   # let the worker park on the wake Event
+        slack_mod._get_scan_event().set()
+        await asyncio.sleep(0.25)   # full manual pipeline: scan -> classify -> draft
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_slack_manual_scan_runs_even_when_paused(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """D-026: `paused` gates ONLY the periodic tick. A MANUAL scan (wake Event set,
+    as the Refresh button does) STILL scans while paused — _scan_read IS called and
+    a fresh needs-classify skeleton is written for the new conversation."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"paused": True, "items": []}), encoding="utf-8")
+
+    now_s = _time.time()
+    unreads = {"channels": [
+        {"channelId": "D_alice", "name": "alice",
+         "messages": [{"user": "alice", "text": "hey", "ts": f"{now_s - 1:.6f}"}]},
+    ]}
+    # Stub classify/draft seams so the chained pipeline is hermetic (no real claude).
+    async def empty_history(_channel_id):
+        return []
+    monkeypatch.setattr(slack_mod, "_fetch_history_for", empty_history)
+    _stub_agent(monkeypatch, {"available": True, "classifications": [], "draft": ""})
+
+    await _run_one_manual_scan(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    # The manual scan ran despite paused=true: the new DM was scanned and written.
+    assert [it["channelId"] for it in saved] == ["D_alice"]
+    assert saved[0]["status"] == "needs-classify"
+    # paused is still true — a manual scan does NOT resume the periodic workers.
+    assert json.loads(slack_file.read_text(encoding="utf-8")).get("paused") is True
+
+
+async def test_slack_manual_scan_drives_full_pipeline_while_paused(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """D-026: a MANUAL scan while paused drives the FULL one-time pipeline —
+    scan → classify → draft — so the user gets ready-to-review drafts even though
+    the periodic classify/draft workers are paused. The freshly-scanned skeleton
+    lands needs-classify, is classified needs-reply → needs-draft, then drafted →
+    needs-review, all in the single manual cycle."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"paused": True, "items": []}), encoding="utf-8")
+
+    now_s = _time.time()
+    unreads = {"channels": [
+        {"channelId": "D_alice", "name": "alice",
+         "messages": [{"user": "alice", "text": "can you review the PR?", "ts": f"{now_s - 1:.6f}"}]},
+    ]}
+
+    async def empty_history(_channel_id):
+        return []
+    monkeypatch.setattr(slack_mod, "_fetch_history_for", empty_history)
+
+    # The seam: classify routes the scanned item to needs-reply, then draft fills it.
+    async def fake_agent(action, payload):
+        fake_agent.calls.append(action)
+        if action == "classify":
+            ids = [it["id"] for it in payload["items"]]
+            return {"available": True, "classifications": [
+                {"id": i, "classification": "needs-reply"} for i in ids]}
+        if action == "draft":
+            return {"available": True, "draft": "Sure, I'll take a look."}
+        return {"available": True, "action": action}
+    fake_agent.calls = []
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+
+    await _run_one_manual_scan(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 1
+    item = saved[0]
+    # Full pipeline ran in the single manual cycle: classify + draft both fired and
+    # the item ended drafted-and-ready despite paused=true.
+    assert "classify" in fake_agent.calls
+    assert "draft" in fake_agent.calls
+    assert item["status"] == "needs-review"
+    assert item["draft"] == "Sure, I'll take a look."
+    # No send ever fired (the pipeline never sends — only the user-gated seam does).
+    assert "send" not in fake_agent.calls
+
+
+# ── Feature 2: classify worker ────────────────────────────────────────────────
+
+
+async def _run_one_classify_cycle(app, monkeypatch):
+    """Drive ONE _classify_worker iteration: force readiness, tighten the interval,
+    run the worker a moment, then cancel cleanly (mirrors _run_one_draft_cycle)."""
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_CLASSIFY_POLL_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._classify_worker(app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def test_slack_scan_skeleton_is_needs_classify():
+    """A freshly-scanned skeleton lands in 'needs-classify' (NOT 'needs-draft', D-025)
+    so the classify worker triages it first."""
+    skel = slack_mod._skeleton_for({
+        "channelId": "D1", "channelType": "dm", "sender": "a",
+        "channel": "c", "snippet": "hi", "ts": 1,
+    })
+    assert skel["status"] == "needs-classify"
+
+
+def test_slack_classify_status_and_active_sets():
+    """D-027: needs-classify is a valid status and dedupes in scan. 'fyi' is NO
+    LONGER a status — it is a classification LABEL on a needs-draft/needs-review
+    item, so it must NOT appear in the status sets; the valid classifications live
+    in their own set."""
+    assert "needs-classify" in slack_mod._VALID_STATUS
+    assert "fyi" not in slack_mod._VALID_STATUS
+    assert "fyi" in slack_mod._VALID_CLASSIFICATIONS
+    assert "needs-classify" in slack_mod._SCAN_ACTIVE_STATUSES
+    assert "fyi" not in slack_mod._SCAN_ACTIVE_STATUSES
+
+
+def test_slack_load_migrates_legacy_fyi_status(slack_file):
+    """D-027 migration: a legacy item written with status 'fyi' (the old terminal
+    state) is converted on _load to status 'needs-draft' + classification 'fyi' so
+    it rejoins drafting and gets context + a draft. _load must NOT write to disk (a
+    read stays a read) — the migration is in-memory until the next normal write."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "old_fyi", "sender": "bot", "channel": "#deploys", "channelType": "mention",
+        "channelId": "C1", "snippet": "deploy finished", "ts": 1, "status": "fyi",
+    }]}), encoding="utf-8")
+    before = slack_file.read_text(encoding="utf-8")
+
+    data, _ = slack_mod._load()
+    item = data["items"][0]
+    assert item["status"] == "needs-draft"
+    assert item["classification"] == "fyi"
+    # The read did not mutate the file on disk (still the legacy shape).
+    assert slack_file.read_text(encoding="utf-8") == before
+
+
+async def test_slack_fyi_classified_item_gets_drafted(client, slack_file, monkeypatch):
+    """D-027: an item classified 'fyi' is NOT terminal — it flows to needs-draft and
+    the draft worker drafts it (context + draft), ending needs-review with the fyi
+    classification preserved. This is the fix for 'FYI has no thread context/draft'."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "f1", "sender": "bot", "channel": "#deploys", "channelType": "mention",
+        "channelId": "C1", "snippet": "deploy finished", "ts": 1,
+        "status": "needs-draft", "classification": "fyi",
+    }]}), encoding="utf-8")
+
+    async def empty_history(_channel_id):
+        return []
+    monkeypatch.setattr(slack_mod, "_fetch_history_for", empty_history)
+    _stub_agent(monkeypatch, {"available": True, "draft": "Noted, thanks for the heads up."})
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"        # drafted like any other item
+    assert saved["draft"] == "Noted, thanks for the heads up."
+    assert saved["classification"] == "fyi"          # label preserved through drafting
+
+
+def test_slack_classify_prompt_and_parse_shape():
+    """The classify prompt asks for the {id, classification} JSON array with the
+    needs-reply/fyi/actionable definitions and forbids tool calls; the parser
+    requires a JSON array and fails loud on a non-array."""
+    prompt = slack_mod._build_agent_prompt("classify", {"items": [
+        {"id": "c1", "sender": "alice", "channel": "DM", "snippet": "can you review?"},
+    ]})
+    assert "needs-reply" in prompt and "fyi" in prompt and "actionable" in prompt
+    assert "JSON array of {id, classification}" in prompt
+    assert "do NOT call any tools" in prompt
+    assert "c1" in prompt  # the item id is rendered into the batch
+
+    ok = slack_mod._parse_agent_result(
+        json.dumps([{"id": "c1", "classification": "fyi"}]), "classify")
+    assert ok["available"] is True
+    assert ok["classifications"][0]["classification"] == "fyi"
+    # A non-array reply fails loud (no fabrication).
+    bad = slack_mod._parse_agent_result(json.dumps({"id": "c1"}), "classify")
+    assert bad["available"] is False
+
+
+def test_slack_classify_action_is_mcp_free_at_spawn():
+    """The 'classify' action is MCP-FREE at spawn (needs_mcp=False) so it gets no
+    --allowedTools / empty --mcp-config. _ALLOWED_TOOLS must NOT grant it any tool
+    (it is absent / read-free by design — the snippet-only triage path)."""
+    assert "classify" not in slack_mod._ALLOWED_TOOLS or \
+        "mcp__slack-mcp__post_message" not in slack_mod._ALLOWED_TOOLS.get("classify", [])
+
+
+async def test_slack_classify_spawn_is_mcp_free(monkeypatch):
+    """The classify subprocess spawns with --strict-mcp-config + an EMPTY --mcp-config
+    (no servers) and NO --allowedTools — zero Slack access, zero cold-start (D-025,
+    same no-MCP path as draft/regenerate)."""
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = list(args)
+        return _SlackFakeProc(stdout_lines=[_result_line(json.dumps([]))])
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_subprocess_exec", fake_exec)
+    result = await slack_mod._run_slack_agent("classify", {"items": [
+        {"id": "c1", "sender": "a", "channel": "c", "snippet": "hi"}]})
+    assert result["available"] is True
+
+    args = captured["args"]
+    assert "--strict-mcp-config" in args
+    # No --allowedTools on the MCP-free classify spawn.
+    assert "--allowedTools" not in args
+    # The --mcp-config (if written) carries NO servers (empty), so no slack-mcp boots.
+    if "--mcp-config" in args:
+        cfg_path = args[args.index("--mcp-config") + 1]
+        if Path(cfg_path).exists():
+            cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+            assert cfg.get("mcpServers", {}) == {}
+
+
+async def test_slack_classify_worker_batches_and_routes(client, slack_file, monkeypatch):
+    """ONE classify cycle: the worker batches all needs-classify items into ONE
+    _run_slack_agent('classify') call, RECORDS the label in `classification`, and
+    routes EVERY item → needs-draft (D-027) so each gets context + a draft
+    regardless of label. fyi is a classification, NOT a terminal status."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "reply1", "sender": "alice", "channel": "DM with alice",
+         "channelType": "dm", "channelId": "D1", "snippet": "can you review the PR?",
+         "ts": 1, "status": "needs-classify"},
+        {"id": "fyi1", "sender": "bot", "channel": "#deploys", "channelType": "mention",
+         "channelId": "C1", "snippet": "deploy finished", "ts": 2, "status": "needs-classify"},
+        {"id": "act1", "sender": "carol", "channel": "DM with carol",
+         "channelType": "dm", "channelId": "D2", "snippet": "please file the ticket",
+         "ts": 3, "status": "needs-classify"},
+    ]}), encoding="utf-8")
+
+    calls = []
+
+    async def fake_agent(action, payload):
+        calls.append((action, payload))
+        # Canned classifications keyed to the batch ids.
+        return {"available": True, "classifications": [
+            {"id": "reply1", "classification": "needs-reply"},
+            {"id": "fyi1", "classification": "fyi"},
+            {"id": "act1", "classification": "actionable"},
+        ]}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+    await _run_one_classify_cycle(client.app, monkeypatch)
+
+    # ONE classify call for the whole batch (all 3 fit in SLACK_CLASSIFY_BATCH=10).
+    classify_calls = [c for c in calls if c[0] == "classify"]
+    assert len(classify_calls) == 1
+    assert {it["id"] for it in classify_calls[0][1]["items"]} == {"reply1", "fyi1", "act1"}
+    # No send call ever fired (classify is read-free, never sends).
+    assert all(action != "send" for action, _ in calls)
+
+    saved = {it["id"]: it for it in json.loads(slack_file.read_text(encoding="utf-8"))["items"]}
+    # D-027: EVERY classified item flows to needs-draft (so it gets a draft); the
+    # triage label is recorded in `classification` and only drives review grouping.
+    assert saved["reply1"]["status"] == "needs-draft"
+    assert saved["reply1"]["classification"] == "needs-reply"
+    assert saved["act1"]["status"] == "needs-draft"
+    assert saved["act1"]["classification"] == "actionable"
+    assert saved["fyi1"]["status"] == "needs-draft"     # fyi is NO LONGER terminal
+    assert saved["fyi1"]["classification"] == "fyi"     # it's a label, not a status
+
+
+async def test_slack_classify_worker_unavailable_leaves_items(client, slack_file, monkeypatch):
+    """An unavailable classify result leaves the needs-classify items AS-IS (fail
+    loud, no fabrication) so the next cycle retries them."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "c1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "hi", "ts": 1, "status": "needs-classify",
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    await _run_one_classify_cycle(client.app, monkeypatch)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-classify"
+
+
+async def test_slack_classify_worker_inert_until_ready(client, slack_file, monkeypatch):
+    """When _probe_readiness is NOT ready (claude absent — the suite default), the
+    classify worker spawns nothing even with pending needs-classify items."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "c1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "hi", "ts": 1, "status": "needs-classify",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "classifications": [
+        {"id": "c1", "classification": "needs-reply"}]})
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": False})
+    monkeypatch.setattr(slack_mod, "SLACK_CLASSIFY_POLL_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._classify_worker(client.app))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert agent.calls == []
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-classify"
+
+
+async def test_slack_classify_worker_task_started_and_cancelled_cleanly(aiohttp_client, app):
+    """The classify-worker lifecycle: on_startup creates app['slack_classify_task'];
+    closing the client cancels+awaits it (no orphan, no 'Task was destroyed')."""
+    c = await aiohttp_client(app)
+    task = app.get("slack_classify_task")
+    assert task is not None and not task.done()
+    await c.close()
+    assert task.done()
+    assert "slack_classify_task" not in app
+
+
+# ── Feature 3: thread muting ──────────────────────────────────────────────────
+
+
+def test_slack_mute_key_falls_back_to_channel_id():
+    """_mute_key_for is channelId-scoped today (no threadTs is captured anywhere);
+    it only becomes thread-scoped when a non-empty threadTs is present (D-025)."""
+    assert slack_mod._mute_key_for({"channelId": "D1"}) == "D1"
+    assert slack_mod._mute_key_for({"channelId": "D1", "threadTs": ""}) == "D1"
+    assert slack_mod._mute_key_for({"channelId": "D1", "threadTs": "1700.5"}) == "D1_1700.5"
+    # No channelId -> no key (unroutable, can't be muted).
+    assert slack_mod._mute_key_for({"sender": "a"}) == ""
+
+
+async def test_slack_mute_dismisses_and_records_muted_thread(client, slack_file, monkeypatch):
+    """POST /queue/{id}/mute soft-dismisses the item AND adds its mute key to
+    mutedThreads with a unix timestamp."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "m1", "sender": "noisy", "channel": "DM with noisy", "channelType": "dm",
+        "channelId": "D_noise", "snippet": "again and again", "ts": 1,
+        "status": "needs-review", "draft": "d", "generatedDraft": "d",
+    }]}), encoding="utf-8")
+    # _mark_channel_read uses the persistent MCP session; stub it so muting never
+    # touches a real slack-mcp in the test.
+    async def noop_mark(_cid):
+        return None
+    monkeypatch.setattr(slack_mod, "_mark_channel_read", noop_mark)
+
+    resp = await client.post("/api/slack/queue/m1/mute")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["muteKey"] == "D_noise"
+    assert body["item"]["status"] == "dismissed"
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    # The item is soft-dismissed (preserved), and the mute key is recorded.
+    assert saved["items"][0]["status"] == "dismissed"
+    assert "D_noise" in saved["mutedThreads"]
+    assert isinstance(saved["mutedThreads"]["D_noise"], int)
+
+
+async def test_slack_mute_sent_item_is_409(client, slack_file, monkeypatch):
+    """Muting a 'sent' item is blocked (409, like dismiss) — sent is real outbound
+    history that must not be hidden."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "s1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "hi", "ts": 1, "status": "sent",
+        "sentAt": 100, "finalText": "done",
+    }]}), encoding="utf-8")
+    resp = await client.post("/api/slack/queue/s1/mute")
+    assert resp.status == 409
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    assert "mutedThreads" not in saved or "D1" not in saved.get("mutedThreads", {})
+
+
+async def test_slack_mute_unknown_item_is_404(client, slack_file):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    resp = await client.post("/api/slack/queue/nope/mute")
+    assert resp.status == 404
+
+
+async def test_slack_get_and_delete_muted_round_trip(client, slack_file):
+    """GET /muted lists the map; DELETE /muted/{key} removes one (404 if absent)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({
+        "items": [],
+        "mutedThreads": {"D_one": 1_700_000_000, "C_two": 1_700_000_100},
+    }), encoding="utf-8")
+
+    body = await (await client.get("/api/slack/muted")).json()
+    assert set(body["muted"]) == {"D_one", "C_two"}
+
+    resp = await client.delete("/api/slack/muted/D_one")
+    assert resp.status == 200
+    assert (await resp.json())["muteKey"] == "D_one"
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    assert set(saved["mutedThreads"]) == {"C_two"}
+
+    # Deleting an absent key -> 404.
+    resp = await client.delete("/api/slack/muted/D_one")
+    assert resp.status == 404
+
+
+async def test_slack_unmute_rejects_path_traversal_key(client, slack_file):
+    """A mute key with path-traversal chars is rejected defensively (400), even
+    though it is only ever a dict key (never a filesystem path)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [], "mutedThreads": {}}), encoding="utf-8")
+    # aiohttp routes '/' as a path separator; '..%2F' or backslash chars exercise the
+    # guard via the matched segment. Use a backslash, which survives as one segment.
+    resp = await client.delete("/api/slack/muted/" + "a\\..\\b")
+    assert resp.status in (400, 404)  # rejected (400) or simply not matched/found
+
+
+async def test_slack_muted_thread_filters_scan_candidates(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """A muted thread key filters scan candidates: a get_unreads payload for a muted
+    channel produces NO skeleton (the candidate is dropped before the merge)."""
+    now_s = _time.time()
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({
+        "items": [],
+        # D_muted is muted (fresh timestamp so it is not pruned); D_open is not.
+        "mutedThreads": {"D_muted": int(now_s) - 60},
+    }), encoding="utf-8")
+
+    unreads = {"channels": [
+        {"channelId": "D_muted", "name": "noisy",
+         "messages": [{"user": "noisy", "text": "again", "ts": f"{now_s - 1:.6f}"}]},
+        {"channelId": "D_open", "name": "alice",
+         "messages": [{"user": "alice", "text": "hey", "ts": f"{now_s - 1:.6f}"}]},
+    ]}
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["channelId"]: it for it in saved}
+    # The muted channel produced NO skeleton; the open channel did.
+    assert "D_muted" not in by_id
+    assert "D_open" in by_id
+    assert by_id["D_open"]["status"] == "needs-classify"
+
+
+async def test_slack_scan_prunes_stale_muted_entries(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """A mutedThreads entry older than the 30-day TTL is pruned on a scan cycle; a
+    fresh entry survives. The pruned map is persisted in the same write."""
+    now_s = _time.time()
+    stale = int(now_s) - (slack_mod._MUTE_TTL_S + 86_400)  # 31 days ago
+    fresh = int(now_s) - 60
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({
+        "items": [],
+        "mutedThreads": {"D_stale": stale, "D_fresh": fresh},
+    }), encoding="utf-8")
+
+    # An empty get_unreads is a clean no-op scan that still prunes + persists.
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads={"channels": []})
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    assert "D_stale" not in saved["mutedThreads"]   # aged out
+    assert "D_fresh" in saved["mutedThreads"]        # still live

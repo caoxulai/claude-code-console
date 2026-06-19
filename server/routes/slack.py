@@ -179,7 +179,24 @@ _SECRET_MARKERS = ("~/.midway", ".midway", "cookie", "mwinit", "aws_secret", "au
 
 # 'dismissed' is a SOFT state (D-014): the item is preserved in the sidecar with
 # its draft/generatedDraft intact so Undo can restore it — it is NOT deleted.
-_VALID_STATUS = {"needs-draft", "needs-review", "edited", "sent", "dismissed"}
+# 'needs-classify' (D-025) is the FIRST state a freshly-scanned skeleton lands in:
+# the classify worker batches these through ONE LLM call, RECORDS the resulting
+# label in the separate ``classification`` field (needs-reply / fyi / actionable),
+# and routes EVERY item to 'needs-draft' so it gets thread context + a draft
+# regardless of label (D-027). 'fyi' is therefore NO LONGER a status — it is a
+# classification on a normally-drafted item, so an FYI message still carries full
+# context and a draft (even though you will usually dismiss it).
+_VALID_STATUS = {
+    "needs-classify", "needs-draft", "needs-review", "edited", "sent",
+    "dismissed",
+}
+
+# The advisory triage labels the classify worker records in the item's
+# ``classification`` field (D-027). PURELY a review-grouping/priority hint — it
+# never gates whether an item is drafted (every classified item is). 'fyi' means
+# "no reply is likely needed", but the draft is still generated so you can send
+# with one click if you decide otherwise.
+_VALID_CLASSIFICATIONS = {"needs-reply", "fyi", "actionable"}
 _SNIPPET_CAP = 2000
 _DRAFT_CAP = 8000
 _CONTEXT_CAP = 16000
@@ -219,6 +236,10 @@ def register(app: web.Application):
     # sending anything. The page surfaces this so an unavailable seam shows WHY.
     app.router.add_get("/api/slack/health", get_health)
     app.router.add_get("/api/slack/queue", get_queue)
+    # PUT the top-level config — currently ONLY the on/off `paused` toggle (D-025).
+    # Etag-guarded like the other mutators; broadcasts 'slack_changed' so an open
+    # page can show/hide its "Paused" badge live.
+    app.router.add_put("/api/slack/config", put_config)
     app.router.add_post("/api/slack/queue/refresh", refresh_queue)
     app.router.add_put("/api/slack/queue/{item_id}", save_draft)
     # SOFT-dismiss (D-014): DELETE flips status to 'dismissed' (item PRESERVED so
@@ -226,6 +247,12 @@ def register(app: web.Application):
     app.router.add_delete("/api/slack/queue/{item_id}", dismiss_item)
     # Undo a dismiss: restore a 'dismissed' item back to needs-review/edited.
     app.router.add_post("/api/slack/queue/{item_id}/undismiss", undismiss_item)
+    # Mute a thread (D-025): dismiss the item AND remember its mute key so future
+    # scans skip the conversation until the mute is removed or it ages out (30d).
+    app.router.add_post("/api/slack/queue/{item_id}/mute", mute_item)
+    # Muted-threads management surface (for a settings UI): list / unmute.
+    app.router.add_get("/api/slack/muted", get_muted)
+    app.router.add_delete("/api/slack/muted/{mute_key}", unmute_thread)
     # Per-item regenerate: re-run draft generation for ONE item, pulling in the
     # accumulated style + topic memory. Never sends.
     app.router.add_post("/api/slack/queue/{item_id}/refresh", regenerate_item)
@@ -265,6 +292,19 @@ def register(app: web.Application):
     app.on_startup.append(_start_draft_worker)
     app.on_cleanup.append(_stop_draft_worker)
 
+    # ── Classify-worker lifecycle (D-025) ─────────────────────────────────────
+    # The scan now writes fresh skeletons in status 'needs-classify' rather than
+    # 'needs-draft'. An in-process asyncio task batches those skeletons through ONE
+    # read-free `claude --print` LLM call (the MCP-FREE 'classify' action) and routes
+    # each: 'needs-reply'/'actionable' → 'needs-draft' (the unchanged draft worker
+    # picks them up), 'fyi' → 'fyi' (terminal, no draft generated). It mirrors the
+    # draft worker's lifecycle EXACTLY (idempotent create + cancel-and-await teardown,
+    # sleep-first so it is inert on startup, gated on _probe_readiness) so the test
+    # suite never spawns a real `claude`. Registered between the draft-worker and
+    # scan-worker hooks. Self-contained here: app.py is untouched.
+    app.on_startup.append(_start_classify_worker)
+    app.on_cleanup.append(_stop_classify_worker)
+
     # ── Scan-worker lifecycle (D-018) ─────────────────────────────────────────
     # The DETERMINISTIC in-process scan worker that replaces the cron's LLM scan.
     # It drives the Slack MCP server DIRECTLY over stdio (via the `mcp` SDK behind
@@ -295,6 +335,16 @@ def _load() -> tuple[dict, str | None]:
         data = {"items": []}
     if "items" not in data:
         data["items"] = []
+    # MIGRATION (D-027): 'fyi' is no longer a terminal STATUS — it is a
+    # ``classification`` label on a normally-drafted item. Convert any legacy
+    # fyi-status item written by the old pipeline so it rejoins drafting: record
+    # the classification and reset it to needs-draft (a draft will be generated;
+    # it was never sent). In-memory only — persisted by the next write on any
+    # normal mutation, so we never write here (a pure read must not mutate disk).
+    for it in data["items"]:
+        if it.get("status") == "fyi":
+            it["classification"] = "fyi"
+            it["status"] = "needs-draft"
     return data, etag
 
 
@@ -342,6 +392,18 @@ SLACK_DRAFT_POLL_INTERVAL_S = 7
 # a burst of new conversations from spawning an unbounded number of processes.
 SLACK_DRAFT_CONCURRENCY = 3
 
+# ── Classify-worker tuning (D-025) ───────────────────────────────────────────
+# How often the in-process classify-worker polls slack_threads.json for skeletons
+# in status 'needs-classify'. Short so a freshly-scanned skeleton is classified
+# within a few seconds (then the draft worker picks up the needs-draft ones).
+SLACK_CLASSIFY_POLL_INTERVAL_S = 6
+
+# How many needs-classify items one classify `claude --print` subprocess handles
+# in a single batch. Classification is cheap per item (no tool calls, no history
+# fetch — it reasons over the snippet already in the skeleton), so batching keeps
+# the number of subprocess spawns small even with a burst of new conversations.
+SLACK_CLASSIFY_BATCH = 10
+
 # How many history3d messages a single draft may carry, and the per-message text
 # cap. The cron used to fetch history3d inline; D-015 moves it into the draft
 # subprocess, which returns an ordered (oldest→newest) array we cap defensively
@@ -370,6 +432,13 @@ _SCAN_OVERLAP_MS = 30 * 1000
 
 # How many DMs/group DMs list_dms is asked to return per scan.
 _SCAN_LIST_DMS_LIMIT = 30
+
+# ── Thread muting (D-025) ─────────────────────────────────────────────────────
+# A muted thread's scan candidates are dropped before the merge. Each mutedThreads
+# entry is {<mute_key>: <unix-seconds-when-muted>}; entries older than this TTL are
+# pruned on every scan cycle so an old mute can't silently suppress a conversation
+# forever (the user can re-mute if it's still noise).
+_MUTE_TTL_S = 30 * 24 * 60 * 60  # 30 days
 
 # Bot senders that never need a human reply — skip during scan.
 _BOT_SENDERS = frozenset({
@@ -781,6 +850,38 @@ def _build_agent_prompt(action: str, payload: dict) -> str:
             "generatedDraft must equal draft. threadContext is a brief plain-text summary "
             "of the conversation topic and what they're asking/discussing — NOT the raw messages."
         )
+    elif action == "classify":
+        # MCP-FREE (D-025): the classify worker batches needs-classify skeletons and
+        # asks the model to label each from the snippet ALONE — no tool calls, no
+        # history fetch, no send. The items are rendered inline so the subprocess
+        # gets NO --allowedTools and an EMPTY --mcp-config under --strict-mcp-config.
+        items = payload.get("items") or []
+        lines = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            iid = str(it.get("id", ""))
+            sender = _one_line(str(it.get("sender", "")), 200)
+            channel = _one_line(str(it.get("channel", "")), 200)
+            snippet = _one_line(str(it.get("snippet", "")), 1000)
+            lines.append(
+                f'- id: {iid}\n  from: {sender}\n  channel: {channel}\n  message: {snippet}'
+            )
+        rendered = "\n".join(lines) if lines else "(no items)"
+        prompt = (
+            "Classify each of MY unread Slack messages below — do NOT call any "
+            "tools, do NOT fetch anything, do NOT send anything. For each message, "
+            "classify as needs-reply (someone is asking me a question or requesting "
+            "action), fyi (status update, notification, acknowledgment, no reply "
+            "needed), or actionable (I need to do something but not reply in Slack). "
+            "Return JSON array of {id, classification}.\n\n"
+            "Messages:\n"
+            f"{rendered}\n\n"
+            "Return ONLY a STRICT JSON array (no prose, no markdown fences) where "
+            "each element is an object with EXACTLY these keys: "
+            '{"id", "classification"}. classification must be exactly one of '
+            '"needs-reply", "fyi", or "actionable". Include every id above exactly once.'
+        )
     elif action == "send":
         # THE ONE intentional cold-start exception (D-022): send spawns a
         # `claude --print --mcp-config` subprocess that boots its own slack-mcp
@@ -853,6 +954,13 @@ def _parse_agent_result(text: str, action: str) -> dict:
             "generatedDraft": generated,
             "threadContext": thread_context,
         }
+    if action == "classify":
+        # Fail-loud on a non-array reply (never fabricate classifications). The
+        # routing in _classify_one only acts on the ids it recognizes, so a partial
+        # or extra-id array is tolerated; we only require the array shape here.
+        if not isinstance(parsed, list):
+            return {"available": False, "reason": "Slack classify reply was not a JSON array."}
+        return {"available": True, "classifications": parsed}
     if action == "send":
         if not isinstance(parsed, dict) or not parsed.get("ok"):
             return {"available": False, "reason": "Slack send did not confirm ok=true."}
@@ -957,7 +1065,12 @@ async def _drive_agent(action: str, payload: dict) -> dict:
     # --mcp-config` because the persistent read-only session refuses post_message
     # (sends are rare and user-gated). 'list' is retained as a harmless read-only
     # seam (no scan loop drives it any more, D-013) and keeps its read allowlist.
-    needs_mcp = action not in ("draft", "regenerate")
+    # 'classify' (D-025) is MCP-FREE like draft/regenerate: it reasons ONLY over the
+    # snippets already in the skeletons, calls no Slack tool, and so gets NO
+    # --allowedTools and an EMPTY --mcp-config under --strict-mcp-config (zero
+    # slack-mcp cold-start). _ALLOWED_TOOLS has no 'classify' entry — it's dead at
+    # spawn time when needs_mcp=False (documented, never grants any tool).
+    needs_mcp = action not in ("draft", "regenerate", "classify")
     if needs_mcp:
         allowed_tools = ",".join(_ALLOWED_TOOLS.get(action, _SLACK_READ_TOOLS))
     else:
@@ -1125,6 +1238,10 @@ async def _run_slack_agent(action: str, payload: dict) -> dict:
       * 'draft' → {available:True, draft, history3d, generatedDraft} for the one
         item — the in-process draft-worker's path (D-015); read-only tools only,
         the subprocess fetches history3d itself and returns it with the draft.
+      * 'classify' → {available:True, classifications:[{id, classification}]} for a
+        BATCH of needs-classify skeletons (D-025) — the MCP-FREE classify worker's
+        path; the subprocess reasons over the snippets already in the skeletons (no
+        tool calls), labelling each needs-reply / fyi / actionable.
       * 'send' → {available:True, ts:...} after sending EXACTLY ONE message.
 
     FAIL-LOUD (feedback_principle_fail_loud_on_missing_input): on ANY spawn
@@ -1722,7 +1839,42 @@ async def get_queue(request: web.Request) -> web.Response:
         "items": data["items"],
         "etag": etag,
         "lastScanAt": data.get("lastScanAt"),
+        # The on/off toggle (D-025). Absent on disk == unpaused (read at use sites
+        # with .get(..., False), never seeded into _load's default).
+        "paused": data.get("paused", False),
     })
+
+
+async def put_config(request: web.Request) -> web.Response:
+    """PUT the top-level Slack config — currently ONLY the on/off `paused` toggle.
+
+    Accepts ONLY ``{"paused": true|false}`` (plus an optional ``etag`` for
+    optimistic concurrency). When paused, the scan / classify / draft worker loops
+    skip their work (gated INSIDE each loop, never by stopping the tasks) while the
+    file-watcher stays alive so toggling back is instant. Etag-guarded exactly like
+    save_draft/dismiss_item; broadcasts 'slack_changed' so an open page can show or
+    hide its "Paused" badge live. NEVER sends.
+    """
+    body = await read_json_body(request)
+    expected_etag = body.get("etag")
+    if "paused" not in body:
+        raise web.HTTPBadRequest(reason="paused field required")
+
+    data, current_etag = _load()
+    data["paused"] = bool(body["paused"])
+
+    try:
+        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
+    except filestore.ConflictError as e:
+        current, current_etag = filestore.read_json(SLACK_PATH)
+        return web.json_response(
+            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            status=409,
+        )
+
+    ws = request.app["ws_manager"]
+    await ws.broadcast("slack_changed", {"paused": data["paused"]})
+    return web.json_response({"paused": data["paused"], "etag": new_etag})
 
 
 async def refresh_queue(request: web.Request) -> web.Response:
@@ -1991,6 +2143,33 @@ def _sanitize_history3d(raw) -> list:
     return out
 
 
+async def _draft_pending(app, sem: asyncio.Semaphore) -> None:
+    """Draft every ``needs-draft`` item currently on disk, in parallel (D-026).
+
+    The shared body of the draft pipeline: the periodic ``_draft_worker`` calls it
+    each (unpaused) cycle, and the manual-scan path calls it directly so a
+    user-triggered scan drafts its freshly-classified items even while the periodic
+    workers are paused. ``_draft_one`` re-reads and writes per item under the etag
+    guard, so concurrent callers stay safe. No-op when nothing is pending.
+    """
+    data, _ = _load()
+    # Snapshot the (id, prompt, history, channel) tuples to draft. build_draft_prompt
+    # reads the item's history3d/needsRedraft to choose a fresh-draft vs re-draft
+    # prompt; we build it now against the current item view.
+    pending = [
+        (it.get("id"), build_draft_prompt(it), it.get("history3d"),
+         it.get("channelId", ""))
+        for it in data["items"]
+        if it.get("id") and _needs_draft(it)
+    ]
+    if not pending:
+        return
+    await asyncio.gather(
+        *(_draft_one(app, sem, item_id, prompt, history3d, channel_id)
+          for item_id, prompt, history3d, channel_id in pending)
+    )
+
+
 async def _draft_worker(app) -> None:
     """The in-process draft-worker (D-015): polls for items needing a draft and
     drafts them in PARALLEL via the read-only seam, capped by a Semaphore.
@@ -2017,23 +2196,15 @@ async def _draft_worker(app) -> None:
             if not _probe_readiness().get("ready"):
                 continue
 
+            # PAUSE GATE (D-025): when the queue is paused, skip drafting this cycle
+            # (the file-watcher stays alive so un-pausing is instant). Checked INSIDE
+            # the loop after the readiness gate — never by stopping the task.
             data, _ = _load()
-            # Snapshot the (id, prompt) pairs to draft. build_draft_prompt reads the
-            # item's history3d/needsRedraft to choose a fresh-draft vs re-draft
-            # prompt; we build it now against the current item view.
-            pending = [
-                (it.get("id"), build_draft_prompt(it), it.get("history3d"),
-                 it.get("channelId", ""))
-                for it in data["items"]
-                if it.get("id") and _needs_draft(it)
-            ]
-            if not pending:
+            if data.get("paused"):
+                logger.info("Slack draft-worker: paused, skipping this cycle.")
                 continue
 
-            await asyncio.gather(
-                *(_draft_one(app, sem, item_id, prompt, history3d, channel_id)
-                  for item_id, prompt, history3d, channel_id in pending)
-            )
+            await _draft_pending(app, sem)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the loop
@@ -2064,6 +2235,187 @@ async def _stop_draft_worker(app) -> None:
         pass
 
 
+# ── In-process classify-worker (D-025) ────────────────────────────────────────
+#
+# A freshly-scanned skeleton lands in 'needs-classify'. This worker batches those
+# skeletons through ONE read-free `claude --print` LLM call (the MCP-FREE 'classify'
+# action) and routes each: 'needs-reply'/'actionable' → 'needs-draft' (the unchanged
+# draft worker picks them up), 'fyi' → 'fyi' (terminal, no draft generated). It is a
+# read-only, single-stage classifier — it spawns no SCAN, mints no new items, and
+# sends nothing — sitting BETWEEN the scan and the draft worker.
+
+# D-027: a classification NO LONGER changes the lifecycle status — EVERY classified
+# item flows to 'needs-draft' so it gets thread context + a draft regardless of
+# label. The label is recorded in the item's ``classification`` field (a review-
+# grouping hint), not baked into the status. We keep this set purely to VALIDATE
+# the untrusted label coming back from the seam.
+_CLASSIFY_NEXT_STATUS = {
+    "needs-reply": "needs-draft",
+    "actionable": "needs-draft",
+    "fyi": "needs-draft",
+}
+
+
+async def _classify_one(app, batch: list[dict]) -> None:
+    """Classify ONE batch of needs-classify items via the MCP-FREE seam.
+
+    Calls ``_run_slack_agent('classify', ...)`` ONCE for the whole batch. On an
+    unavailable result the items are left AS-IS (retried next cycle — fail-loud, no
+    fabrication). On success we RE-READ the sidecar fresh, re-locate each item by id,
+    and flip its status per the classification (needs-reply/actionable → needs-draft;
+    fyi → fyi). Items whose id is missing from the reply, or that were touched in the
+    meantime (no longer 'needs-classify'), are left alone. Writes against the FRESH
+    etag; a ConflictError just skips (idempotent — the next cycle re-reads).
+    """
+    payload_items = [
+        {
+            "id": it.get("id"),
+            "sender": it.get("sender", ""),
+            "channel": it.get("channel", ""),
+            "snippet": it.get("snippet", ""),
+        }
+        for it in batch
+    ]
+    result = await _run_slack_agent("classify", {"items": payload_items})
+
+    if not result.get("available"):
+        # Honest failure — leave the items untouched so they retry next cycle.
+        logger.info(
+            "Slack classify-worker: batch unavailable: %s",
+            _scrub(str(result.get("reason", "")))[:200],
+        )
+        return
+
+    # Build an id → (label, next-status) map from the (untrusted) classifications.
+    # Unknown labels are ignored (the item stays needs-classify and retries next
+    # cycle). D-027: the label is RECORDED on the item; the status always becomes
+    # needs-draft so every item gets context + a draft regardless of label.
+    routing: dict[str, tuple[str, str]] = {}
+    for entry in result.get("classifications") or []:
+        if not isinstance(entry, dict):
+            continue
+        iid = str(entry.get("id", "") or "")
+        label = str(entry.get("classification", "") or "").strip().lower()
+        next_status = _CLASSIFY_NEXT_STATUS.get(label)
+        if iid and next_status:
+            routing[iid] = (label, next_status)
+    if not routing:
+        return
+
+    # RE-READ fresh right before the write so a concurrent scan/draft/approve that
+    # touched the file doesn't make us clobber their change; re-locate each by id.
+    data, current_etag = _load()
+    changed = False
+    for item in data["items"]:
+        iid = str(item.get("id", "") or "")
+        # Only act on items STILL awaiting classification (a concurrent dismiss/edit
+        # may have moved it on); never override a non-needs-classify status.
+        if item.get("status") != "needs-classify":
+            continue
+        routed = routing.get(iid)
+        if routed:
+            label, next_status = routed
+            item["classification"] = label
+            item["status"] = next_status
+            changed = True
+
+    if not changed:
+        return
+
+    try:
+        filestore.write_json(SLACK_PATH, data, current_etag)
+    except filestore.ConflictError:
+        # Another writer won — idempotent: the next cycle re-reads and re-classifies
+        # any item still in needs-classify.
+        return
+
+    await app["ws_manager"].broadcast("slack_changed", {"classified": True})
+
+
+async def _classify_pending(app) -> None:
+    """Classify every ``needs-classify`` item currently on disk, batched (D-026).
+
+    The shared body of the classify pipeline: the periodic ``_classify_worker``
+    calls it each (unpaused) cycle, and the manual-scan path calls it directly so a
+    user-triggered scan triages its fresh skeletons even while the periodic workers
+    are paused. Re-reads inside ``_classify_one`` per batch, so it is safe to call
+    from either caller. No-op when nothing is pending.
+    """
+    data, _ = _load()
+    pending = [
+        it for it in data["items"]
+        if it.get("id") and it.get("status") == "needs-classify"
+    ]
+    if not pending:
+        return
+    # Batch up to SLACK_CLASSIFY_BATCH items per LLM call, ONE call per batch.
+    for start in range(0, len(pending), SLACK_CLASSIFY_BATCH):
+        await _classify_one(app, pending[start:start + SLACK_CLASSIFY_BATCH])
+
+
+async def _classify_worker(app) -> None:
+    """The in-process classify-worker (D-025): batches needs-classify skeletons.
+
+    Mirrors ``_draft_worker``'s lifecycle EXACTLY (the shape that keeps the suite
+    warning-free): the FIRST action each loop is ``await asyncio.sleep(interval)`` so
+    it is INERT on startup — critical because app.on_startup fires under
+    aiohttp_client(app) in EVERY test, so the worker must not spawn anything until an
+    interval elapses AND ``_probe_readiness()`` reports ready (the same gate the draft
+    worker uses so the suite never spawns a real `claude`). Honors the PAUSE gate
+    (D-025) INSIDE the loop. CancelledError propagates so shutdown can cancel+await
+    cleanly; a per-iteration try/except catches+logs (scrubbed) so one bad cycle
+    never kills the loop.
+    """
+    while True:
+        try:
+            await asyncio.sleep(SLACK_CLASSIFY_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+
+        try:
+            # Gate on readiness so we never spawn a real `claude` when the seam
+            # can't work (and so the test suite — claude absent — never spawns).
+            if not _probe_readiness().get("ready"):
+                continue
+
+            data, _ = _load()
+            # PAUSE GATE (D-025): skip classification while paused (the file-watcher
+            # stays alive so un-pausing is instant). Checked INSIDE the loop.
+            if data.get("paused"):
+                logger.info("Slack classify-worker: paused, skipping this cycle.")
+                continue
+
+            await _classify_pending(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the loop
+            logger.warning("Slack classify-worker iteration failed: %s", _scrub(str(e)))
+
+
+async def _start_classify_worker(app) -> None:
+    """on_startup: launch the single classify-worker task (idempotent)."""
+    task = app.get("slack_classify_task")
+    if task is None or task.done():
+        app["slack_classify_task"] = asyncio.create_task(_classify_worker(app))
+
+
+async def _stop_classify_worker(app) -> None:
+    """on_cleanup: cancel AND await the classify-worker so it tears down cleanly.
+
+    Mirrors ``_stop_draft_worker``. Each in-flight ``_run_slack_agent('classify',
+    ...)`` subprocess is reaped by ``_drive_agent``'s own finally (terminate→kill)
+    when its awaiting task is cancelled, so no `claude` orphan survives shutdown.
+    """
+    task = app.pop("slack_classify_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 # ── Deterministic scan worker (D-018) ─────────────────────────────────────────
 #
 # Replaces the cron's LLM-driven scan with deterministic in-process Python: call
@@ -2071,8 +2423,15 @@ async def _stop_draft_worker(app) -> None:
 # dedupe by EXACT channelId in Python, write needs-draft skeletons. No LLM, no
 # `claude` subprocess. The unchanged _draft_worker then drafts those skeletons.
 # Statuses below treat 'dismissed' as ALREADY-REPRESENTED so a dismissed
-# conversation is never resurrected (same rule the cron used).
-_SCAN_ACTIVE_STATUSES = {"needs-draft", "needs-review", "edited", "dismissed"}
+# conversation is never resurrected (same rule the cron used). 'needs-classify'
+# (D-025) is included so the scan dedupes against an in-flight-classify skeleton
+# (a candidate already awaiting classification is not re-appended as a duplicate).
+# 'fyi' is deliberately ABSENT: an fyi conversation that grows new messages should
+# earn a fresh skeleton (the user may now need to reply), exactly like a never-seen
+# conversation — so an fyi item never suppresses a new candidate.
+_SCAN_ACTIVE_STATUSES = {
+    "needs-classify", "needs-draft", "needs-review", "edited", "dismissed",
+}
 
 
 def _normalize_datamarks(value):
@@ -2322,11 +2681,16 @@ def _mention_candidates(unreads_payload) -> list[dict]:
 
 
 def _skeleton_for(cand: dict) -> dict:
-    """A fresh needs-draft SKELETON item from a scan candidate.
+    """A fresh needs-classify SKELETON item from a scan candidate.
 
-    Matches the existing item shape; snippet is carried (the draft worker fills the
-    real draft). channelId/userId are verbatim routing ids. A fresh 8-hex id like
-    the rest of the queue. The draft worker drafts it on its next cycle.
+    Matches the existing item shape; snippet is carried (the classify worker reads
+    it, then the draft worker fills the real draft). channelId/userId are verbatim
+    routing ids. A fresh 8-hex id like the rest of the queue.
+
+    D-025: a freshly-scanned skeleton lands in 'needs-classify', NOT 'needs-draft'.
+    The classify worker batches it through ONE LLM call and routes it to
+    'needs-draft' (needs-reply / actionable) or 'fyi' (terminal); only then does the
+    draft worker draft it.
     """
     return {
         "id": secrets.token_hex(4),
@@ -2336,9 +2700,52 @@ def _skeleton_for(cand: dict) -> dict:
         "userId": cand.get("userId", ""),
         "channelType": cand.get("channelType", "dm"),
         "snippet": cand.get("snippet", ""),
-        "status": "needs-draft",
+        "status": "needs-classify",
         "ts": cand.get("ts", 0),
     }
+
+
+def _mute_key_for(item_or_cand: dict) -> str:
+    """Derive the mute key for a queue item OR a scan candidate (D-025).
+
+    The key is ``channelId`` for DMs/group DMs, and ``channelId + '_' + threadTs``
+    ONLY when a non-empty ``threadTs`` field is present.
+
+    DESIGN NOTE (ADR D-025): ``threadTs`` does NOT exist anywhere in the codebase
+    today — scan candidates / skeletons carry only ``channelId`` — so this
+    GRACEFULLY falls back to the bare ``channelId`` when ``threadTs`` is absent
+    (the current reality for every DM / @mention item). When a future scan begins
+    capturing a per-thread ``threadTs``, the key automatically becomes
+    thread-scoped with no change here. Returns "" when there is no channelId (an
+    unroutable item can't be muted).
+    """
+    channel_id = str(item_or_cand.get("channelId", "") or "").strip()
+    if not channel_id:
+        return ""
+    thread_ts = str(item_or_cand.get("threadTs", "") or "").strip()
+    if thread_ts:
+        return f"{channel_id}_{thread_ts}"
+    return channel_id
+
+
+def _prune_muted(muted: dict, now_s: float) -> dict:
+    """Return a copy of ``muted`` with entries older than the 30-day TTL removed.
+
+    Each value is the unix-SECONDS timestamp the thread was muted; an entry whose
+    timestamp is older than ``_MUTE_TTL_S`` ago is dropped so a stale mute can't
+    suppress a conversation forever. Non-dict input / unparseable timestamps are
+    treated defensively (a junk value is dropped rather than kept indefinitely).
+    """
+    if not isinstance(muted, dict):
+        return {}
+    cutoff = now_s - _MUTE_TTL_S
+    out: dict = {}
+    for key, ts in muted.items():
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        if ts >= cutoff:
+            out[key] = ts
+    return out
 
 
 def _merge_scan_candidates(items: list[dict], candidates: list[dict]) -> bool:
@@ -2529,6 +2936,17 @@ async def _scan_once(app) -> None:
 
     data, current_etag = _load()
 
+    # Thread muting (D-025): prune entries older than the 30-day TTL on EVERY scan
+    # cycle (persisted in the same write below), then drop any candidate whose mute
+    # key matches a (still-live) muted thread. The drop happens BEFORE the merge so a
+    # muted conversation never produces a skeleton. A pruned/empty dict is written
+    # back so a stale mute can't suppress a conversation indefinitely.
+    now_s = now_ms / 1000.0
+    muted = _prune_muted(data.get("mutedThreads") or {}, now_s)
+    data["mutedThreads"] = muted
+    if muted:
+        candidates = [c for c in candidates if _mute_key_for(c) not in muted]
+
     # Identify which candidates are genuinely NEW (not already in queue) so we
     # can pre-fetch history only for those — avoid redundant MCP calls.
     existing_ids = {
@@ -2551,11 +2969,13 @@ async def _scan_once(app) -> None:
 
     changed = _merge_scan_candidates(data["items"], candidates)
 
-    # Attach pre-fetched history to newly-appended skeletons.
+    # Attach pre-fetched history to newly-appended skeletons. Freshly-scanned
+    # skeletons land in 'needs-classify' now (D-025), so key the attach on that
+    # status — the history rides along through classification into drafting.
     if histories:
         for item in data["items"]:
             cid = item.get("channelId", "")
-            if (item.get("status") == "needs-draft"
+            if (item.get("status") == "needs-classify"
                     and cid in histories
                     and not item.get("history3d")):
                 item["history3d"] = histories[cid]
@@ -2605,15 +3025,19 @@ async def _scan_worker(app) -> None:
     (scrubbed) so one bad cycle never kills the loop.
     """
     event = _get_scan_event()
+    sem = asyncio.Semaphore(SLACK_DRAFT_CONCURRENCY)
     while True:
+        manual = False
         try:
             # Interruptible sleep: wake early when a manual Refresh sets the Event,
-            # else fall through on the normal periodic timeout. TimeoutError is the
-            # ordinary tick (NOT an error) — swallow it and proceed.
+            # else fall through on the normal periodic timeout. A completed wait()
+            # (no TimeoutError) means the Event fired — i.e. a MANUAL scan; a
+            # TimeoutError is the ordinary periodic tick (NOT an error).
             try:
                 await asyncio.wait_for(event.wait(), timeout=SLACK_SCAN_INTERVAL_S)
+                manual = True
             except asyncio.TimeoutError:
-                pass
+                manual = False
         except asyncio.CancelledError:
             raise
         # Clear the wake Event at the top of the cycle so a manual Refresh that
@@ -2625,10 +3049,30 @@ async def _scan_worker(app) -> None:
             # can't work (and so the test suite — claude/MCP absent — never spawns).
             if not _probe_readiness().get("ready"):
                 continue
+            # PAUSE GATE (D-026): `paused` controls ONLY the periodic tick. A MANUAL
+            # scan (the Refresh button → wake Event) ALWAYS runs, even while paused —
+            # pause means "stop auto-scanning", not "stop me from scanning on
+            # demand". Checked INSIDE the loop — never by stopping the task.
+            if not manual:
+                data, _ = _load()
+                if data.get("paused"):
+                    logger.info("Slack scan-worker: paused, skipping this periodic tick.")
+                    continue
             # Run under the shared guard: skip (log, not error) if a scan is already
-            # in flight so the periodic tick never overlaps a manual scan.
+            # in flight so a periodic tick and a manual scan never overlap — the
+            # newer trigger is simply dismissed (the Refresh endpoint reports this).
             if not await _run_guarded_scan(app):
-                logger.info("Slack scan-worker: a scan is already in progress, skipping this tick.")
+                logger.info("Slack scan-worker: a scan is already in progress, skipping this %s.",
+                            "manual scan" if manual else "tick")
+                continue
+            # A MANUAL scan drives the FULL one-time pipeline (D-026): its fresh
+            # needs-classify skeletons are classified and the resulting needs-draft
+            # items drafted right now, so a user gets ready-to-review drafts even
+            # while the periodic classify/draft workers are paused. The periodic tick
+            # leaves this to those workers (which run only when unpaused).
+            if manual:
+                await _classify_pending(app)
+                await _draft_pending(app, sem)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the loop
@@ -2815,6 +3259,110 @@ async def undismiss_item(request: web.Request) -> web.Response:
     ws = request.app["ws_manager"]
     await ws.broadcast("slack_changed", {"id": item_id})
     return web.json_response({"item": item, "etag": new_etag})
+
+
+def _is_clean_mute_key(key: str) -> bool:
+    """Defensive sanity check on a mute key from the URL (D-025).
+
+    A mute key is a dict key only (channelId, or channelId_threadTs) — NEVER a
+    filesystem path — but we still reject path-traversal characters so a malformed
+    key can't be mistaken for one, mirroring _validate_contact.
+    """
+    return bool(key) and ".." not in key and "/" not in key and "\\" not in key
+
+
+async def mute_item(request: web.Request) -> web.Response:
+    """Mute a thread AND dismiss the item (D-025).
+
+    Derives the mute key (channelId for DMs/group DMs, channelId_threadTs only when
+    a threadTs is present — see _mute_key_for), records it in ``mutedThreads`` with
+    the current unix timestamp, and SOFT-dismisses the item (status='dismissed', all
+    other fields preserved) so subsequent scans skip the conversation until the mute
+    is removed or ages out (30 days). Etag-guarded like dismiss_item; best-effort
+    marks the channel read; broadcasts 'slack_changed' with {muted:True}.
+
+    Muting a 'sent' item is BLOCKED (409, like dismiss): a sent item is real
+    outbound history and hiding it would misrepresent a send. NEVER sends.
+    """
+    item_id = request.match_info["item_id"]
+    body = await read_json_body(request) if request.can_read_body else {}
+    expected_etag = body.get("etag")
+
+    data, current_etag = _load()
+    item = next((it for it in data["items"] if it.get("id") == item_id), None)
+    if not item:
+        raise web.HTTPNotFound(reason=f"item {item_id} not found")
+    if item.get("status") == "sent":
+        raise web.HTTPConflict(reason="cannot mute a sent item")
+
+    mute_key = _mute_key_for(item)
+    if not mute_key:
+        raise web.HTTPBadRequest(reason="item has no channel id to mute")
+
+    # Record the mute (unix seconds) and soft-dismiss the item.
+    data.setdefault("mutedThreads", {})[mute_key] = int(time.time())
+    item["status"] = "dismissed"
+
+    try:
+        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
+    except filestore.ConflictError as e:
+        current, current_etag = filestore.read_json(SLACK_PATH)
+        return web.json_response(
+            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            status=409,
+        )
+
+    # Clear unread badge in Slack (best-effort, non-fatal).
+    await _mark_channel_read(item.get("channelId", ""))
+
+    ws = request.app["ws_manager"]
+    await ws.broadcast("slack_changed", {"id": item_id, "muted": True})
+    return web.json_response(
+        {"ok": True, "id": item_id, "muteKey": mute_key, "item": item, "etag": new_etag}
+    )
+
+
+async def get_muted(request: web.Request) -> web.Response:
+    """GET the muted-threads map (D-025) for a settings/management UI."""
+    data, etag = _load()
+    return web.json_response({"muted": data.get("mutedThreads", {}), "etag": etag})
+
+
+async def unmute_thread(request: web.Request) -> web.Response:
+    """Remove a mute key from ``mutedThreads`` (D-025).
+
+    404 when the key is absent; etag-guarded like the other mutators; broadcasts
+    'slack_changed'. Does NOT resurrect any dismissed item — un-muting only stops
+    future scans from skipping the conversation (a genuinely new message then earns
+    a fresh skeleton). NEVER sends.
+    """
+    mute_key = request.match_info["mute_key"]
+    if not _is_clean_mute_key(mute_key):
+        raise web.HTTPBadRequest(reason="invalid mute key")
+
+    body = await read_json_body(request) if request.can_read_body else {}
+    expected_etag = body.get("etag")
+
+    data, current_etag = _load()
+    muted = data.get("mutedThreads") or {}
+    if mute_key not in muted:
+        raise web.HTTPNotFound(reason=f"mute key {mute_key} not found")
+
+    del muted[mute_key]
+    data["mutedThreads"] = muted
+
+    try:
+        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
+    except filestore.ConflictError as e:
+        current, current_etag = filestore.read_json(SLACK_PATH)
+        return web.json_response(
+            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            status=409,
+        )
+
+    ws = request.app["ws_manager"]
+    await ws.broadcast("slack_changed", {"muteKey": mute_key, "unmuted": True})
+    return web.json_response({"ok": True, "muteKey": mute_key, "etag": new_etag})
 
 
 async def regenerate_item(request: web.Request) -> web.Response:

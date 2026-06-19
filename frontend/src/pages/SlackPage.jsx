@@ -1,10 +1,10 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import {
   FiRefreshCw, FiSend, FiRotateCw, FiTrash2, FiSave, FiChevronDown, FiChevronRight,
-  FiCheckCircle, FiAlertCircle, FiClock, FiXCircle,
+  FiCheckCircle, FiAlertCircle, FiClock, FiXCircle, FiBellOff, FiPause, FiPlay,
 } from 'react-icons/fi';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
-import { isActionable } from '../lib/slackQueue';
+import { isActionable, reviewGroup } from '../lib/slackQueue';
 
 // Length (seconds) of the client-side cancellable window shown after Approve &
 // Send is confirmed, before the per-item approve call actually fires. Undo
@@ -168,6 +168,24 @@ const NEEDS_DRAFT_BADGE_STYLE = { background: '#262b31', color: '#9aa3ad' };
 // App.css diff at zero.
 const DISMISSED_BADGE_STYLE = { background: '#23262b', color: '#7c8088' };
 
+// The 'FYI' classification badge (D-027): the classify worker decided a reply is
+// unlikely needed. It is NOT a status — the item is fully drafted and sendable and
+// IS counted in "N to review"; the badge just flags the triage so you can clear the
+// FYI group fast. Muted info-grey palette, quieter than needs-review. No App.css.
+const FYI_BADGE_STYLE = { background: '#26262e', color: '#9a9ab0' };
+
+// A 'needs-classify' item has been scanned but not yet triaged by the classify
+// worker (which records needs-reply / fyi / actionable). It is the only pre-draft
+// pending state, so it reads as a quiet pending state with a pulsing "classifying…"
+// affordance. It IS counted (it still needs your attention) but has no draft yet.
+// Styled like needs-draft but tinted slightly distinct. No App.css class.
+const NEEDS_CLASSIFY_BADGE_STYLE = { background: '#2b2730', color: '#a39aad' };
+
+// The 'Paused' header badge shown when the backend's scan/draft/classify workers
+// are paused (data.paused === true). Uses the amber warning palette via the
+// shared .badge-warn class so it reads as an attention/non-error state — no new
+// inline color needed.
+
 // Inline animation for the worker-owned "drafting…" indicator. Reuses the
 // `pulse` @keyframes ALREADY defined in App.css (opacity/scale breathe) by name
 // only — referencing an existing keyframe from an inline `animation` string adds
@@ -176,11 +194,19 @@ const DISMISSED_BADGE_STYLE = { background: '#23262b', color: '#7c8088' };
 // worker, not stalled. (The user-triggered drafting indicator stays static.)
 const PULSE_ICON_STYLE = { animation: 'pulse 1.4s ease-in-out infinite' };
 
-function statusBadge(status) {
+function statusBadge(item) {
+  // Accept either a raw status string (legacy callers) or the full item so we can
+  // also reflect the D-027 `classification` label on a drafted row.
+  const status = typeof item === 'string' ? item : (item && item.status);
+  const classification = typeof item === 'string' ? '' : (item && item.classification);
   if (status === 'sent') return { label: 'sent', className: 'badge badge-ok', style: undefined };
   if (status === 'edited') return { label: 'edited', className: 'badge badge-warn', style: undefined };
-  if (status === 'needs-draft') return { label: 'needs draft', className: 'badge', style: NEEDS_DRAFT_BADGE_STYLE };
   if (status === 'dismissed') return { label: 'dismissed', className: 'badge', style: DISMISSED_BADGE_STYLE };
+  if (status === 'needs-classify') return { label: 'classifying', className: 'badge', style: NEEDS_CLASSIFY_BADGE_STYLE };
+  // FYI is a classification on a drafted item (needs-draft/needs-review), not a
+  // status — flag it so the row reads as "drafted, but likely no reply needed".
+  if (classification === 'fyi') return { label: 'fyi', className: 'badge', style: FYI_BADGE_STYLE };
+  if (status === 'needs-draft') return { label: 'needs draft', className: 'badge', style: NEEDS_DRAFT_BADGE_STYLE };
   // default / 'needs-review'
   return { label: 'needs review', className: 'badge', style: NEEDS_REVIEW_BADGE_STYLE };
 }
@@ -200,6 +226,14 @@ export default function SlackPage() {
   // The backend persists it in slack_threads.json so it survives a restart; it
   // is null/absent on a fresh install (never scanned) — the label hides then.
   const [lastScanAt, setLastScanAt] = useState(null);
+  // Whether the backend's scan/draft/classify workers are PAUSED, read from
+  // GET /api/slack/queue's `paused` field. When true the workers skip their work
+  // each cycle (the file-watcher stays alive, so toggling back is instant). We
+  // surface a 'Paused' header badge and let the user toggle it via PUT
+  // /api/slack/config. Read defensively: anything but an explicit true is false.
+  const [paused, setPaused] = useState(false);
+  // Whether a pause/unpause toggle PUT is in flight — disables the toggle button.
+  const [pausing, setPausing] = useState(false);
   // A bare counter bumped on an interval purely to force a re-render so the
   // relative "Updated …" label stays current without a fetch. Value is unused.
   const [, setTick] = useState(0);
@@ -318,6 +352,9 @@ export default function SlackPage() {
       // null/undefined (fresh install / never scanned) leaves it null so the
       // label degrades gracefully (hidden) instead of crashing relativeTime.
       setLastScanAt(finiteOrNull(json.lastScanAt));
+      // Backend paused flag (scan/draft/classify workers idle). Default false so
+      // an old backend that omits the field reads as running.
+      setPaused(json.paused === true);
     } catch {
       setError('Failed to load the Slack queue.');
     }
@@ -505,6 +542,43 @@ export default function SlackPage() {
     scanHintRef.current = setTimeout(() => { setScanning(false); scanHintRef.current = null; }, 30000);
   };
 
+  // Toggle the backend pause flag via PUT /api/slack/config {paused, etag}. When
+  // paused the scan/draft/classify workers skip their work each cycle (the gate
+  // is INSIDE the worker loops, so the file-watcher stays alive and toggling back
+  // is instant). Etag-guarded like the other mutators: a 409 means the queue
+  // changed under us, so we re-read (which also re-reads the authoritative
+  // `paused` value) and surface a conflict banner. The backend broadcasts
+  // slack_changed on toggle, so other open tabs repaint via useLiveUpdates too.
+  const togglePaused = async () => {
+    const next = !paused;
+    setPausing(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/slack/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: next, etag }),
+      });
+      if (res.status === 409) {
+        setError('Conflict: the queue was modified elsewhere. Refreshing…');
+        refresh();
+        return;
+      }
+      if (!res.ok) {
+        setError(next ? 'Failed to pause Slack scanning.' : 'Failed to resume Slack scanning.');
+        return;
+      }
+      const json = await res.json().catch(() => null);
+      if (json && json.etag) setEtag(json.etag);
+      // Trust the server's echoed value when present, else our optimistic next.
+      setPaused(json && typeof json.paused === 'boolean' ? json.paused : next);
+    } catch {
+      setError(next ? 'Failed to pause Slack scanning.' : 'Failed to resume Slack scanning.');
+    } finally {
+      setPausing(false);
+    }
+  };
+
   // Expand/collapse a row. Opening a row seeds the draft editor with the item's
   // current draft so editing is inline; collapsing discards the working buffer.
   const toggleExpand = (item) => {
@@ -628,6 +702,7 @@ export default function SlackPage() {
           setEtag(fj.etag ?? null);
           setNotAvailable(fj.available === false);
           setLastScanAt(finiteOrNull(fj.lastScanAt));
+          setPaused(fj.paused === true);
           fresh = list.find(it => it.id === id) || null;
         } catch {
           fresh = null;
@@ -800,6 +875,42 @@ export default function SlackPage() {
     }
   };
 
+  // Mute the item's THREAD: POST /api/slack/queue/{id}/mute. The backend derives
+  // the mute key (channelId for DMs, channelId_threadTs for threaded messages),
+  // records it in mutedThreads so future scans skip that thread, AND sets THIS
+  // item's status to 'dismissed' — so the same dismiss repaint/Undo path applies
+  // (the row moves into the Dismissed section). Etag-guarded; reuses the exact
+  // setBusyId/error handling as dismiss(). Per-item only — there is no bulk-mute.
+  const mute = async (id) => {
+    cancelPendingSend(id); // a pending send for this row is no longer valid
+    setBusyId(id);
+    try {
+      const res = await fetch(`/api/slack/queue/${encodeURIComponent(id)}/mute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ etag }),
+      });
+      if (res.status === 409) {
+        setError('Conflict: the queue was modified elsewhere. Refreshing…');
+        refresh();
+        return;
+      }
+      if (!res.ok) {
+        setError('Failed to mute the thread.');
+        return;
+      }
+      const json = await res.json().catch(() => null);
+      if (json && json.etag) setEtag(json.etag);
+      if (expandedId === id) { setExpandedId(null); setEditingId(null); }
+      setError(null);
+      refresh();
+    } catch {
+      setError('Failed to mute the thread.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   // Undo a soft-dismiss: POST /api/slack/queue/{id}/undismiss restores a
   // 'dismissed' item back to needs-review (or 'edited' if its draft differs from
   // the generated baseline — the backend decides). Etag-guarded like the other
@@ -848,7 +959,21 @@ export default function SlackPage() {
     // (show its draft) but with an Undo affordance to restore it. Treated as a
     // terminal/inactive row — no editing, no draft generation, no send.
     const isDismissed = item.status === 'dismissed';
-    const isReadOnly = isSent || isDismissed;
+    // 'fyi' is NO LONGER a status (D-027) — it is the item.classification label on
+    // a normally-drafted item. An FYI message therefore renders like any other
+    // needs-review row: full thread context, a generated draft, and an Approve &
+    // Send button — it just lives in the FYI review group. We surface the label so
+    // the row can show a quiet "FYI" hint, but it gates NOTHING.
+    const isFyiClassified = item.classification === 'fyi';
+    // 'needs-classify' = scanned but not yet triaged by the classify worker. It is
+    // the ONLY pending-pre-draft state left: read-only with a passive "classifying…"
+    // affordance until the worker records a classification and flips it to
+    // needs-draft (after which it drafts and becomes a normal needs-review row).
+    const isClassifying = item.status === 'needs-classify';
+    // Read-only states never expose Generate / edit / Approve & Send: sent,
+    // dismissed, and the brief pre-draft classifying window. (fyi is NOT read-only
+    // any more — it's a fully-drafted, sendable item.)
+    const isReadOnly = isSent || isDismissed || isClassifying;
     // `drafting` = a USER-triggered Generate/Retry is in flight (id in
     // draftingIds). `workerDrafting` = the BACKEND worker is presumably on it —
     // an undrafted needs-draft skeleton with no user-triggered attempt running.
@@ -980,8 +1105,20 @@ export default function SlackPage() {
         {/* --- Draft reply --------------------------------------------------- */}
         <div style={sectionStyle}>
           <div style={labelStyle}>
-            {isSent ? 'Sent reply' : isDismissed ? 'Dismissed draft' : 'Draft reply'}
+            {isSent ? 'Sent reply'
+              : isDismissed ? 'Dismissed draft'
+              : isClassifying ? 'Classification'
+              : 'Draft reply'}
           </div>
+          {/* FYI hint (D-027): this item was classified as "no reply likely
+              needed", but it still carries full context and a draft — shown so a
+              one-click send is available if you decide otherwise. Pure hint; it
+              gates nothing. Only on a not-yet-terminal, drafted row. */}
+          {isFyiClassified && !isReadOnly && (
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35em', color: 'var(--muted)', fontSize: '0.8em', marginBottom: '0.4em' }}>
+              <FiCheckCircle size={12} /> Classified FYI — no reply likely needed, but a draft is ready if you want to send one.
+            </div>
+          )}
           {/* New messages arrived — the worker is regenerating this reply to
               cover them. Non-blocking: the current draft below stays usable. */}
           {updating && (
@@ -1006,6 +1143,13 @@ export default function SlackPage() {
             // was never sent. Restore it via Undo (in the Actions section below).
             <div style={{ color: 'var(--text)', fontSize: '0.9em', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
               {item.draft || '(no draft recorded)'}
+            </div>
+          ) : isClassifying ? (
+            // Scanned but not yet triaged by the classify worker. Passive pulsing
+            // affordance; the worker flips it to needs-draft or fyi via the
+            // slack_changed broadcast. No draft / no send path here.
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', color: 'var(--muted)', fontSize: '0.85em', fontStyle: 'italic' }}>
+              <FiClock size={13} style={PULSE_ICON_STYLE} /> classifying… <span style={{ opacity: 0.8 }}>(deciding whether a reply is needed)</span>
             </div>
           ) : undrafted ? (
             // Listed but not yet drafted. Three sub-states, NEVER a fabricated
@@ -1119,6 +1263,9 @@ export default function SlackPage() {
             <button className="btn btn-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
               <FiTrash2 size={13} /> Dismiss
             </button>
+            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this thread — dismiss it and stop surfacing future messages from this thread">
+              <FiBellOff size={13} /> Mute thread
+            </button>
           </div>
         )}
         {!isReadOnly && !undrafted && (
@@ -1157,6 +1304,9 @@ export default function SlackPage() {
               </button>
               <button className="btn btn-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
                 <FiTrash2 size={13} /> Dismiss
+              </button>
+              <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this thread — dismiss it and stop surfacing future messages from this thread">
+                <FiBellOff size={13} /> Mute thread
               </button>
               {dirty && (
                 <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
@@ -1207,7 +1357,7 @@ export default function SlackPage() {
       </thead>
       <tbody>
         {list.map(item => {
-          const badge = statusBadge(item.status);
+          const badge = statusBadge(item);
           const open = expandedId === item.id;
           const rowHasDraft = (item.draft || '').trim() !== '';
           const rowWorkerDrafting = item.status === 'needs-draft' && !rowHasDraft
@@ -1308,17 +1458,26 @@ export default function SlackPage() {
     border: 'none', padding: 0, fontWeight: 600,
   };
 
-  // Partition the queue purely client-side. Needs-review = the actionable rows
-  // (needs-draft / needs-review / edited). Sent / Dismissed are terminal states
-  // shown in their own collapsible sections.
+  // Partition the queue purely client-side (D-027). EVERY non-terminal item is
+  // counted (isActionable = not sent/dismissed) and falls into exactly one of three
+  // review GROUPS via reviewGroup() — kept in lockstep with slackQueue.js and the
+  // nav bubble:
+  //   reply       — needs-reply / actionable (and not-yet-classified-but-drafted)
+  //   fyi         — classified "no reply likely needed" (still drafted & sendable)
+  //   classifying — still being triaged (needs-classify), no draft yet
+  // Sent / Dismissed are the only terminal, non-counting states (own sections).
   const needsReviewItems = items.filter(isActionable);
   const sentItems = items.filter(it => it.status === 'sent');
   const dismissedItems = items.filter(it => it.status === 'dismissed');
 
-  // Sub-partition actionable items by channel type.
-  const dmItems = needsReviewItems.filter(it => it.channelType === 'dm');
-  const groupDmItems = needsReviewItems.filter(it => it.channelType === 'group_dm');
-  const channelItems = needsReviewItems.filter(it => it.channelType !== 'dm' && it.channelType !== 'group_dm');
+  const replyItems = needsReviewItems.filter(it => reviewGroup(it) === 'reply');
+  const fyiItems = needsReviewItems.filter(it => reviewGroup(it) === 'fyi');
+  const classifyingItems = needsReviewItems.filter(it => reviewGroup(it) === 'classifying');
+
+  // Sub-partition the reply group by channel type (DMs / Group DMs / Channels).
+  const dmItems = replyItems.filter(it => it.channelType === 'dm');
+  const groupDmItems = replyItems.filter(it => it.channelType === 'group_dm');
+  const channelItems = replyItems.filter(it => it.channelType !== 'dm' && it.channelType !== 'group_dm');
 
   // Dismiss all items in a list (sequential, best-effort per item).
   const dismissAll = async (list) => {
@@ -1358,6 +1517,54 @@ export default function SlackPage() {
               <FiClock size={12} /> Updated {relativeTime(lastScanAt)}
             </span>
           )}
+          {/* Running/Paused TOGGLE — an accessible switch (role=switch +
+              aria-checked) that flips the backend's scan/draft/classify workers via
+              PUT /api/slack/config {paused, etag}. The gate lives inside the worker
+              loops, so toggling is instant (the file-watcher stays alive). ON =
+              running (periodic scanning active), OFF = paused. Self-labeling, so the
+              old separate "Paused" badge is no longer needed. No App.css change —
+              the switch is styled inline with design tokens. */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!paused}
+            onClick={togglePaused}
+            disabled={pausing}
+            title={paused
+              ? 'Paused — Slack scanning, drafting and classification are off. Click to resume.'
+              : 'Running — Slack scanning, drafting and classification are on. Click to pause.'}
+            aria-label={paused ? 'Slack scanning paused — resume' : 'Slack scanning running — pause'}
+            style={{
+              position: 'relative', display: 'inline-flex', alignItems: 'center',
+              width: '96px', height: '24px', flex: 'none', padding: 0,
+              borderRadius: '12px', border: 'none',
+              background: paused ? 'var(--warning)' : 'var(--accent2)',
+              cursor: pausing ? 'default' : 'pointer',
+              opacity: pausing ? 0.6 : 1,
+              transition: 'background 0.15s ease',
+              // The label lives INSIDE the track, on the side opposite the thumb:
+              // thumb right + label left when running, thumb left + label right when
+              // paused. flexDirection flips to keep the label clear of the thumb.
+              flexDirection: paused ? 'row-reverse' : 'row',
+              color: '#000', fontSize: '0.78em', fontWeight: 700,
+            }}
+          >
+            {/* Sliding thumb (icon inside). Sits at the leading edge per direction. */}
+            <span
+              aria-hidden="true"
+              style={{
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                width: '20px', height: '20px', margin: '0 2px', flex: 'none',
+                borderRadius: '50%', background: 'var(--bg)', color: 'var(--text)',
+              }}
+            >
+              {paused ? <FiPause size={11} /> : <FiPlay size={11} />}
+            </span>
+            {/* Label fills the remaining track, centered in its half. */}
+            <span style={{ flex: 1, textAlign: 'center', letterSpacing: '0.02em' }}>
+              {paused ? 'Paused' : 'Running'}
+            </span>
+          </button>
           <button className="btn btn-primary" onClick={refreshQueue} disabled={refreshing}>
             <FiRefreshCw size={14} /> {scanning ? 'Scanning…' : 'Refresh'}
           </button>
@@ -1411,18 +1618,15 @@ export default function SlackPage() {
           is running (a genuine manual-nudge backlog). The 'N sending…' hint
           reflects any in-flight per-item pending sends. Plain React text. */}
       {(needsReviewItems.length > 0 || anyPending) && (() => {
-        const needDraft = needsReviewItems.filter(it => it.status === 'needs-draft' && !(it.draft || '').trim());
-        // Genuinely stuck: a manual attempt failed and none is running.
-        const failed = needDraft.filter(it => draftFailedIds.has(it.id) && !draftingIds.has(it.id)).length;
-        // Everything else undrafted is being worked (worker or user-triggered).
-        const drafting = needDraft.length - failed;
-        const drafted = needsReviewItems.length - needDraft.length;
+        // Group-level breakdown (D-027): every non-terminal item is counted; the
+        // three review groups (reply / fyi / classifying) sum to "N to review".
         const sendingCount = Object.keys(pendingSends).length;
         return (
           <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginBottom: 'var(--space-md)' }}>
-            {needsReviewItems.length} to review · {drafted} drafted
-            {drafting > 0 ? ` · ${drafting} drafting…` : ''}
-            {failed > 0 ? ` · ${failed} need draft` : ''}
+            {needsReviewItems.length} to review
+            {replyItems.length > 0 ? ` · ${replyItems.length} reply` : ''}
+            {fyiItems.length > 0 ? ` · ${fyiItems.length} fyi` : ''}
+            {classifyingItems.length > 0 ? ` · ${classifyingItems.length} classifying…` : ''}
             {sendingCount > 0 ? ` · ${sendingCount} sending…` : ''}
           </div>
         );
@@ -1486,6 +1690,37 @@ export default function SlackPage() {
             </div>
           )}
         </>
+      )}
+
+      {/* --- FYI — no reply needed (D-027) --------------------------------- */}
+      {/* Classified as "no reply likely needed" but FULLY drafted & sendable, and
+          COUNTED in "N to review". A visible group (not hidden) so you can scan it
+          and clear it fast via Dismiss all; any row can still be opened and sent
+          with one click. Empty group renders nothing. */}
+      {fyiItems.length > 0 && (
+        <div style={{ marginBottom: 'var(--space-md)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
+            <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>FYI — no reply needed ({fyiItems.length})</span>
+            <button className="btn" style={{ fontSize: '0.78em', padding: '0.2em 0.5em' }} onClick={() => dismissAll(fyiItems)}>
+              <FiTrash2 size={11} /> Dismiss all
+            </button>
+          </div>
+          <div className="card">{renderTable(fyiItems)}</div>
+        </div>
+      )}
+
+      {/* --- Classifying… (D-027) ------------------------------------------ */}
+      {/* Scanned but not yet triaged by the classify worker — no draft yet. Counted
+          (still needs your attention). A visible group with a passive label; rows
+          flip into reply/fyi (with a draft) as triage resolves via slack_changed.
+          Empty group renders nothing. */}
+      {classifyingItems.length > 0 && (
+        <div style={{ marginBottom: 'var(--space-md)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.4em' }}>
+            <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>Classifying… ({classifyingItems.length})</span>
+          </div>
+          <div className="card">{renderTable(classifyingItems)}</div>
+        </div>
       )}
 
       {/* --- Sent (collapsible, collapsed by default) ---------------------- */}
