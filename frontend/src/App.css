@@ -751,3 +751,24 @@ kbd {
   .hero-grid { grid-template-columns: repeat(2, 1fr) !important; }
   .page-header h2 { font-size: 1.3em; }
 }
+
+/* Sidebar nav count bubble (e.g. unreviewed Slack items). Pushed to the right
+   edge of the .nav-item flex row via margin-left:auto. Reuses the .badge pill
+   language (small bold text, pill radius, compact padding). Accent background
+   with explicit dark text so it stays legible on the active tab, where the
+   .nav-item.active rule turns the link's color into var(--accent). */
+.nav-badge {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.5em;
+  padding: 0.05em 0.5em;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 1.4;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #000;
+  white-space: nowrap;
+}

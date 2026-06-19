@@ -2,10 +2,10 @@ import { useEffect, useRef } from 'react';
 
 // Single shared WebSocket to /ws for the whole app. The backend broadcasts
 // file-change events (memory_changed, mcp_changed, settings_changed, cron_*,
-// skill_*, hooks_changed, …) whenever a write happens — from this GUI, another
-// browser tab, or the `claude` CLI editing the same files. Pages subscribe to
-// the event types they care about and refetch, so the console stays in sync
-// with the CLI without per-page polling.
+// skill_*, hooks_changed, slack_changed, slack_deleted, …) whenever a write
+// happens — from this GUI, another browser tab, or the `claude` CLI editing
+// the same files. Pages subscribe to the event types they care about and
+// refetch, so the console stays in sync with the CLI without per-page polling.
 
 const listeners = new Set(); // Set<(msg) => void>
 let socket = null;

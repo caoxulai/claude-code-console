@@ -1,14 +1,19 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   FiHome, FiMessageSquare, FiSettings, FiBookOpen, FiZap,
-  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiCalendar
+  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiSlack, FiCalendar
 } from 'react-icons/fi';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
+import { countActionable } from '../lib/slackQueue';
 
 const NAV_ITEMS = [
   { group: 'Overview', items: [
     { to: '/', icon: FiHome, label: 'Dashboard' },
     { to: '/usage', icon: FiBarChart2, label: 'Usage' },
+  ]},
+  { group: 'Connect', items: [
+    { to: '/slack', icon: FiSlack, label: 'Slack' },
   ]},
   { group: 'Work', items: [
     { to: '/projects', icon: FiFolder, label: 'Projects' },
@@ -38,6 +43,33 @@ export default function NavBar({ onClose }) {
     if (window.innerWidth <= 768) onClose();
   }, [onClose]);
 
+  // Unreviewed-Slack-items count for the sidebar bubble. The NavBar is always
+  // mounted (it lives in the persistent Layout shell), so it — not the lazy
+  // SlackPage — owns the count. Fetched once on mount and refetched on every
+  // slack_changed / slack_deleted broadcast so the bubble stays live even while
+  // the user is on another tab. Degrades to 0 (bubble hidden) on any failure: a
+  // throw, a non-2xx, available:false, or a missing/non-array items list. We
+  // never show a stale or guessed number.
+  const [slackCount, setSlackCount] = useState(0);
+
+  const refreshSlackCount = useCallback(async () => {
+    try {
+      const res = await fetch('/api/slack/queue');
+      if (!res.ok) { setSlackCount(0); return; }
+      const json = await res.json();
+      if (!json || json.available === false || !Array.isArray(json.items)) {
+        setSlackCount(0);
+        return;
+      }
+      setSlackCount(countActionable(json.items));
+    } catch {
+      setSlackCount(0);
+    }
+  }, []);
+
+  useEffect(() => { refreshSlackCount(); }, [refreshSlackCount]);
+  useLiveUpdates(['slack_changed', 'slack_deleted'], refreshSlackCount);
+
   return (
     <nav className="navbar" style={{ display: 'flex', flexDirection: 'column' }}>
       <div style={{ flex: 1 }}>
@@ -54,6 +86,14 @@ export default function NavBar({ onClose }) {
               >
                 <item.icon size={16} />
                 <span>{item.label}</span>
+                {item.to === '/slack' && slackCount > 0 && (
+                  <span
+                    className="nav-badge"
+                    aria-label={`${slackCount} unreviewed Slack items`}
+                  >
+                    {slackCount > 99 ? '99+' : slackCount}
+                  </span>
+                )}
               </NavLink>
             ))}
           </div>

@@ -134,6 +134,7 @@ setup(
         "aiohttp>=3.9",
         "python-dotenv>=1.0",
         "croniter>=2.0",
+        "mcp>=1.27,<2",
     ],
     entry_points={
         "console_scripts": [

@@ -4480,6 +4480,2525 @@ async def test_manager_stop_all_is_exception_safe(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Slack assistant routes (/api/slack)
+#
+# The MCP delegation seam (_run_slack_agent) is stubbed in-tree to an
+# "unavailable" result; tests monkeypatch it to exercise the contract WITHOUT
+# spawning a subprocess or fabricating message data. SLACK_PATH is repointed at
+# a tmp sidecar so the filestore round-trip is real.
+# --------------------------------------------------------------------------- #
+
+import server.routes.slack as slack_mod  # noqa: E402
+
+
+@pytest.fixture
+def slack_file(tmp_path: Path, monkeypatch) -> Path:
+    """Repoint the slack sidecar (+ sibling style/topic stores) at tmp_path."""
+    p = tmp_path / "slack" / "slack_threads.json"
+    monkeypatch.setattr(slack_mod, "SLACK_PATH", p)
+    return p
+
+
+@pytest.fixture(autouse=True)
+def _reset_slack_scan_guard():
+    """Reset the shared scan guard + manual-refresh wake Event between tests (D-023).
+
+    ``_scan_in_progress_lock`` and ``_scan_wake_event`` are module-level asyncio
+    primitives, lazily created on first use (``_get_scan_lock``/``_get_scan_event``)
+    inside the running loop. The startup ``_scan_worker`` calls ``_get_scan_event()``
+    in EVERY test (on_startup under aiohttp_client(app)), so without this reset the
+    Event/Lock created in one test's event loop would be reused by the next test and
+    raise ``RuntimeError: ... is bound to a different event loop``. Clearing both to
+    None forces a fresh primitive in the current loop, exactly as if the server just
+    started. Autouse so the startup-worker leak is neutralized for every test, not
+    just the ones that touch refresh/scan directly."""
+    slack_mod._scan_in_progress_lock = None
+    slack_mod._scan_wake_event = None
+    yield
+    slack_mod._scan_in_progress_lock = None
+    slack_mod._scan_wake_event = None
+
+
+def _stub_agent(monkeypatch, result):
+    """Monkeypatch the delegation seam to return a fixed result dict."""
+    async def fake_agent(action, payload):
+        fake_agent.calls.append((action, payload))
+        return dict(result, action=action)
+    fake_agent.calls = []
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+    return fake_agent
+
+
+async def test_slack_queue_empty_when_no_file(client, slack_file):
+    resp = await client.get("/api/slack/queue")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["items"] == []
+
+
+# NOTE (D-023, in-process scan + manual-refresh trigger): the scanner is the
+# in-process ``_scan_worker`` running ``_scan_once``; the retired ``.slack_scan_now``
+# cron sentinel is GONE. POST /api/slack/queue/refresh no longer touches a sentinel
+# file — it triggers a REAL scan by setting the worker's wake Event (non-blocking,
+# returns the warm etag immediately), sharing ONE scan-in-progress guard with the
+# periodic worker so a manual and a system scan can never overlap. The new refresh
+# contract is asserted by test_slack_refresh_triggers_real_scan_non_blocking and
+# test_slack_refresh_while_scan_in_progress_is_rejected; freshness (the durable
+# lastScanAt) by test_slack_queue_returns_last_scan_at and
+# test_slack_scan_noop_still_advances_last_scan_and_broadcasts.
+
+
+async def test_slack_needs_draft_regenerates_to_needs_review(client, slack_file, monkeypatch):
+    """The on-demand/drain draft path flips a needs-draft item to needs-review via
+    the single-item 'regenerate' seam — and is fail-loud per item."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "", "generatedDraft": "",
+        "status": "needs-draft", "ts": 1,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "drafted reply"})
+    resp = await client.post("/api/slack/queue/i1/refresh")
+    assert resp.status == 200
+    body = await resp.json()
+    assert agent.calls[0][0] == "regenerate"
+    assert body["item"]["draft"] == "drafted reply"
+    assert body["item"]["status"] == "needs-review"
+
+
+async def test_slack_needs_draft_failed_draft_stays_needs_draft(client, slack_file, monkeypatch):
+    """A per-item draft failure leaves that single row in needs-draft with no
+    fabricated draft (the row keeps its retry affordance)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "", "generatedDraft": "",
+        "status": "needs-draft", "ts": 1,
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    resp = await client.post("/api/slack/queue/i1/refresh")
+    assert resp.status == 502
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-draft"
+    assert saved["draft"] == ""
+
+
+async def test_slack_save_draft_marks_edited_and_round_trips(client, slack_file, monkeypatch):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "alice", "channel": "general", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "auto draft",
+        "generatedDraft": "auto draft", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    resp = await client.put("/api/slack/queue/i1", json={"draft": "my own words"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["draft"] == "my own words"
+    assert body["item"]["status"] == "edited"  # diverged from generatedDraft
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["draft"] == "my own words"
+
+
+async def test_slack_save_draft_conflict_returns_409(client, slack_file):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "d",
+        "generatedDraft": "d", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    resp = await client.put("/api/slack/queue/i1", json={"draft": "x", "etag": "stale-etag"})
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+
+
+async def test_slack_dismiss_sets_status_not_delete(client, slack_file):
+    """SOFT-DISMISS (T1 contract): DELETE /api/slack/queue/{id} no longer REMOVES
+    the item — it flips its status to 'dismissed' and PRESERVES it in the sidecar
+    (so it can be shown in a Dismissed section and Undone). The item must still be
+    present in GET /queue (status='dismissed'), and persisted to disk (not just
+    echoed in the response)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+         "snippet": "hi", "threadContext": "", "draft": "d",
+         "generatedDraft": "d", "status": "needs-review", "ts": 1},
+        {"id": "i2", "sender": "b", "channel": "c", "channelType": "dm",
+         "snippet": "yo", "threadContext": "", "draft": "e",
+         "generatedDraft": "e", "status": "needs-review", "ts": 2},
+    ]}), encoding="utf-8")
+    resp = await client.delete("/api/slack/queue/i1", json={})
+    assert resp.status == 200
+
+    # Still present in the queue, now flagged dismissed (item preserved, the
+    # untouched sibling keeps its status).
+    items = (await (await client.get("/api/slack/queue")).json())["items"]
+    by_id = {it["id"]: it for it in items}
+    assert set(by_id) == {"i1", "i2"}
+    assert by_id["i1"]["status"] == "dismissed"
+    assert by_id["i2"]["status"] == "needs-review"
+
+    # Persisted to disk, not merely echoed in the response body.
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    saved_by_id = {it["id"]: it for it in saved}
+    assert set(saved_by_id) == {"i1", "i2"}
+    assert saved_by_id["i1"]["status"] == "dismissed"
+
+
+async def test_slack_dismiss_unknown_is_404(client, slack_file):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    resp = await client.delete("/api/slack/queue/nope", json={})
+    assert resp.status == 404
+
+
+async def test_slack_regenerate_unavailable_does_not_fabricate(client, slack_file, monkeypatch):
+    """Per-item regenerate with an unavailable seam returns 502 and leaves the
+    stored draft untouched — never fabricating a draft."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "original draft",
+        "generatedDraft": "original draft", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    resp = await client.post("/api/slack/queue/i1/refresh")
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["available"] is False
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["draft"] == "original draft"  # untouched
+
+
+async def test_slack_regenerate_replaces_draft_when_available(client, slack_file, monkeypatch):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "old",
+        "generatedDraft": "old", "status": "edited", "ts": 1,
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": True, "draft": "fresh draft"})
+    resp = await client.post("/api/slack/queue/i1/refresh")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["draft"] == "fresh draft"
+    assert body["item"]["generatedDraft"] == "fresh draft"  # new baseline
+    assert body["item"]["status"] == "needs-review"
+
+
+async def test_slack_approve_unavailable_does_not_mark_sent(client, slack_file, monkeypatch):
+    """An unavailable send seam must NOT fabricate a send-success: 502, and the
+    item stays unsent."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D0TEST1234",
+        "snippet": "hi", "threadContext": "", "draft": "ready to send",
+        "generatedDraft": "ready to send", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    resp = await client.post("/api/slack/queue/i1/approve", json={})
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["available"] is False
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] != "sent"
+
+
+async def test_slack_approve_sends_and_distills_style_note(client, slack_file, monkeypatch):
+    """Approving an edited draft marks it sent AND distills the (generated→final)
+    edit into the human-readable learned-style store."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "alice", "channel": "c", "channelType": "dm",
+        "channelId": "D0ALICE123",
+        "snippet": "ping", "threadContext": "", "draft": "Hey! Sounds great.",
+        "generatedDraft": "Sure, that works.", "status": "edited", "ts": 1,
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "sent"
+    assert body["item"]["finalText"] == "Hey! Sounds great."
+    # Style note distilled to the sibling style store.
+    style = slack_mod._style_path().read_text(encoding="utf-8")
+    assert "Hey! Sounds great." in style
+    # Per-contact topic memory updated.
+    topic = (slack_mod._topics_dir() / "alice.md").read_text(encoding="utf-8")
+    assert "ping" in topic
+
+
+async def test_slack_approve_already_sent_is_409(client, slack_file, monkeypatch):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "x",
+        "generatedDraft": "x", "status": "sent", "ts": 1,
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={})
+    assert resp.status == 409
+
+
+# --- SOFT-DISMISS undo + dismissed status (T1 contract) -------------------- #
+#
+# Contract this test suite LOCKS IN for the sibling T1 (backend) / T5 (frontend):
+#   * DELETE /api/slack/queue/{id}     → status='dismissed', item PRESERVED,
+#                                        broadcasts 'slack_changed' (asserted above).
+#   * POST   /api/slack/queue/{id}/undismiss → restores a dismissed item:
+#       - draft == generatedDraft (an unedited machine draft) → 'needs-review'
+#       - draft != generatedDraft (a human edit was in flight) → 'edited'
+#     Undismiss on a NON-dismissed item → 409 (nothing to undo).
+
+
+async def test_slack_undismiss_restores(client, slack_file):
+    """Undismiss flips a dismissed item back to its actionable status: an unedited
+    draft → needs-review, an edited draft → edited."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    # Case A: dismissed item whose draft still equals the generated draft → it was
+    # never edited, so it returns to 'needs-review'.
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "auto draft",
+        "generatedDraft": "auto draft", "status": "dismissed", "ts": 1,
+    }]}), encoding="utf-8")
+    resp = await client.post("/api/slack/queue/i1/undismiss", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "needs-review"
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+
+    # Case B: dismissed item whose draft diverged from the generated draft (a human
+    # edit was in flight when it was dismissed) → it returns to 'edited'.
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i2", "sender": "b", "channel": "c", "channelType": "dm",
+        "snippet": "yo", "threadContext": "", "draft": "my own words",
+        "generatedDraft": "auto draft", "status": "dismissed", "ts": 2,
+    }]}), encoding="utf-8")
+    resp = await client.post("/api/slack/queue/i2/undismiss", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "edited"
+
+
+async def test_slack_undismiss_non_dismissed_is_409(client, slack_file):
+    """Undismiss only applies to a dismissed item — undoing a live needs-review
+    item is a conflict (there is nothing to restore)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "d",
+        "generatedDraft": "d", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    resp = await client.post("/api/slack/queue/i1/undismiss", json={})
+    assert resp.status == 409
+
+
+async def test_slack_undismiss_unknown_is_404(client, slack_file):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    resp = await client.post("/api/slack/queue/nope/undismiss", json={})
+    assert resp.status == 404
+
+
+def test_slack_valid_status_includes_dismissed():
+    """SOFT-DISMISS adds 'dismissed' to the accepted status set; the original four
+    actionable/terminal statuses are unchanged."""
+    assert "dismissed" in slack_mod._VALID_STATUS
+    assert {"needs-draft", "needs-review", "edited", "sent"} <= slack_mod._VALID_STATUS
+
+
+# --- approve survives a concurrent */3-cron / 5s-watcher queue refresh ----- #
+#
+# The "waited 10s, didn't send" regression: a confirmed send fires its /approve
+# AFTER the undo window, but the */3 cron and the 5s file-watcher refresh the
+# whole queue (advancing the WHOLE-FILE etag) during that window. A page-level
+# etag captured at confirm time is then STALE → the etag-guarded write 409s and
+# the send is silently lost.
+#
+# T1 fix contract LOCKED IN here: the approve body forwards a per-ITEM content
+# baseline `expectedDraft` (what the client believed THIS item's sendable text
+# was at confirm time). On a stale WHOLE-FILE etag, the backend re-reads the
+# target item and proceeds with the send IFF the item's OWN content still matches
+# `expectedDraft` (an unrelated queue churn must not lose the send); it surfaces a
+# 409 ONLY when the TARGET item itself changed vs the baseline (the user must
+# re-review). This is a content match, NOT a blanket etag bypass.
+
+
+async def test_slack_approve_survives_concurrent_refresh(client, slack_file, monkeypatch):
+    """A stale WHOLE-FILE etag (from a concurrent cron/watcher refresh that did
+    NOT touch the target item) does NOT lose an unedited approved send: it goes
+    out and the item moves to 'sent'."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D0TEST1234",
+        "snippet": "hi", "threadContext": "", "draft": "ready to send",
+        "generatedDraft": "ready to send", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+
+    # The page reads the queue and captures THIS etag at confirm time.
+    queued = await (await client.get("/api/slack/queue")).json()
+    stale_etag = queued["etag"]
+
+    # Simulate the */3 cron / 5s watcher refreshing the queue DURING the undo
+    # window: the whole-file etag advances (mtime_ns moves) but the TARGET item's
+    # own content is untouched. sleep so the mtime_ns-based etag actually changes.
+    _time.sleep(0.01)
+    data, cur = slack_mod.filestore.read_json(slack_file)
+    data["items"].append({
+        "id": "i2", "sender": "z", "channel": "c2", "channelType": "dm",
+        "snippet": "new unread", "threadContext": "", "draft": "",
+        "generatedDraft": "", "status": "needs-draft", "ts": 2,
+    })
+    slack_mod.filestore.write_json(slack_file, data, cur)
+    new_etag = slack_mod.filestore.read_json(slack_file)[1]
+    assert new_etag != stale_etag  # the page-level etag is now genuinely stale
+
+    _stub_agent(monkeypatch, {"available": True})
+    # Forward the now-STALE page etag AND the per-item content baseline. The
+    # target item's content is unchanged vs the baseline, so the send must succeed.
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "ready to send",
+        "etag": stale_etag,
+        "expectedDraft": "ready to send",
+    })
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "sent"
+    assert body["item"]["finalText"] == "ready to send"
+    # Persisted: the target is sent, the concurrently-added sibling survived.
+    saved = {it["id"]: it for it in json.loads(slack_file.read_text(encoding="utf-8"))["items"]}
+    assert saved["i1"]["status"] == "sent"
+    assert "i2" in saved  # the concurrent refresh's addition was not clobbered
+
+
+async def test_slack_approve_conflict_when_target_item_changed(client, slack_file, monkeypatch):
+    """The content match is NOT a blanket etag bypass: if the TARGET item's own
+    content changed vs the forwarded baseline (e.g. the cron redrafted it during
+    the window), approve returns 409 so the user must re-review — no surprise
+    send of text they never approved."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "old text the user saw",
+        "generatedDraft": "old text the user saw", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    stale_etag = (await (await client.get("/api/slack/queue")).json())["etag"]
+
+    # The cron redrafts THIS item during the undo window — its content now differs
+    # from what the user confirmed.
+    _time.sleep(0.01)
+    data, cur = slack_mod.filestore.read_json(slack_file)
+    data["items"][0]["draft"] = "a totally different draft the cron wrote"
+    data["items"][0]["generatedDraft"] = "a totally different draft the cron wrote"
+    slack_mod.filestore.write_json(slack_file, data, cur)
+
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "old text the user saw",
+        "etag": stale_etag,
+        "expectedDraft": "old text the user saw",
+    })
+    assert resp.status == 409
+    # The send must NOT have fired (no approved text the user never re-reviewed).
+    assert not any(call[0] == "send" for call in agent.calls)
+    # And the item is NOT marked sent.
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] != "sent"
+
+
+async def test_slack_approve_already_sent_409_even_on_stale_etag(client, slack_file, monkeypatch):
+    """The double-send guard is INDEPENDENT of the stale-etag fix: an item already
+    'sent' returns 409 regardless of the forwarded etag/baseline, so T1's
+    concurrent-refresh fix can never be read as weakening the no-double-send
+    guarantee."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "x",
+        "generatedDraft": "x", "status": "sent", "ts": 1, "finalText": "x",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "x", "etag": "stale-or-bogus-etag", "expectedDraft": "x",
+    })
+    assert resp.status == 409
+    # No second send was attempted.
+    assert not any(call[0] == "send" for call in agent.calls)
+
+
+# --- approve sends to routable channelId / loud failure when unroutable --- #
+
+
+async def test_slack_approve_sends_to_channel_id(client, slack_file, monkeypatch):
+    """When an item has a channelId, approve passes it as 'target' to the send
+    seam — the subprocess receives the routable ID, not a display name."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
+        "channelType": "dm", "channelId": "D02P0TU89CN", "userId": "U02P2R0L3DX",
+        "snippet": "hi", "threadContext": "", "draft": "sounds good",
+        "generatedDraft": "sounds good", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "sounds good",
+    })
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "sent"
+    # The seam received the channelId as target, NOT the display name.
+    assert len(agent.calls) == 1
+    action, payload = agent.calls[0]
+    assert action == "send"
+    assert payload["target"] == "D02P0TU89CN"
+    assert "DM with" not in payload.get("channel", "")
+
+
+async def test_slack_approve_falls_back_to_user_id(client, slack_file, monkeypatch):
+    """When channelId is absent but userId is present, approve uses userId as
+    the routable target."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
+        "channelType": "dm", "userId": "U02P2R0L3DX",
+        "snippet": "hi", "threadContext": "", "draft": "ok",
+        "generatedDraft": "ok", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "ok",
+    })
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "sent"
+    assert agent.calls[0][1]["target"] == "U02P2R0L3DX"
+
+
+async def test_slack_approve_unroutable_item_fails_loudly(client, slack_file, monkeypatch):
+    """An item with NO channelId and NO userId returns 400 with a clear reason
+    — the send seam is NEVER called, the item stays unsent."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
+        "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "sounds good",
+        "generatedDraft": "sounds good", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "sounds good",
+    })
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["available"] is False
+    assert "routable" in body["reason"].lower() or "channel" in body["reason"].lower()
+    # The send seam must NOT have been called.
+    assert not any(call[0] == "send" for call in agent.calls)
+    # The item remains unsent on disk.
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] != "sent"
+
+
+async def test_slack_approve_empty_channel_id_is_unroutable(client, slack_file, monkeypatch):
+    """An empty-string channelId (e.g. from a scan that couldn't capture one)
+    is treated as absent — fails loudly just like a missing field."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "DM with a",
+        "channelType": "dm", "channelId": "", "userId": "",
+        "snippet": "hi", "threadContext": "", "draft": "hey",
+        "generatedDraft": "hey", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "hey",
+    })
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["available"] is False
+    assert not any(call[0] == "send" for call in agent.calls)
+
+
+def test_slack_build_draft_prompt_injects_style_and_topic(slack_file):
+    """build_draft_prompt must inject the learned style notes and the contact's
+    running topic summary so generated drafts reach the prompt with memory."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_mod._style_path().write_text("# style\n- be terse\n", encoding="utf-8")
+    slack_mod._topics_dir().mkdir(parents=True, exist_ok=True)
+    (slack_mod._topics_dir() / "alice.md").write_text(
+        "# Topics with alice\n- we discussed the launch\n", encoding="utf-8")
+    # Use a Chinese snippet so the (style-sample) block is included — style notes
+    # are gated out for non-Chinese conversations (they only drag the reply toward
+    # Chinese). Topic memory + the incoming message are always injected.
+    prompt = slack_mod.build_draft_prompt({
+        "sender": "alice", "channel": "general",
+        "snippet": "准备好了吗？", "threadContext": "ctx",
+    })
+    assert "be terse" in prompt
+    assert "we discussed the launch" in prompt
+    assert "准备好了吗？" in prompt
+
+
+def test_slack_build_draft_prompt_scrubs_secrets(slack_file):
+    """No credential material may ride into the draft prompt."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_mod._style_path().write_text("authorization: Bearer leak\n- be terse\n", encoding="utf-8")
+    # Chinese snippet so the style block (which carries the secret to scrub) is included.
+    prompt = slack_mod.build_draft_prompt({
+        "sender": "alice", "channel": "general",
+        "snippet": "你好", "threadContext": "",
+    })
+    assert "authorization:" not in prompt
+    assert "be terse" in prompt
+
+
+async def test_slack_topic_traversal_rejected(client, slack_file):
+    resp = await client.get("/api/slack/topics/..%2f..%2fetc")
+    assert resp.status == 400
+
+
+# --- /api/slack/health (readiness probe — no message I/O, no send) --------- #
+
+
+async def test_slack_health_shape_and_no_credentials(client, monkeypatch):
+    """GET /api/slack/health returns the readiness shape; detail never leaks creds."""
+    resp = await client.get("/api/slack/health")
+    assert resp.status == 200
+    body = await resp.json()
+    assert set(body) == {"claudeOnPath", "mcpConfigured", "ready", "detail"}
+    assert isinstance(body["claudeOnPath"], bool)
+    assert body["mcpConfigured"] in (True, False, "unknown")
+    assert isinstance(body["ready"], bool)
+    assert isinstance(body["detail"], str)
+
+
+def test_slack_probe_ready_when_claude_and_mcp_present(monkeypatch):
+    monkeypatch.setattr(slack_mod.shutil, "which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(slack_mod, "_detect_mcp_configured", lambda: True)
+    probe = slack_mod._probe_readiness()
+    assert probe["claudeOnPath"] is True
+    assert probe["mcpConfigured"] is True
+    assert probe["ready"] is True
+
+
+def test_slack_probe_not_ready_when_claude_absent(monkeypatch):
+    monkeypatch.setattr(slack_mod.shutil, "which", lambda _: None)
+    probe = slack_mod._probe_readiness()
+    assert probe["claudeOnPath"] is False
+    assert probe["ready"] is False
+    assert "PATH" in probe["detail"]
+
+
+def test_slack_probe_mcp_unknown_is_possibly_ready(monkeypatch):
+    monkeypatch.setattr(slack_mod.shutil, "which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(slack_mod, "_detect_mcp_configured", lambda: "unknown")
+    probe = slack_mod._probe_readiness()
+    assert probe["mcpConfigured"] == "unknown"
+    assert probe["ready"] is True  # 'unknown' is not a positive False
+
+
+def test_slack_probe_not_ready_when_mcp_absent(monkeypatch):
+    monkeypatch.setattr(slack_mod.shutil, "which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(slack_mod, "_detect_mcp_configured", lambda: False)
+    probe = slack_mod._probe_readiness()
+    assert probe["mcpConfigured"] is False
+    assert probe["ready"] is False
+
+
+# --- _run_slack_agent failure modes (subprocess MOCKED — no real claude) --- #
+#
+# These exercise the live seam's fail-loud + no-fabrication contract without
+# ever spawning a real `claude`. We monkeypatch asyncio.create_subprocess_exec
+# in the slack module with a fake process whose stdout/stderr/returncode we
+# control.
+
+
+class _SlackFakeStream:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.pop(0)
+
+
+class _SlackFakeStdin:
+    def write(self, _data):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _SlackFakeProc:
+    def __init__(self, stdout_lines=(), stderr_lines=(), returncode=0):
+        self.stdin = _SlackFakeStdin()
+        self.stdout = _SlackFakeStream(stdout_lines)
+        self.stderr = _SlackFakeStream(stderr_lines)
+        self.returncode = returncode
+
+    async def wait(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
+def _patch_subprocess(monkeypatch, proc=None, raises=None):
+    async def fake_exec(*args, **kwargs):
+        if raises is not None:
+            raise raises
+        return proc
+    monkeypatch.setattr(slack_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+
+def _result_line(text):
+    import json as _json
+    return (_json.dumps({"type": "result", "result": text}) + "\n").encode()
+
+
+async def test_slack_seam_spawn_failure_is_unavailable(monkeypatch):
+    """A spawn failure (claude not found) returns available:false, never fabricates."""
+    _patch_subprocess(monkeypatch, raises=FileNotFoundError("claude"))
+    result = await slack_mod._run_slack_agent("list", {})
+    assert result["available"] is False
+    assert "items" not in result
+    assert isinstance(result["reason"], str)
+
+
+async def test_slack_seam_bad_json_is_unavailable(monkeypatch):
+    """An unparseable reply must not fabricate items."""
+    proc = _SlackFakeProc(stdout_lines=[_result_line("this is not json")])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("list", {})
+    assert result["available"] is False
+    assert "items" not in result
+
+
+async def test_slack_seam_empty_reply_is_unavailable(monkeypatch):
+    proc = _SlackFakeProc(stdout_lines=[_result_line("")])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("regenerate", {"prompt": "p"})
+    assert result["available"] is False
+    assert "draft" not in result
+
+
+async def test_slack_seam_no_result_event_is_unavailable(monkeypatch):
+    """If the stream ends with no result event, fail loud (no send-success)."""
+    proc = _SlackFakeProc(stdout_lines=[(json.dumps({"type": "system"}) + "\n").encode()])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("send", {"channel": "c", "text": "hi"})
+    assert result["available"] is False
+
+
+async def test_slack_seam_auth_error_is_unavailable(monkeypatch):
+    """An auth/credential error is classified and surfaced as unavailable."""
+    proc = _SlackFakeProc(
+        stdout_lines=[_result_line("ExpiredToken: The security token included in the request is expired")],
+    )
+    proc_evt = _SlackFakeProc(stdout_lines=[
+        (json.dumps({"type": "result", "is_error": True,
+                     "result": "The security token included in the request is expired"}) + "\n").encode()
+    ])
+    _patch_subprocess(monkeypatch, proc=proc_evt)
+    result = await slack_mod._run_slack_agent("send", {"channel": "c", "text": "hi"})
+    assert result["available"] is False
+    assert "items" not in result and "ts" not in result
+
+
+async def test_slack_seam_nonzero_exit_is_unavailable(monkeypatch):
+    proc = _SlackFakeProc(stdout_lines=[_result_line("not json either")], returncode=2)
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("list", {})
+    assert result["available"] is False
+
+
+async def test_slack_seam_list_happy_path_parses_array(monkeypatch):
+    """A valid STRICT JSON array list result is parsed into items."""
+    items = [{"id": "x1", "sender": "alice", "channel": "general",
+              "channelType": "dm", "snippet": "hi", "threadContext": ""}]
+    proc = _SlackFakeProc(stdout_lines=[_result_line(json.dumps(items))])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("list", {})
+    assert result["available"] is True
+    assert result["items"][0]["id"] == "x1"
+
+
+async def test_slack_seam_list_uses_shorter_timeout(monkeypatch):
+    """The 'list' action runs under the shorter dedicated _LIST_TIMEOUT_S budget,
+    not the 120s send/regenerate budget."""
+    captured = {}
+
+    async def fake_wait_for(coro, timeout):
+        captured["timeout"] = timeout
+        return await coro
+
+    proc = _SlackFakeProc(stdout_lines=[_result_line(json.dumps([]))])
+    _patch_subprocess(monkeypatch, proc=proc)
+    monkeypatch.setattr(slack_mod.asyncio, "wait_for", fake_wait_for)
+    await slack_mod._run_slack_agent("list", {})
+    assert captured["timeout"] == slack_mod._LIST_TIMEOUT_S
+    assert slack_mod._LIST_TIMEOUT_S < slack_mod._AGENT_TIMEOUT_S
+
+
+async def test_slack_seam_send_happy_path_confirms_ok(monkeypatch):
+    proc = _SlackFakeProc(stdout_lines=[_result_line(json.dumps({"ok": True, "ts": "1.2"}))])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("send", {"channel": "c", "text": "hi"})
+    assert result["available"] is True
+    assert result["ts"] == "1.2"
+
+
+async def test_slack_seam_send_without_ok_is_unavailable(monkeypatch):
+    """Send must NOT fabricate success when the agent doesn't confirm ok=true."""
+    proc = _SlackFakeProc(stdout_lines=[_result_line(json.dumps({"ok": False}))])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("send", {"channel": "c", "text": "hi"})
+    assert result["available"] is False
+
+
+async def test_slack_seam_timeout_is_unavailable(monkeypatch):
+    """A hung subprocess hits the bounded timeout and returns unavailable."""
+    monkeypatch.setattr(slack_mod, "_AGENT_TIMEOUT_S", 0.05)
+
+    class _HangStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(10)
+            raise StopAsyncIteration
+
+    proc = _SlackFakeProc()
+    proc.stdout = _HangStream()
+    proc.stderr = _SlackFakeStream([])
+    _patch_subprocess(monkeypatch, proc=proc)
+    result = await slack_mod._run_slack_agent("regenerate", {"prompt": "p"})
+    assert result["available"] is False
+    assert "timed out" in result["reason"].lower()
+
+
+# --- T4 additive gaps: timeout-reap (no-orphan) + health detail cred-scrub --- #
+#
+# The slack seam-failure + health-shape coverage above (added by a parallel
+# task) is comprehensive; these two close genuine remaining gaps the existing
+# tests do NOT assert:
+#   * the no-orphan subprocess-hygiene contract on timeout (existing timeout
+#     test asserts only available:False + the reason string, NOT that the child
+#     was reaped);
+#   * the no-credential-leak contract on the health detail string across ALL
+#     readiness states (existing health test asserts shape/types only).
+# They reuse the existing _patch_subprocess helper and the client fixture — no
+# new module-level fixture/class names (avoiding the duplicate-name shadowing
+# footgun documented in qa.md).
+
+
+async def test_slack_seam_timeout_reaps_subprocess(monkeypatch):
+    """On timeout the seam must reap the child (no orphan) AND not fabricate.
+
+    The hung proc reports returncode None (still alive) so _reap actually runs
+    its escalation; we record that proc.wait() was awaited to prove the seam
+    drove the reap rather than abandoning the process.
+    """
+    monkeypatch.setattr(slack_mod, "_AGENT_TIMEOUT_S", 0.05)
+
+    class _HangStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(10)
+            raise StopAsyncIteration
+
+    class _ReapRecordingStdin:
+        def write(self, _data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    class _ReapRecordingProc:
+        def __init__(self):
+            self.stdin = _ReapRecordingStdin()
+            self.stdout = _HangStream()
+            self.stderr = _SlackFakeStream([])
+            self.returncode = None  # still alive -> _reap must act
+            self.waited = 0
+            self.terminated = False
+            self.killed = False
+
+        async def wait(self):
+            self.waited += 1
+            # First wait (the bounded grace) appears to succeed: the process
+            # exits after being asked to close, so terminate/kill aren't needed.
+            self.returncode = -15
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    proc = _ReapRecordingProc()
+    _patch_subprocess(monkeypatch, proc=proc)
+
+    result = await slack_mod._run_slack_agent("regenerate", {"prompt": "p"})
+
+    assert result["available"] is False
+    # No fabrication on the timeout path.
+    assert "items" not in result and "ts" not in result and "draft" not in result
+    # The child was reaped, not orphaned: _reap awaited proc.wait() at least once.
+    assert proc.waited >= 1
+
+
+async def test_slack_health_detail_has_no_credential_markers(client, monkeypatch):
+    """The health detail string must never carry credential material in ANY
+    readiness state. Drives all four states and scans detail against the same
+    _SECRET_MARKERS the backend scrubs with."""
+    markers = ("cookie", "mwinit", "~/.midway", ".midway", "authorization:", "aws_secret")
+
+    states = [
+        (lambda _: "/usr/bin/claude", lambda: True),       # ready
+        (lambda _: "/usr/bin/claude", lambda: False),      # mcp absent
+        (lambda _: "/usr/bin/claude", lambda: "unknown"),  # mcp unknown
+        (lambda _: None, lambda: True),                    # claude absent
+    ]
+    for which_fn, mcp_fn in states:
+        monkeypatch.setattr(slack_mod.shutil, "which", which_fn)
+        monkeypatch.setattr(slack_mod, "_detect_mcp_configured", mcp_fn)
+        resp = await client.get("/api/slack/health")
+        assert resp.status == 200
+        body = await resp.json()
+        detail_low = body["detail"].lower()
+        assert detail_low, "detail must be a non-empty explanation"
+        for marker in markers:
+            assert marker not in detail_low, f"credential marker leaked: {marker!r}"
+        # `ready` must track claudeOnPath being false.
+        if not body["claudeOnPath"]:
+            assert body["ready"] is False
+
+
+
+# --- Bug 4 drain-bound contract (backend half) ----------------------------- #
+#
+# The background draft DRAIN lives frontend-side (SlackPage), naturally bounded
+# to a small concurrency while the page is open. The CONCURRENCY CAP itself is a
+# browser concern (no real subprocess runs in this suite), so here we verify the
+# BACKEND invariant a bounded drain relies on: each per-item /{id}/refresh is
+# INDEPENDENT (drafting one item never mutates another) and is READ-ONLY (the
+# regenerate seam never sends). The per-item happy/fail-loud + needs-draft ->
+# needs-review flips are already covered by
+# test_slack_needs_draft_regenerates_to_needs_review /
+# test_slack_needs_draft_failed_draft_stays_needs_draft above; this adds the
+# isolation + never-sends assertions those don't make.
+async def test_slack_drain_draft_is_per_item_isolated_and_never_sends(client, slack_file, monkeypatch):
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+         "snippet": "one", "threadContext": "", "draft": "",
+         "generatedDraft": "", "status": "needs-draft", "ts": 1},
+        {"id": "i2", "sender": "b", "channel": "c", "channelType": "dm",
+         "snippet": "two", "threadContext": "", "draft": "",
+         "generatedDraft": "", "status": "needs-draft", "ts": 2},
+    ]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "drafted i1"})
+    resp = await client.post("/api/slack/queue/i1/refresh")
+    assert resp.status == 200
+    items = {it["id"]: it for it in json.loads(slack_file.read_text(encoding="utf-8"))["items"]}
+    # Drafting i1 must touch ONLY i1 — i2 stays needs-draft with an empty draft.
+    assert items["i1"]["status"] == "needs-review" and items["i1"]["draft"] == "drafted i1"
+    assert items["i2"]["status"] == "needs-draft" and items["i2"]["draft"] == ""
+    # The drain reuses the regenerate path, which is READ-ONLY: it NEVER sends.
+    assert agent.calls and all(action == "regenerate" for action, _ in agent.calls)
+    assert all(action != "send" for action, _ in agent.calls)
+
+
+# --- In-process scan + manual-refresh trigger (D-023) + external observability - #
+#
+# The scanner is the in-process ``_scan_worker`` running the deterministic
+# ``_scan_once`` (get_unreads → write slack_threads.json). The server is no longer a
+# pure cron reader — but it also never blocks a request on a scan:
+#   * POST /api/slack/queue/refresh triggers a REAL scan by SETTING the worker's wake
+#     Event (so a scan starts promptly, not after the full interval), returns the warm
+#     etag immediately (NON-blocking — no inline scan in the request), and does NOT
+#     write any ``.slack_scan_now`` sentinel (that retired cron sentinel is GONE).
+#   * A manual Refresh shares ONE scan-in-progress guard (``_get_scan_lock``) with the
+#     periodic worker: if a scan is already running, the manual trigger is dismissed
+#     with HTTP 200 ``{scanning:false, reason:"A scan is already in progress."}`` —
+#     a deliberately non-error shape the page surfaces instead of "Scanning…".
+#   * GET /api/slack/queue echoes a durable top-level ``lastScanAt`` (epoch ms) that
+#     ``_scan_once`` persists on EVERY completed scan, so the "Updated …" freshness
+#     label reflects scan freshness and survives a server restart.
+#   * an externally-written change to slack_threads.json (a scan/cron write) is
+#     observable to an open page via GET /queue and the file-watcher's broadcast.
+# All exercised with NO real claude/Slack I/O (the seam + scan-read are stubbed).
+
+
+async def test_slack_refresh_triggers_real_scan_non_blocking(client, slack_file, monkeypatch):
+    """NEW refresh contract (D-023): POST /api/slack/queue/refresh triggers a REAL
+    scan by SETTING the worker's wake Event, returns the warm etag IMMEDIATELY
+    (HTTP 202 {scanning:true, etag}) WITHOUT blocking the request on the MCP scan,
+    and writes NO ``.slack_scan_now`` sentinel (the retired cron sentinel is gone).
+
+    Skeptic asserts: (1) the wake Event the worker awaits is SET by the handler (the
+    real trigger, not a no-op); (2) the handler runs NO inline blocking scan in the
+    request — ``_scan_once`` is monkeypatched to a tripwire that fails the test if the
+    request awaits it, and the scanning seam / subprocess is never spawned.
+    """
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    # Tripwire: the request must NOT run a scan inline (it returns immediately and
+    # the background worker does the scan). If refresh awaits _scan_once, fail loud.
+    async def boom_scan_once(app):
+        raise AssertionError("refresh must NOT run an inline blocking scan in the request")
+
+    async def boom_exec(*args, **kwargs):
+        raise AssertionError("refresh must NOT spawn a scanning subprocess in the request")
+
+    monkeypatch.setattr(slack_mod, "_scan_once", boom_scan_once)
+    monkeypatch.setattr(slack_mod.asyncio, "create_subprocess_exec", boom_exec)
+    # The MCP-delegation seam must not be invoked on the refresh path either.
+    agent = _stub_agent(monkeypatch, {"available": True, "items": []})
+
+    # The sidecar sibling sentinel is dead — assert it never appears.
+    sentinel = slack_mod.SLACK_PATH.parent / ".slack_scan_now"
+    assert not sentinel.exists()
+
+    # The startup _scan_worker (launched on_startup in this test) is already parked
+    # on the module wake Event and would CONSUME+clear it the instant the handler
+    # sets it — racing any post-request is_set() check. Swap in a FRESH Event the
+    # running worker is NOT awaiting, so the handler's _get_scan_event().set() lands
+    # on an event nothing clears; we can then deterministically observe the trigger.
+    probe_event = asyncio.Event()
+    monkeypatch.setattr(slack_mod, "_scan_wake_event", probe_event)
+    assert not probe_event.is_set()
+
+    resp = await client.post("/api/slack/queue/refresh")
+    assert resp.status == 202
+    body = await resp.json()
+    # Distinct, non-error success shape: a scan was triggered, warm etag returned.
+    assert body["scanning"] is True
+    assert "etag" in body
+
+    # The REAL trigger: the handler SET the worker's wake Event (so the periodic
+    # worker's interval sleep is interrupted and a scan starts promptly, not 5 min
+    # later) — not a no-op. Asserted on the probe event nothing else consumes.
+    assert probe_event.is_set()
+    # No inline scan, no spawned subprocess, the seam was never called.
+    assert agent.calls == []
+    # The retired cron sentinel was NOT written.
+    assert not sentinel.exists()
+
+
+async def test_slack_queue_returns_last_scan_at(client, slack_file):
+    """GET /api/slack/queue echoes the durable top-level ``lastScanAt`` (epoch ms)
+    that ``_scan_once`` persists on every completed scan (D-023). It survives a
+    server restart by virtue of living on disk (``_load`` does not strip it), and
+    degrades to ``None`` (never crashes) when no scan has happened yet.
+    """
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Never-scanned case: no lastScanAt key on disk → endpoint returns it as null.
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    body = await (await client.get("/api/slack/queue")).json()
+    assert body["lastScanAt"] is None
+
+    # A scan completed and persisted lastScanAt; the endpoint reads it back from
+    # disk (the persistence-survives-restart path — written to the file, read
+    # through a fresh GET, not held in process memory).
+    scanned_at = 1_750_000_000_000
+    slack_file.write_text(json.dumps({
+        "lastScanAt": scanned_at,
+        "items": [{
+            "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+            "snippet": "hi", "threadContext": "", "draft": "", "generatedDraft": "",
+            "status": "needs-draft", "ts": 1,
+        }],
+    }), encoding="utf-8")
+    body = await (await client.get("/api/slack/queue")).json()
+    assert body["lastScanAt"] == scanned_at
+    # The items still come through alongside the freshness timestamp.
+    assert [it["id"] for it in body["items"]] == ["i1"]
+
+
+async def test_slack_refresh_while_scan_in_progress_is_rejected(client, slack_file, monkeypatch):
+    """A manual Refresh that races an IN-FLIGHT scan (periodic worker OR a prior
+    manual trigger) is DISMISSED, not errored (D-023, spec item 3). We simulate an
+    in-flight scan by holding the shared scan guard (``_get_scan_lock()``, the same
+    lock ``_run_guarded_scan`` holds for the duration of a scan), then POST refresh
+    and assert a NON-error response (HTTP 200) carrying the clear, secret-free
+    ``{scanning:false, reason:"A scan is already in progress."}`` the page surfaces
+    instead of a misleading "Scanning…" state.
+
+    The refresh path must NOT spawn a subprocess or run an inline scan even on the
+    rejected path. The autouse _reset_slack_scan_guard fixture clears the lock/event
+    after this test so the held lock never leaks into a later test.
+    """
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    async def boom_exec(*args, **kwargs):
+        raise AssertionError("a rejected refresh must NOT spawn a scanning subprocess")
+
+    async def boom_scan_once(app):
+        raise AssertionError("a rejected refresh must NOT run an inline scan")
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_subprocess_exec", boom_exec)
+    monkeypatch.setattr(slack_mod, "_scan_once", boom_scan_once)
+
+    # Hold the shared scan guard to simulate a scan already in flight.
+    lock = slack_mod._get_scan_lock()
+    await lock.acquire()
+    try:
+        resp = await client.post("/api/slack/queue/refresh")
+        # Non-error: a 200/202 (NOT 4xx/5xx). The contract is HTTP 200.
+        assert resp.status in (200, 202)
+        body = await resp.json()
+        assert body["scanning"] is False
+        assert "already in progress" in body["reason"].lower()
+        # The reason string carries NO secret material (it is shown verbatim in UI).
+        reason_blob = body["reason"].lower()
+        for marker in ("cookie", "mwinit", "~/.midway", ".midway", "authorization:", "aws_secret"):
+            assert marker not in reason_blob
+    finally:
+        lock.release()
+
+
+async def test_slack_external_write_is_observable_via_queue(client, slack_file):
+    """A cron write (simulated as an out-of-band write to slack_threads.json) is
+    observable to an open page: GET /api/slack/queue returns the NEW drafted items
+    without any server scan. This is the client-backstop-poll path of the DONE-WHEN
+    repaint check — the page re-fetches and sees the cron's freshly drafted card.
+    """
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    # Start empty (as the page would first see it).
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+    first = await (await client.get("/api/slack/queue")).json()
+    assert first["items"] == []
+
+    # etag is mtime_ns-based, so separate the two writes in real time or the
+    # mtimes collide and the etag wouldn't appear to advance.
+    _time.sleep(0.01)
+    # The cron drafts a needs-review card (with history3d) directly into the file.
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "cron1", "sender": "alice", "channel": "general", "channelType": "dm",
+        "snippet": "ping", "threadContext": "", "draft": "drafted by cron",
+        "generatedDraft": "drafted by cron", "status": "needs-review", "ts": 2,
+        "history3d": [{"ts": 1, "author": "alice", "text": "ping"}],
+    }]}), encoding="utf-8")
+
+    # The next page fetch (backstop poll / live-update repaint / manual Refresh)
+    # surfaces the new card with NO server-side scan.
+    again = await (await client.get("/api/slack/queue")).json()
+    assert [it["id"] for it in again["items"]] == ["cron1"]
+    card = again["items"][0]
+    assert card["status"] == "needs-review"
+    assert card["draft"] == "drafted by cron"
+    # The cron's history3d passes through untouched (GET /queue is a passthrough).
+    assert card["history3d"][0]["text"] == "ping"
+    # The etag advanced, so a page comparing etags would repaint.
+    assert again["etag"] != first["etag"]
+
+
+async def test_slack_watcher_broadcasts_on_external_change(client, slack_file, monkeypatch):
+    """If T1 implemented the in-process file-watcher, an external write to
+    slack_threads.json (a cron write) drives a 'slack_changed' broadcast so any
+    open page repaints. Skips cleanly if the watcher was omitted (the client
+    backstop poll in test_slack_external_write_is_observable_via_queue covers
+    promptness in that case)."""
+    watcher = getattr(slack_mod, "_slack_watcher", None)
+    if watcher is None:
+        pytest.skip("server file-watcher not implemented (client backstop poll covers repaint)")
+
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    app = client.app
+    # Record every broadcast the watcher emits.
+    events: list = []
+
+    async def record(event_type, data=None):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(app["ws_manager"], "broadcast", record)
+    # Tighten the watch interval (if exposed) so the loop ticks fast under test.
+    if hasattr(slack_mod, "SLACK_WATCH_INTERVAL_S"):
+        monkeypatch.setattr(slack_mod, "SLACK_WATCH_INTERVAL_S", 0.01)
+
+    task = asyncio.create_task(watcher(app))
+    try:
+        # Let the watcher take its baseline mtime/etag reading.
+        await asyncio.sleep(0.05)
+        # Simulate a cron write: change the file out-of-band.
+        await asyncio.sleep(0.02)
+        slack_file.write_text(json.dumps({"items": [{
+            "id": "cron1", "sender": "a", "channel": "c", "channelType": "dm",
+            "snippet": "hi", "threadContext": "", "draft": "d",
+            "generatedDraft": "d", "status": "needs-review", "ts": 1,
+        }]}), encoding="utf-8")
+        # Give the watcher a few ticks to notice the change and broadcast.
+        for _ in range(50):
+            if any(ev[0] == "slack_changed" for ev in events):
+                break
+            await asyncio.sleep(0.02)
+        assert any(ev[0] == "slack_changed" for ev in events), \
+            "watcher did not broadcast slack_changed after an external file change"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_slack_scan_spawn_scopes_to_slack_mcp_with_batch_and_cap(monkeypatch):
+    """The spawn must carry --mcp-config + --strict-mcp-config (slack-mcp only),
+    the allowlist must include the batch read tools, and the list prompt must
+    state the cap — all verifiable on the spawn args / prompt."""
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = list(args)
+        return _SlackFakeProc(stdout_lines=[_result_line(json.dumps([]))])
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_subprocess_exec", fake_exec)
+    result = await slack_mod._run_slack_agent("list", {})
+    assert result["available"] is True
+
+    args = captured["args"]
+    assert "--strict-mcp-config" in args
+    assert "--mcp-config" in args
+    cfg_path = args[args.index("--mcp-config") + 1]
+    cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8")) if Path(cfg_path).exists() else None
+    if cfg is not None:
+        # Only slack-mcp is loaded, and the config carries NO secret markers.
+        assert list(cfg.get("mcpServers", {})) == ["slack-mcp"]
+        blob = json.dumps(cfg).lower()
+        for marker in ("cookie", "mwinit", "~/.midway", "authorization:", "aws_secret"):
+            assert marker not in blob
+    # Batch read tools are on the read allowlist (more threads, fewer round-trips).
+    allow = args[args.index("--allowedTools") + 1]
+    assert "mcp__slack-mcp__batch_get_threads" in allow
+    assert "mcp__slack-mcp__batch_get_messages" in allow
+    # The list prompt states the cap explicitly.
+    prompt = slack_mod._build_agent_prompt("list", {})
+    assert str(slack_mod.SLACK_LIST_CAP) in prompt
+
+
+def test_slack_mcp_config_has_no_secrets_and_only_slack(slack_file):
+    """_slack_mcp_config builds a slack-mcp-only doc with no credential material."""
+    cfg = slack_mod._slack_mcp_config()
+    assert list(cfg["mcpServers"]) == ["slack-mcp"]
+    blob = json.dumps(cfg).lower()
+    for marker in ("cookie", "mwinit", "~/.midway", "authorization:", "aws_secret"):
+        assert marker not in blob
+
+
+def test_slack_send_allowlist_unchanged_by_scoping():
+    """Scoping which servers load must NOT widen what 'send' may do: send still
+    gets ONLY post_message; the batch read tools are NOT on the send allowlist."""
+    assert slack_mod._ALLOWED_TOOLS["send"] == slack_mod._SLACK_SEND_TOOLS
+    assert "mcp__slack-mcp__batch_get_threads" not in slack_mod._ALLOWED_TOOLS["send"]
+    assert "mcp__slack-mcp__post_message" not in slack_mod._SLACK_READ_TOOLS
+
+
+# --------------------------------------------------------------------------- #
+# Backend draft-worker pool (D-015)
+#
+# The cron writes draft-free SKELETON items (status 'needs-draft') + flags
+# existing items that grew new messages (needsRedraft). An in-process asyncio
+# worker drafts them in parallel via the read-only 'draft' seam (capped by a
+# Semaphore). These exercise the worker's selection + per-item draft coroutine
+# WITHOUT a real `claude` (the seam is stubbed; we monkeypatch _probe_readiness
+# ready so the gate passes, and drive ONE worker iteration directly — same shape
+# as the file-watcher test above). The startup worker in every test stays inert
+# (its first action is an interval sleep + a readiness gate that is False because
+# `claude` is absent), so it never spawns under aiohttp_client(app).
+# --------------------------------------------------------------------------- #
+
+
+def test_slack_draft_action_grants_no_write_tool_and_uses_full_timeout():
+    """D-022 (cold-start invariant): the 'draft' action is MCP-FREE at spawn time —
+    _drive_agent sets needs_mcp=False for it (asserted in the arg-capture test
+    below), so its _ALLOWED_TOOLS entry is never consulted. Even so, that entry must
+    NEVER grant a write tool (it is read-only by design), and draft reuses the full
+    agent timeout (not the shorter list budget). (Updated from the pre-D-022 test
+    that asserted draft mapped verbatim to the read-only allowlist as the SEND-safety
+    boundary; the real boundary is now needs_mcp=False — draft gets no allowlist at
+    all at spawn — eliminating per-cold-spawn SAML 429 throttling.)"""
+    # If the (now dead-at-spawn) draft entry exists, it must be read-only — never a
+    # post_message write tool. Tolerant of the entry being absent entirely.
+    draft_tools = slack_mod._ALLOWED_TOOLS.get("draft", [])
+    assert "mcp__slack-mcp__post_message" not in draft_tools
+    # And it reuses the standard agent timeout (not the shorter list budget).
+    assert slack_mod._timeout_for("draft") == slack_mod._AGENT_TIMEOUT_S
+
+
+def test_slack_draft_prompt_forbids_tool_calls_and_keeps_return_shape():
+    """D-022: the 'draft' prompt no longer instructs the subprocess to FETCH
+    history — it explicitly forbids ANY tool call (history is pre-fetched on the
+    persistent session and rendered into the wrapped per-item prompt). It still
+    asks for the {draft, generatedDraft, threadContext} strict-JSON shape and must
+    not send. (Updated from the pre-D-022 test that asserted batch_get_messages /
+    '3-day' history-fetch instructions, which are gone now that drafting is
+    MCP-free.)"""
+    prompt = slack_mod._build_agent_prompt("draft", {"prompt": "BASE_PROMPT"})
+    # The subprocess is told NOT to fetch anything / call any tools.
+    assert "do NOT call any tools" in prompt
+    assert "do NOT fetch anything" in prompt
+    # No history-fetch tool name leaks into the (now MCP-free) draft prompt.
+    assert "batch_get_messages" not in prompt
+    # The return-shape contract is still enforced.
+    assert "generatedDraft" in prompt
+    assert "BASE_PROMPT" in prompt  # the per-item instructions are wrapped in
+    assert "do NOT send" in prompt
+
+
+def test_slack_draft_parse_passes_through_history_and_generated():
+    """_parse_agent_result('draft') mirrors 'regenerate' (require dict + 'draft')
+    and additionally passes through history3d (list) + generatedDraft, defaulting
+    generatedDraft to draft and a non-list history3d to []."""
+    ok = slack_mod._parse_agent_result(
+        json.dumps({"draft": "hi", "history3d": [{"ts": 1, "author": "a", "text": "x"}]}),
+        "draft",
+    )
+    assert ok["available"] is True
+    assert ok["draft"] == "hi"
+    assert ok["generatedDraft"] == "hi"  # defaulted to draft
+    assert ok["history3d"][0]["text"] == "x"
+    # Missing 'draft' -> unavailable (no fabrication).
+    bad = slack_mod._parse_agent_result(json.dumps({"history3d": []}), "draft")
+    assert bad["available"] is False and "draft" not in bad
+    # Non-list history3d normalizes to [].
+    nl = slack_mod._parse_agent_result(json.dumps({"draft": "h", "history3d": "nope"}), "draft")
+    assert nl["history3d"] == []
+
+
+def test_slack_needs_draft_selection_and_edited_guard():
+    """The worker selects needs-draft skeletons and needs-review+needsRedraft
+    items, but NEVER an edited (draft != generatedDraft) item — even with a stray
+    needsRedraft flag (defense in depth, spec item 4)."""
+    nd = slack_mod._needs_draft
+    assert nd({"status": "needs-draft"}) is True
+    assert nd({"status": "needs-review", "needsRedraft": True, "draft": "d", "generatedDraft": "d"}) is True
+    # Edited item with a stray needsRedraft -> NOT selected (user owns the draft).
+    assert nd({"status": "needs-review", "needsRedraft": True, "draft": "EDITED", "generatedDraft": "d"}) is False
+    # needs-review without the flag (already drafted) -> not selected.
+    assert nd({"status": "needs-review", "draft": "d", "generatedDraft": "d"}) is False
+    # Terminal / in-progress states -> never selected.
+    assert nd({"status": "sent"}) is False
+    assert nd({"status": "dismissed"}) is False
+    assert nd({"status": "edited", "draft": "x", "generatedDraft": "y"}) is False
+
+
+async def _run_one_draft_cycle(app, monkeypatch, fetch_history=None):
+    """Drive ONE _draft_worker iteration: tighten the interval, force readiness,
+    and run the worker for a moment so its (sleep → gate → select → gather) body
+    executes exactly enough, then cancel cleanly.
+
+    HERMETICITY (D-022): _draft_one now pre-fetches history via _fetch_history_for
+    on the PERSISTENT MCP session when an item lacks history3d. In tests that real
+    call would spawn a live slack-mcp subprocess (the very cold-start the feature
+    eliminates) and hit a real SAML auth. So we ALWAYS stub _fetch_history_for here
+    — by default to an empty-history coroutine (the worker then drafts from the
+    snippet, exactly as in the unreadable-channel case) so no test escapes the
+    stubbed seam into a real MCP spawn. A test that needs a specific pre-fetched
+    history passes its own `fetch_history` coroutine.
+    """
+    if fetch_history is None:
+        async def fetch_history(_channel_id):
+            return []
+    monkeypatch.setattr(slack_mod, "_fetch_history_for", fetch_history)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_DRAFT_POLL_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._draft_worker(app))
+    try:
+        # A few ticks: long enough for at least one full select+draft+write cycle.
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_slack_worker_drafts_a_needs_draft_skeleton(client, slack_file, monkeypatch):
+    """A cron-written needs-draft SKELETON triggers the worker, which drafts it via
+    the read-only 'draft' seam and flips it to needs-review with the draft +
+    history3d filled in."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "s1", "sender": "alice", "channel": "DM with alice", "channelType": "dm",
+        "channelId": "D1", "userId": "U1", "snippet": "ping", "ts": 1,
+        "status": "needs-draft",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {
+        "available": True, "draft": "drafted by worker",
+        "history3d": [{"ts": 1, "author": "alice", "text": "ping"}],
+        "generatedDraft": "drafted by worker",
+    })
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    # The worker used the READ-ONLY 'draft' action (never 'send').
+    assert agent.calls and all(action == "draft" for action, _ in agent.calls)
+    assert all(action != "send" for action, _ in agent.calls)
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["draft"] == "drafted by worker"
+    assert saved["generatedDraft"] == "drafted by worker"
+    assert saved["history3d"][0]["text"] == "ping"
+    assert not saved.get("needsRedraft")
+
+
+async def test_slack_worker_redrafts_needs_review_with_needsredraft(client, slack_file, monkeypatch):
+    """A needs-review item flagged needsRedraft (the conversation grew) gets
+    re-drafted: the new draft replaces the old, history3d updates, and needsRedraft
+    is cleared. The redraft prompt carries the re-draft instruction."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "r1", "sender": "bob", "channel": "DM with bob", "channelType": "dm",
+        "channelId": "D2", "userId": "U2", "snippet": "and one more thing", "ts": 5,
+        "status": "needs-review", "draft": "old draft", "generatedDraft": "old draft",
+        "needsRedraft": True,
+        "history3d": [{"ts": 4, "author": "bob", "text": "first"}],
+    }]}), encoding="utf-8")
+
+    captured = {}
+
+    async def fake_agent(action, payload):
+        captured["action"] = action
+        captured["prompt"] = payload.get("prompt", "")
+        return {"available": True, "draft": "fresh cohesive reply",
+                "history3d": [{"ts": 4, "author": "bob", "text": "first"},
+                              {"ts": 5, "author": "bob", "text": "and one more thing"}],
+                "generatedDraft": "fresh cohesive reply"}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    assert captured.get("action") == "draft"
+    # The re-draft prompt instructs ONE cohesive reply to all unanswered messages.
+    assert "addresses ALL their unanswered messages" in captured["prompt"]
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["draft"] == "fresh cohesive reply"
+    assert saved["generatedDraft"] == "fresh cohesive reply"
+    assert len(saved["history3d"]) == 2
+    assert not saved.get("needsRedraft")
+
+
+async def test_slack_worker_never_redrafts_an_edited_item(client, slack_file, monkeypatch):
+    """CRITICAL (spec item 4): the worker must NEVER re-draft an item whose draft
+    was manually edited (draft != generatedDraft). Even with a stray needsRedraft
+    flag the user's draft is left ALONE — the seam is never even invoked for it."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "e1", "sender": "carol", "channel": "DM with carol", "channelType": "dm",
+        "channelId": "D3", "snippet": "new msg", "ts": 9,
+        # User edited the draft (diverged from generatedDraft) but a needsRedraft
+        # flag is lingering — the guard must still protect their text.
+        "status": "needs-review", "draft": "MY OWN WORDS", "generatedDraft": "machine draft",
+        "needsRedraft": True,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "ROBO REPLACEMENT",
+                                      "generatedDraft": "ROBO REPLACEMENT"})
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    # The seam was NEVER called for this edited item (selection guard rejected it).
+    assert agent.calls == []
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    # The user's edited draft is untouched.
+    assert saved["draft"] == "MY OWN WORDS"
+    assert saved["status"] == "needs-review"
+
+
+async def test_slack_draft_one_guards_edit_that_lands_during_draft(client, slack_file, monkeypatch):
+    """Defense in depth: even if an item passed the selection guard, the per-item
+    coroutine RE-READS fresh before writing. If the user edited the draft DURING
+    the draft subprocess (draft now != generatedDraft), the worker must NOT
+    overwrite their text — it only refreshes history3d + clears needsRedraft."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "x1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "ping", "ts": 1, "status": "needs-draft",
+    }]}), encoding="utf-8")
+
+    async def fake_agent(action, payload):
+        # Simulate the user editing the draft WHILE the subprocess runs: rewrite the
+        # sidecar so the re-read inside _draft_one finds an edited item.
+        data, _ = slack_mod._load()
+        data["items"][0].update({"status": "edited", "draft": "USER EDIT",
+                                 "generatedDraft": "machine"})
+        slack_mod.filestore.write_json(slack_mod.SLACK_PATH, data, None)
+        return {"available": True, "draft": "ROBO", "generatedDraft": "ROBO",
+                "history3d": [{"ts": 1, "author": "a", "text": "ping"}]}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+    sem = asyncio.Semaphore(1)
+    await slack_mod._draft_one(client.app, sem, "x1",
+                               slack_mod.build_draft_prompt({"sender": "a", "snippet": "ping"}))
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    # The user's in-flight edit survived — the worker did NOT clobber it.
+    assert saved["draft"] == "USER EDIT"
+    assert saved["status"] == "edited"
+    # But history3d was refreshed for context.
+    assert saved["history3d"][0]["text"] == "ping"
+
+
+async def test_slack_worker_leaves_already_drafted_items_untouched(client, slack_file, monkeypatch):
+    """Backward compat: an existing needs-review item that already has a draft and
+    NO needsRedraft flag is NOT selected — the worker never touches it (and the
+    seam is never invoked)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "d1", "sender": "dan", "channel": "DM with dan", "channelType": "dm",
+        "channelId": "D4", "snippet": "hi", "ts": 1,
+        "status": "needs-review", "draft": "already drafted", "generatedDraft": "already drafted",
+        "history3d": [{"ts": 1, "author": "dan", "text": "hi"}],
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "should not run"})
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    assert agent.calls == []
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["draft"] == "already drafted"
+
+
+async def test_slack_worker_unavailable_leaves_item_for_retry(client, slack_file, monkeypatch):
+    """An unavailable seam result leaves the needs-draft item AS-IS (fail-loud, no
+    fabrication) so the next poll cycle retries it."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "s1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "ping", "ts": 1, "status": "needs-draft",
+    }]}), encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    await _run_one_draft_cycle(client.app, monkeypatch)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-draft"
+    assert "draft" not in saved or saved.get("draft", "") == ""
+
+
+async def test_slack_worker_inert_until_ready(client, slack_file, monkeypatch):
+    """When _probe_readiness reports NOT ready (e.g. claude absent — the test
+    suite's default), the worker spawns nothing even with pending items: the seam
+    is never invoked. This is the gate that keeps the startup worker inert under
+    aiohttp_client(app) in every test."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "s1", "sender": "a", "channel": "c", "channelType": "dm",
+        "channelId": "D1", "snippet": "ping", "ts": 1, "status": "needs-draft",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "x"})
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": False})
+    monkeypatch.setattr(slack_mod, "SLACK_DRAFT_POLL_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._draft_worker(client.app))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert agent.calls == []
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-draft"
+
+
+async def test_slack_draft_worker_task_started_and_cancelled_cleanly(aiohttp_client, app):
+    """The draft-worker lifecycle: on_startup creates app['slack_draft_task'];
+    closing the client cancels+awaits it (no orphan, no 'Task was destroyed')."""
+    c = await aiohttp_client(app)
+    task = app.get("slack_draft_task")
+    assert task is not None and not task.done()
+    await c.close()
+    assert task.done()
+    assert "slack_draft_task" not in app
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic SCAN worker (D-018) — the scan no longer needs an LLM.
+#
+# The scan moved out of the cron's `claude --print` turn into an in-process
+# asyncio worker that drives the Slack MCP server DIRECTLY over stdio via the
+# `mcp` SDK (call_read_tool -> stdio_client -> ClientSession). NO `claude`
+# subprocess, NO LLM in the scan loop. These tests guard the new pure-Python
+# scan path the existing `_run_slack_agent('list')`/`_draft_worker` tests do NOT
+# touch:
+#   * THE SEND-SAFETY BOUNDARY: call_read_tool REFUSES any tool not in the
+#     hardcoded _SLACK_READ_ONLY_TOOLS frozenset BEFORE the SDK touches the
+#     server — incl. a SABOTAGE check (widening the allowlist lets post_message
+#     through, proving the frozenset is the single load-bearing guard).
+#   * the deterministic merge: writes skeletons for new channelIds, dedupes
+#     existing, sets needsRedraft on a STALE needs-review, never resurrects
+#     dismissed/sent, distinguishes a group-DM 'C…' from a 1:1-DM 'D…' that
+#     share a participant, and gives a 'sent' item with NEWER activity a fresh
+#     skeleton.
+#   * a "drive ONE cycle" test that monkeypatches _scan_read to canned
+#     list_dms/get_unreads payloads and tightens the interval (mirroring
+#     _run_one_draft_cycle) — NOT a real MCP server.
+#   * the inertness-under-harness contract. NB (slack.py warning): in THIS env
+#     _probe_readiness().get('ready') is True (claude + slack-mcp are genuinely
+#     present), so the startup _scan_worker is inert under aiohttp_client(app)
+#     ONLY because its first action is the full-interval interval wait — NOT
+#     because the gate is False. D-023 replaced the bare sleep with an
+#     interruptible ``wait_for(event.wait(), SLACK_SCAN_INTERVAL_S)``, but absent a
+#     SET wake Event it just times out after the full interval, behaving exactly
+#     like the old sleep-first. The inert test therefore proves the unset
+#     interruptible wait keeps it from calling _scan_read, and does NOT lean on the
+#     gate being False here.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def reset_scan_ts(monkeypatch):
+    """Reset the module-level last-scan tracker so the activity window starts
+    from the fixed fallback (no leakage between tests). _scan_window_start_ms
+    uses _LAST_SCAN_TS_MS when set, else now - _SCAN_WINDOW_MS."""
+    monkeypatch.setattr(slack_mod, "_LAST_SCAN_TS_MS", None)
+
+
+@pytest.fixture
+def reset_mcp_state():
+    """Reset the persistent MCP session state so no prior test's session leaks.
+
+    The persistent session pattern (D-020) stores the MCP session + context managers
+    in _mcp_state (a module-level dataclass instance). Without this reset a prior
+    test's stored session would be reused by _connect_mcp (it short-circuits on
+    _mcp_state.session is not None), making the monkeypatched stdio_client/ClientSession
+    never reached. Clearing all fields to None forces a fresh connect on the next
+    call_read_tool, exactly as if the server just started.
+    """
+    state = slack_mod._mcp_state
+    state.session = None
+    state.read_stream = None
+    state.write_stream = None
+    state.stdio_cm = None
+    state.session_cm = None
+    state.connected_at = None
+    # Also clear the lock to avoid stale lock state between tests.
+    slack_mod._mcp_connect_lock = None
+    yield
+    # Teardown: clear again so a test that connected doesn't leak into the next.
+    state.session = None
+    state.read_stream = None
+    state.write_stream = None
+    state.stdio_cm = None
+    state.session_cm = None
+    state.connected_at = None
+    slack_mod._mcp_connect_lock = None
+
+
+async def test_slack_scan_read_tool_refuses_write_tool(reset_mcp_state):
+    """THE SEND-SAFETY BOUNDARY: call_read_tool refuses ANY tool not in the
+    hardcoded read-only allowlist BEFORE the SDK touches the server. A write tool
+    (post_message / edit_message / delete_message / schedule_message) raises
+    SlackMcpError and never spawns the MCP server."""
+    for write_tool in ("post_message", "edit_message", "delete_message",
+                       "schedule_message"):
+        with pytest.raises(slack_mod.SlackMcpError) as ei:
+            await slack_mod.call_read_tool(write_tool, {"channel": "C1", "text": "x"})
+        # The refusal is by name, citing the read-only allowlist.
+        assert write_tool in str(ei.value)
+        assert "read-only" in str(ei.value).lower()
+    # The frozenset itself must never list a write tool.
+    for write_tool in ("post_message", "edit_message", "delete_message",
+                       "schedule_message", "bulk_post_message"):
+        assert write_tool not in slack_mod._SLACK_READ_ONLY_TOOLS
+
+
+async def test_slack_scan_read_tool_allows_read_tools_reach_sdk(monkeypatch, reset_mcp_state):
+    """A read tool IS in the allowlist, so it passes the name guard and reaches
+    the SDK's call_tool (here stubbed). Proves the guard rejects by name only —
+    legitimate read tools are not blocked."""
+    captured = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            captured["initialized"] = True
+
+        async def call_tool(self, name, args):
+            captured["called"] = (name, args)
+
+            class _R:
+                isError = False
+                structuredContent = {"dms": [{"channelId": "D1"}]}
+
+            return _R()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeStdio:
+        async def __aenter__(self):
+            return ("r", "w")
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(slack_mod, "stdio_client", lambda params: _FakeStdio())
+    monkeypatch.setattr(slack_mod, "ClientSession", lambda r, w: _FakeSession())
+
+    out = await slack_mod.call_read_tool("list_dms", {"limit": 5})
+    # A read tool reached call_tool and its structured content came back parsed.
+    assert captured["called"] == ("list_dms", {"limit": 5})
+    assert out == {"dms": [{"channelId": "D1"}]}
+
+
+async def test_slack_scan_read_tool_guard_is_the_load_bearing_line(monkeypatch, reset_mcp_state):
+    """SABOTAGE check: the frozenset name-guard is the ONLY thing stopping a write
+    tool. If a regression WIDENS _SLACK_READ_ONLY_TOOLS to include post_message,
+    the call passes the guard and reaches the SDK's call_tool('post_message', …) —
+    proving the guard (not some other layer) is what makes the worker structurally
+    incapable of sending. This is the test that would catch a widened allowlist."""
+    # Intact guard: post_message is refused before any SDK touch.
+    with pytest.raises(slack_mod.SlackMcpError):
+        await slack_mod.call_read_tool("post_message", {"channel": "C1", "text": "x"})
+
+    # Now SABOTAGE the boundary: widen the allowlist to include the write tool.
+    monkeypatch.setattr(
+        slack_mod, "_SLACK_READ_ONLY_TOOLS",
+        frozenset(slack_mod._SLACK_READ_ONLY_TOOLS | {"post_message"}),
+    )
+    sent = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            pass
+
+        async def call_tool(self, name, args):
+            sent["call"] = (name, args)
+
+            class _R:
+                isError = False
+                structuredContent = {"ok": True}
+
+            return _R()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeStdio:
+        async def __aenter__(self):
+            return ("r", "w")
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(slack_mod, "stdio_client", lambda params: _FakeStdio())
+    monkeypatch.setattr(slack_mod, "ClientSession", lambda r, w: _FakeSession())
+
+    # With the guard sabotaged, the write tool now reaches the server — exactly the
+    # failure a real boundary must prevent. (The guard restored automatically by
+    # monkeypatch teardown.)
+    await slack_mod.call_read_tool("post_message", {"channel": "C1", "text": "x"})
+    assert sent["call"] == ("post_message", {"channel": "C1", "text": "x"})
+
+
+async def test_slack_scan_read_tool_error_result_fails_loud(monkeypatch, reset_mcp_state):
+    """An isError tool result raises SlackMcpError (never treated as data) so the
+    scan leaves state untouched — mirroring the _drive_agent fail-loud contract."""
+    class _FakeSession:
+        async def initialize(self):
+            pass
+
+        async def call_tool(self, name, args):
+            class _R:
+                isError = True
+                content = []
+                structuredContent = {"error": "expired auth"}
+
+            return _R()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeStdio:
+        async def __aenter__(self):
+            return ("r", "w")
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(slack_mod, "stdio_client", lambda params: _FakeStdio())
+    monkeypatch.setattr(slack_mod, "ClientSession", lambda r, w: _FakeSession())
+
+    with pytest.raises(slack_mod.SlackMcpError):
+        await slack_mod.call_read_tool("get_unreads", {})
+
+
+async def test_slack_scan_read_tool_connect_failure_fails_loud(monkeypatch, reset_mcp_state):
+    """A connect/handshake exception is wrapped as SlackMcpError (fail-loud, no
+    fabrication) and scrubbed."""
+    def _boom(params):
+        raise OSError("could not spawn slack-mcp")
+
+    monkeypatch.setattr(slack_mod, "stdio_client", _boom)
+    with pytest.raises(slack_mod.SlackMcpError):
+        await slack_mod.call_read_tool("list_dms", {})
+
+
+# --------------------------------------------------------------------------- #
+# REAL-SDK retry path (D-019) — the live BrokenResourceError race the OTHER
+# scan tests could NOT have caught because they monkeypatch _scan_read to canned
+# payloads (so they never exercise the real stdio_client -> ClientSession ->
+# initialize -> call_tool sequence, hence never its retry).
+#
+# call_read_tool wraps the WHOLE connect->call sequence in a bounded retry
+# (_SCAN_MCP_RETRY_ATTEMPTS total, growing _SCAN_MCP_RETRY_BACKOFF_S backoff).
+# inside the long-lived aiohttp loop the sequence intermittently fails with an
+# anyio BrokenResourceError surfaced from inside the SDK's anyio TaskGroup — i.e.
+# wrapped in a BaseExceptionGroup/ExceptionGroup. The SAME call succeeds on a
+# retry with a FRESH subprocess. These tests drive call_read_tool DIRECTLY (it
+# has NO _probe_readiness gate) with in-process fakes — NO real slack-mcp ever
+# spawns — and prove:
+#   (1) attempt 1 raising a TaskGroup-wrapped BrokenResourceError is retried and
+#       attempt 2 (a fresh stdio_client subprocess) recovers, returning the
+#       parsed payload — and attempt 1's subprocess was REAPED before attempt 2.
+#   (2) the send-safety name-guard is refused with ZERO connect attempts EVEN
+#       WITH the retry loop in place (the retry never turns a refused write tool
+#       into a call) — the inviolable boundary, complementing the load-bearing
+#       SABOTAGE test above.
+#   (3) a NON-transient failure (an isError result; a non-stream-break connect
+#       error) fails loud IMMEDIATELY with exactly ONE attempt — the classifier
+#       never over-retries an auth/parse error into N spawns.
+# The success path is built from REAL mcp.types.CallToolResult / TextContent so
+# the genuine SDK result type flows through _normalize_tool_result's JSON parse.
+# --------------------------------------------------------------------------- #
+import anyio  # noqa: E402
+from mcp.types import CallToolResult, TextContent  # noqa: E402
+
+
+async def test_slack_scan_read_tool_retries_transient_broken_resource(monkeypatch, reset_mcp_state):
+    """A transient stream break on attempt 1 (an anyio BrokenResourceError raised
+    from inside the SDK's anyio TaskGroup -> surfaced as a BaseExceptionGroup) is
+    RETRIED, and attempt 2 — a FRESH stdio_client subprocess — connects cleanly and
+    returns real data. Proves the retry recovers the live warmup race, uses a fresh
+    pipe each attempt, and reaps the failed attempt's subprocess before the next."""
+    # Drive backoff to zero so the retry is instant under the suite (real const).
+    monkeypatch.setattr(slack_mod, "_SCAN_MCP_RETRY_BACKOFF_S", (0, 0))
+
+    state = {"spawns": 0, "reaped": 0}
+
+    class _FakeSession:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        async def initialize(self):
+            # Attempt 1: the stream resource breaks mid-handshake, wrapped exactly
+            # as the SDK surfaces it (a TaskGroup ExceptionGroup with a single
+            # anyio.BrokenResourceError leaf). Later attempts initialize cleanly.
+            if self._attempt == 1:
+                raise BaseExceptionGroup(
+                    "unhandled errors in a TaskGroup (1 sub-exception)",
+                    [anyio.BrokenResourceError()],
+                )
+
+        async def call_tool(self, name, args):
+            state["called"] = (name, args)
+            # A REAL CallToolResult (no structuredContent) so the genuine SDK type
+            # flows through _normalize_tool_result's text-content JSON-parse path.
+            return CallToolResult(
+                content=[TextContent(
+                    type="text", text=json.dumps({"dms": [{"channelId": "D1"}]}))],
+                isError=False,
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeStdio:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        async def __aenter__(self):
+            return ("r", "w")
+
+        async def __aexit__(self, *a):
+            # The async-with ALWAYS reaps this attempt's subprocess on exit — incl.
+            # when attempt 1 raised mid-flight (so no orphan accumulates).
+            state["reaped"] += 1
+            return False
+
+    def _spawn(params):
+        # Each stdio_client(params) call models a fresh subprocess + fresh pipe.
+        state["spawns"] += 1
+        state["attempt"] = state["spawns"]
+        return _FakeStdio(state["spawns"])
+
+    monkeypatch.setattr(slack_mod, "stdio_client", _spawn)
+    monkeypatch.setattr(
+        slack_mod, "ClientSession", lambda r, w: _FakeSession(state["attempt"]))
+
+    out = await slack_mod.call_read_tool("list_dms", {"limit": 5})
+
+    # The retry recovered: the parsed payload came back from attempt 2.
+    assert out == {"dms": [{"channelId": "D1"}]}
+    assert state["called"] == ("list_dms", {"limit": 5})
+    # Exactly 2 spawns: attempt 1 raised+was reaped, attempt 2 succeeded — a FRESH
+    # subprocess per attempt (not a single retried-in-place connection).
+    assert state["spawns"] == 2
+    # Attempt 1's subprocess was reaped during _connect_mcp's partial-failure
+    # cleanup. Attempt 2's subprocess stays alive (persistent session). No orphan.
+    assert state["reaped"] == 1
+
+
+async def test_slack_scan_read_tool_guard_not_retried_with_retry_in_place(monkeypatch, reset_mcp_state):
+    """THE INVIOLABLE BOUNDARY, with the retry live: a write tool is refused by the
+    name-guard BEFORE any connect, and the retry loop NEVER turns a refused write
+    tool into a connect attempt. A spy stdio_client that counts EVERY call must see
+    ZERO calls. (Complements the load-bearing SABOTAGE test above.)"""
+    monkeypatch.setattr(slack_mod, "_SCAN_MCP_RETRY_BACKOFF_S", (0, 0))
+    spawns = []
+
+    def _spy(params):
+        spawns.append(1)
+        raise AssertionError("name-guard must reject BEFORE any connect attempt")
+
+    monkeypatch.setattr(slack_mod, "stdio_client", _spy)
+
+    with pytest.raises(slack_mod.SlackMcpError):
+        await slack_mod.call_read_tool("post_message", {"channel": "C1", "text": "x"})
+    # The guard rejected with ZERO connect attempts — the retry never even started.
+    assert spawns == []
+    # And post_message must never be in the read-only allowlist in the first place.
+    assert "post_message" not in slack_mod._SLACK_READ_ONLY_TOOLS
+
+
+async def test_slack_scan_read_tool_non_transient_isError_no_retry(monkeypatch, reset_mcp_state):
+    """NON-transient failures fail loud IMMEDIATELY, never retried into N spawns:
+    (a) an isError tool result (e.g. expired auth) connects cleanly ONCE then raises;
+    (b) a non-stream-break connect error (ValueError) also yields exactly ONE attempt.
+    Proves the classifier does not over-retry an auth/parse/non-stream error."""
+    monkeypatch.setattr(slack_mod, "_SCAN_MCP_RETRY_BACKOFF_S", (0, 0))
+
+    # (a) isError result — a clean connect, but the tool reports an error.
+    err_state = {"spawns": 0, "reaped": 0}
+
+    class _FakeSession:
+        async def initialize(self):
+            pass
+
+        async def call_tool(self, name, args):
+            # A REAL CallToolResult flagged isError — never treated as data.
+            return CallToolResult(
+                content=[], isError=True,
+                structuredContent={"error": "expired auth"})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeStdio:
+        async def __aenter__(self):
+            return ("r", "w")
+
+        async def __aexit__(self, *a):
+            err_state["reaped"] += 1
+            return False
+
+    def _spawn(params):
+        err_state["spawns"] += 1
+        return _FakeStdio()
+
+    monkeypatch.setattr(slack_mod, "stdio_client", _spawn)
+    monkeypatch.setattr(slack_mod, "ClientSession", lambda r, w: _FakeSession())
+
+    with pytest.raises(slack_mod.SlackMcpError) as ei:
+        await slack_mod.call_read_tool("get_unreads", {})
+    assert "expired auth" in str(ei.value)
+    # isError is non-transient: exactly ONE spawn (one clean connect), the session
+    # stays alive (persistent — no reap on a non-stream error).
+    assert err_state["spawns"] == 1
+    assert err_state["reaped"] == 0
+
+    # Reset persistent state so part (b) exercises a fresh connect path.
+    slack_mod._mcp_state.session = None
+    slack_mod._mcp_state.read_stream = None
+    slack_mod._mcp_state.write_stream = None
+    slack_mod._mcp_state.stdio_cm = None
+    slack_mod._mcp_state.session_cm = None
+    slack_mod._mcp_state.connected_at = None
+    slack_mod._mcp_connect_lock = None
+
+    # (b) A non-stream-break connect error (NOT wrapping a transient leaf) is also
+    # NON-transient -> exactly ONE attempt, fail loud (the classifier won't retry).
+    connect_spawns = {"n": 0}
+
+    def _bad_connect(params):
+        connect_spawns["n"] += 1
+        raise ValueError("bad params")
+
+    monkeypatch.setattr(slack_mod, "stdio_client", _bad_connect)
+    with pytest.raises(slack_mod.SlackMcpError):
+        await slack_mod.call_read_tool("list_dms", {})
+    assert connect_spawns["n"] == 1
+
+
+def test_slack_dm_candidates_distinguish_group_and_dm(reset_scan_ts):
+    """_dm_candidates builds DM/group-DM candidates from a list_dms payload by the
+    activity window, and a group DM 'C…' is channelType 'group_dm' while a 1:1 DM
+    'D…' is 'dm' — even when they share a participant. channelId is verbatim."""
+    now = 2_000_000_000_000
+    payload = {"dms": [
+        {"channelId": "D_one_on_one", "user": "U_alice", "name": "alice",
+         "lastActivity": now - 1000},
+        {"channelId": "C_group", "isGroup": True, "name": "mpdm-alice--bob-1",
+         "lastActivity": now - 1000},
+        # Too old -> excluded by the activity window (fallback window from now).
+        {"channelId": "D_stale", "user": "U_old", "name": "old",
+         "lastActivity": now - 10 * slack_mod._SCAN_WINDOW_MS},
+    ]}
+    cands = slack_mod._dm_candidates(payload, now)
+    by_id = {c["channelId"]: c for c in cands}
+    assert set(by_id) == {"D_one_on_one", "C_group"}  # the stale DM dropped
+    assert by_id["D_one_on_one"]["channelType"] == "dm"
+    assert by_id["C_group"]["channelType"] == "group_dm"
+    # The group-DM sender is derived from the mpdm slug's first participant.
+    assert by_id["C_group"]["sender"] == "alice"
+    # channelId is captured verbatim (it is the routable key, not a secret).
+    assert by_id["D_one_on_one"]["channelId"] == "D_one_on_one"
+
+
+def test_slack_mention_candidates_from_unreads():
+    """_mention_candidates pulls ONLY channels where the user is @mentioned,
+    channelType 'mention', channelId verbatim."""
+    payload = {"mentions": [
+        {"channelId": "C_mention", "channel": "#proj",
+         "messages": [{"user": "carol", "text": "hey <@W0187CHBRU0> ping", "ts": "1718.5"}]},
+        {"channelId": "C_nomention", "channel": "#other",
+         "messages": [{"user": "dave", "text": "random chat", "ts": "1718.6"}]},
+    ], "dms": [{"channelId": "D_ignored"}]}
+    cands = slack_mod._mention_candidates(payload)
+    assert len(cands) == 1
+    m = cands[0]
+    assert m["channelId"] == "C_mention"
+    assert m["channelType"] == "mention"
+    assert m["sender"] == "carol"
+    assert "ping" in m["snippet"]
+
+
+def test_slack_merge_appends_skeletons_for_new_channels():
+    """_merge_scan_candidates appends a needs-draft SKELETON for each genuinely-new
+    channelId; a group-DM 'C…' and a 1:1-DM 'D…' that share a participant are kept
+    DISTINCT (dedupe is EXACT channelId)."""
+    items: list = []
+    cands = [
+        {"channelId": "D1", "channelType": "dm", "sender": "alice",
+         "channel": "DM with alice", "snippet": "hi", "ts": 100},
+        {"channelId": "C1", "channelType": "group_dm", "sender": "alice",
+         "channel": "mpdm-alice--bob-1", "snippet": "team?", "ts": 100},
+    ]
+    changed = slack_mod._merge_scan_candidates(items, cands)
+    assert changed is True
+    by_id = {it["channelId"]: it for it in items}
+    # Both appended as distinct skeletons (the shared participant does NOT collapse
+    # the group DM into the 1:1 DM).
+    assert set(by_id) == {"D1", "C1"}
+    assert by_id["D1"]["status"] == "needs-draft" and by_id["D1"]["channelType"] == "dm"
+    assert by_id["C1"]["status"] == "needs-draft" and by_id["C1"]["channelType"] == "group_dm"
+    # Skeletons carry a fresh id and the candidate's routing/snippet fields.
+    assert by_id["D1"]["id"] and by_id["D1"]["snippet"] == "hi"
+
+
+# Realistic epoch-MILLIS timestamps. _as_int_ms keeps values >= 1e11 verbatim
+# (treats anything smaller as epoch SECONDS and scales x1000), so the merge tests
+# use ms-scale values to assert exact ts round-trips and unambiguous ordering.
+_MS = 1_700_000_000_000  # ~2023-11-14 in ms
+_MS_OLDER = _MS - 60_000
+_MS_NEWER = _MS + 60_000
+
+
+def test_slack_merge_dedupes_existing_active_channel():
+    """An ACTIVE item (needs-draft/needs-review/edited) with the candidate's exact
+    channelId already represents it — no duplicate skeleton is appended, and when
+    the activity is NOT newer it is left entirely untouched."""
+    items = [{
+        "id": "a", "channelId": "D1", "channelType": "dm", "status": "needs-draft",
+        "snippet": "old", "ts": _MS,
+    }]
+    cands = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+              "channel": "c", "snippet": "same", "ts": _MS_OLDER}]  # not newer
+    changed = slack_mod._merge_scan_candidates(items, cands)
+    assert changed is False
+    assert len(items) == 1  # no duplicate appended
+    assert items[0]["snippet"] == "old"  # untouched (activity not newer)
+
+
+def test_slack_merge_sets_needsredraft_on_stale_needs_review():
+    """A needs-review item whose conversation grew (candidate ts NEWER than the
+    item's ts) is flagged needsRedraft with an updated snippet/ts — the same
+    redraft signal the cron used. edited/sent/dismissed are never flagged."""
+    items = [{
+        "id": "a", "channelId": "D1", "channelType": "dm", "status": "needs-review",
+        "draft": "d", "generatedDraft": "d", "snippet": "first", "ts": _MS_OLDER,
+    }]
+    cands = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+              "channel": "c", "snippet": "and another", "ts": _MS_NEWER}]  # newer
+    changed = slack_mod._merge_scan_candidates(items, cands)
+    assert changed is True
+    assert len(items) == 1  # still no NEW skeleton — the existing item is reused
+    assert items[0]["needsRedraft"] is True
+    assert items[0]["snippet"] == "and another"  # snippet refreshed
+    assert items[0]["ts"] == _MS_NEWER  # ms-scale ts passes through verbatim
+
+
+def test_slack_merge_does_not_flag_edited_item():
+    """An EDITED item (the user owns the draft) is never flagged needsRedraft even
+    when the conversation grew — the draft-worker's selection guard would protect
+    it anyway, but the merge must not even set the flag (spec item 4)."""
+    items = [{
+        "id": "a", "channelId": "D1", "channelType": "dm", "status": "edited",
+        "draft": "MY WORDS", "generatedDraft": "machine", "snippet": "first", "ts": _MS_OLDER,
+    }]
+    cands = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+              "channel": "c", "snippet": "newer", "ts": _MS_NEWER}]
+    changed = slack_mod._merge_scan_candidates(items, cands)
+    assert changed is False
+    assert "needsRedraft" not in items[0]
+    assert items[0]["draft"] == "MY WORDS"  # untouched
+
+
+def test_slack_merge_never_resurrects_dismissed():
+    """A dismissed conversation is treated as ALREADY-REPRESENTED (D-014 soft
+    state): a new candidate for its exact channelId does NOT append a fresh
+    skeleton and does NOT flip it back to actionable."""
+    items = [{
+        "id": "a", "channelId": "D1", "channelType": "dm", "status": "dismissed",
+        "snippet": "old", "ts": _MS_OLDER,
+    }]
+    cands = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+              "channel": "c", "snippet": "newer", "ts": _MS_NEWER}]
+    changed = slack_mod._merge_scan_candidates(items, cands)
+    assert changed is False
+    assert len(items) == 1
+    assert items[0]["status"] == "dismissed"  # NOT resurrected
+
+
+def test_slack_merge_sent_item_suppresses_until_newer_activity():
+    """A 'sent' item suppresses a candidate ONLY while the conversation has no
+    activity newer than the send. A candidate whose ts <= sentAt is suppressed; a
+    candidate with NEWER activity earns a fresh needs-draft skeleton (a genuinely
+    new message after the reply went out)."""
+    # Case A: no newer activity (ts <= sentAt) -> suppressed, no new card.
+    items_a = [{
+        "id": "s1", "channelId": "D1", "channelType": "dm", "status": "sent",
+        "sentAt": _MS, "snippet": "replied", "ts": _MS,
+    }]
+    cands_a = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+                "channel": "c", "snippet": "old", "ts": _MS}]
+    assert slack_mod._merge_scan_candidates(items_a, cands_a) is False
+    assert len(items_a) == 1
+
+    # Case B: newer activity (ts > sentAt) -> a fresh skeleton is appended.
+    items_b = [{
+        "id": "s1", "channelId": "D1", "channelType": "dm", "status": "sent",
+        "sentAt": _MS, "snippet": "replied", "ts": _MS,
+    }]
+    cands_b = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+                "channel": "c", "snippet": "new message!", "ts": _MS_NEWER}]
+    assert slack_mod._merge_scan_candidates(items_b, cands_b) is True
+    statuses = sorted(it["status"] for it in items_b)
+    assert statuses == ["needs-draft", "sent"]  # the sent stays, a new skeleton joins
+
+
+async def _run_one_scan_cycle(app, monkeypatch, *, unreads):
+    """Drive ONE _scan_worker iteration with a canned get_unreads payload.
+
+    Monkeypatches _scan_read to return the canned payload (NO real MCP server),
+    forces readiness, tightens the interval, runs the worker a moment, then
+    cancels cleanly."""
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            return unreads
+        if name == "get_messages":
+            return {"messages": []}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._scan_worker(app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_slack_scan_worker_writes_skeletons_for_new_conversations(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """End-to-end ONE scan cycle: canned list_dms/get_unreads -> the worker writes
+    needs-draft SKELETONS for the new DM, group DM, and @mention, deduping by exact
+    channelId. NO real MCP server (DIRECTLY patches _scan_read)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    now_s = _time.time()
+    unreads = {"channels": [
+        {"channelId": "D_alice", "name": "alice",
+         "messages": [{"user": "alice", "text": "hey", "ts": f"{now_s - 1:.6f}"}]},
+        {"channelId": "C_grp", "name": "mpdm-alice--bob-1",
+         "messages": [{"user": "bob", "text": "team?", "ts": f"{now_s - 1:.6f}"}]},
+        {"channelId": "C_proj", "name": "#proj",
+         "messages": [{"user": "carol", "text": "hey <@W0187CHBRU0> look", "ts": f"{now_s - 0.5:.6f}"}]},
+    ]}
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["channelId"]: it for it in saved}
+    assert set(by_id) == {"D_alice", "C_grp", "C_proj"}
+    # All written as needs-draft skeletons the _draft_worker will later draft.
+    assert all(it["status"] == "needs-draft" for it in saved)
+    assert by_id["D_alice"]["channelType"] == "dm"
+    assert by_id["C_grp"]["channelType"] == "group_dm"
+    assert by_id["C_proj"]["channelType"] == "mention"
+    # Each skeleton carries a routable channelId verbatim (the send path needs it).
+    assert by_id["D_alice"]["channelId"] == "D_alice"
+
+
+async def test_slack_scan_worker_dedupes_against_existing_and_flags_stale(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """ONE scan cycle against a non-empty queue: an existing active needs-draft for
+    the same channelId is NOT duplicated; an existing needs-review whose
+    conversation grew is flagged needsRedraft (snippet/ts updated)."""
+    now = int(_time.time() * 1000)
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "keep", "channelId": "D_dup", "channelType": "dm",
+         "status": "needs-draft", "snippet": "already here", "ts": now - 5000},
+        {"id": "stale", "channelId": "D_grow", "channelType": "dm",
+         "status": "needs-review", "draft": "d", "generatedDraft": "d",
+         "snippet": "first", "ts": now - 5000},
+    ]}), encoding="utf-8")
+
+    now_s = now / 1000.0
+    unreads = {"channels": [
+        {"channelId": "D_dup", "name": "dup",
+         "messages": [{"user": "U1", "text": "again", "ts": f"{now_s - 0.1:.6f}"}]},
+        {"channelId": "D_grow", "name": "grow",
+         "messages": [{"user": "U2", "text": "and more", "ts": f"{now_s - 0.05:.6f}"}]},
+    ]}
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = {it["id"]: it for it in json.loads(slack_file.read_text(encoding="utf-8"))["items"]}
+    # No duplicate skeleton for D_dup (still exactly the two original items).
+    assert set(saved) == {"keep", "stale"}
+    assert saved["keep"]["status"] == "needs-draft"
+    # The grown needs-review item was flagged for a redraft, snippet refreshed.
+    assert saved["stale"]["needsRedraft"] is True
+    assert saved["stale"]["snippet"] == "and more"
+
+
+async def test_slack_scan_worker_never_resurrects_dismissed_or_sent(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """ONE scan cycle must NOT resurrect a dismissed conversation, and must NOT
+    re-card a 'sent' conversation whose activity is not newer than the send — but
+    a 'sent' conversation with NEWER activity DOES earn a fresh skeleton."""
+    now = int(_time.time() * 1000)
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "dis", "channelId": "D_dismissed", "channelType": "dm",
+         "status": "dismissed", "snippet": "go away", "ts": now - 9000},
+        {"id": "sentold", "channelId": "D_sent_old", "channelType": "dm",
+         "status": "sent", "sentAt": now, "finalText": "done", "ts": now},
+        {"id": "sentnew", "channelId": "D_sent_new", "channelType": "dm",
+         "status": "sent", "sentAt": now - 9000, "finalText": "done", "ts": now - 9000},
+    ]}), encoding="utf-8")
+
+    now_s = now / 1000.0
+    unreads = {"channels": [
+        # Dismissed conversation with brand-new activity: must NOT resurrect.
+        {"channelId": "D_dismissed", "name": "d",
+         "messages": [{"user": "U1", "text": "still here", "ts": f"{now_s - 0.01:.6f}"}]},
+        # Sent conversation, NO newer activity than the send: suppressed.
+        {"channelId": "D_sent_old", "name": "s1",
+         "messages": [{"user": "U2", "text": "old", "ts": f"{now_s - 5:.6f}"}]},
+        # Sent conversation WITH newer activity than the send: fresh skeleton.
+        {"channelId": "D_sent_new", "name": "s2",
+         "messages": [{"user": "U3", "text": "they replied again", "ts": f"{now_s - 0.01:.6f}"}]},
+    ]}
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    by_channel: dict = {}
+    for it in saved:
+        by_channel.setdefault(it["channelId"], []).append(it)
+    # Dismissed conversation: still exactly one item, still dismissed.
+    assert len(by_channel["D_dismissed"]) == 1
+    assert by_channel["D_dismissed"][0]["status"] == "dismissed"
+    # Sent-no-newer: still exactly the one sent item (no new skeleton).
+    assert len(by_channel["D_sent_old"]) == 1
+    assert by_channel["D_sent_old"][0]["status"] == "sent"
+    # Sent-with-newer: the sent item PLUS a fresh needs-draft skeleton.
+    statuses = sorted(it["status"] for it in by_channel["D_sent_new"])
+    assert statuses == ["needs-draft", "sent"]
+
+
+async def test_slack_scan_worker_read_failure_leaves_queue_untouched(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """If a Slack/MCP read FAILS (SlackMcpError), the cycle must leave the queue
+    UNTOUCHED — never fabricate, never partial-write (fail-loud, mirroring the
+    _drive_agent contract). The worker logs it and retries next cycle."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    original = {"items": [{
+        "id": "i1", "channelId": "D1", "channelType": "dm", "status": "needs-review",
+        "draft": "d", "generatedDraft": "d", "snippet": "hi", "ts": 1,
+    }]}
+    slack_file.write_text(json.dumps(original), encoding="utf-8")
+    before = slack_file.read_text(encoding="utf-8")
+
+    async def boom_scan_read(name, arguments):
+        raise slack_mod.SlackMcpError("slack-mcp read failed")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", boom_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        # A few cycles: each one must fail loud and write nothing.
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # The queue is byte-for-byte unchanged — no partial/fabricated write.
+    assert slack_file.read_text(encoding="utf-8") == before
+
+
+async def test_slack_scan_noop_still_advances_last_scan_and_broadcasts(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """A no-op scan (nothing new/changed) STILL advances the persisted lastScanAt
+    AND broadcasts 'slack_changed' (D-023, spec item 4). Before D-023 _scan_once
+    returned early when ``not changed and not histories`` — leaving the "Updated …"
+    label stale and the manual-refresh "Scanning…" hint hanging after a no-op.
+
+    The queue already holds an ACTIVE needs-draft for channel D_seen; get_unreads
+    re-surfaces ONLY that same channel, so the dedupe finds it already represented
+    → zero new/changed candidates, zero history pre-fetches. We assert (a) a
+    'slack_changed' broadcast fired so open pages re-render the freshness label and
+    the "Scanning…" hint clears, and (b) the persisted top-level lastScanAt advanced
+    past its prior value, even though the items array is otherwise unchanged.
+    """
+    prior_scan = 1_700_000_000_000  # an old, fixed timestamp on disk
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({
+        "lastScanAt": prior_scan,
+        "items": [{
+            "id": "seen", "channelId": "D_seen", "channelType": "dm",
+            "status": "needs-draft", "snippet": "already here", "ts": 1,
+        }],
+    }), encoding="utf-8")
+    items_before = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+
+    # Record every broadcast (mirror test_slack_watcher_broadcasts_on_external_change).
+    events: list = []
+
+    async def record(event_type, data=None):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(client.app["ws_manager"], "broadcast", record)
+
+    # get_unreads re-surfaces ONLY the already-queued channel → no new/changed
+    # candidate, no history pre-fetch. This is the genuine no-op cycle.
+    now_s = _time.time()
+    unreads = {"channels": [
+        {"channelId": "D_seen", "name": "seen",
+         "messages": [{"user": "alice", "text": "already here", "ts": f"{now_s - 1:.6f}"}]},
+    ]}
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    # (a) A no-op scan still notifies open pages so freshness re-renders.
+    assert any(ev[0] == "slack_changed" for ev in events), \
+        "a no-op scan must still broadcast slack_changed so the freshness label advances"
+    # (b) The persisted freshness timestamp advanced past its prior value...
+    assert saved["lastScanAt"] > prior_scan
+    # ...even though the items array is unchanged (this WAS a no-op for the queue).
+    assert saved["items"] == items_before
+
+
+async def test_slack_scan_worker_inert_under_harness_via_sleep_first(
+    client, slack_file, monkeypatch
+):
+    """Inertness contract (preserved under D-023's interruptible sleep): the startup
+    _scan_worker must NOT drive any MCP read on startup. Per the slack.py warning,
+    in THIS env _probe_readiness() is genuinely ready, so the ONLY thing keeping the
+    worker inert under aiohttp_client(app) is the FIRST-action interval wait. D-023
+    replaced the bare ``sleep`` with ``wait_for(event.wait(), SLACK_SCAN_INTERVAL_S)``
+    — but absent a SET wake Event that wait_for just blocks until the full interval
+    times out, behaving EXACTLY like the old sleep-first. We assert _scan_read is NOT
+    called within a short window even though the gate would pass — proving the
+    interruptible-but-unset wait, not the gate, provides the inertness here."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "channelId": "D1", "channelType": "dm", "status": "needs-review",
+        "draft": "d", "generatedDraft": "d", "snippet": "hi", "ts": 1,
+    }]}), encoding="utf-8")
+
+    called = []
+
+    async def spy_scan_read(name, arguments):
+        called.append(name)
+        return {}
+
+    # The gate IS ready (as it genuinely is in this env) — so only the unmodified
+    # full SLACK_SCAN_INTERVAL_S (300s) wait can keep the worker from scanning.
+    monkeypatch.setattr(slack_mod, "_scan_read", spy_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    # Do NOT shorten SLACK_SCAN_INTERVAL_S, and do NOT set the wake Event — leave the
+    # real full-interval interruptible wait in place so it behaves as a plain sleep.
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.15)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    # No scan was driven: the unset interruptible wait kept it inert despite the
+    # ready gate (and the wake Event stayed unset — nothing triggered an early scan).
+    assert called == []
+    assert not slack_mod._get_scan_event().is_set()
+
+
+async def test_slack_scan_worker_task_started_and_cancelled_cleanly(aiohttp_client, app):
+    """The scan-worker lifecycle: on_startup creates app['slack_scan_task'];
+    closing the client cancels+awaits it (no orphan, no 'Task was destroyed').
+    Mirrors the draft-worker lifecycle test — the in-flight MCP subprocess is
+    reaped by stdio_client's context manager on cancellation."""
+    c = await aiohttp_client(app)
+    task = app.get("slack_scan_task")
+    assert task is not None and not task.done()
+    await c.close()
+    assert task.done()
+    assert "slack_scan_task" not in app
+
+
+async def test_slack_cleanup_persistent_mcp_called_on_shutdown(aiohttp_client, app):
+    """_cleanup_persistent_mcp is registered as an on_cleanup hook and calls
+    _disconnect_mcp on app shutdown. Since the session is never connected in
+    tests (lazy-init, _probe_readiness gate), _disconnect_mcp is a no-op —
+    verify it runs without error and leaves the state cleared."""
+    c = await aiohttp_client(app)
+    # Verify the hook is registered (appended AFTER _stop_scan_worker).
+    assert slack_mod._cleanup_persistent_mcp in app.on_cleanup
+    # Simulate a connected state by setting the dataclass fields.
+    slack_mod._mcp_state.session = "fake_session"
+    slack_mod._mcp_state.connected_at = 12345.0
+    try:
+        await c.close()
+    finally:
+        # Ensure cleanup cleared the state (no-op path since the fake CMs are None).
+        assert slack_mod._mcp_state.session is None
+        assert slack_mod._mcp_state.connected_at is None
+
+
+async def test_slack_disconnect_mcp_idempotent(aiohttp_client, app):
+    """_disconnect_mcp is idempotent — calling it when no session is connected
+    is a safe no-op (no error raised, state stays cleared)."""
+    await aiohttp_client(app)
+    # Ensure clean state.
+    slack_mod._mcp_state.session = None
+    slack_mod._mcp_state.read_stream = None
+    slack_mod._mcp_state.write_stream = None
+    slack_mod._mcp_state.connected_at = None
+    slack_mod._mcp_state.stdio_cm = None
+    slack_mod._mcp_state.session_cm = None
+    # Should not raise.
+    await slack_mod._disconnect_mcp()
+    assert slack_mod._mcp_state.session is None
+    assert slack_mod._mcp_state.connected_at is None
+
+
+async def test_slack_disconnect_mcp_exits_context_managers(aiohttp_client, app):
+    """_disconnect_mcp properly calls __aexit__ on both the session and stdio
+    context managers, reaping the subprocess."""
+    await aiohttp_client(app)
+    exit_calls = []
+
+    class FakeCM:
+        def __init__(self, name):
+            self._name = name
+
+        async def __aexit__(self, *args):
+            exit_calls.append(self._name)
+
+    slack_mod._mcp_state.session = "fake_session"
+    slack_mod._mcp_state.read_stream = "fake_read"
+    slack_mod._mcp_state.write_stream = "fake_write"
+    slack_mod._mcp_state.connected_at = 99999.0
+    slack_mod._mcp_state.session_cm = FakeCM("session_cm")
+    slack_mod._mcp_state.stdio_cm = FakeCM("stdio_cm")
+    slack_mod._mcp_connect_lock = None  # Force fresh lock creation
+
+    await slack_mod._disconnect_mcp()
+
+    # Both context managers had their __aexit__ called, in order.
+    assert "session_cm" in exit_calls
+    assert "stdio_cm" in exit_calls
+    # Session CM exited BEFORE stdio CM (session handshake before subprocess kill).
+    assert exit_calls.index("session_cm") < exit_calls.index("stdio_cm")
+    # All state cleared.
+    assert slack_mod._mcp_state.session is None
+    assert slack_mod._mcp_state.read_stream is None
+    assert slack_mod._mcp_state.write_stream is None
+    assert slack_mod._mcp_state.connected_at is None
+    assert slack_mod._mcp_state.stdio_cm is None
+    assert slack_mod._mcp_state.session_cm is None
+
+
 # --------------------------------------------------------------------------- #
 # OS-cron routes (/api/oscron) — READ-ONLY mirror of crontab + systemd timers.
 # The subprocess seams (_run_crontab/_run_systemctl_*) are monkeypatched so the
@@ -4962,3 +7481,510 @@ async def test_oscron_log_slice_systemd_not_available(client, monkeypatch):
     assert body["error"] == "not available"
 
 
+
+# --- T5 QA: send-routing prefers channelId over userId, double-send guard --- #
+#
+# The parallel writer already landed test_slack_approve_falls_back_to_user_id
+# (userId fallback), test_slack_approve_unroutable_item_fails_loudly (400 on
+# no id), and test_slack_approve_empty_channel_id_is_unroutable (empty-string
+# edge). These two close the remaining spec gaps:
+#   * channelId is PREFERRED over userId when both are present (the human-
+#     readable 'channel' field must NEVER reach the send seam as target).
+#   * The already-sent→409 double-send guard works identically WITH channelId.
+
+
+async def test_slack_approve_uses_channel_id_in_send_payload(client, slack_file, monkeypatch):
+    """approve_item sends to the captured channelId (the D.../C.../G... conversation
+    id from the Slack read payload), NOT the human-readable 'channel' field.
+    channelId is preferred over userId when both are present."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
+        "channelType": "dm", "channelId": "D02P0TU89CN", "userId": "U02P2R0L3DX",
+        "snippet": "can you review?", "threadContext": "", "draft": "sure thing",
+        "generatedDraft": "sure thing", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "sent"
+    # The send seam was called with the routable channelId as target.
+    assert len(agent.calls) == 1
+    action, payload = agent.calls[0]
+    assert action == "send"
+    assert payload["target"] == "D02P0TU89CN"
+    # channelId is PREFERRED over userId — verify userId is NOT the target.
+    assert payload["target"] != "U02P2R0L3DX"
+    # The human-readable 'channel' field must NOT appear as the send target.
+    assert "DM with" not in payload.get("target", "")
+
+
+async def test_slack_approve_double_send_guard_still_holds_with_channel_id(client, slack_file, monkeypatch):
+    """The already-sent->409 double-send guard is INDEPENDENT of the channelId
+    routing logic: an item with channelId AND status='sent' still returns 409
+    and the send seam is never called."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
+        "channelType": "dm", "channelId": "D02P0TU89CN", "userId": "U02P2R0L3DX",
+        "snippet": "done?", "threadContext": "", "draft": "yep",
+        "generatedDraft": "yep", "status": "sent", "ts": 1, "finalText": "yep",
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/i1/approve", json={
+        "text": "yep", "etag": "stale-or-bogus", "expectedDraft": "yep",
+    })
+    assert resp.status == 409
+    # No send attempted.
+    assert len(agent.calls) == 0
+
+
+# --- T4 QA: group_dm channelType flows through the backend correctly --- #
+#
+# The backend treats channelType as informational metadata (not a validation
+# gate — _VALID_STATUS validates only the status field). These tests confirm
+# that "group_dm" items round-trip, route, dismiss/undismiss, and save without
+# any channelType-specific rejection.
+
+
+async def test_slack_group_dm_item_round_trips(client, slack_file):
+    """A group_dm item written to the sidecar is served back via GET /api/slack/queue
+    with channelType 'group_dm' intact — the backend never rewrites or rejects it."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "gdm1", "sender": "manhalr", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "snippet": "hey team, quick sync?", "threadContext": "",
+        "draft": "sure, let me check my calendar", "generatedDraft": "sure, let me check my calendar",
+        "status": "needs-review", "ts": 1718600000,
+    }]}), encoding="utf-8")
+    resp = await client.get("/api/slack/queue")
+    assert resp.status == 200
+    body = await resp.json()
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["channelType"] == "group_dm"
+    assert item["channelId"] == "C0BC0TT5Z2L"
+    assert item["channel"] == "mpdm-manhalr--xulaicao--emake-1"
+    assert item["sender"] == "manhalr"
+    assert item["status"] == "needs-review"
+
+
+async def test_slack_group_dm_approve_routes_via_channel_id(client, slack_file, monkeypatch):
+    """Approve on a group_dm item routes the send to the channelId — same
+    routing logic as DMs. channelId is the routable key regardless of channelType."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "gdm1", "sender": "manhalr", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "snippet": "hey team", "threadContext": "",
+        "draft": "on it", "generatedDraft": "on it",
+        "status": "needs-review", "ts": 1718600000,
+    }]}), encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True})
+    resp = await client.post("/api/slack/queue/gdm1/approve", json={
+        "text": "on it",
+    })
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "sent"
+    # The send seam was called with channelId as the target.
+    assert len(agent.calls) == 1
+    action, payload = agent.calls[0]
+    assert action == "send"
+    assert payload["target"] == "C0BC0TT5Z2L"
+    # The human-readable mpdm slug must NOT be used as the send target.
+    assert "mpdm" not in payload.get("target", "")
+
+
+async def test_slack_group_dm_dismiss_and_undismiss(client, slack_file):
+    """Soft-dismiss semantics apply identically to group_dm items: dismiss flips
+    to 'dismissed', undismiss restores to 'needs-review' (draft == generatedDraft)."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "gdm1", "sender": "emake", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "snippet": "thoughts?", "threadContext": "",
+        "draft": "let me think about it", "generatedDraft": "let me think about it",
+        "status": "needs-review", "ts": 1718600000,
+    }]}), encoding="utf-8")
+
+    # Dismiss it.
+    resp = await client.delete("/api/slack/queue/gdm1", json={})
+    assert resp.status == 200
+    items = (await (await client.get("/api/slack/queue")).json())["items"]
+    assert len(items) == 1
+    assert items[0]["status"] == "dismissed"
+    assert items[0]["channelType"] == "group_dm"  # channelType preserved
+
+    # Undismiss it — restores to needs-review since draft == generatedDraft.
+    resp = await client.post("/api/slack/queue/gdm1/undismiss", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "needs-review"
+    assert body["item"]["channelType"] == "group_dm"  # still group_dm
+
+    # Verify persisted to disk.
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["channelType"] == "group_dm"
+
+
+async def test_slack_channeltype_group_dm_accepted_by_save_draft(client, slack_file):
+    """PUT (save draft) on a group_dm item in needs-review status with a draft
+    succeeds with 200 — no validation blocks 'group_dm' as a channelType value."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "gdm1", "sender": "manhalr", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "snippet": "can you review this PR?", "threadContext": "",
+        "draft": "auto draft", "generatedDraft": "auto draft",
+        "status": "needs-review", "ts": 1718600000,
+    }]}), encoding="utf-8")
+    resp = await client.put("/api/slack/queue/gdm1", json={"draft": "will review after lunch"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["draft"] == "will review after lunch"
+    assert body["item"]["status"] == "edited"  # diverged from generatedDraft
+    assert body["item"]["channelType"] == "group_dm"  # still group_dm
+    # Persisted correctly.
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["draft"] == "will review after lunch"
+    assert saved["channelType"] == "group_dm"
+
+
+# --------------------------------------------------------------------------- #
+# T3 regression: the slack-mcp "r5 status: 429" SAML-throttle fix (D-022).
+#
+# INVARIANT under test: the ONLY code path that cold-starts a slack-mcp process is
+# the single PERSISTENT read-only session (_connect_mcp). The draft + regenerate
+# paths pre-fetch any conversation history on THAT warm-auth session (via
+# _fetch_history_for) and render it into the prompt, so their `claude --print`
+# subprocess gets NO --allowedTools and an EMPTY --mcp-config under
+# --strict-mcp-config (so it does NOT inherit the global slack-mcp entry) and
+# never boots its own slack-mcp. 'send' is the ONE intentional cold-start exception (it needs the
+# post_message write tool the read-only session refuses). _mark_channel_read uses
+# ONLY the persistent session — never a one-shot stdio_client/ClientSession.
+#
+# These tests are PURELY ADDITIVE. They reuse the existing reset_mcp_state /
+# _run_one_draft_cycle / _stub_agent / slack_file / client fixtures and the
+# _SlackFakeProc / _result_line helpers (no new module-level fixture/class names,
+# avoiding the duplicate-name shadowing footgun documented in qa.md).
+# --------------------------------------------------------------------------- #
+
+
+# ── ITEM #1: _mark_channel_read uses ONLY the persistent session ──────────────
+
+
+async def test_slack_mark_channel_read_uses_persistent_session_never_one_shot(
+        monkeypatch, reset_mcp_state):
+    """_mark_channel_read must route set_last_read through the PERSISTENT MCP
+    session (via _connect_mcp / _mcp_state.session) and NEVER construct a one-shot
+    stdio_client / StdioServerParameters connection (which would trigger a fresh
+    SAML auth and risk the 429 throttle). We monkeypatch both connection
+    constructors to RAISE if ever touched, point _connect_mcp at a fake recording
+    session, and assert (a) neither constructor was hit and (b) the fake session
+    received the set_last_read call."""
+    def _boom_stdio(*_a, **_k):
+        raise AssertionError("_mark_channel_read constructed a one-shot stdio_client!")
+
+    def _boom_params(*_a, **_k):
+        raise AssertionError("_mark_channel_read constructed StdioServerParameters!")
+
+    monkeypatch.setattr(slack_mod, "stdio_client", _boom_stdio)
+    monkeypatch.setattr(slack_mod, "StdioServerParameters", _boom_params)
+
+    calls = []
+
+    class _FakeSession:
+        async def call_tool(self, name, args):
+            calls.append((name, args))
+
+            class _R:
+                isError = False
+                structuredContent = {"ok": True}
+
+            return _R()
+
+    async def fake_connect():
+        # The persistent path: _connect_mcp sets _mcp_state.session (no spawn here).
+        slack_mod._mcp_state.session = _FakeSession()
+
+    monkeypatch.setattr(slack_mod, "_connect_mcp", fake_connect)
+
+    await slack_mod._mark_channel_read("D1")
+
+    # (a) The one-shot connection constructors were NEVER touched (no _boom raised).
+    # (b) The mark-read went through the persistent session's call_tool.
+    assert calls and calls[0][0] == "set_last_read"
+    assert calls[0][1].get("channel") == "D1"
+
+
+async def test_slack_mark_channel_read_empty_channel_is_noop(monkeypatch, reset_mcp_state):
+    """An empty channel id is a clean no-op — it never even connects (so it can
+    never cold-start slack-mcp). Guards the early-return guard."""
+    def _boom_connect():
+        raise AssertionError("_mark_channel_read connected for an empty channel id!")
+
+    monkeypatch.setattr(slack_mod, "_connect_mcp", _boom_connect)
+    # No raise from the boom connect => the early return fired before connecting.
+    await slack_mod._mark_channel_read("")
+
+
+# ── ITEM #2: the draft path is MCP-FREE (history via the persistent session) ──
+
+
+async def test_slack_draft_path_prefetches_history_on_persistent_session(
+        client, slack_file, monkeypatch):
+    """A needs-draft skeleton with a channelId but NO history3d must have its
+    history pre-fetched via _fetch_history_for (the PERSISTENT warm-auth session)
+    and passed into the draft seam payload — so the 'draft' subprocess never needs
+    MCP. We assert _fetch_history_for was called with the item's channelId and that
+    the seam payload carried that history3d."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "nd1", "sender": "alice", "channel": "DM with alice", "channelType": "dm",
+        "channelId": "D1", "userId": "U1", "snippet": "ping", "ts": 1,
+        "status": "needs-draft",
+    }]}), encoding="utf-8")
+
+    canned = [{"ts": 1, "author": "alice", "text": "ping from history"}]
+    fetched_for = []
+
+    async def fake_fetch(channel_id):
+        fetched_for.append(channel_id)
+        return list(canned)
+
+    captured = {}
+
+    async def fake_agent(action, payload):
+        captured["action"] = action
+        captured["payload"] = payload
+        return {"available": True, "draft": "drafted from history",
+                "history3d": payload.get("history3d", []),
+                "generatedDraft": "drafted from history"}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+    # Drive the worker with OUR history-fetch stub (the persistent-session seam).
+    await _run_one_draft_cycle(client.app, monkeypatch, fetch_history=fake_fetch)
+
+    # The persistent session supplied history for THIS item's channelId.
+    assert "D1" in fetched_for
+    # The seam ran the MCP-free 'draft' action and carried the fetched history3d.
+    assert captured.get("action") == "draft"
+    assert captured["payload"].get("history3d") == canned
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["draft"] == "drafted from history"
+
+
+async def test_slack_draft_path_empty_history_still_drafts_from_snippet(
+        client, slack_file, monkeypatch):
+    """EDGE CASE: if _fetch_history_for returns [] (unreadable channel), the worker
+    must STILL draft (from the snippet alone) via the MCP-free 'draft' action — it
+    must NEVER fall back to a cold-MCP path just to draft text."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "nd2", "sender": "bob", "channel": "DM with bob", "channelType": "dm",
+        "channelId": "D2", "userId": "U2", "snippet": "are you free?", "ts": 2,
+        "status": "needs-draft",
+    }]}), encoding="utf-8")
+
+    async def fake_fetch(channel_id):
+        return []  # channel unreadable — no history
+
+    actions = []
+
+    async def fake_agent(action, payload):
+        actions.append(action)
+        return {"available": True, "draft": "sure, what's up?",
+                "generatedDraft": "sure, what's up?"}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+    await _run_one_draft_cycle(client.app, monkeypatch, fetch_history=fake_fetch)
+
+    # The draft proceeded via the MCP-free 'draft' action (NEVER a cold-MCP path).
+    assert actions and all(a == "draft" for a in actions)
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["draft"] == "sure, what's up?"
+
+
+def _capture_spawn_args(monkeypatch, result_text):
+    """Monkeypatch create_subprocess_exec to RECORD the spawned arg list and return
+    a fake proc whose stdout yields one strict-JSON result event. Returns the list
+    the recorded args are appended to (one entry per spawn).
+
+    Each recorded entry also carries an attribute-free side channel: we snapshot the
+    --mcp-config file's PARSED contents AT SPAWN TIME into a parallel ``configs``
+    list, because _drive_agent unlinks that temp file in its finally block before
+    returning — reading it after the call would raise FileNotFoundError."""
+    class _SpawnLog(list):
+        """A list (so existing `spawned[0]` callers keep working) that also carries
+        a parallel ``.configs`` list of parsed --mcp-config snapshots."""
+        configs: list = []
+
+    spawned = _SpawnLog()
+    spawned.configs = []
+
+    async def fake_exec(*args, **kwargs):
+        arglist = list(args)
+        spawned.append(arglist)
+        cfg = None
+        if "--mcp-config" in arglist:
+            cfg_path = arglist[arglist.index("--mcp-config") + 1]
+            try:
+                cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cfg = None
+        spawned.configs.append(cfg)
+        return _SlackFakeProc(stdout_lines=[_result_line(result_text)])
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_subprocess_exec", fake_exec)
+    return spawned
+
+
+def _assert_strict_empty_mcp_config(args, cfg):
+    """A draft/regenerate spawn must be SCOPED AWAY from the global slack-mcp:
+    --strict-mcp-config is present AND the inline --mcp-config carries an EMPTY
+    mcpServers map (no slack-mcp). Without strict, a bare `claude --print` inherits
+    the user's GLOBAL ~/.claude.json mcpServers (which contains slack-mcp) and
+    cold-starts it on every draft — the exact regression this guards (D-022).
+
+    ``cfg`` is the config PARSED AT SPAWN TIME (the temp file is unlinked before
+    _drive_agent returns, so it can't be re-read here)."""
+    assert "--strict-mcp-config" in args, (
+        "draft/regenerate spawn dropped --strict-mcp-config — a bare "
+        "`claude --print` inherits the global slack-mcp and cold-starts it")
+    assert "--mcp-config" in args, "expected an inline (empty) --mcp-config to scope the subprocess"
+    assert cfg is not None, "--mcp-config file was unreadable at spawn time"
+    # Empty server map: the subprocess loads NO MCP server, so nothing cold-starts.
+    assert cfg.get("mcpServers") == {}, (
+        f"draft/regenerate --mcp-config must omit ALL servers, got {cfg.get('mcpServers')}")
+
+
+async def test_slack_drive_agent_draft_spawn_is_mcp_free_but_strict(monkeypatch):
+    """At the _drive_agent level: a 'draft' spawn (with pre-fetched history) builds
+    `claude --print` args with NO --allowedTools and an EMPTY --mcp-config under
+    --strict-mcp-config — so it loads no slack-mcp and never cold-starts one."""
+    spawned = _capture_spawn_args(monkeypatch, json.dumps(
+        {"draft": "hi", "generatedDraft": "hi", "threadContext": "t"}))
+    result = await slack_mod._drive_agent(
+        "draft", {"id": "x", "prompt": "P",
+                  "history3d": [{"ts": 1, "author": "a", "text": "x"}]})
+    assert result["available"] is True
+    assert spawned, "no subprocess was spawned"
+    assert "--allowedTools" not in spawned[0]
+    _assert_strict_empty_mcp_config(spawned[0], spawned.configs[0])
+
+
+async def test_slack_drive_agent_regenerate_spawn_is_mcp_free_but_strict(monkeypatch):
+    """A 'regenerate' spawn is likewise MCP-free: no --allowedTools, and an EMPTY
+    --mcp-config under --strict-mcp-config so it cannot inherit the global slack-mcp."""
+    spawned = _capture_spawn_args(monkeypatch, json.dumps({"draft": "redrafted"}))
+    result = await slack_mod._drive_agent("regenerate", {"id": "x", "prompt": "P"})
+    assert result["available"] is True
+    assert "--allowedTools" not in spawned[0]
+    _assert_strict_empty_mcp_config(spawned[0], spawned.configs[0])
+
+
+async def test_slack_drive_agent_send_spawn_keeps_mcp_config(monkeypatch):
+    """CONTRAST (the one intentional exception): a 'send' spawn DOES carry
+    --mcp-config + --allowedTools (it needs the post_message write tool the
+    persistent read-only session refuses). This proves the draft/regenerate
+    MCP-free assertions above are not vacuous — the flag IS added when needed."""
+    spawned = _capture_spawn_args(monkeypatch, json.dumps({"ok": True, "ts": "1.2"}))
+    result = await slack_mod._drive_agent(
+        "send", {"target": "D1", "text": "hi"})
+    assert result["available"] is True
+    args = spawned[0]
+    assert "--mcp-config" in args
+    assert "--allowedTools" in args
+    # And the send allowlist grants the write tool — the deliberate exception.
+    idx = args.index("--allowedTools")
+    assert "post_message" in args[idx + 1]
+
+
+# ── ITEM #3: the regenerate path is MCP-FREE (history via persistent session) ──
+
+
+async def test_slack_regenerate_prefetches_history_on_persistent_session(
+        client, slack_file, monkeypatch):
+    """POST /api/slack/queue/{id}/refresh (regenerate_item) for an item with a
+    channelId and NO history3d must pre-fetch history via _fetch_history_for (the
+    PERSISTENT warm-auth session) and feed it into the prompt the MCP-free
+    'regenerate' seam drafts from — so the regenerate path never cold-starts
+    slack-mcp. We assert _fetch_history_for was called with the channelId and that
+    the fetched message text reached the seam prompt."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "rg1", "sender": "carol", "channel": "DM with carol", "channelType": "dm",
+        "channelId": "D9", "userId": "U9", "snippet": "thoughts?", "threadContext": "",
+        "draft": "old", "generatedDraft": "old", "status": "needs-review", "ts": 3,
+    }]}), encoding="utf-8")
+
+    fetched_for = []
+
+    async def fake_fetch(channel_id):
+        fetched_for.append(channel_id)
+        return [{"ts": 3, "author": "carol", "text": "HISTORY_MARKER_TEXT"}]
+
+    monkeypatch.setattr(slack_mod, "_fetch_history_for", fake_fetch)
+
+    captured = {}
+
+    async def fake_agent(action, payload):
+        captured["action"] = action
+        captured["prompt"] = payload.get("prompt", "")
+        return {"available": True, "draft": "regenerated reply"}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+
+    resp = await client.post("/api/slack/queue/rg1/refresh")
+    assert resp.status == 200
+    body = await resp.json()
+
+    # The persistent session supplied history for THIS item's channelId.
+    assert fetched_for == ["D9"]
+    # The MCP-free 'regenerate' action ran, with the fetched history in its prompt.
+    assert captured.get("action") == "regenerate"
+    assert "HISTORY_MARKER_TEXT" in captured["prompt"]
+    assert body["item"]["draft"] == "regenerated reply"
+    assert body["item"]["status"] == "needs-review"
+
+
+async def test_slack_regenerate_skips_history_fetch_when_already_present(
+        client, slack_file, monkeypatch):
+    """If the item ALREADY carries history3d, regenerate must NOT re-fetch (avoid a
+    redundant persistent-session round-trip) — but still runs the MCP-free
+    'regenerate' seam. Guards the `if not item.get("history3d")` gate."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "rg2", "sender": "dave", "channel": "DM with dave", "channelType": "dm",
+        "channelId": "D10", "snippet": "ping", "threadContext": "",
+        "draft": "old", "generatedDraft": "old", "status": "needs-review", "ts": 4,
+        "history3d": [{"ts": 4, "author": "dave", "text": "already here"}],
+    }]}), encoding="utf-8")
+
+    fetched_for = []
+
+    async def fake_fetch(channel_id):
+        fetched_for.append(channel_id)
+        return [{"ts": 4, "author": "dave", "text": "should not be used"}]
+
+    monkeypatch.setattr(slack_mod, "_fetch_history_for", fake_fetch)
+
+    captured = {}
+
+    async def fake_agent(action, payload):
+        captured["action"] = action
+        return {"available": True, "draft": "regenerated"}
+
+    monkeypatch.setattr(slack_mod, "_run_slack_agent", fake_agent)
+
+    resp = await client.post("/api/slack/queue/rg2/refresh")
+    assert resp.status == 200
+    # Already had history3d -> no redundant fetch.
+    assert fetched_for == []
+    assert captured.get("action") == "regenerate"
