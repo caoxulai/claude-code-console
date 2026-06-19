@@ -86,6 +86,10 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
 
     cwd = _resolve_cwd(body.get("cwd"), request.app)
     resume = body.get("resume")
+    # Reject path-traversal in a client-supplied resume id before it reaches
+    # `--resume <id>` (mirrors sessions._validate_session_id; defense in depth).
+    if resume and ("/" in resume or "\\" in resume or ".." in resume):
+        raise web.HTTPBadRequest(reason="invalid session id")
     manager: SessionManager = request.app["session_manager"]
 
     # Get or create a persistent session

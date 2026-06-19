@@ -126,7 +126,7 @@ function MonthGrid({ weeks, max, monthLabels, hover, setHover, selectedWeekIdx, 
                   height: CELL,
                   marginRight: GAP,
                   borderRadius: 2,
-                  background: isSelected ? 'var(--accent)' : 'var(--accent)',
+                  background: 'var(--accent)',
                   opacity: isSelected
                     ? Math.max(opacityForValue(cell.count, max), 0.35)
                     : opacityForValue(cell.count, max),

@@ -63,12 +63,20 @@ def write_text(path: Path, content: str, expected_etag: str | None = None) -> st
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    closed = False
     try:
         os.write(fd, content.encode("utf-8"))
         os.close(fd)
+        closed = True
         os.replace(tmp, str(path))
     except BaseException:
-        os.close(fd) if not os.get_inheritable(fd) else None
+        # Only close if we haven't already (a failure in os.replace happens AFTER
+        # the close above — re-closing would hit EBADF and mask the real error).
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp)
         except OSError:

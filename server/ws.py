@@ -31,7 +31,9 @@ class WebSocketManager:
         """Push an event to all connected clients."""
         payload = json.dumps({"type": event_type, **(data or {})})
         closed = []
-        for ws in self._clients:
+        # Snapshot the WeakSet: a weakly-referenced socket GC'd during the await
+        # below would otherwise mutate the set mid-iteration → RuntimeError.
+        for ws in list(self._clients):
             try:
                 await ws.send_str(payload)
             except (ConnectionResetError, RuntimeError):
