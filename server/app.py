@@ -8,7 +8,7 @@ from aiohttp import web
 
 from server.cli import resolve_permission_mode
 from server.ws import WebSocketManager
-from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, tasks, plugins, usage, agents
+from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents
 
 
 def _resolve_frontend_dist() -> Path:
@@ -56,6 +56,7 @@ def create_app() -> web.Application:
     hooks.register(app)
     mcp.register(app)
     crons.register(app)
+    oscron.register(app)
     tasks.register(app)
     plugins.register(app)
     usage.register(app)

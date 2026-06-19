@@ -19,6 +19,30 @@ function truncate(str, len) {
   return str.length > len ? str.slice(0, len) + '...' : str;
 }
 
+// Derive a short 1-2 sentence summary from a prompt when no stored description
+// exists. Skips blank lines and shell-comment lines (# ...), takes the first
+// meaningful line, prefers its first sentence, and trims to ~140 chars. Pure and
+// defensive: never throws on null/empty prompts or prompts that open with shell
+// commands or heredocs — worst case it returns a trimmed first line or ''.
+function deriveCronSummary(prompt) {
+  if (!prompt || typeof prompt !== 'string') return '';
+  const lines = prompt.split('\n');
+  let candidate = '';
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#')) continue; // shell comment / markdown heading noise
+    candidate = line;
+    break;
+  }
+  if (!candidate) candidate = prompt.trim();
+  // Prefer the first sentence if one ends within the first line.
+  const sentenceMatch = candidate.match(/^(.*?[.!?])(\s|$)/);
+  let summary = sentenceMatch ? sentenceMatch[1] : candidate;
+  summary = summary.trim();
+  return truncate(summary, 140);
+}
+
 // Format an epoch-millis timestamp (the harness stores createdAt as ms, not an
 // ISO string) into a compact relative label. relativeTime() above takes an ISO
 // string, so millis need their own helper to avoid double-parsing.
@@ -30,6 +54,10 @@ function relativeTimeFromMillis(ms) {
 }
 
 const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+// How many recent run-history records to show per job before "Show all" (mirrors
+// SystemCronPage's EXECUTIONS_PREVIEW so both cron tabs cap their history identically).
+const EXECUTIONS_PREVIEW = 10;
 
 // --- Cron decoding -----------------------------------------------------------
 // Self-contained, dependency-free helpers that turn a 5-field cron expression
@@ -126,16 +154,17 @@ function decodeCron(expr) {
   return sentence;
 }
 
-// Compute the next Date (from now) that matches the expression, scanning forward
-// minute-by-minute up to ~366 days. Returns null if it can't parse or find one.
+// Compute the next `count` Dates (from now) that match the expression, scanning
+// forward minute-by-minute up to ~366 days. Returns [] if it can't parse or finds
+// none. Callers that want a single fire use nextFires(expr, 1)[0] (may be undefined).
 //
 // Cron fields are matched against UTC components, because the harness scheduler
 // runs on the server (a UTC host) and fires on the server's wall clock — NOT the
-// viewer's local time. The returned Date is a real instant, so toLocaleString()
-// at the call site converts it to the viewer's timezone (e.g. Seattle) for display.
-function nextFire(expr) {
+// viewer's local time. The returned Dates are real instants, so toLocaleString()
+// at the call site converts them to the viewer's timezone (e.g. Seattle) for display.
+function nextFires(expr, count = 1) {
   const c = parseCron(expr);
-  if (!c) return null;
+  if (!c) return [];
   const minuteSet = new Set(c.minute);
   const hourSet = new Set(c.hour);
   const domSet = new Set(c.dom);
@@ -144,6 +173,7 @@ function nextFire(expr) {
   const everyDom = c.raw.dom === '*';
   const everyDow = c.raw.dow === '*';
 
+  const fires = [];
   const d = new Date();
   d.setUTCSeconds(0, 0);
   d.setUTCMinutes(d.getUTCMinutes() + 1); // strictly after now
@@ -160,11 +190,12 @@ function nextFire(expr) {
     else dayOk = domSet.has(dom) || dowSet.has(dow);
 
     if (monthSet.has(month) && dayOk && hourSet.has(d.getUTCHours()) && minuteSet.has(d.getUTCMinutes())) {
-      return new Date(d);
+      fires.push(new Date(d));
+      if (fires.length >= count) return fires;
     }
     d.setUTCMinutes(d.getUTCMinutes() + 1);
   }
-  return null;
+  return fires;
 }
 
 // "in 5m" / "in 3h" style label for an upcoming Date.
@@ -182,7 +213,42 @@ function untilLabel(date) {
 function runOutcomeBadgeClass(outcome) {
   if (outcome === 'success') return 'badge-ok';
   if (outcome === 'failure') return 'badge-warn';
+  if (outcome === 'fired') return 'badge-fired';
   return '';
+}
+
+// Inline style for the 'fired' badge. App.css owns the success/failure badge
+// colors (.badge-ok / .badge-warn); this page can't edit App.css, so the
+// scheduler-fire badge is styled here with a muted info/blue tone (matching the
+// existing .badge-user palette) — visually distinct from the green success and
+// amber failure badges, not bright, and comfortable in dark mode.
+const FIRED_BADGE_STYLE = { background: '#1a2a3a', color: '#7ab8e6' };
+function runOutcomeBadgeStyle(outcome) {
+  return outcome === 'fired' ? FIRED_BADGE_STYLE : undefined;
+}
+
+// Derive an at-a-glance health pill purely from the reconciled runs + lastFiredAt.
+// NEVER fabricates an outcome:
+//   healthy     — most recent CONSOLE run (success/failure source) succeeded
+//   problem     — most recent console run failed
+//   fired       — only scheduled-fire entries, no captured success/failure
+//   never-fired — no runs at all and the harness never recorded a fire
+// Returns { key, label, className, style } reusing the existing badge palette.
+function deriveStatusPill(runs, lastFiredAt) {
+  const list = Array.isArray(runs) ? runs : [];
+  if (list.length === 0 && !lastFiredAt) {
+    return { key: 'never', label: 'never fired', className: 'badge', style: FIRED_BADGE_STYLE };
+  }
+  const sorted = [...list].sort((a, b) => Number(b.ts ?? 0) - Number(a.ts ?? 0));
+  const latestConsole = sorted.find(r => r.outcome === 'success' || r.outcome === 'failure');
+  if (latestConsole) {
+    if (latestConsole.outcome === 'success') {
+      return { key: 'healthy', label: 'healthy', className: 'badge badge-ok', style: undefined };
+    }
+    return { key: 'problem', label: 'problem', className: 'badge badge-warn', style: undefined };
+  }
+  // No captured success/failure — only scheduled fires (or just lastFiredAt).
+  return { key: 'fired', label: 'fired', className: 'badge badge-fired', style: FIRED_BADGE_STYLE };
 }
 
 export default function CronsPage() {
@@ -196,15 +262,52 @@ export default function CronsPage() {
   // Run-history for the open panel: { [jobId]: { loading, runs } }.
   const [runsByJob, setRunsByJob] = useState({});
 
+  // Whether the full prompt is expanded in the open detail panel. Folded by
+  // default; reset whenever a different job is expanded (one job open at a time).
+  const [promptExpanded, setPromptExpanded] = useState(false);
+  // Whether the reference "Details" block (created / mode / source) is shown.
+  const [detailsExpanded, setDetailsExpanded] = useState(false);
+  // Per-entry expansion of long run results, keyed by run id/index.
+  const [expandedResults, setExpandedResults] = useState({});
+  // Jobs whose run-history list is expanded to ALL runs. By default each job
+  // shows only the most-recent EXECUTIONS_PREVIEW; "Show all" reveals the rest.
+  // Per-job Set (mirrors SystemCronPage's showAllRunsJobs) so other jobs are
+  // unaffected; the entry harmlessly persists when a job is collapsed.
+  const [showAllRuns, setShowAllRuns] = useState(() => new Set());
+
   // New job form state
   const [newCron, setNewCron] = useState('');
   const [newPrompt, setNewPrompt] = useState('');
+  const [newDescription, setNewDescription] = useState('');
   const [newRecurring, setNewRecurring] = useState(true);
 
   // Edit form state
   const [editCron, setEditCron] = useState('');
   const [editPrompt, setEditPrompt] = useState('');
+  const [editDescription, setEditDescription] = useState('');
   const [editRecurring, setEditRecurring] = useState(true);
+
+  // Shared presentation tokens, mirroring SystemCronPage's proven style objects so
+  // the two cron tabs read identically. Defined LOCALLY (the pages are independent —
+  // we do NOT import styles across pages); scoped here so BOTH the table render and
+  // renderDetailPanel can use them. Alignment: the Description column reads as text,
+  // so it's left-aligned; every other column is short and centers cleanly. Headers
+  // and cells share the same alignment so columns line up (App.css centers all <th>
+  // and left-aligns all <td>, so the explicit per-cell override is what makes them track).
+  const labelStyle = { fontSize: '0.72em', fontWeight: 600, textTransform: 'uppercase', color: 'var(--muted)', marginBottom: '0.3em' };
+  const sectionStyle = { marginBottom: 'var(--space-md)' };
+  const colLeft = { textAlign: 'left' };
+  const colCenter = { textAlign: 'center' };
+  // Monospace pre for the Prompt section, matching SystemCronPage's Command pre.
+  const preStyle = {
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+    fontSize: '0.85em',
+    lineHeight: 1.5,
+    margin: 0,
+    color: 'var(--text)',
+    fontFamily: 'monospace',
+  };
 
   const refresh = async () => {
     try {
@@ -218,9 +321,11 @@ export default function CronsPage() {
     }
   };
 
-  // Fetch run history for a single job. The harness fires these jobs externally
-  // and does not report runs, so the endpoint legitimately returns an empty
-  // list (or may not exist) — treat any non-array / failure as "no runs".
+  // Fetch run history for a single job. The server reconciles two sources into
+  // a single newest-first list: console-recorded runs (success/failure) from
+  // cron_runs.json AND the harness's lastFiredAt fire timestamp, surfaced as a
+  // distinct {outcome:'fired'} entry. We just render what the server returns;
+  // treat any non-array / failure as "no runs".
   const loadRuns = async (jobId) => {
     setRunsByJob(prev => ({ ...prev, [jobId]: { loading: true, runs: prev[jobId]?.runs || [] } }));
     try {
@@ -251,6 +356,9 @@ export default function CronsPage() {
       setExpandedId(null);
     } else {
       setExpandedId(jobId);
+      setPromptExpanded(false);
+      setDetailsExpanded(false);
+      setExpandedResults({});
       loadRuns(jobId);
     }
   };
@@ -261,7 +369,7 @@ export default function CronsPage() {
       const res = await fetch('/api/crons', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cron: newCron, prompt: newPrompt, recurring: newRecurring }),
+        body: JSON.stringify({ cron: newCron, prompt: newPrompt, description: newDescription, recurring: newRecurring }),
       });
       if (!res.ok) {
         setError('Failed to create job.');
@@ -272,6 +380,7 @@ export default function CronsPage() {
       setShowNew(false);
       setNewCron('');
       setNewPrompt('');
+      setNewDescription('');
       setNewRecurring(true);
       setError(null);
       refresh();
@@ -285,6 +394,7 @@ export default function CronsPage() {
     setExpandedId(null); // a row being edited is never also expanded
     setEditCron(job.cron);
     setEditPrompt(job.prompt);
+    setEditDescription(job.description || '');
     setEditRecurring(job.recurring);
     setError(null);
   };
@@ -298,7 +408,7 @@ export default function CronsPage() {
       const res = await fetch(`/api/crons/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cron: editCron, prompt: editPrompt, recurring: editRecurring, etag }),
+        body: JSON.stringify({ cron: editCron, prompt: editPrompt, description: editDescription, recurring: editRecurring, etag }),
       });
       if (res.status === 409) {
         setError('Conflict: job was modified externally. Refreshing...');
@@ -344,30 +454,72 @@ export default function CronsPage() {
   // --- Detail panel rendered inside a full-width row when a job is expanded ---
   const renderDetailPanel = (job) => {
     const decoded = decodeCron(job.cron);
-    const next = nextFire(job.cron);
+    const fires = nextFires(job.cron, 5);
+    const next = fires[0];
     const history = runsByJob[job.id];
-    const labelStyle = { fontSize: '0.72em', fontWeight: 600, textTransform: 'uppercase', color: 'var(--muted)', marginBottom: '0.3em' };
-    const sectionStyle = { marginBottom: 'var(--space-md)' };
+    const toggleStyle = {
+      display: 'inline-flex', alignItems: 'center', gap: '0.35em',
+      cursor: 'pointer', color: 'var(--accent)', fontSize: '0.8em', background: 'none',
+      border: 'none', padding: 0,
+    };
+
+    // Stored description wins; otherwise auto-derive a short summary from the
+    // prompt so existing jobs (no description) still read cleanly. Plain text.
+    const summary = (job.description && job.description.trim())
+      ? job.description.trim()
+      : deriveCronSummary(job.prompt);
+
+    // Reconciled, newest-first runs for status pill + last-run line.
+    const runs = (history && Array.isArray(history.runs)) ? history.runs : [];
+    const runsLoaded = history && !history.loading;
+    const sortedRuns = [...runs].sort((a, b) => Number(b.ts ?? 0) - Number(a.ts ?? 0));
+    const lastRun = sortedRuns[0];
+    const pill = deriveStatusPill(runs, job.lastFiredAt);
 
     return (
       <div style={{ padding: 'var(--space-md)', background: 'var(--surface2)', borderRadius: 'var(--radius)' }}>
-        {/* Full prompt */}
+        {/* --- Status at a glance + last run (kept at the very top) ----------- */}
         <div style={sectionStyle}>
-          <div style={labelStyle}>Prompt</div>
-          <pre style={{
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-            fontSize: '0.85em',
-            lineHeight: 1.5,
-            margin: 0,
-            color: 'var(--text)',
-            fontFamily: 'monospace',
-          }}>{job.prompt}</pre>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6em', flexWrap: 'wrap' }}>
+            <span className={pill.className} style={pill.style}>{pill.label}</span>
+            {runsLoaded && lastRun && (
+              <span style={{ color: 'var(--muted)', fontSize: '0.82em' }}>
+                Last run: {lastRun.outcome || 'unknown'} · {lastRun.ts ? relativeTimeFromMillis(lastRun.ts) : 'unknown time'}
+              </span>
+            )}
+            {runsLoaded && !lastRun && (
+              <span style={{ color: 'var(--muted)', fontSize: '0.82em' }}>No runs yet</span>
+            )}
+          </div>
         </div>
 
-        {/* Schedule decode + next fire */}
+        {/* --- About (summary) ----------------------------------------------- */}
+        {summary && (
+          <div style={sectionStyle}>
+            <div style={labelStyle}>About</div>
+            <div style={{ fontSize: '0.85em', lineHeight: 1.6, color: 'var(--text)' }}>{summary}</div>
+          </div>
+        )}
+
+        {/* --- Prompt (full prompt, folded behind a toggle; collapsed) -------- */}
         <div style={sectionStyle}>
-          <div style={labelStyle}>Schedule</div>
+          <div style={labelStyle}>Prompt</div>
+          <button
+            type="button"
+            style={toggleStyle}
+            onClick={() => setPromptExpanded(v => !v)}
+          >
+            {promptExpanded ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
+            {promptExpanded ? 'Hide full prompt' : 'Show full prompt'}
+          </button>
+          {promptExpanded && (
+            <pre style={{ ...preStyle, marginTop: '0.4em' }}>{job.prompt}</pre>
+          )}
+        </div>
+
+        {/* --- Schedule & timing --------------------------------------------- */}
+        <div style={sectionStyle}>
+          <div style={labelStyle}>Schedule &amp; timing</div>
           <div style={{ fontSize: '0.85em', lineHeight: 1.6 }}>
             <div>
               <span style={{ fontFamily: 'monospace', color: 'var(--accent)' }}>{job.cron}</span>
@@ -375,73 +527,152 @@ export default function CronsPage() {
               {!decoded && <span style={{ color: 'var(--muted)' }}> — (could not decode this expression)</span>}
             </div>
             <div style={{ color: 'var(--muted)', marginTop: '0.2em' }}>
-              Next fire (estimated): {next
+              Next fire (earliest matching time): {next
                 ? <>{next.toLocaleString(undefined, { timeZoneName: 'short' })} <span>({untilLabel(next)})</span></>
                 : 'unknown'}
             </div>
+            {fires.length > 0 && (
+              <div style={{ color: 'var(--muted)', marginTop: '0.4em' }}>
+                Upcoming fire times:
+                <ul style={{ margin: '0.25em 0 0', paddingLeft: '1.2em' }}>
+                  {fires.map((d, i) => (
+                    <li key={i}>{d.toLocaleString(undefined, { timeZoneName: 'short' })}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {/* Make the scheduled-vs-actual drift obvious when the job has fired. */}
+            {job.lastFiredAt && (
+              <div style={{ color: 'var(--muted)', marginTop: '0.2em' }}>
+                Last actually fired: {new Date(Number(job.lastFiredAt)).toLocaleString(undefined, { timeZoneName: 'short' })}
+                {' '}({relativeTimeFromMillis(job.lastFiredAt)})
+              </div>
+            )}
+            <div style={{ color: 'var(--muted)', marginTop: '0.2em', fontSize: '0.92em', fontStyle: 'italic' }}>
+              The scheduler may fire later than this — it runs jobs opportunistically
+              (e.g. when polled or when a session is active), not at the exact minute.
+            </div>
           </div>
         </div>
 
-        {/* Source / metadata */}
+        {/* --- Run history --------------------------------------------------- */}
         <div style={sectionStyle}>
-          <div style={labelStyle}>Source</div>
-          <div style={{ fontSize: '0.85em', lineHeight: 1.7, color: 'var(--muted)' }}>
-            <div>
-              Created: {job.createdAt ? new Date(Number(job.createdAt)).toLocaleString() : '--'}
-              {job.createdAt ? ` (${relativeTimeFromMillis(job.createdAt)})` : ''}
-            </div>
-            <div>
-              Mode: <span className={`badge ${job.recurring ? 'badge-ok' : ''}`}>{job.recurring ? 'recurring' : 'once'}</span>
-            </div>
-            <div>Created by: {job.createdBySessionId || 'console'}</div>
-            {/* The harness does not populate lastFiredAt; never imply a run. */}
-            <div>Last fired: {job.lastFiredAt ? relativeTime(job.lastFiredAt) : 'never'}</div>
-          </div>
-        </div>
-
-        {/* Run history */}
-        <div>
-          <div style={labelStyle}>Run history</div>
+          <div style={labelStyle}>Run history{runsLoaded ? ` (${runs.length})` : ''}</div>
           {!history || history.loading ? (
             <div style={{ color: 'var(--muted)', fontSize: '0.85em' }}>Loading runs…</div>
-          ) : history.runs.length === 0 ? (
+          ) : runs.length === 0 ? (
             <div className="empty-state" style={{ padding: 'var(--space-md)', textAlign: 'left' }}>
               <p style={{ color: 'var(--muted)', fontSize: '0.85em', margin: 0, lineHeight: 1.6 }}>
-                No runs recorded yet — claude-web records a run only when one is triggered
-                through the console; the Claude Code scheduler fires these jobs externally and
-                does not report run history.
+                No runs recorded yet — this job has not fired on schedule and no run has been
+                triggered through the console. Scheduled fires appear here once the scheduler
+                runs the job.
               </p>
             </div>
-          ) : (
+          ) : (() => {
+            // Cap to the most-recent EXECUTIONS_PREVIEW unless the user expanded
+            // this job (mirrors SystemCronPage). sortedRuns is already newest-first.
+            const showAll = showAllRuns.has(job.id);
+            const visibleRuns = showAll ? sortedRuns : sortedRuns.slice(0, EXECUTIONS_PREVIEW);
+            return (
+            <>
             <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-              {[...history.runs]
-                .sort((a, b) => Number(b.ts ?? 0) - Number(a.ts ?? 0))
-                .map((run, i) => {
-                  const ts = run.ts;
-                  const outcome = run.outcome || 'unknown';
-                  return (
-                    <div
-                      key={run.id || i}
-                      style={{
-                        padding: '0.6em 0.9em',
-                        borderBottom: i < history.runs.length - 1 ? '1px solid var(--border)' : 'none',
-                        fontSize: '0.82em',
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6em', flexWrap: 'wrap' }}>
-                        <span className={`badge ${runOutcomeBadgeClass(outcome)}`}>{outcome}</span>
-                        <span style={{ color: 'var(--muted)' }}>
-                          {ts ? new Date(Number(ts)).toLocaleString() : 'unknown time'}
-                        </span>
-                      </div>
-                      {run.result && (
-                        <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                          {run.result}
-                        </div>
-                      )}
+              {visibleRuns.map((run, i) => {
+                const ts = run.ts;
+                const outcome = run.outcome || 'unknown';
+                const key = run.id || i;
+                const result = run.result || '';
+                const longResult = result.length > 200;
+                const resultOpen = !!expandedResults[key];
+                return (
+                  <div
+                    key={key}
+                    style={{
+                      padding: '0.6em 0.9em',
+                      borderBottom: i < visibleRuns.length - 1 ? '1px solid var(--border)' : 'none',
+                      fontSize: '0.82em',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6em', flexWrap: 'wrap' }}>
+                      <span className={`badge ${runOutcomeBadgeClass(outcome)}`} style={runOutcomeBadgeStyle(outcome)}>{outcome}</span>
+                      <span style={{ color: 'var(--muted)' }}>
+                        {ts ? new Date(Number(ts)).toLocaleString() : 'unknown time'}
+                      </span>
                     </div>
-                  );
+                    {result ? (
+                      longResult ? (
+                        <div style={{ marginTop: '0.3em' }}>
+                          <button
+                            type="button"
+                            style={toggleStyle}
+                            onClick={() => setExpandedResults(prev => ({ ...prev, [key]: !prev[key] }))}
+                          >
+                            {resultOpen ? <FiChevronDown size={12} /> : <FiChevronRight size={12} />}
+                            {resultOpen ? 'Hide result' : 'Show result'}
+                          </button>
+                          {resultOpen && (
+                            <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                              {result}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                          {result}
+                        </div>
+                      )
+                    ) : outcome === 'fired' ? (
+                      // A scheduled fire the harness recorded with no output we could
+                      // harvest. Never fabricate a success/failure — show an explicit
+                      // muted note that the result wasn't captured.
+                      <div style={{ marginTop: '0.3em', color: 'var(--muted)', fontStyle: 'italic' }}>
+                        fired (result not captured by the scheduler)
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+            {sortedRuns.length > EXECUTIONS_PREVIEW && (
+              <div
+                onClick={() => setShowAllRuns(prev => {
+                  const next = new Set(prev);
+                  if (next.has(job.id)) next.delete(job.id); else next.add(job.id);
+                  return next;
                 })}
+                style={{ cursor: 'pointer', color: 'var(--accent)', fontSize: '0.82em', marginTop: '0.5em' }}
+              >
+                {showAll ? 'Show less' : `Show all ${sortedRuns.length} executions (${sortedRuns.length - visibleRuns.length} more)`}
+              </div>
+            )}
+            </>
+            );
+          })()}
+        </div>
+
+        {/* --- Details (reference metadata, collapsed) ----------------------- */}
+        <div>
+          <button
+            type="button"
+            style={toggleStyle}
+            onClick={() => setDetailsExpanded(v => !v)}
+          >
+            {detailsExpanded ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
+            {detailsExpanded ? 'Hide details' : 'Show details'}
+          </button>
+          {detailsExpanded && (
+            <div style={{ fontSize: '0.85em', lineHeight: 1.7, color: 'var(--muted)', marginTop: '0.4em' }}>
+              <div>ID: <span style={{ fontFamily: 'monospace' }}>{job.id}</span></div>
+              <div>
+                Created: {job.createdAt ? new Date(Number(job.createdAt)).toLocaleString() : '--'}
+                {job.createdAt ? ` (${relativeTimeFromMillis(job.createdAt)})` : ''}
+              </div>
+              <div>
+                Mode: <span className={`badge ${job.recurring ? 'badge-ok' : ''}`}>{job.recurring ? 'recurring' : 'once'}</span>
+              </div>
+              <div>Created by: {job.createdBySessionId || 'console'}</div>
+              {/* The harness DOES populate lastFiredAt — a real fire timestamp in
+                  epoch millis, written when the scheduler runs the job. */}
+              <div>Last fired: {job.lastFiredAt ? relativeTimeFromMillis(job.lastFiredAt) : 'never'}</div>
             </div>
           )}
         </div>
@@ -481,6 +712,15 @@ export default function CronsPage() {
               onChange={e => setNewPrompt(e.target.value)}
             />
           </div>
+          <div className="form-group">
+            <label className="form-label">Description (optional)</label>
+            <input
+              className="form-input"
+              placeholder="A 1–2 sentence summary of what this job does"
+              value={newDescription}
+              onChange={e => setNewDescription(e.target.value)}
+            />
+          </div>
           <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.5em' }}>
             <input
               type="checkbox"
@@ -492,7 +732,7 @@ export default function CronsPage() {
           </div>
           <div style={{ display: 'flex', gap: '0.5em' }}>
             <button className="btn btn-primary" onClick={createJob}><FiSave size={14} /> Save</button>
-            <button className="btn" onClick={() => { setShowNew(false); setNewCron(''); setNewPrompt(''); setNewRecurring(true); }}>
+            <button className="btn" onClick={() => { setShowNew(false); setNewCron(''); setNewPrompt(''); setNewDescription(''); setNewRecurring(true); }}>
               <FiX size={14} /> Cancel
             </button>
           </div>
@@ -508,13 +748,15 @@ export default function CronsPage() {
         ) : (
           <table className="data-table">
             <thead>
+              {/* Description left-aligned (it's text); the rest centered. Headers
+                  match their cells' alignment so columns line up. */}
               <tr>
-                <th>ID</th>
-                <th>Schedule</th>
-                <th>Prompt</th>
-                <th>Recurring</th>
-                <th>Last Fired</th>
-                <th>Actions</th>
+                <th style={colLeft}>Description</th>
+                <th style={colCenter}>Schedule</th>
+                <th style={colCenter}>Next run</th>
+                <th style={colCenter}>Last run</th>
+                <th style={colCenter}>Status</th>
+                <th style={colCenter}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -537,6 +779,13 @@ export default function CronsPage() {
                         onChange={e => setEditPrompt(e.target.value)}
                         style={{ minHeight: '60px', width: '100%' }}
                       />
+                      <input
+                        className="form-input"
+                        placeholder="Description (optional) — 1–2 sentence summary"
+                        value={editDescription}
+                        onChange={e => setEditDescription(e.target.value)}
+                        style={{ width: '100%', marginTop: '0.4em' }}
+                      />
                     </td>
                     <td>
                       <input
@@ -545,7 +794,7 @@ export default function CronsPage() {
                         onChange={e => setEditRecurring(e.target.checked)}
                       />
                     </td>
-                    <td style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(job.lastFiredAt)}</td>
+                    <td style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTimeFromMillis(job.lastFiredAt)}</td>
                     <td>
                       <div style={{ display: 'flex', gap: '0.4em' }}>
                         <button className="btn btn-primary" onClick={() => saveEdit(job.id)} title="Save">
@@ -563,24 +812,36 @@ export default function CronsPage() {
                       onClick={() => toggleExpand(job.id)}
                       style={{ cursor: 'pointer' }}
                     >
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.82em' }}>
+                      <td style={colLeft}>
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em' }}>
                           <span style={{ color: 'var(--muted)' }}>
                             {expandedId === job.id ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
                           </span>
-                          {truncate(job.id, 8)}
+                          {job.description?.trim() || deriveCronSummary(job.prompt) || '(no description)'}
                         </span>
                       </td>
-                      <td style={{ fontFamily: 'monospace' }}>{job.cron}</td>
-                      <td title={job.prompt}>{truncate(job.prompt, 80)}</td>
-                      <td>
-                        <span className={`badge ${job.recurring ? 'badge-ok' : ''}`}>
-                          {job.recurring ? 'recurring' : 'once'}
-                        </span>
-                      </td>
-                      <td style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(job.lastFiredAt)}</td>
-                      <td>
-                        <div style={{ display: 'flex', gap: '0.4em' }}>
+                      <td style={{ ...colCenter, fontFamily: 'monospace' }}>{job.cron}</td>
+                      {/* Row pill derives from lastFiredAt alone (empty runs) so the
+                          table never eagerly fetches every job's runs; see Next run. */}
+                      {(() => {
+                        const next = nextFires(job.cron, 1)[0];
+                        const pill = deriveStatusPill([], job.lastFiredAt);
+                        return (
+                          <>
+                            <td style={{ ...colCenter, color: 'var(--muted)', fontSize: '0.85em' }}>
+                              {next ? untilLabel(next) : 'unknown'}
+                            </td>
+                            <td style={{ ...colCenter, color: 'var(--muted)', fontSize: '0.85em' }}>
+                              {relativeTimeFromMillis(job.lastFiredAt)}
+                            </td>
+                            <td style={colCenter}>
+                              <span className={pill.className} style={pill.style}>{pill.label}</span>
+                            </td>
+                          </>
+                        );
+                      })()}
+                      <td style={colCenter}>
+                        <div style={{ display: 'flex', gap: '0.4em', justifyContent: 'center' }}>
                           <button className="btn" onClick={(e) => { e.stopPropagation(); startEdit(job); }} title="Edit">
                             <FiEdit3 size={13} />
                           </button>

@@ -133,6 +133,7 @@ setup(
     install_requires=[
         "aiohttp>=3.9",
         "python-dotenv>=1.0",
+        "croniter>=2.0",
     ],
     entry_points={
         "console_scripts": [

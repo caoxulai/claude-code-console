@@ -19,6 +19,7 @@ const SkillsPage = lazy(() => import('./pages/SkillsPage'));
 const HooksPage = lazy(() => import('./pages/HooksPage'));
 const McpPage = lazy(() => import('./pages/McpPage'));
 const CronsPage = lazy(() => import('./pages/CronsPage'));
+const SystemCronPage = lazy(() => import('./pages/SystemCronPage'));
 const SessionsPage = lazy(() => import('./pages/SessionsPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const PluginsPage = lazy(() => import('./pages/PluginsPage'));
@@ -51,6 +52,7 @@ export const router = createBrowserRouter([
       { path: 'hooks', element: lazyRoute(HooksPage) },
       { path: 'mcp', element: lazyRoute(McpPage) },
       { path: 'crons', element: lazyRoute(CronsPage) },
+      { path: 'system-cron', element: lazyRoute(SystemCronPage) },
       { path: 'sessions', element: lazyRoute(SessionsPage) },
       { path: 'tasks', element: lazyRoute(TasksPage) },
       { path: 'plugins', element: lazyRoute(PluginsPage) },

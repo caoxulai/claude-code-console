@@ -245,7 +245,7 @@ html, body, #root {
   text-align: left;
   border-bottom: 1px solid var(--border);
 }
-.data-table th { color: var(--muted); font-weight: 600; font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.03em; text-align: center; }
+.data-table th { color: var(--muted); font-weight: 600; font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.03em; text-align: left; }
 .data-table tbody tr { transition: background 0.1s; }
 .data-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
 .data-table tbody tr:hover td { background: var(--surface2); }
@@ -266,6 +266,9 @@ html, body, #root {
 }
 .badge-ok { background: #1a3a2a; color: var(--accent2); }
 .badge-warn { background: #3a2a1a; color: var(--warning); }
+/* Scheduled-fire marker: a job the harness fired on schedule (neutral event,
+   never a success/failure verdict). Calm indigo — distinct from ok/warn/error. */
+.badge-fired { background: #222a3a; color: #8fa8e6; }
 .badge-error { background: #3a1a2a; color: var(--error); }
 .badge-feedback { background: #2a2a1a; color: #e6c87a; }
 .badge-user { background: #1a2a3a; color: #7ab8e6; }

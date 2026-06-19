@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder, FiBarChart2, FiCheckSquare } from 'react-icons/fi';
+import { FiMessageSquare, FiBookOpen, FiZap, FiServer, FiClock, FiList, FiFolder, FiBarChart2, FiCheckSquare, FiCalendar } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 import BudgetAlert from '../components/BudgetAlert';
 
@@ -43,8 +43,9 @@ export default function DashboardPage() {
       getJson('/api/sessions/live'),
       getJson('/api/projects'),
       getJson('/api/tasks'),
+      getJson('/api/oscron'),
     ]).then((results) => {
-      const [sessions, memory, skills, mcp, crons, live, projectsData, tasksData] =
+      const [sessions, memory, skills, mcp, crons, live, projectsData, tasksData, oscron] =
         results.map(r => (r.status === 'fulfilled' ? r.value : null));
 
       if (results.every(r => r.status !== 'fulfilled' || r.value === null)) {
@@ -63,6 +64,12 @@ export default function DashboardPage() {
         skills: count(skills && skills.length),
         mcp: count(mcp && (mcp.servers?.length ?? 0)),
         crons: count(crons && (crons.jobs?.length ?? 0)),
+        // Only the user's own crontab entries — NOT the platform-provided systemd
+        // timers (OS housekeeping + fleet agents). Matches SystemCronPage's
+        // "mineJobs" split (source === 'crontab' = the schedules you authored).
+        systemCrons: count(oscron && (Array.isArray(oscron.jobs)
+          ? oscron.jobs.filter(j => j.source === 'crontab').length
+          : 0)),
         live: count(live && live.length),
         projects: projectsData ? projectsList.length : undefined,
         // Open tasks = anything not completed (in_progress + pending + other).
@@ -100,6 +107,7 @@ export default function DashboardPage() {
     { icon: FiZap, label: 'Skills', value: stats?.skills, link: '/skills' },
     { icon: FiServer, label: 'MCP Servers', value: stats?.mcp, link: '/mcp' },
     { icon: FiClock, label: 'Cron Jobs', value: stats?.crons, link: '/crons' },
+    { icon: FiCalendar, label: 'System Cron', value: stats?.systemCrons, link: '/system-cron' },
     { icon: FiFolder, label: 'Projects', value: stats?.projects, link: '/projects' },
     {
       icon: FiBarChart2,
@@ -144,7 +152,7 @@ export default function DashboardPage() {
       <BudgetAlert dailyCost={todayCost} />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1em' }}>
         {!stats ? (
-          Array.from({ length: 9 }).map((_, i) => (
+          Array.from({ length: cards.length }).map((_, i) => (
             <SkeletonCard key={i} style={{ height: STAT_CARD_HEIGHT }} />
           ))
         ) : (

@@ -874,6 +874,296 @@ def test_detect_conflicts_none_when_unrelated():
     assert detect_conflicts(parse_context_entries(txt)) == []
 
 
+# A real backend-dev-like file: many entries, all sharing ubiquitous words
+# (test/etag/context) but only ONE genuine supersede pair. Old clustering
+# collapsed the whole file into one mega-cluster; new clustering must yield
+# exactly the 2-entry superseded pair.
+_REALISTIC_CONTEXT = """# backend-dev — project context
+- 2026-06-01: Use read_json_body for body parsing; raw request.json returns 500 on a malformed test body.
+- 2026-06-02: Run pytest with the project venv; system python lacks pytest-aiohttp in this context.
+- 2026-06-03: etag optimistic concurrency uses write_text expected_etag; conflict tests need a sleep.
+- 2026-06-04: SessionManager serializes lifecycle ops per session id via a locks dict in this context.
+- 2026-06-05: PersistentSession stop must None-guard stdin before close in the shutdown test path.
+- 2026-06-06: oscron mirrors the OS scheduler without mutating it; the test monkeypatches the subprocess seams.
+- 2026-06-07: Cron run history is reconciled server-side; the harness writes lastFiredAt on the task.
+- 2026-06-08: Slack queue split into a fast list and a per-item regenerate to fit the test timeout.
+- 2026-06-09: The slack poller starts in every test but its first wait is a long sleep, inert.
+- 2026-06-10: Pipeline crontab format uses a CRON_TZ line; the warmup marker dedupes the cron entry.
+- 2026-06-11: Skills frontmatter parser tolerates a missing tools field in the test context.
+- 2026-06-12: Memory CRUD reuses the etag conflict pattern; the conflict test asserts a 409 status.
+- 2026-06-13: Supersedes the 2026-06-08 note — the slack regenerate action reuses the read tools only, not the write tool. (correction)
+- 2026-06-14: Design doc ADR parser ignores lines before the first header in the test fixture.
+- 2026-06-15: Settings put mirrors the etag handler; the conflict response shape is error conflict.
+"""
+
+
+def test_detect_conflicts_no_mega_cluster_on_real_file():
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    entries = parse_context_entries(_REALISTIC_CONTEXT)
+    clusters = detect_conflicts(entries)
+    # No giant cluster — every emitted cluster is small (<= the size cap).
+    assert all(len(c["entryIndices"]) <= 5 for c in clusters), clusters
+    # The one genuine supersede pair (the 06-08 slack note + its 06-13 correction)
+    # surfaces as a 2-entry superseded cluster.
+    slack_pairs = [
+        c for c in clusters
+        if c["reason"] == "superseded" and 7 in c["entryIndices"] and 12 in c["entryIndices"]
+    ]
+    assert len(slack_pairs) == 1, clusters
+    assert len(slack_pairs[0]["entryIndices"]) == 2
+
+
+# The conservative linking rule (overlap-ratio + dated-supersede). These three
+# focused fixtures pin the contract the Merge action depends on: a file of
+# distinct-but-related decisions about one subsystem (each merely co-mentioning a
+# shared identifier) yields ZERO clusters, while a genuine near-duplicate pair or
+# an explicit dated correction yields exactly one tight 2-entry cluster.
+def test_detect_conflicts_distinct_but_related_one_shared_id_no_cluster():
+    """Two distinct decisions about the same subsystem that share a single
+    identifier (and little else) must NOT cluster — merging them would destroy
+    distinct knowledge. This is the Slack-timeline (D-010/D-014) failure mode."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# backend-dev -- project context\n"
+        "- 2026-06-10: Slack queue D-010: the in-process poller keeps slack_threads.json "
+        "warm via a background single-flight scan, gated on a readiness probe.\n"
+        "- 2026-06-14: Slack queue D-014: soft-dismiss flips slack_threads.json status in "
+        "place and approve forwards an expectedDraft baseline so a stale whole-file etag "
+        "still sends.\n"
+    )
+    assert detect_conflicts(parse_context_entries(txt)) == []
+
+
+def test_detect_conflicts_genuine_near_duplicate_clusters():
+    """A genuine near-duplicate pair (a high fraction of shared discriminative
+    vocabulary) clusters as one 'redundant' 2-entry group."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# qa -- project context\n"
+        "- 2026-06-01: Skeptic sabotage that paid off: backed up oscron.py to /tmp, broke "
+        "the croniter next-run guard, watched the test fail, restored, diff -q byte-identical.\n"
+        "- 2026-06-02: Sabotage that paid off: backed oscron.py to /tmp, broke the croniter "
+        "next-run guard, watched the test fail loud, restored, diff -q byte-identical after.\n"
+        "- 2026-06-03: Postgres handles the database connection pooling in this context.\n"
+    )
+    clusters = detect_conflicts(parse_context_entries(txt))
+    assert len(clusters) == 1, clusters
+    assert clusters[0]["reason"] == "redundant"
+    assert clusters[0]["entryIndices"] == [0, 1]
+
+
+def test_detect_conflicts_dated_supersede_labels_superseded():
+    """An explicit 'supersedes the YYYY-MM-DD note' reference links specifically to
+    the entry carrying that date (with >=1 shared discriminative token) and labels
+    the cluster 'superseded'."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# backend-dev -- project context\n"
+        "- 2026-06-05: Reset the module cache in an autouse fixture between tests.\n"
+        "- 2026-06-09: Frontend uses the Vite bundler for hot reload.\n"
+        "- 2026-06-13: Supersedes the 2026-06-05 note — the cache reset must use a fresh "
+        "_Cache() instance, not clear.\n"
+    )
+    clusters = detect_conflicts(parse_context_entries(txt))
+    assert len(clusters) == 1, clusters
+    assert clusters[0]["reason"] == "superseded"
+    assert clusters[0]["entryIndices"] == [0, 2]
+
+
+def test_detect_conflicts_bare_dated_supersede_no_overlap_does_not_link():
+    """A 'supersedes the YYYY-MM-DD note' marker with ZERO topic overlap must not
+    falsely bind to the dated entry — the dated-supersede rule requires at least
+    one shared discriminative token."""
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    txt = (
+        "# backend-dev -- project context\n"
+        "- 2026-06-05: Postgres handles database connection pooling.\n"
+        "- 2026-06-13: Supersedes the 2026-06-05 note — actually the Vite bundler drives "
+        "frontend hot reload entirely.\n"
+    )
+    assert detect_conflicts(parse_context_entries(txt)) == []
+
+
+def test_classify_ephemeral_tags_ceremony_families():
+    from server.routes.agents import parse_context_entries, classify_ephemeral
+    txt = (
+        "# qa — project context\n"
+        "- 2026-06-01: Skeptic sabotage that PAID OFF: caught a 200 masking an empty body.\n"
+        "- 2026-06-02: LIVE in-process proof: hit the real endpoint and read it back.\n"
+        "- 2026-06-03: UNVERIFIED-by-design: browser pixel render not checked, out of scope.\n"
+        "- 2026-06-04: Scope clean: HEAD unchanged, no stray files after the run.\n"
+        "- 2026-06-05: Re-ran the full UAT regression suite 284 green, no flake.\n"
+        "- 2026-06-06: Use the project venv to run pytest; system python lacks the plugin.\n"
+    )
+    flags = classify_ephemeral(parse_context_entries(txt))
+    assert flags == [True, True, True, True, True, False]
+
+
+async def test_context_ephemeral_endpoint(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: hit the endpoint and read it back.\n"
+        "- 2026-06-02: Use the project venv to run pytest.\n",
+    )
+    resp = await client.get("/api/projects/alpha/agents/qa/context/ephemeral")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ephemeralIndices"] == [0]
+    assert data["entries"][0]["ephemeral"] is True
+    assert data["entries"][1]["ephemeral"] is False
+
+
+async def test_reconcile_sweep_bulk_drops_only_listed(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson worth keeping.\n"
+        "- 2026-06-03: Scope clean: HEAD unchanged after B.\n",
+    )
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0, 2]},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["removed"] == 2
+    text = ctx_path.read_text(encoding="utf-8")
+    assert "Durable lesson worth keeping." in text
+    assert "LIVE in-process proof" not in text
+    assert "Scope clean" not in text
+
+
+async def test_reconcile_compact_shortens_one_entry_in_place(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "compact", "entryIndices": [0], "compactText": "Use read_json_body for bodies."},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["removed"] == 0  # rewrite in place, nothing dropped
+    text = ctx_path.read_text(encoding="utf-8")
+    from server.routes.agents import parse_context_entries
+    entries = parse_context_entries(text)
+    assert len(entries) == 4  # no entry removed
+    assert entries[0]["text"] == "Use read_json_body for bodies."
+    assert entries[0]["date"] == "2026-06-01"  # date prefix preserved
+
+
+async def test_reconcile_compact_etag_conflict(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "compact", "entryIndices": [0], "compactText": "short", "etag": "stale-etag"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+
+
+async def test_reconcile_keep_superseded_keeps_newest(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    text = ctx_path.read_text(encoding="utf-8")
+    assert "fresh _Cache() instance" in text  # newest correction kept
+    assert "autouse fixture" not in text       # older superseded dropped
+
+
+async def test_reconcile_keep_redundant_keeps_oldest():
+    # Plain redundancy (no supersede marker) keeps the oldest (min index).
+    from server.routes.agents import _keep_survivor, parse_context_entries
+    entries = parse_context_entries(
+        "# x\n- 2026-01-01: Frontend build uses Vite bundler tool.\n"
+        "- 2026-01-02: Frontend build uses the Vite bundler tool here.\n"
+    )
+    assert _keep_survivor({}, [0, 1], entries) == 0
+
+
+async def test_reconcile_keep_index_overrides_survivor():
+    from server.routes.agents import _keep_survivor, parse_context_entries
+    entries = parse_context_entries(_CONTEXT_SAMPLE)
+    # Explicit keepIndex wins regardless of reason.
+    assert _keep_survivor({"keepIndex": 1}, [1, 3], entries) == 1
+
+
+async def test_content_based_new_detection_mid_file_insert(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    # Mark everything reviewed (writes the content-hash marker).
+    assert (await client.post("/api/projects/alpha/agents/backend-dev/context/mark-reviewed")).status == 200
+
+    # Insert a NEW entry in the MIDDLE of the file (not at the tail).
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    lines = ctx_path.read_text(encoding="utf-8").splitlines()
+    insert_at = 3  # after the heading + first two entries
+    lines.insert(insert_at, "- 2026-06-20: Brand new mid-file lesson about deployment timing.")
+    ctx_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    resp = await client.get("/api/projects/alpha/agents/backend-dev/context")
+    data = await resp.json()
+    assert data["newEntryCount"] == 1
+    # The inserted entry's index (mid-file), not a tail index.
+    new_idx = data["newEntryIndices"][0]
+    assert "mid-file lesson" in data["entries"][new_idx]["text"]
+
+
+async def test_legacy_count_marker_falls_back(client, projects_layout):
+    # A pre-existing count-only marker (old format) must still work via the
+    # count-based fallback.
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    marker = workspace / "alpha" / ".claude" / "agent-context" / ".reviewed" / "backend-dev.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("2:abc123\n", encoding="utf-8")  # legacy: count only
+    resp = await client.get("/api/projects/alpha/agents/backend-dev/context")
+    data = await resp.json()
+    assert data["newEntryCount"] == 2  # 4 entries, 2 reviewed → tail 2 are new
+
+
+async def test_oversized_context_signal(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    big = "# qa\n" + "".join(
+        f"- 2026-06-01: Lesson number {i} about a distinct topic with enough text to add bytes here.\n"
+        for i in range(500)
+    )
+    _seed_context(workspace, "alpha", "qa", big)
+    # Panel signal.
+    data = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert data["oversized"] is True
+    # Agent list badge signal.
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["qa"]["oversized"] is True
+
+
+async def test_small_context_not_oversized(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    data = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert data["oversized"] is False
+
+
 async def test_get_agent_context_reports_new_entries(client, projects_layout):
     workspace = projects_layout["workspace"]
     _seed_agent(workspace, "alpha", "backend-dev")
@@ -921,7 +1211,6 @@ async def test_reconcile_keep_removes_others(client, projects_layout):
     assert "read_json_body" in text            # unrelated entry untouched
 
 
-
 async def test_reconcile_merge_replaces_cluster(client, projects_layout):
     workspace = projects_layout["workspace"]
     _seed_agent(workspace, "alpha", "backend-dev")
@@ -938,6 +1227,136 @@ async def test_reconcile_merge_replaces_cluster(client, projects_layout):
     # Two entries collapsed into one → 3 entries remain.
     from server.routes.agents import parse_context_entries
     assert len(parse_context_entries(text)) == 3
+
+
+# -- T1 frontend-dev: documented reconcile success/409 SHAPES per action --------
+# These pin the exact response contract the panel's pure decideReconcileOutcome()
+# branches on (see frontend/src/components/reconcileOutcome.js + .test.mjs). The
+# panel renders a silent no-op iff it can't tell ok from conflict; these guard
+# the wire shapes both sides agree on: success {ok:True, action, removed, etag}
+# and 409 {error:'conflict', current, etag}. The browser pixel render of the
+# inline banner is verified separately (see the task report's UNVERIFIED note).
+
+async def _conflict_cluster_indices(client, project, name):
+    """Helper: the first detected cluster's entryIndices for `name`."""
+    clusters = (await (await client.get(
+        f"/api/projects/{project}/agents/{name}/context/conflicts")).json())["clusters"]
+    assert clusters, "expected at least one conflict cluster"
+    return clusters[0]["entryIndices"]
+
+
+async def test_reconcile_success_shape_carries_etag_for_every_action(client, projects_layout):
+    """keep / merge / compact / sweep each return {ok, action, removed, etag} on
+    success — the etag the panel must adopt so a follow-up action stays guarded.
+    dismiss returns {ok, action, removed:0} (it writes no entries, so no etag)."""
+    workspace = projects_layout["workspace"]
+
+    # keep
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]})).json()
+    assert body["ok"] is True and body["action"] == "keep"
+    assert body["removed"] == 1 and isinstance(body["etag"], str) and body["etag"]
+
+    # merge (re-seed: the keep above mutated the file)
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Merged note."})).json()
+    assert body["ok"] is True and body["action"] == "merge" and body["etag"]
+
+    # compact (single entry, rewrites in place; removed == 0)
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "compact", "entryIndices": [0], "compactText": "Short."})).json()
+    assert body["ok"] is True and body["action"] == "compact"
+    assert body["removed"] == 0 and body["etag"]
+
+    # sweep (bulk drop)
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0]})).json()
+    assert body["ok"] is True and body["action"] == "sweep"
+    assert body["removed"] == 1 and body["etag"]
+
+    # dismiss writes nothing → no etag, removed 0.
+    _seed_context(workspace, "alpha", "backend-dev")
+    body = await (await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": [1, 3]})).json()
+    assert body["ok"] is True and body["action"] == "dismiss" and body["removed"] == 0
+
+
+async def test_reconcile_merge_and_compact_conflict_shape_on_stale_etag(client, projects_layout):
+    """A stale etag on merge OR compact must 409 with {error:'conflict', current,
+    etag} and write NOTHING — the exact shape the panel adopts to re-review. This
+    is the bug's heart: a 409 must be a distinguishable response, never a no-op."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    for payload in (
+        {"action": "merge", "entryIndices": [1, 3], "mergedText": "X", "etag": "stale"},
+        {"action": "compact", "entryIndices": [0], "compactText": "Y", "etag": "stale"},
+    ):
+        resp = await client.post(
+            "/api/projects/alpha/agents/backend-dev/context/reconcile", json=payload)
+        assert resp.status == 409, payload["action"]
+        body = await resp.json()
+        assert body["error"] == "conflict"
+        assert isinstance(body["current"], str) and isinstance(body["etag"], str) and body["etag"]
+        # Untouched: the rejected write never lands.
+        assert ctx_path.read_text(encoding="utf-8") == before, payload["action"]
+
+
+async def test_reconcile_second_click_succeeds_against_fresh_etag(client, projects_layout):
+    """End-to-end of the panel's 409 recovery: a stale-etag merge 409s and returns
+    the server's fresh etag; re-firing the SAME merge with that etag SUCCEEDS.
+    This is the 'click again to re-confirm' contract the inline banner promises."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    # First click: stale etag → 409 carrying the current etag.
+    first = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reconciled note.", "etag": "stale"})
+    assert first.status == 409
+    fresh_etag = (await first.json())["etag"]
+
+    # Second click: adopt the fresh etag → 200, the merge lands.
+    second = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reconciled note.", "etag": fresh_etag})
+    assert second.status == 200
+    assert (await second.json())["ok"] is True
+    assert "Reconciled note." in ctx_path.read_text(encoding="utf-8")
+
+
+async def test_reconcile_dismiss_then_other_action_no_silent_drop(client, projects_layout):
+    """dismiss returns a clear ok shape (removed:0) AND leaves the file byte-equal,
+    so the panel's 'Keep all' is never mistaken for a silent failure."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+    target = await _conflict_cluster_indices(client, "alpha", "backend-dev")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": target})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True and body["removed"] == 0
+    assert ctx_path.read_text(encoding="utf-8") == before
 
 
 async def test_reconcile_dismiss_removes_nothing(client, projects_layout):
@@ -1006,6 +1425,310 @@ async def test_mark_reviewed_clears_new_count(client, projects_layout):
 async def test_context_traversal_rejected(client, projects_layout):
     assert (await client.get("/api/projects/alpha/agents/..%2f..%2fx/context")).status == 400
     assert (await client.post("/api/projects/..%2f../agents/x/context/mark-reviewed")).status == 400
+
+
+# -- T3 QA additions: gaps not covered by the parallel agent-context tests ----
+# The parallel writer covered the realistic-file (ubiquitous-words -> small caps),
+# compact, supersede-keep-newest, ephemeral classifier/endpoint, content-based
+# new-detection, and oversized-vs-small. These three close the spec's explicit
+# remaining asks: a clean 10+-distinct file -> ZERO clusters, the sweep action's
+# etag guard (409 on stale), and a never-raises smoke on an oversized/garbage file.
+
+# 12 topically-distinct entries that DELIBERATELY share two ubiquitous words
+# ("test"/"context") so every pair would link under the naive union-find. The
+# OLD heuristic (link on >=2 shared tokens, no DF filter, no size cap) collapses
+# them into ONE 12-entry mega-cluster. The NEW heuristic must yield ZERO: the
+# document-frequency filter drops the ubiquitous words AND the size cap rejects
+# any over-large connected group. This is defense-in-depth -- either guard alone
+# yields zero here, so a regression of EITHER stays caught only when both fail,
+# but the end-to-end "clean file -> zero clusters" guarantee is what's asserted.
+_TEN_DISTINCT_CONTEXT = """# backend-dev -- project context
+- 2026-06-01: In this test context, the Vite bundler drives frontend hot reload.
+- 2026-06-02: In this test context, Postgres handles database connection pooling.
+- 2026-06-03: In this test context, Midway validates the upstream cookie session.
+- 2026-06-04: In this test context, CloudWatch ingests structured logging lines.
+- 2026-06-05: In this test context, Redis caches with a sliding expiration policy.
+- 2026-06-06: In this test context, Apollo promotes deployment artifacts onward.
+- 2026-06-07: In this test context, dashboards aggregate regional latency metrics.
+- 2026-06-08: In this test context, SES batches hourly email notification delivery.
+- 2026-06-09: In this test context, OpenSearch rebuilds the nightly search index.
+- 2026-06-10: In this test context, LaunchDarkly evaluates feature flag experiments.
+- 2026-06-11: In this test context, billing webhooks reconcile payment settlement.
+- 2026-06-12: In this test context, Lambda resizes media thumbnail images lazily.
+"""
+
+
+def test_detect_conflicts_zero_on_ten_distinct_topics():
+    from server.routes.agents import parse_context_entries, detect_conflicts
+    entries = parse_context_entries(_TEN_DISTINCT_CONTEXT)
+    assert len(entries) >= 10
+    # Despite the shared ubiquitous words, no genuine near-duplicates exist -> no
+    # clusters at all. The old code returned one 12-entry mega-cluster here.
+    assert detect_conflicts(entries) == []
+
+
+# Anti-toy-fixture invariant: the tmp fixtures above are small and hand-shaped,
+# but the LIVE role-context files are large and churn fast (the qa file went
+# 164->407 entries during this project). The safety property Merge depends on is
+# that detect_conflicts NEVER offers a mega/blob cluster spanning distinct-but-
+# related decisions (e.g. the Slack D-010/D-014/D-017/D-018 timeline) -- every
+# emitted cluster must stay at or under the size cap so Merge only ever sees a
+# tight, fuseable group. We assert that STRUCTURAL invariant against the real
+# files (read-only) rather than an exact cluster count, which would be brittle as
+# the files grow. Skips gracefully when a file is absent so the suite stays
+# portable across checkouts.
+_REAL_CONTEXT_ROLES = ["backend-dev", "frontend-dev", "qa"]
+
+
+@pytest.mark.parametrize("role", _REAL_CONTEXT_ROLES)
+def test_detect_conflicts_no_blob_on_real_context_files(role):
+    from server.routes.agents import (
+        parse_context_entries,
+        detect_conflicts,
+        _MAX_CLUSTER_SIZE,
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    path = repo_root / ".claude" / "agent-context" / f"{role}.md"
+    if not path.is_file():
+        pytest.skip(f"{role} context file not present in this checkout")
+
+    entries = parse_context_entries(path.read_text(encoding="utf-8"))
+    clusters = detect_conflicts(entries)
+    # The hard invariant: no cluster exceeds the size cap. A distinct-but-related
+    # blob would surface as a large connected component; the conservative linker
+    # plus the cap must keep every offered cluster tight (~2 entries in practice).
+    oversized = [c for c in clusters if len(c["entryIndices"]) > _MAX_CLUSTER_SIZE]
+    assert not oversized, (
+        f"{role}: detect_conflicts emitted a blob cluster (> {_MAX_CLUSTER_SIZE} "
+        f"entries) that Merge would wrongly try to fuse: {oversized}"
+    )
+
+
+async def test_reconcile_sweep_etag_conflict(client, projects_layout):
+    """The ephemeral bulk-sweep must be etag-guarded: a stale etag yields a 409
+    with the conflict shape, never a silent destructive drop against a moved file.
+    """
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson worth keeping.\n",
+    )
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
+    before = ctx_path.read_text(encoding="utf-8")
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0], "etag": "stale-etag-value"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "current" in body and "etag" in body
+    # Nothing was removed -- the file is byte-identical after the rejected sweep.
+    assert ctx_path.read_text(encoding="utf-8") == before
+
+
+def test_context_summary_and_list_never_raise_on_oversized_garbage(tmp_path, monkeypatch):
+    """Defensive contract: context_summary and the agents listing must never throw,
+    so the Agents/Projects listings can't break -- on either (a) a malformed but
+    parseable oversized file (size signal still fires) or (b) a genuinely
+    unreadable (non-UTF-8) file that makes read_text raise (degrades to defaults).
+    Drives the helpers directly (no client) on an isolated tmp project.
+    """
+    import server.routes.agents as agents_mod
+    # Isolate the global agents dir so the developer's real ~/.claude/agents/ is
+    # not scanned by _list_agents during this unit-level check.
+    monkeypatch.setattr(agents_mod, "GLOBAL_AGENTS_DIR", tmp_path / "dot_claude" / "agents")
+
+    project_dir = tmp_path / "workspace" / "proj"
+    agents_d = project_dir / ".claude" / "agents"
+    ctx_d = project_dir / ".claude" / "agent-context"
+    agents_d.mkdir(parents=True)
+    ctx_d.mkdir(parents=True)
+    (agents_d / "qa.md").write_text("---\nname: qa\n---\nbody\n", encoding="utf-8")
+
+    # (a) Oversized (> ~6KB / 400 lines) AND malformed: stray headers, non-bullet
+    # lines, broken bullets -- must parse defensively, not raise, and still flag.
+    garbage = "# qa\n" + (
+        "garbled non-bullet line %s\n## stray header\n- - nested?? weird\n" % ("x" * 60)
+    ) * 200
+    (ctx_d / "qa.md").write_text(garbage, encoding="utf-8")
+    summary = agents_mod.context_summary(project_dir, "qa")  # must not raise
+    assert summary["oversized"] is True  # size signal fires even on garbage
+    recs = agents_mod._list_agents(project_dir)  # must not raise
+    qa = next(r for r in recs if r["slug"] == "qa")
+    assert qa["oversized"] is True
+
+    # (b) A non-UTF-8 (binary) context file makes filestore.read_text raise; the
+    # defensive except must swallow it and return the zeroed defaults, never throw.
+    (ctx_d / "qa.md").write_bytes(b"\xff\xfe\x00 not valid utf-8 " + b"x" * 7000)
+    summary2 = agents_mod.context_summary(project_dir, "qa")  # must not raise
+    assert summary2 == {
+        "entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0,
+        "oversized": False, "contextBytes": 0, "lineCount": 0,
+    }
+    # The listing still survives an unreadable context file (record is skipped or
+    # zeroed, but the call itself never raises).
+    agents_mod._list_agents(project_dir)
+
+
+# -- Reconcile CONTRACT lock (T2): the success + 409 SHAPES the review UI branches
+# on. The 'Save merged got no response' bug routed through the merge 409 path, so
+# these pin (a) the documented success body {ok, action, removed:int, etag:str} for
+# merge/keep/sweep so the frontend's etag-adoption-on-success path has a guaranteed
+# shape, (b) the FULL 409 body {error, message, current, etag} for merge AND keep
+# with a byte-identical file (no destructive write on conflict), and (c) that the
+# 409 body's etag is the REAL current etag (differs from the stale one the client
+# sent AND equals a fresh GET /context etag), since the panel adopts body.etag for
+# the re-confirm click. These do NOT duplicate the existing merge/keep/sweep success
+# or compact/sweep 409 tests -- they add the explicit etag-presence + action-echo +
+# adopted-etag-is-fresh asserts those don't make.
+
+
+async def test_reconcile_merge_success_shape_has_etag_and_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3],
+              "mergedText": "Reset the cache with a fresh _Cache() in an autouse fixture."},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["action"] == "merge"        # action echoed back for the UI
+    assert isinstance(body["removed"], int) and body["removed"] == 1
+    assert isinstance(body["etag"], str) and body["etag"]  # non-empty fresh etag
+    # The fresh etag the UI must adopt is the file's actual current etag.
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == after["etag"]
+
+
+async def test_reconcile_keep_success_shape_has_etag_and_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["action"] == "keep"
+    assert isinstance(body["removed"], int) and body["removed"] == 1
+    assert isinstance(body["etag"], str) and body["etag"]
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == after["etag"]
+
+
+async def test_reconcile_sweep_success_shape_has_etag_and_action(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson worth keeping.\n",
+    )
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["action"] == "sweep"
+    assert isinstance(body["removed"], int) and body["removed"] == 1
+    assert isinstance(body["etag"], str) and body["etag"]
+    after = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert body["etag"] == after["etag"]
+
+
+async def test_reconcile_dismiss_success_shape(client, projects_layout):
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "dismiss", "entryIndices": [1, 3]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # dismiss records the cluster but removes nothing and rewrites nothing, so it
+    # carries no etag -- the UI's dismiss branch must NOT try to adopt one.
+    assert body == {"ok": True, "action": "dismiss", "removed": 0}
+
+
+async def test_reconcile_merge_etag_conflict_full_shape_no_write(client, projects_layout):
+    """The exact path 'Save merged got no response' routed through: a merge with a
+    stale etag -> 409 with the FULL documented body and a byte-IDENTICAL file. The
+    body etag is the real current one (differs from the stale etag, equals a fresh
+    GET) so the panel can adopt it and a second click can succeed."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    stale = "stale-etag-value"
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3],
+              "mergedText": "merged but stale", "etag": stale},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    # Full documented 409 contract.
+    assert body["error"] == "conflict"
+    assert isinstance(body["message"], str) and body["message"]
+    assert isinstance(body["current"], str)        # current file content for re-review
+    assert isinstance(body["etag"], str) and body["etag"]  # fresh etag to adopt
+    # The adopted etag is the REAL current etag: not the stale one, and it matches
+    # both the on-disk file and a fresh GET /context (the second-click etag source).
+    assert body["etag"] != stale
+    from server import filestore
+    assert body["etag"] == filestore.etag_for(ctx_path)
+    get = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == get["etag"]
+    assert body["current"] == get["content"]
+    # No destructive write on conflict -- the file is byte-identical.
+    assert ctx_path.read_text(encoding="utf-8") == before
+
+
+async def test_reconcile_keep_etag_conflict_full_shape_no_write(client, projects_layout):
+    """Keep (drop-the-rest) is etag-guarded identically: a stale etag -> 409 with
+    the full conflict body and a byte-identical file (no silent destructive drop)."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+    before = ctx_path.read_text(encoding="utf-8")
+
+    stale = "stale-etag-value"
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3], "etag": stale},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert isinstance(body["message"], str) and body["message"]
+    assert isinstance(body["current"], str)
+    assert isinstance(body["etag"], str) and body["etag"]
+    assert body["etag"] != stale
+    from server import filestore
+    assert body["etag"] == filestore.etag_for(ctx_path)
+    get = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert body["etag"] == get["etag"]
+    assert body["current"] == get["content"]
+    assert ctx_path.read_text(encoding="utf-8") == before
 
 
 async def test_put_design_accepts_proposed_adr(client, projects_layout):
@@ -2224,6 +2947,89 @@ async def test_crons_update_preserves_harness_fields(client, crons_file):
 
 
 # --------------------------------------------------------------------------- #
+# Optional "description" field (T1): additive 1-2 sentence summary on the task.
+# Persisted only when non-empty so existing jobs/callers stay byte-identical
+# (no description:null key). Round-trips through create + update + GET.
+# --------------------------------------------------------------------------- #
+async def test_crons_create_round_trips_description(client, crons_file):
+    """POST with a description -> 201, job carries it back, and GET lists it."""
+    create = await client.post(
+        "/api/crons",
+        json={"cron": "0 9 * * *", "prompt": "standup", "description": "a summary"},
+    )
+    assert create.status == 201
+    job = (await create.json())["job"]
+    assert job["description"] == "a summary"
+    job_id = job["id"]
+
+    # Survives reload via GET (read back from the persisted store).
+    listed = (await (await client.get("/api/crons")).json())["jobs"]
+    match = next(j for j in listed if j["id"] == job_id)
+    assert match["description"] == "a summary"
+
+
+async def test_crons_update_round_trips_description(client, crons_file):
+    """PUT with a description persists it and survives a re-GET."""
+    create = await client.post("/api/crons", json={"cron": "0 9 * * *", "prompt": "standup"})
+    job_id = (await create.json())["job"]["id"]
+
+    upd = await client.put(f"/api/crons/{job_id}", json={"description": "updated"})
+    assert upd.status == 200
+    assert (await upd.json())["job"]["description"] == "updated"
+
+    listed = (await (await client.get("/api/crons")).json())["jobs"]
+    match = next(j for j in listed if j["id"] == job_id)
+    assert match["description"] == "updated"
+
+
+async def test_crons_create_without_description_omits_key(client, crons_file):
+    """Omitting description must NOT write a 'description' key (existing-job render
+    must not break) and create still works."""
+    create = await client.post("/api/crons", json={"cron": "0 9 * * *", "prompt": "standup"})
+    assert create.status == 201
+    job = (await create.json())["job"]
+    assert "description" not in job
+
+    # And it's absent in the persisted store too, not just the response.
+    saved = json.loads(crons_file.read_text(encoding="utf-8"))["tasks"][0]
+    assert "description" not in saved
+
+
+async def test_crons_update_without_description_preserves_fields(client, crons_file):
+    """Editing prompt on a job that HAS a description must preserve the description
+    and the harness-only fields (mirrors test_crons_update_preserves_harness_fields)."""
+    crons_file.parent.mkdir(parents=True, exist_ok=True)
+    crons_file.write_text(json.dumps({"tasks": [{
+        "id": "abc12345", "cron": "37 23 * * *", "prompt": "old",
+        "recurring": True, "createdAt": 1, "createdBySessionId": "sess-1",
+        "description": "kept summary",
+    }]}), encoding="utf-8")
+
+    upd = await client.put("/api/crons/abc12345", json={"prompt": "new"})
+    assert upd.status == 200
+    saved = json.loads(crons_file.read_text(encoding="utf-8"))["tasks"][0]
+    assert saved["prompt"] == "new"
+    assert saved["description"] == "kept summary"  # preserved (not in PUT body)
+    assert saved["createdBySessionId"] == "sess-1"  # harness field preserved
+
+
+async def test_crons_job_without_description_serializes_cleanly(client, crons_file):
+    """A pre-existing harness job with no description renders through GET (200, no
+    'description' key) — absence never breaks the list/detail view."""
+    crons_file.parent.mkdir(parents=True, exist_ok=True)
+    crons_file.write_text(json.dumps({"tasks": [{
+        "id": "nodesc01", "cron": "30 22 * * *", "prompt": "health check",
+        "recurring": True, "createdAt": 1, "lastFiredAt": None,
+    }]}), encoding="utf-8")
+
+    resp = await client.get("/api/crons")
+    assert resp.status == 200
+    jobs = (await resp.json())["jobs"]
+    assert len(jobs) == 1
+    assert "description" not in jobs[0]
+
+
+# --------------------------------------------------------------------------- #
 # Cron run-history store (/api/crons/{id}/runs)
 #
 # Run history lives in a *separate sidecar* file (cron_runs.json) so the harness's
@@ -2352,6 +3158,450 @@ def test_resolve_runs_path_defaults_beside_tasks(tmp_path, monkeypatch):
     monkeypatch.setattr(crons_mod, "TASKS_PATH", tmp_path / ".claude" / "scheduled_tasks.json")
     resolved = crons_mod._resolve_runs_path()
     assert resolved == tmp_path / ".claude" / "cron_runs.json"
+
+
+# --------------------------------------------------------------------------- #
+# Cron run RECONCILIATION (harness lastFiredAt -> "fired" run entry) + harvest
+#
+# GET /api/crons/{id}/runs reconciles the harness fire timestamp (lastFiredAt in
+# scheduled_tasks.json) with the console-POSTed sidecar runs. A scheduled fire
+# surfaces as a distinct "fired" entry; output is harvested best-effort from the
+# creating session's transcript, with an honest empty fallback (never fabricated).
+# --------------------------------------------------------------------------- #
+def _write_tasks(crons_file: Path, task: dict):
+    crons_file.parent.mkdir(parents=True, exist_ok=True)
+    crons_file.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+
+
+async def test_fired_entry_from_lastfiredat_with_empty_runs(client, crons_file, cron_runs_file):
+    """A harness-written lastFiredAt with NO console runs surfaces exactly one
+    'fired' entry — not 'No runs recorded yet'."""
+    _write_tasks(crons_file, {
+        "id": "3af99bc9", "cron": "30 22 * * *", "prompt": "health check",
+        "recurring": True, "createdAt": 1, "lastFiredAt": 1781482020160,
+    })
+    runs = (await (await client.get("/api/crons/3af99bc9/runs")).json())["runs"]
+    assert len(runs) == 1
+    assert runs[0]["outcome"] == "fired"
+    assert runs[0]["ts"] == 1781482020160
+    assert runs[0]["source"] == "harness"
+    assert runs[0]["id"] == "fired-1781482020160"
+    # No harvestable transcript → honest empty result, NOT a fabricated success.
+    assert runs[0]["result"] == ""
+
+
+async def test_fired_entry_absent_when_no_lastfiredat(client, crons_file, cron_runs_file):
+    """A task that never fired (lastFiredAt None/0) yields no 'fired' entry."""
+    _write_tasks(crons_file, {
+        "id": "neverfired", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": None,
+    })
+    runs = (await (await client.get("/api/crons/neverfired/runs")).json())["runs"]
+    assert runs == []
+
+
+async def test_fired_entry_deduped_against_console_run(client, crons_file, cron_runs_file):
+    """A console-POSTed run near the fire timestamp is the SAME fire — the
+    synthesized 'fired' entry is suppressed so it isn't shown twice."""
+    fired_ms = 1781482020160
+    _write_tasks(crons_file, {
+        "id": "dedupe1", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": fired_ms,
+    })
+    # Console run 5s after the fire → within the dedupe window.
+    resp = await client.post(
+        "/api/crons/dedupe1/runs",
+        json={"outcome": "success", "result": "ran", "ts": fired_ms + 5000},
+    )
+    assert resp.status == 201
+    runs = (await (await client.get("/api/crons/dedupe1/runs")).json())["runs"]
+    assert len(runs) == 1
+    # The real console outcome wins; no duplicate synthesized 'fired' entry.
+    assert runs[0]["outcome"] == "success"
+    assert all(r.get("source") != "harness" for r in runs)
+
+
+async def test_fired_entry_not_deduped_when_far_from_console_run(client, crons_file, cron_runs_file):
+    """A console run far from the fire timestamp is a DIFFERENT run — both show."""
+    fired_ms = 1781482020160
+    _write_tasks(crons_file, {
+        "id": "two1", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": fired_ms,
+    })
+    await client.post(
+        "/api/crons/two1/runs",
+        json={"outcome": "failure", "result": "old run", "ts": fired_ms - 10 * 60_000},
+    )
+    runs = (await (await client.get("/api/crons/two1/runs")).json())["runs"]
+    assert len(runs) == 2
+    # Newest-first: the fire (newer) leads, the older console failure follows.
+    assert runs[0]["outcome"] == "fired"
+    assert runs[1]["outcome"] == "failure"
+
+
+async def test_fired_entry_harvests_transcript_result(client, crons_file, cron_runs_file, tmp_path, monkeypatch):
+    """When the creating session's transcript exists, the 'fired' entry carries the
+    real VERDICT text from the assistant turn following the matching enqueue line."""
+    fired_ms = 1781482020160
+    cwd = "/local/home/u/workspace/projects/demo"
+    slug = crons_mod._project_path_to_claude_slug(cwd)
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(crons_mod, "CLAUDE_PROJECTS_BASE", projects)
+    sess_dir = projects / slug
+    sess_dir.mkdir(parents=True)
+    lines = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:07:00.161Z", "content": "do the check"},
+        {"type": "queue-operation", "operation": "dequeue",
+         "timestamp": "2026-06-15T00:07:00.182Z"},
+        {"type": "user", "message": {"content": "do the check"}},
+        # interleaved tool call/result lines that carry no text
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "content": "out"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "HEALTHY — all good."}]}},
+        {"type": "system", "message": {}},
+    ]
+    (sess_dir / "sess-1.jsonl").write_text(
+        "\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+    _write_tasks(crons_file, {
+        "id": "harv1", "cron": "30 22 * * *", "prompt": "health check",
+        "recurring": True, "createdAt": 1, "lastFiredAt": fired_ms,
+        "createdBySessionId": "sess-1", "cwd": cwd,
+    })
+    runs = (await (await client.get("/api/crons/harv1/runs")).json())["runs"]
+    assert len(runs) == 1
+    assert runs[0]["outcome"] == "fired"
+    assert runs[0]["result"] == "HEALTHY — all good."
+
+
+async def test_fired_entry_missing_transcript_falls_back_empty(client, crons_file, cron_runs_file, tmp_path, monkeypatch):
+    """No transcript file → honest 'result not captured' fallback (empty result),
+    never a fabricated outcome."""
+    monkeypatch.setattr(crons_mod, "CLAUDE_PROJECTS_BASE", tmp_path / "projects")
+    _write_tasks(crons_file, {
+        "id": "miss1", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": 1781482020160,
+        "createdBySessionId": "no-such-session", "cwd": "/local/home/u/x",
+    })
+    runs = (await (await client.get("/api/crons/miss1/runs")).json())["runs"]
+    assert len(runs) == 1
+    assert runs[0]["outcome"] == "fired"
+    assert runs[0]["result"] == ""
+
+
+async def test_fired_entry_scrubs_credential_text(client, crons_file, cron_runs_file, tmp_path, monkeypatch):
+    """An assistant turn mentioning credential/cookie material is scrubbed from the
+    harvested result — never surfaced."""
+    fired_ms = 1781482020160
+    cwd = "/local/home/u/workspace/projects/sec"
+    slug = crons_mod._project_path_to_claude_slug(cwd)
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(crons_mod, "CLAUDE_PROJECTS_BASE", projects)
+    sess_dir = projects / slug
+    sess_dir.mkdir(parents=True)
+    lines = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:07:00.161Z", "content": "check"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "your ~/.midway/cookie is AABBCC secret"}]}},
+    ]
+    (sess_dir / "s.jsonl").write_text(
+        "\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+    _write_tasks(crons_file, {
+        "id": "scrub1", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": fired_ms,
+        "createdBySessionId": "s", "cwd": cwd,
+    })
+    runs = (await (await client.get("/api/crons/scrub1/runs")).json())["runs"]
+    assert len(runs) == 1
+    assert "cookie" not in runs[0]["result"].lower()
+    assert "AABBCC" not in runs[0]["result"]
+    # No safe text remained → honest empty fallback.
+    assert runs[0]["result"] == ""
+
+
+async def test_list_runs_does_not_write_harness_files(client, crons_file, cron_runs_file):
+    """Reconciliation is READ-only: a GET must never write scheduled_tasks.json,
+    create the runs sidecar, or otherwise mutate harness state."""
+    _write_tasks(crons_file, {
+        "id": "ro1", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": 1781482020160,
+    })
+    before = crons_file.read_text(encoding="utf-8")
+    await client.get("/api/crons/ro1/runs")
+    assert crons_file.read_text(encoding="utf-8") == before
+    # A pure read with no console runs must not have created the sidecar.
+    assert not cron_runs_file.exists()
+
+
+async def test_client_cannot_post_fired_outcome(client, cron_runs_file):
+    """'fired' is reserved for synthesized harness entries — a client POST of it is
+    normalized to 'unknown' (not stored as a fake harness fire)."""
+    resp = await client.post(
+        "/api/crons/x1/runs", json={"outcome": "fired", "result": "sneaky"}
+    )
+    assert resp.status == 201
+    assert (await resp.json())["run"]["outcome"] == "unknown"
+
+
+async def test_fired_entry_merges_with_two_distinct_console_runs(client, crons_file, cron_runs_file):
+    """lastFiredAt PLUS two console runs at clearly distinct times -> exactly 3
+    entries, strictly newest-first by ts, with the synthesized 'fired' entry present
+    and not collapsing the far-apart console runs into it."""
+    fired_ms = 1781482020160
+    older = fired_ms - 86_400_000        # 1 day before the fire
+    oldest = fired_ms - 2 * 86_400_000   # 2 days before the fire
+    _write_tasks(crons_file, {
+        "id": "merge3", "cron": "30 22 * * *", "prompt": "x",
+        "recurring": True, "createdAt": 1, "lastFiredAt": fired_ms,
+    })
+    # Two genuinely separate console runs, both well outside the dedupe window.
+    await client.post("/api/crons/merge3/runs",
+                      json={"outcome": "success", "result": "day-1", "ts": older})
+    await client.post("/api/crons/merge3/runs",
+                      json={"outcome": "failure", "result": "day-2", "ts": oldest})
+
+    runs = (await (await client.get("/api/crons/merge3/runs")).json())["runs"]
+    assert len(runs) == 3, f"fire + two distinct console runs => 3 entries, got {runs}"
+    ts_list = [r["ts"] for r in runs]
+    assert ts_list == sorted(ts_list, reverse=True), "must be strictly newest-first by ts"
+    # The fire is the newest of the three, so it leads; both console runs survive.
+    assert runs[0]["outcome"] == "fired" and runs[0]["ts"] == fired_ms
+    outcomes = {r["outcome"] for r in runs}
+    assert {"fired", "success", "failure"} == outcomes
+
+
+# --------------------------------------------------------------------------- #
+# Cron FULL fire-history harvest + idempotent backfill (_harvest_all_fires)
+#
+# Beyond the single lastFiredAt synthesis, GET /api/crons/{id}/runs enumerates
+# EVERY fire from the creating session's transcript (each fire is a
+# queue-operation/enqueue whose content's first line == the job prompt's first
+# line, excluding <task-notification> wrappers), persists the new ones into
+# cron_runs.json idempotently, and reconciles them newest-first.
+# --------------------------------------------------------------------------- #
+_WARMUP_PROMPT = "SLACK-WARMUP v1 (claude-web)\nStep 1: do the thing.\nStep 2: finish."
+
+
+def _warmup_transcript_lines():
+    """Three matching fires (interleaved assistant turns) + noise the matcher must
+    ignore: a dequeue, a <task-notification> enqueue, and an unrelated enqueue."""
+    return [
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:00:00.000Z", "content": _WARMUP_PROMPT},
+        {"type": "user", "message": {"content": _WARMUP_PROMPT}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "fire one done"}]}},
+        # Workflow notification — NOT a cron fire, must be excluded.
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:01:00.000Z",
+         "content": "<task-notification>something</task-notification>"},
+        # Unrelated enqueue (different prompt) — not this job's fire.
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:02:00.000Z", "content": "OTHER JOB\nrun something else"},
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:03:00.000Z", "content": _WARMUP_PROMPT},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "fire two done"}]}},
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:04:00.000Z", "content": _WARMUP_PROMPT},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "fire three done"}]}},
+    ]
+
+
+def _setup_warmup_transcript(crons_file, tmp_path, monkeypatch, job_id="warm1",
+                             lines=None, session_id="sess-w"):
+    """Wire a warm-up job + its transcript located via the createdBySessionId
+    fallback (cwd=None, like the real harness jobs)."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(crons_mod, "CLAUDE_PROJECTS_BASE", projects)
+    sess_dir = projects / "-some-proj-slug"
+    sess_dir.mkdir(parents=True)
+    if lines is None:
+        lines = _warmup_transcript_lines()
+    (sess_dir / f"{session_id}.jsonl").write_text(
+        "\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+    _write_tasks(crons_file, {
+        "id": job_id, "cron": "*/10 * * * *", "prompt": _WARMUP_PROMPT,
+        "recurring": True, "createdAt": 1, "lastFiredAt": 1781482020160,
+        "createdBySessionId": session_id, "cwd": None,
+    })
+
+
+async def test_harvest_all_fires_yields_multiple_entries(client, crons_file, cron_runs_file,
+                                                          tmp_path, monkeypatch):
+    """A transcript with N>1 matching enqueue fires yields N 'fired' entries,
+    newest-first — not just the single last fire."""
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch)
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    assert len(runs) == 3, runs
+    assert all(r["outcome"] == "fired" for r in runs)
+    ts_list = [r["ts"] for r in runs]
+    assert ts_list == sorted(ts_list, reverse=True), "newest-first"
+    # The verdict text is harvested per-fire (newest first).
+    assert runs[0]["result"] == "fire three done"
+    assert runs[1]["result"] == "fire two done"
+    assert runs[2]["result"] == "fire one done"
+
+
+async def test_harvest_excludes_task_notification_and_unrelated(client, crons_file,
+                                                                cron_runs_file, tmp_path, monkeypatch):
+    """<task-notification> enqueues and enqueues for a DIFFERENT prompt are NOT
+    counted as fires of this job."""
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch)
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    # Only the 3 real warm-up enqueues, despite 5 enqueue lines total.
+    assert len(runs) == 3
+    # None of the harvested results came from the unrelated job's enqueue.
+    assert all("else" not in r["result"] for r in runs)
+
+
+async def test_harvest_backfill_is_idempotent(client, crons_file, cron_runs_file,
+                                               tmp_path, monkeypatch):
+    """Backfill persists into cron_runs.json; a SECOND GET does not duplicate
+    entries (full transcript scan effectively happens once)."""
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch)
+    first = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    assert len(first) == 3
+    # The sidecar now holds the backfilled fires.
+    stored = json.loads(cron_runs_file.read_text(encoding="utf-8"))["runs"]["warm1"]
+    assert len(stored) == 3
+    assert all(r["source"] == "harness" for r in stored)
+
+    second = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    assert len(second) == 3, "a repeat GET must not duplicate entries"
+    stored2 = json.loads(cron_runs_file.read_text(encoding="utf-8"))["runs"]["warm1"]
+    assert len(stored2) == 3, "sidecar must not grow on a repeat read"
+    assert {r["id"] for r in stored} == {r["id"] for r in stored2}
+
+
+async def test_harvest_console_run_within_window_deduped(client, crons_file, cron_runs_file,
+                                                         tmp_path, monkeypatch):
+    """A console-POSTed run within _FIRE_DEDUPE_MS of a harvested fire is the SAME
+    fire — it is not shown twice."""
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch)
+    # The newest harvested fire is at 2026-06-15T00:04:00Z.
+    fire_ms = crons_mod._iso_to_ms("2026-06-15T00:04:00.000Z")
+    resp = await client.post(
+        "/api/crons/warm1/runs",
+        json={"outcome": "success", "result": "console", "ts": fire_ms + 5000},
+    )
+    assert resp.status == 201
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    # 3 fires but the newest one collapses with the console run → 3 entries total.
+    assert len(runs) == 3, runs
+    # The real console outcome wins for the collided slot.
+    newest = max(runs, key=lambda r: r["ts"])
+    assert newest["outcome"] == "success" and newest.get("source") != "harness"
+
+
+async def test_harvest_missing_transcript_falls_back_to_lastfiredat(client, crons_file,
+                                                                    cron_runs_file, tmp_path, monkeypatch):
+    """When the transcript can't be found / yields zero fires, the single
+    lastFiredAt synthesis remains as the fallback — not an error, not empty."""
+    monkeypatch.setattr(crons_mod, "CLAUDE_PROJECTS_BASE", tmp_path / "projects")
+    _write_tasks(crons_file, {
+        "id": "fb1", "cron": "*/10 * * * *", "prompt": _WARMUP_PROMPT,
+        "recurring": True, "createdAt": 1, "lastFiredAt": 1781482020160,
+        "createdBySessionId": "no-such-session", "cwd": None,
+    })
+    runs = (await (await client.get("/api/crons/fb1/runs")).json())["runs"]
+    assert len(runs) == 1
+    assert runs[0]["outcome"] == "fired"
+    assert runs[0]["id"] == "fired-1781482020160"
+    # No transcript yields zero harvested fires → no backfill write happened.
+    assert not cron_runs_file.exists()
+
+
+async def test_harvest_scrubs_credential_text(client, crons_file, cron_runs_file,
+                                              tmp_path, monkeypatch):
+    """A fire whose assistant text contains a secret marker is scrubbed from the
+    harvested result (never surfaced)."""
+    lines = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-06-15T00:00:00.000Z", "content": _WARMUP_PROMPT},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "refreshed ~/.midway/cookie = TOPSECRET"}]}},
+    ]
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch, lines=lines)
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    assert len(runs) == 1
+    assert runs[0]["outcome"] == "fired"
+    assert "cookie" not in runs[0]["result"].lower()
+    assert "TOPSECRET" not in runs[0]["result"]
+    assert runs[0]["result"] == ""  # no safe text → honest empty fallback
+
+
+async def test_harvest_cap_at_runs_cap(client, crons_file, cron_runs_file,
+                                       tmp_path, monkeypatch):
+    """More matched fires than _RUNS_CAP → only the most-recent cap are returned."""
+    monkeypatch.setattr(crons_mod, "_RUNS_CAP", 5)
+    lines = []
+    for i in range(8):
+        lines.append({"type": "queue-operation", "operation": "enqueue",
+                      "timestamp": f"2026-06-15T00:{i:02d}:00.000Z", "content": _WARMUP_PROMPT})
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch, lines=lines)
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    assert len(runs) == 5, "capped at _RUNS_CAP"
+    # The 5 most-recent (minutes 03..07) survive; the oldest are dropped.
+    assert runs[0]["id"] == f"fired-{crons_mod._iso_to_ms('2026-06-15T00:07:00.000Z')}"
+
+
+async def test_harvest_fires_seconds_apart_all_survive(client, crons_file, cron_runs_file,
+                                                       tmp_path, monkeypatch):
+    """High-frequency fires only seconds apart (well inside _FIRE_DEDUPE_MS) are each
+    DISTINCT recoverable fires and must ALL survive — they must not collapse against
+    each other. Mirrors the real warm-up cron, whose fires occur 0-3s apart."""
+    lines = []
+    # 10 fires 2 seconds apart — every adjacent pair is inside the 60s dedupe window.
+    for i in range(10):
+        lines.append({"type": "queue-operation", "operation": "enqueue",
+                      "timestamp": f"2026-06-15T00:00:{2 * i:02d}.000Z",
+                      "content": _WARMUP_PROMPT})
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch, lines=lines)
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    assert len(runs) == 10, "one record per recoverable fire, none collapsed"
+    assert all(r["outcome"] == "fired" for r in runs)
+    # All ids are distinct fired-<ts> entries.
+    assert len({r["id"] for r in runs}) == 10
+
+
+async def test_dense_harness_fire_still_dedupes_against_console_post(
+        client, crons_file, cron_runs_file, tmp_path, monkeypatch):
+    """Even amid dense seconds-apart harness fires, a console POST coincident with
+    ONE of them still collapses against that single fire (cross-boundary dedupe is
+    preserved) without dropping the other distinct fires."""
+    lines = []
+    for i in range(5):
+        lines.append({"type": "queue-operation", "operation": "enqueue",
+                      "timestamp": f"2026-06-15T00:00:{2 * i:02d}.000Z",
+                      "content": _WARMUP_PROMPT})
+    _setup_warmup_transcript(crons_file, tmp_path, monkeypatch, lines=lines)
+    # Console POST 1s after the newest fire (00:00:08) → same fire.
+    fire_ms = crons_mod._iso_to_ms("2026-06-15T00:00:08.000Z")
+    resp = await client.post(
+        "/api/crons/warm1/runs",
+        json={"outcome": "success", "result": "console", "ts": fire_ms + 1000},
+    )
+    assert resp.status == 201
+    runs = (await (await client.get("/api/crons/warm1/runs")).json())["runs"]
+    # 5 harness fires, the newest collapses with the console POST → 5 entries.
+    assert len(runs) == 5, runs
+    newest = max(runs, key=lambda r: r["ts"])
+    assert newest["outcome"] == "success" and newest.get("source") != "harness"
+
+
+def test_enqueue_matcher_rule():
+    """Unit-level: the prompt-first-line matcher (excludes <task-notification>)."""
+    first = crons_mod._first_nonempty_line(_WARMUP_PROMPT)
+    assert first == "SLACK-WARMUP v1 (claude-web)"
+    assert crons_mod._enqueue_is_fire(_WARMUP_PROMPT, first) is True
+    assert crons_mod._enqueue_is_fire("\n\n" + _WARMUP_PROMPT, first) is True
+    assert crons_mod._enqueue_is_fire(
+        "<task-notification>" + _WARMUP_PROMPT + "</task-notification>", first) is False
+    assert crons_mod._enqueue_is_fire("OTHER JOB\nstuff", first) is False
+    assert crons_mod._enqueue_is_fire(None, first) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -2665,7 +3915,7 @@ def test_is_loopback_classification():
 
 def test_cmd_start_refuses_non_loopback_without_flag(monkeypatch):
     monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
-    args = SimpleNamespace(host="0.0.0.0", port=7780, no_browser=True, allow_remote=False)
+    args = SimpleNamespace(host="0.0.0.0", port=9000, no_browser=True, allow_remote=False)
     # Must exit(2) BEFORE importing/creating the app or calling run_app.
     with pytest.raises(SystemExit) as exc:
         cli_mod.cmd_start(args)
@@ -2677,7 +3927,7 @@ def test_cmd_start_allows_non_loopback_with_flag(monkeypatch):
     started = {}
     # Stub run_app so the test doesn't actually block on a server.
     monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
-    args = SimpleNamespace(host="0.0.0.0", port=7780, no_browser=True, allow_remote=True)
+    args = SimpleNamespace(host="0.0.0.0", port=9000, no_browser=True, allow_remote=True)
     cli_mod.cmd_start(args)
     assert started.get("host") == "0.0.0.0"
 
@@ -2686,7 +3936,7 @@ def test_cmd_start_allows_non_loopback_via_env(monkeypatch):
     monkeypatch.setenv("CLAUDE_WEB_ALLOW_REMOTE", "1")
     started = {}
     monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
-    args = SimpleNamespace(host="0.0.0.0", port=7780, no_browser=True, allow_remote=False)
+    args = SimpleNamespace(host="0.0.0.0", port=9000, no_browser=True, allow_remote=False)
     cli_mod.cmd_start(args)
     assert started.get("host") == "0.0.0.0"
 
@@ -2696,7 +3946,7 @@ def test_cmd_start_loopback_does_not_require_flag(monkeypatch):
     started = {}
     monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
     # no_browser=True so webbrowser.open isn't invoked during the test.
-    args = SimpleNamespace(host="127.0.0.1", port=7780, no_browser=True, allow_remote=False)
+    args = SimpleNamespace(host="127.0.0.1", port=9000, no_browser=True, allow_remote=False)
     cli_mod.cmd_start(args)
     assert started.get("host") == "127.0.0.1"
 
@@ -3229,638 +4479,486 @@ async def test_manager_stop_all_is_exception_safe(monkeypatch):
     assert mgr._sessions == {}        # dict cleared regardless of the exception
 
 
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# OS-cron routes (/api/oscron) — READ-ONLY mirror of crontab + systemd timers.
+# The subprocess seams (_run_crontab/_run_systemctl_*) are monkeypatched so the
+# tests never exec a real `crontab`/`systemctl`.
+# --------------------------------------------------------------------------- #
+import server.routes.oscron as oscron_mod  # noqa: E402
 
-# ── Agent-context conservative-detection + reconcile tests ──
+# A realistic crontab: a CRON_TZ line, a redirect-to-log job (with preceding
+# comments used as the description), a no-log job, and a secret-bearing job.
+_FAKE_CRONTAB = (
+    "# Black Falcon refresh — unified.\n"
+    "# Runs twice daily 3am/3pm Pacific.\n"
+    "CRON_TZ=America/Los_Angeles\n"
+    "0 3,15 * * * cd /proj && python3 refresh_cron.py "
+    ">> /proj/data/refresh-cron.log 2>&1\n"
+    "\n"
+    "30 9 * * 1 echo hello\n"
+    "# leaky\n"
+    "0 0 * * * curl --cookie ~/.midway/cookie https://example\n"
+)
 
-
-_REALISTIC_CONTEXT = """# backend-dev — project context
-- 2026-06-01: Use read_json_body for body parsing; raw request.json returns 500 on a malformed test body.
-- 2026-06-02: Run pytest with the project venv; system python lacks pytest-aiohttp in this context.
-- 2026-06-03: etag optimistic concurrency uses write_text expected_etag; conflict tests need a sleep.
-- 2026-06-04: SessionManager serializes lifecycle ops per session id via a locks dict in this context.
-- 2026-06-05: PersistentSession stop must None-guard stdin before close in the shutdown test path.
-- 2026-06-06: oscron mirrors the OS scheduler without mutating it; the test monkeypatches the subprocess seams.
-- 2026-06-07: Cron run history is reconciled server-side; the harness writes lastFiredAt on the task.
-- 2026-06-08: Slack queue split into a fast list and a per-item regenerate to fit the test timeout.
-- 2026-06-09: The slack poller starts in every test but its first wait is a long sleep, inert.
-- 2026-06-10: Pipeline crontab format uses a CRON_TZ line; the warmup marker dedupes the cron entry.
-- 2026-06-11: Skills frontmatter parser tolerates a missing tools field in the test context.
-- 2026-06-12: Memory CRUD reuses the etag conflict pattern; the conflict test asserts a 409 status.
-- 2026-06-13: Supersedes the 2026-06-08 note — the slack regenerate action reuses the read tools only, not the write tool. (correction)
-- 2026-06-14: Design doc ADR parser ignores lines before the first header in the test fixture.
-- 2026-06-15: Settings put mirrors the etag handler; the conflict response shape is error conflict.
-"""
-
-
-_TEN_DISTINCT_CONTEXT = """# backend-dev -- project context
-- 2026-06-01: In this test context, the Vite bundler drives frontend hot reload.
-- 2026-06-02: In this test context, Postgres handles database connection pooling.
-- 2026-06-03: In this test context, Midway validates the upstream cookie session.
-- 2026-06-04: In this test context, CloudWatch ingests structured logging lines.
-- 2026-06-05: In this test context, Redis caches with a sliding expiration policy.
-- 2026-06-06: In this test context, Apollo promotes deployment artifacts onward.
-- 2026-06-07: In this test context, dashboards aggregate regional latency metrics.
-- 2026-06-08: In this test context, SES batches hourly email notification delivery.
-- 2026-06-09: In this test context, OpenSearch rebuilds the nightly search index.
-- 2026-06-10: In this test context, LaunchDarkly evaluates feature flag experiments.
-- 2026-06-11: In this test context, billing webhooks reconcile payment settlement.
-- 2026-06-12: In this test context, Lambda resizes media thumbnail images lazily.
-"""
+_FAKE_SYSTEMD = json.dumps([
+    {"next": 1781558357465630, "last": 1781471957407619,
+     "unit": "backup.timer", "activates": "backup.service"},
+    {"next": None, "last": None,
+     "unit": "grub-boot-success.timer", "activates": "grub-boot-success.service"},
+])
 
 
-_REAL_CONTEXT_ROLES = ["backend-dev", "frontend-dev", "qa"]
+def _patch_oscron(monkeypatch, *, crontab=("rc", "out"), systemd=None):
+    rc, out = crontab
+
+    async def fake_crontab():
+        return (0, out) if rc == "ok" else (rc if isinstance(rc, int) else 1, out)
+
+    async def fake_user():
+        return (0, systemd) if systemd else (1, "")
+
+    async def fake_system():
+        return (1, "")
+
+    monkeypatch.setattr(oscron_mod, "_run_crontab", fake_crontab)
+    monkeypatch.setattr(oscron_mod, "_run_systemctl_user", fake_user)
+    monkeypatch.setattr(oscron_mod, "_run_systemctl_system", fake_system)
 
 
-async def _conflict_cluster_indices(client, project, name):
-    """Helper: the first detected cluster's entryIndices for `name`."""
-    clusters = (await (await client.get(
-        f"/api/projects/{project}/agents/{name}/context/conflicts")).json())["clusters"]
-    assert clusters, "expected at least one conflict cluster"
-    return clusters[0]["entryIndices"]
-
-
-def test_detect_conflicts_no_mega_cluster_on_real_file():
-    from server.routes.agents import parse_context_entries, detect_conflicts
-    entries = parse_context_entries(_REALISTIC_CONTEXT)
-    clusters = detect_conflicts(entries)
-    # No giant cluster — every emitted cluster is small (<= the size cap).
-    assert all(len(c["entryIndices"]) <= 5 for c in clusters), clusters
-    # The one genuine supersede pair (the 06-08 slack note + its 06-13 correction)
-    # surfaces as a 2-entry superseded cluster.
-    slack_pairs = [
-        c for c in clusters
-        if c["reason"] == "superseded" and 7 in c["entryIndices"] and 12 in c["entryIndices"]
-    ]
-    assert len(slack_pairs) == 1, clusters
-    assert len(slack_pairs[0]["entryIndices"]) == 2
-
-
-def test_detect_conflicts_distinct_but_related_one_shared_id_no_cluster():
-    """Two distinct decisions about the same subsystem that share a single
-    identifier (and little else) must NOT cluster — merging them would destroy
-    distinct knowledge. This is the Slack-timeline (D-010/D-014) failure mode."""
-    from server.routes.agents import parse_context_entries, detect_conflicts
-    txt = (
-        "# backend-dev -- project context\n"
-        "- 2026-06-10: Slack queue D-010: the in-process poller keeps slack_threads.json "
-        "warm via a background single-flight scan, gated on a readiness probe.\n"
-        "- 2026-06-14: Slack queue D-014: soft-dismiss flips slack_threads.json status in "
-        "place and approve forwards an expectedDraft baseline so a stale whole-file etag "
-        "still sends.\n"
-    )
-    assert detect_conflicts(parse_context_entries(txt)) == []
-
-
-def test_detect_conflicts_genuine_near_duplicate_clusters():
-    """A genuine near-duplicate pair (a high fraction of shared discriminative
-    vocabulary) clusters as one 'redundant' 2-entry group."""
-    from server.routes.agents import parse_context_entries, detect_conflicts
-    txt = (
-        "# qa -- project context\n"
-        "- 2026-06-01: Skeptic sabotage that paid off: backed up oscron.py to /tmp, broke "
-        "the croniter next-run guard, watched the test fail, restored, diff -q byte-identical.\n"
-        "- 2026-06-02: Sabotage that paid off: backed oscron.py to /tmp, broke the croniter "
-        "next-run guard, watched the test fail loud, restored, diff -q byte-identical after.\n"
-        "- 2026-06-03: Postgres handles the database connection pooling in this context.\n"
-    )
-    clusters = detect_conflicts(parse_context_entries(txt))
-    assert len(clusters) == 1, clusters
-    assert clusters[0]["reason"] == "redundant"
-    assert clusters[0]["entryIndices"] == [0, 1]
-
-
-def test_detect_conflicts_dated_supersede_labels_superseded():
-    """An explicit 'supersedes the YYYY-MM-DD note' reference links specifically to
-    the entry carrying that date (with >=1 shared discriminative token) and labels
-    the cluster 'superseded'."""
-    from server.routes.agents import parse_context_entries, detect_conflicts
-    txt = (
-        "# backend-dev -- project context\n"
-        "- 2026-06-05: Reset the module cache in an autouse fixture between tests.\n"
-        "- 2026-06-09: Frontend uses the Vite bundler for hot reload.\n"
-        "- 2026-06-13: Supersedes the 2026-06-05 note — the cache reset must use a fresh "
-        "_Cache() instance, not clear.\n"
-    )
-    clusters = detect_conflicts(parse_context_entries(txt))
-    assert len(clusters) == 1, clusters
-    assert clusters[0]["reason"] == "superseded"
-    assert clusters[0]["entryIndices"] == [0, 2]
-
-
-def test_detect_conflicts_bare_dated_supersede_no_overlap_does_not_link():
-    """A 'supersedes the YYYY-MM-DD note' marker with ZERO topic overlap must not
-    falsely bind to the dated entry — the dated-supersede rule requires at least
-    one shared discriminative token."""
-    from server.routes.agents import parse_context_entries, detect_conflicts
-    txt = (
-        "# backend-dev -- project context\n"
-        "- 2026-06-05: Postgres handles database connection pooling.\n"
-        "- 2026-06-13: Supersedes the 2026-06-05 note — actually the Vite bundler drives "
-        "frontend hot reload entirely.\n"
-    )
-    assert detect_conflicts(parse_context_entries(txt)) == []
-
-
-def test_classify_ephemeral_tags_ceremony_families():
-    from server.routes.agents import parse_context_entries, classify_ephemeral
-    txt = (
-        "# qa — project context\n"
-        "- 2026-06-01: Skeptic sabotage that PAID OFF: caught a 200 masking an empty body.\n"
-        "- 2026-06-02: LIVE in-process proof: hit the real endpoint and read it back.\n"
-        "- 2026-06-03: UNVERIFIED-by-design: browser pixel render not checked, out of scope.\n"
-        "- 2026-06-04: Scope clean: HEAD unchanged, no stray files after the run.\n"
-        "- 2026-06-05: Re-ran the full UAT regression suite 284 green, no flake.\n"
-        "- 2026-06-06: Use the project venv to run pytest; system python lacks the plugin.\n"
-    )
-    flags = classify_ephemeral(parse_context_entries(txt))
-    assert flags == [True, True, True, True, True, False]
-
-
-async def test_context_ephemeral_endpoint(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "qa")
-    _seed_context(
-        workspace, "alpha", "qa",
-        "# qa\n"
-        "- 2026-06-01: LIVE in-process proof: hit the endpoint and read it back.\n"
-        "- 2026-06-02: Use the project venv to run pytest.\n",
-    )
-    resp = await client.get("/api/projects/alpha/agents/qa/context/ephemeral")
+async def test_oscron_parses_crontab_with_tz_and_log(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=("ok", _FAKE_CRONTAB), systemd=_FAKE_SYSTEMD)
+    resp = await client.get("/api/oscron")
     assert resp.status == 200
-    data = await resp.json()
-    assert data["ephemeralIndices"] == [0]
-    assert data["entries"][0]["ephemeral"] is True
-    assert data["entries"][1]["ephemeral"] is False
+    jobs = (await resp.json())["jobs"]
+
+    cron_jobs = [j for j in jobs if j["source"] == "crontab"]
+    # The secret-bearing line must be dropped, leaving the 3am/3pm + the weekly job.
+    assert len(cron_jobs) == 2
+    refresh = next(j for j in cron_jobs if j["schedule"] == "0 3,15 * * *")
+    assert refresh["cronTz"] == "America/Los_Angeles"
+    assert refresh["logPath"] == "/proj/data/refresh-cron.log"
+    assert refresh["runHistory"] == "logs_only"
+    # First comment line is the short title; the rest forms the longer description.
+    assert refresh["title"] == "Black Falcon refresh — unified."
+    assert refresh["description"] == "Runs twice daily 3am/3pm Pacific."
+
+    weekly = next(j for j in cron_jobs if j["schedule"] == "30 9 * * 1")
+    assert weekly["logPath"] is None
+    assert weekly["runHistory"] == "none"
 
 
-async def test_reconcile_sweep_bulk_drops_only_listed(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "qa")
-    _seed_context(
-        workspace, "alpha", "qa",
-        "# qa\n"
-        "- 2026-06-01: LIVE in-process proof: A.\n"
-        "- 2026-06-02: Durable lesson worth keeping.\n"
-        "- 2026-06-03: Scope clean: HEAD unchanged after B.\n",
-    )
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
-    resp = await client.post(
-        "/api/projects/alpha/agents/qa/context/reconcile",
-        json={"action": "sweep", "entryIndices": [0, 2]},
-    )
+async def test_oscron_next_run_is_pacific_3am_3pm(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=("ok", _FAKE_CRONTAB))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    refresh = next(j for j in jobs if j.get("schedule") == "0 3,15 * * *")
+    assert refresh["nextRun"] is not None
+    assert len(refresh["nextRuns"]) == 3
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    pac = ZoneInfo("America/Los_Angeles")
+    for ms in refresh["nextRuns"]:
+        dt = datetime.fromtimestamp(ms / 1000, pac)
+        assert dt.hour in (3, 15) and dt.minute == 0
+
+
+async def test_oscron_unparseable_schedule_next_run_null(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=("ok", "bogus not a schedule at all here now\n"))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    cron_jobs = [j for j in jobs if j["source"] == "crontab"]
+    assert len(cron_jobs) == 1
+    assert cron_jobs[0]["nextRun"] is None
+    assert cron_jobs[0]["nextRuns"] == []
+
+
+async def test_oscron_empty_crontab_no_error(client, monkeypatch):
+    """`crontab -l` exiting non-zero ('no crontab for user') => empty list, no 500."""
+    _patch_oscron(monkeypatch, crontab=(1, "no crontab for user\n"))
+    resp = await client.get("/api/oscron")
     assert resp.status == 200
-    assert (await resp.json())["removed"] == 2
-    text = ctx_path.read_text(encoding="utf-8")
-    assert "Durable lesson worth keeping." in text
-    assert "LIVE in-process proof" not in text
-    assert "Scope clean" not in text
+    assert (await resp.json())["jobs"] == []
 
 
-async def test_reconcile_compact_shortens_one_entry_in_place(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+async def test_oscron_systemd_timers_mapped(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd=_FAKE_SYSTEMD)
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    sd = [j for j in jobs if j["source"] == "systemd"]
+    assert len(sd) == 2
+    backup = next(j for j in sd if j["unit"] == "backup.timer")
+    assert backup["command"] == "backup.service"
+    assert backup["nextRun"] == 1781558357465  # usec -> ms
+    assert backup["lastRun"] == 1781471957407
+    assert backup["runHistory"] == "logs_only"
+    # A timer with next:null still lists, with nextRun None.
+    grub = next(j for j in sd if j["unit"] == "grub-boot-success.timer")
+    assert grub["nextRun"] is None
 
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "compact", "entryIndices": [0], "compactText": "Use read_json_body for bodies."},
-    )
+
+async def test_oscron_bad_systemd_json_degrades(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd="}{ not json")
+    resp = await client.get("/api/oscron")
     assert resp.status == 200
-    assert (await resp.json())["removed"] == 0  # rewrite in place, nothing dropped
-    text = ctx_path.read_text(encoding="utf-8")
-    from server.routes.agents import parse_context_entries
-    entries = parse_context_entries(text)
-    assert len(entries) == 4  # no entry removed
-    assert entries[0]["text"] == "Use read_json_body for bodies."
-    assert entries[0]["date"] == "2026-06-01"  # date prefix preserved
+    assert (await resp.json())["jobs"] == []
 
 
-async def test_reconcile_compact_etag_conflict(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "compact", "entryIndices": [0], "compactText": "short", "etag": "stale-etag"},
+async def test_oscron_command_secret_never_surfaced(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=("ok", _FAKE_CRONTAB))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    for j in jobs:
+        blob = json.dumps(j).lower()
+        for marker in oscron_mod._SECRET_MARKERS:
+            assert marker not in blob, f"secret marker leaked: {marker!r}"
+
+
+async def test_oscron_secret_in_comment_not_surfaced_as_description(client, monkeypatch):
+    """A credential-bearing comment line must never reach the title or description."""
+    crontab = (
+        "# Refresh job.\n"
+        "# Runs nightly.\n"
+        "# Requires a valid Midway session at run time (~/.midway/cookie).\n"
+        "0 3 * * * /bin/run.sh >> /tmp/run.log 2>&1\n"
     )
-    assert resp.status == 409
-    body = await resp.json()
-    assert body["error"] == "conflict"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    cron = next(j for j in jobs if j["source"] == "crontab")
+    # First comment is the title; the secret-bearing comment must be scrubbed from
+    # the description, leaving only the safe remaining line.
+    assert cron["title"] == "Refresh job."
+    assert cron["description"] == "Runs nightly."
+    blob = json.dumps(cron).lower()
+    for marker in oscron_mod._SECRET_MARKERS:
+        assert marker not in blob
 
 
-async def test_reconcile_keep_superseded_keeps_newest(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "keep", "entryIndices": [1, 3]},
-    )
-    assert resp.status == 200
-    text = ctx_path.read_text(encoding="utf-8")
-    assert "fresh _Cache() instance" in text  # newest correction kept
-    assert "autouse fixture" not in text       # older superseded dropped
+async def test_oscron_log_tail_reads_redirect_log(client, monkeypatch, tmp_path):
+    log = tmp_path / "refresh-cron.log"
+    log.write_text("line one\nAuthorization: Bearer secret-token\nline three\n", encoding="utf-8")
+    crontab = f"# job\n0 3 * * * /bin/run.sh >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
 
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
 
-async def test_reconcile_keep_redundant_keeps_oldest():
-    # Plain redundancy (no supersede marker) keeps the oldest (min index).
-    from server.routes.agents import _keep_survivor, parse_context_entries
-    entries = parse_context_entries(
-        "# x\n- 2026-01-01: Frontend build uses Vite bundler tool.\n"
-        "- 2026-01-02: Frontend build uses the Vite bundler tool here.\n"
-    )
-    assert _keep_survivor({}, [0, 1], entries) == 0
-
-
-async def test_reconcile_keep_index_overrides_survivor():
-    from server.routes.agents import _keep_survivor, parse_context_entries
-    entries = parse_context_entries(_CONTEXT_SAMPLE)
-    # Explicit keepIndex wins regardless of reason.
-    assert _keep_survivor({"keepIndex": 1}, [1, 3], entries) == 1
-
-
-async def test_oversized_context_signal(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "qa")
-    big = "# qa\n" + "".join(
-        f"- 2026-06-01: Lesson number {i} about a distinct topic with enough text to add bytes here.\n"
-        for i in range(500)
-    )
-    _seed_context(workspace, "alpha", "qa", big)
-    # Panel signal.
-    data = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
-    assert data["oversized"] is True
-    # Agent list badge signal.
-    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
-    assert agents["qa"]["oversized"] is True
-
-
-async def test_small_context_not_oversized(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    data = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
-    assert data["oversized"] is False
-
-
-async def test_reconcile_success_shape_carries_etag_for_every_action(client, projects_layout):
-    """keep / merge / compact / sweep each return {ok, action, removed, etag} on
-    success — the etag the panel must adopt so a follow-up action stays guarded.
-    dismiss returns {ok, action, removed:0} (it writes no entries, so no etag)."""
-    workspace = projects_layout["workspace"]
-
-    # keep
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    body = await (await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "keep", "entryIndices": [1, 3]})).json()
-    assert body["ok"] is True and body["action"] == "keep"
-    assert body["removed"] == 1 and isinstance(body["etag"], str) and body["etag"]
-
-    # merge (re-seed: the keep above mutated the file)
-    _seed_context(workspace, "alpha", "backend-dev")
-    body = await (await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Merged note."})).json()
-    assert body["ok"] is True and body["action"] == "merge" and body["etag"]
-
-    # compact (single entry, rewrites in place; removed == 0)
-    _seed_context(workspace, "alpha", "backend-dev")
-    body = await (await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "compact", "entryIndices": [0], "compactText": "Short."})).json()
-    assert body["ok"] is True and body["action"] == "compact"
-    assert body["removed"] == 0 and body["etag"]
-
-    # sweep (bulk drop)
-    _seed_context(workspace, "alpha", "backend-dev")
-    body = await (await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "sweep", "entryIndices": [0]})).json()
-    assert body["ok"] is True and body["action"] == "sweep"
-    assert body["removed"] == 1 and body["etag"]
-
-    # dismiss writes nothing → no etag, removed 0.
-    _seed_context(workspace, "alpha", "backend-dev")
-    body = await (await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "dismiss", "entryIndices": [1, 3]})).json()
-    assert body["ok"] is True and body["action"] == "dismiss" and body["removed"] == 0
-
-
-async def test_reconcile_merge_and_compact_conflict_shape_on_stale_etag(client, projects_layout):
-    """A stale etag on merge OR compact must 409 with {error:'conflict', current,
-    etag} and write NOTHING — the exact shape the panel adopts to re-review. This
-    is the bug's heart: a 409 must be a distinguishable response, never a no-op."""
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
-    before = ctx_path.read_text(encoding="utf-8")
-
-    for payload in (
-        {"action": "merge", "entryIndices": [1, 3], "mergedText": "X", "etag": "stale"},
-        {"action": "compact", "entryIndices": [0], "compactText": "Y", "etag": "stale"},
-    ):
-        resp = await client.post(
-            "/api/projects/alpha/agents/backend-dev/context/reconcile", json=payload)
-        assert resp.status == 409, payload["action"]
-        body = await resp.json()
-        assert body["error"] == "conflict"
-        assert isinstance(body["current"], str) and isinstance(body["etag"], str) and body["etag"]
-        # Untouched: the rejected write never lands.
-        assert ctx_path.read_text(encoding="utf-8") == before, payload["action"]
-
-
-async def test_reconcile_second_click_succeeds_against_fresh_etag(client, projects_layout):
-    """End-to-end of the panel's 409 recovery: a stale-etag merge 409s and returns
-    the server's fresh etag; re-firing the SAME merge with that etag SUCCEEDS.
-    This is the 'click again to re-confirm' contract the inline banner promises."""
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
-
-    # First click: stale etag → 409 carrying the current etag.
-    first = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reconciled note.", "etag": "stale"})
-    assert first.status == 409
-    fresh_etag = (await first.json())["etag"]
-
-    # Second click: adopt the fresh etag → 200, the merge lands.
-    second = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "merge", "entryIndices": [1, 3], "mergedText": "Reconciled note.", "etag": fresh_etag})
-    assert second.status == 200
-    assert (await second.json())["ok"] is True
-    assert "Reconciled note." in ctx_path.read_text(encoding="utf-8")
-
-
-async def test_reconcile_dismiss_then_other_action_no_silent_drop(client, projects_layout):
-    """dismiss returns a clear ok shape (removed:0) AND leaves the file byte-equal,
-    so the panel's 'Keep all' is never mistaken for a silent failure."""
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
-    before = ctx_path.read_text(encoding="utf-8")
-    target = await _conflict_cluster_indices(client, "alpha", "backend-dev")
-
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "dismiss", "entryIndices": target})
+    resp = await client.get(f"/api/oscron/{job_id}/log")
     assert resp.status == 200
     body = await resp.json()
-    assert body["ok"] is True and body["removed"] == 0
-    assert ctx_path.read_text(encoding="utf-8") == before
+    assert body["path"] == str(log)
+    assert body["lines"] == ["line one", "line three"]  # secret line scrubbed out
+    assert "error" not in body
 
 
-def test_detect_conflicts_zero_on_ten_distinct_topics():
-    from server.routes.agents import parse_context_entries, detect_conflicts
-    entries = parse_context_entries(_TEN_DISTINCT_CONTEXT)
-    assert len(entries) >= 10
-    # Despite the shared ubiquitous words, no genuine near-duplicates exist -> no
-    # clusters at all. The old code returned one 12-entry mega-cluster here.
-    assert detect_conflicts(entries) == []
+async def test_oscron_log_missing_file_not_available(client, monkeypatch, tmp_path):
+    missing = tmp_path / "nope.log"
+    crontab = f"0 3 * * * /bin/run.sh >> {missing} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/log")).json()
+    assert body["lines"] == []
+    assert body["error"] == "not available"
 
 
-@pytest.mark.parametrize("role", _REAL_CONTEXT_ROLES)
-def test_detect_conflicts_no_blob_on_real_context_files(role):
-    from server.routes.agents import (
-        parse_context_entries,
-        detect_conflicts,
-        _MAX_CLUSTER_SIZE,
+async def test_oscron_log_no_logpath_not_available(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=("ok", "30 9 * * 1 echo hi\n"))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+    body = await (await client.get(f"/api/oscron/{job_id}/log")).json()
+    assert body["lines"] == []
+    assert body["error"] == "not available"
+
+
+async def test_oscron_log_unknown_id_not_available(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=(1, ""))
+    body = await (await client.get("/api/oscron/deadbeef/log")).json()
+    assert body["lines"] == []
+    assert body["error"] == "not available"
+
+
+async def test_oscron_log_tail_caps_at_max(client, monkeypatch, tmp_path):
+    log = tmp_path / "big.log"
+    log.write_text("\n".join(f"l{i}" for i in range(1000)) + "\n", encoding="utf-8")
+    crontab = f"0 3 * * * /bin/run.sh >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/log?tail=9999")).json()
+    assert len(body["lines"]) == oscron_mod._MAX_TAIL
+    assert body["truncated"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Execution-history endpoint (/api/oscron/{id}/runs) + per-run log slicing.
+# --------------------------------------------------------------------------- #
+
+# A refresh_cron.py-format log: a failed (AUTH-error) run, a succeeded run, and a
+# started-but-unfinished trailing run. The AUTH-error path embeds a secret marker
+# so we can assert it never leaks into the runs response.
+_FAKE_REFRESH_LOG = (
+    "2020-01-01 03:00:00,001 [INFO] === refresh_cron starting at 2020-01-01T03:00:00.001000+00:00 ===\n"
+    "2020-01-01 03:00:00,002 [ERROR] AUTH: No Midway cookie at /home/u/.midway/cookie. Run mwinit.\n"
+    "2020-01-01 03:05:00,001 [INFO] === refresh_cron starting at 2020-01-01T03:05:00.001000+00:00 ===\n"
+    "2020-01-01 03:05:00,010 [INFO] Claimed refresh job abc123 (trigger=cron)\n"
+    "2020-01-01 03:05:00,500 [INFO] doing work\n"
+    "2020-01-01 03:05:47,001 [INFO] Refresh job abc123 finished: state=succeeded finishedAt=2020-01-01T03:05:47.001000+00:00\n"
+    "2020-01-01 03:10:00,001 [INFO] === refresh_cron starting at 2020-01-01T03:10:00.001000+00:00 ===\n"
+    "2020-01-01 03:10:00,010 [INFO] Claimed refresh job def456 (trigger=manual)\n"
+    "2020-01-01 03:10:00,500 [INFO] still going\n"
+)
+
+
+async def test_oscron_runs_crontab_segments_with_statuses(client, monkeypatch, tmp_path):
+    log = tmp_path / "refresh-cron.log"
+    log.write_text(_FAKE_REFRESH_LOG, encoding="utf-8")
+    crontab = f"# refresh\n0 3 * * * /bin/refresh >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body["parsed"] is True
+    assert body["source"] == "crontab"
+    runs = body["runs"]
+    assert len(runs) == 3
+    # Most-recent first: the trailing unfinished run (old start) => unknown.
+    trailing, succeeded, failed = runs
+    assert trailing["status"] == "unknown"  # not recent + no finish => never "succeeded"
+    assert trailing["finishedAt"] is None
+    assert trailing["durationMs"] is None
+    assert trailing["trigger"] == "manual"
+
+    assert succeeded["status"] == "succeeded"
+    assert succeeded["trigger"] == "cron"
+    assert succeeded["durationMs"] == 47000  # 03:05:47 - 03:05:00
+    assert succeeded["startedAt"] is not None and succeeded["finishedAt"] is not None
+    assert succeeded["lineStart"] == 3 and succeeded["lineEnd"] == 6
+
+    # AUTH error before any finish => failed (never silently succeeded).
+    assert failed["status"] == "failed"
+    assert failed["lineStart"] == 1
+
+
+async def test_oscron_runs_running_when_recent(client, monkeypatch, tmp_path):
+    """A started-but-unfinished run whose start is recent => 'running' (not 'succeeded')."""
+    log = tmp_path / "run.log"
+    log.write_text(
+        "2099-01-01 03:00:00,001 [INFO] === refresh_cron starting at 2099-01-01T03:00:00+00:00 ===\n"
+        "2099-01-01 03:00:00,010 [INFO] Claimed refresh job z (trigger=cron)\n",
+        encoding="utf-8",
     )
+    crontab = f"0 3 * * * /bin/run >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
 
-    repo_root = Path(__file__).resolve().parent.parent
-    path = repo_root / ".claude" / "agent-context" / f"{role}.md"
-    if not path.is_file():
-        pytest.skip(f"{role} context file not present in this checkout")
+    # Freeze "now" just after the start so the orphan is recent.
+    monkeypatch.setattr(oscron_mod.time, "time", lambda: 4070919660.0)  # ~1min after 2099-01-01 03:00 UTC
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body["parsed"] is True
+    assert body["runs"][0]["status"] == "running"
+    assert body["runs"][0]["finishedAt"] is None
 
-    entries = parse_context_entries(path.read_text(encoding="utf-8"))
-    clusters = detect_conflicts(entries)
-    # The hard invariant: no cluster exceeds the size cap. A distinct-but-related
-    # blob would surface as a large connected component; the conservative linker
-    # plus the cap must keep every offered cluster tight (~2 entries in practice).
-    oversized = [c for c in clusters if len(c["entryIndices"]) > _MAX_CLUSTER_SIZE]
-    assert not oversized, (
-        f"{role}: detect_conflicts emitted a blob cluster (> {_MAX_CLUSTER_SIZE} "
-        f"entries) that Merge would wrongly try to fuse: {oversized}"
+
+async def test_oscron_runs_no_markers_parsed_false(client, monkeypatch, tmp_path):
+    """A log with no recognizable run-start markers => parsed:false + empty runs."""
+    log = tmp_path / "plain.log"
+    log.write_text("just some output\nno markers here\nmore lines\n", encoding="utf-8")
+    crontab = f"0 3 * * * /bin/run >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body["parsed"] is False
+    assert body["runs"] == []
+    assert body["source"] == "crontab"
+
+
+async def test_oscron_runs_no_logpath_parsed_false(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=("ok", "30 9 * * 1 echo hi\n"))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body == {"runs": [], "parsed": False, "source": "crontab"}
+
+
+async def test_oscron_runs_unknown_id_parsed_false(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=(1, ""))
+    body = await (await client.get("/api/oscron/deadbeef/runs")).json()
+    assert body["parsed"] is False
+    assert body["runs"] == []
+
+
+async def test_oscron_runs_secret_never_surfaced(client, monkeypatch, tmp_path):
+    """The AUTH-error line carries a secret marker; it must never leak into runs."""
+    log = tmp_path / "secret.log"
+    log.write_text(_FAKE_REFRESH_LOG, encoding="utf-8")
+    crontab = f"0 3 * * * /bin/run >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    blob = json.dumps(body).lower()
+    for marker in oscron_mod._SECRET_MARKERS:
+        assert marker not in blob, f"secret marker leaked into runs: {marker!r}"
+
+
+async def test_oscron_log_slice_returns_line_range(client, monkeypatch, tmp_path):
+    log = tmp_path / "refresh-cron.log"
+    log.write_text(_FAKE_REFRESH_LOG, encoding="utf-8")
+    crontab = f"0 3 * * * /bin/run >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    # The succeeded run spans lines 3..6.
+    body = await (await client.get(f"/api/oscron/{job_id}/log?lineStart=3&lineEnd=6")).json()
+    assert "error" not in body
+    assert any("Claimed refresh job abc123" in ln for ln in body["lines"])
+    assert any("finished: state=succeeded" in ln for ln in body["lines"])
+    # Lines outside the slice are absent.
+    assert not any("def456" in ln for ln in body["lines"])
+    assert body["truncated"] is False
+
+
+async def test_oscron_log_slice_scrubs_secret(client, monkeypatch, tmp_path):
+    log = tmp_path / "refresh-cron.log"
+    log.write_text(_FAKE_REFRESH_LOG, encoding="utf-8")
+    crontab = f"0 3 * * * /bin/run >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+
+    # The failed run spans lines 1..2; line 2 is the secret-bearing AUTH error.
+    body = await (await client.get(f"/api/oscron/{job_id}/log?lineStart=1&lineEnd=2")).json()
+    blob = json.dumps(body).lower()
+    for marker in oscron_mod._SECRET_MARKERS:
+        assert marker not in blob
+
+
+async def test_oscron_log_tail_unchanged_without_slice(client, monkeypatch, tmp_path):
+    """Absent lineStart/lineEnd, get_log keeps today's tail behavior."""
+    log = tmp_path / "run.log"
+    log.write_text("a\nb\nc\n", encoding="utf-8")
+    crontab = f"0 3 * * * /bin/run >> {log} 2>&1\n"
+    _patch_oscron(monkeypatch, crontab=("ok", crontab))
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "crontab")
+    body = await (await client.get(f"/api/oscron/{job_id}/log")).json()
+    assert body["lines"] == ["a", "b", "c"]
+
+
+# A journald JSON stream: a Starting/Finished pair (done => succeeded) and a
+# Starting/Finished pair (failed). __REALTIME_TIMESTAMP is usec since epoch.
+_FAKE_JOURNAL = "\n".join([
+    json.dumps({"MESSAGE": "Starting Cleanup of Temporary Directories...",
+                "__REALTIME_TIMESTAMP": "1781471957000000"}),
+    json.dumps({"MESSAGE": "Finished Cleanup of Temporary Directories.",
+                "__REALTIME_TIMESTAMP": "1781471959000000", "JOB_RESULT": "done"}),
+    json.dumps({"MESSAGE": "Starting Cleanup of Temporary Directories...",
+                "__REALTIME_TIMESTAMP": "1781475557000000"}),
+    json.dumps({"MESSAGE": "Finished Cleanup of Temporary Directories.",
+                "__REALTIME_TIMESTAMP": "1781475560000000", "JOB_RESULT": "failed"}),
+])
+
+
+def _patch_oscron_systemd_runs(monkeypatch, *, journal=None, show=None):
+    async def fake_journal_user(unit):
+        return (0, journal) if journal else (1, "")
+
+    async def fake_journal_system(unit):
+        return (0, journal) if journal else (1, "")
+
+    async def fake_show_user(unit):
+        return (0, show) if show else (1, "")
+
+    async def fake_show_system(unit):
+        return (0, show) if show else (1, "")
+
+    monkeypatch.setattr(oscron_mod, "_run_journalctl_user", fake_journal_user)
+    monkeypatch.setattr(oscron_mod, "_run_journalctl_system", fake_journal_system)
+    monkeypatch.setattr(oscron_mod, "_run_systemctl_show_user", fake_show_user)
+    monkeypatch.setattr(oscron_mod, "_run_systemctl_show_system", fake_show_system)
+
+
+async def test_oscron_runs_systemd_journald_mapping(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd=_FAKE_SYSTEMD)
+    _patch_oscron_systemd_runs(monkeypatch, journal=_FAKE_JOURNAL)
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "systemd")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body["parsed"] is True
+    assert body["source"] == "systemd"
+    runs = body["runs"]
+    assert len(runs) == 2
+    # Most-recent first: the failed run, then the succeeded one.
+    failed, succeeded = runs
+    assert failed["status"] == "failed"
+    assert succeeded["status"] == "succeeded"
+    assert succeeded["startedAt"] == 1781471957000  # usec -> ms
+    assert succeeded["finishedAt"] == 1781471959000
+    assert succeeded["durationMs"] == 2000
+
+
+async def test_oscron_runs_systemd_show_fallback(client, monkeypatch):
+    """No journald events => fall back to a single systemctl-show invocation."""
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd=_FAKE_SYSTEMD)
+    show = (
+        "ExecMainStartTimestamp=@1781471957\n"
+        "ExecMainExitTimestamp=@1781471959\n"
+        "ExecMainStatus=0\n"
+        "Result=success\n"
     )
+    _patch_oscron_systemd_runs(monkeypatch, journal=None, show=show)
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "systemd")
+
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body["parsed"] is True
+    assert len(body["runs"]) == 1
+    run = body["runs"][0]
+    assert run["status"] == "succeeded"
+    assert run["startedAt"] == 1781471957000
+    assert run["durationMs"] == 2000
 
 
-async def test_reconcile_sweep_etag_conflict(client, projects_layout):
-    """The ephemeral bulk-sweep must be etag-guarded: a stale etag yields a 409
-    with the conflict shape, never a silent destructive drop against a moved file.
-    """
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "qa")
-    _seed_context(
-        workspace, "alpha", "qa",
-        "# qa\n"
-        "- 2026-06-01: LIVE in-process proof: A.\n"
-        "- 2026-06-02: Durable lesson worth keeping.\n",
-    )
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
-    before = ctx_path.read_text(encoding="utf-8")
-    resp = await client.post(
-        "/api/projects/alpha/agents/qa/context/reconcile",
-        json={"action": "sweep", "entryIndices": [0], "etag": "stale-etag-value"},
-    )
-    assert resp.status == 409
-    body = await resp.json()
-    assert body["error"] == "conflict"
-    assert "current" in body and "etag" in body
-    # Nothing was removed -- the file is byte-identical after the rejected sweep.
-    assert ctx_path.read_text(encoding="utf-8") == before
+async def test_oscron_runs_systemd_empty_parsed_false(client, monkeypatch):
+    """No journald + no show data => parsed:false (never a fabricated run)."""
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd=_FAKE_SYSTEMD)
+    _patch_oscron_systemd_runs(monkeypatch, journal=None, show=None)
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "systemd")
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    assert body == {"runs": [], "parsed": False, "source": "systemd"}
 
 
-def test_context_summary_and_list_never_raise_on_oversized_garbage(tmp_path, monkeypatch):
-    """Defensive contract: context_summary and the agents listing must never throw,
-    so the Agents/Projects listings can't break -- on either (a) a malformed but
-    parseable oversized file (size signal still fires) or (b) a genuinely
-    unreadable (non-UTF-8) file that makes read_text raise (degrades to defaults).
-    Drives the helpers directly (no client) on an isolated tmp project.
-    """
-    import server.routes.agents as agents_mod
-    # Isolate the global agents dir so the developer's real ~/.claude/agents/ is
-    # not scanned by _list_agents during this unit-level check.
-    monkeypatch.setattr(agents_mod, "GLOBAL_AGENTS_DIR", tmp_path / "dot_claude" / "agents")
-
-    project_dir = tmp_path / "workspace" / "proj"
-    agents_d = project_dir / ".claude" / "agents"
-    ctx_d = project_dir / ".claude" / "agent-context"
-    agents_d.mkdir(parents=True)
-    ctx_d.mkdir(parents=True)
-    (agents_d / "qa.md").write_text("---\nname: qa\n---\nbody\n", encoding="utf-8")
-
-    # (a) Oversized (> ~6KB / 400 lines) AND malformed: stray headers, non-bullet
-    # lines, broken bullets -- must parse defensively, not raise, and still flag.
-    garbage = "# qa\n" + (
-        "garbled non-bullet line %s\n## stray header\n- - nested?? weird\n" % ("x" * 60)
-    ) * 200
-    (ctx_d / "qa.md").write_text(garbage, encoding="utf-8")
-    summary = agents_mod.context_summary(project_dir, "qa")  # must not raise
-    assert summary["oversized"] is True  # size signal fires even on garbage
-    recs = agents_mod._list_agents(project_dir)  # must not raise
-    qa = next(r for r in recs if r["slug"] == "qa")
-    assert qa["oversized"] is True
-
-    # (b) A non-UTF-8 (binary) context file makes filestore.read_text raise; the
-    # defensive except must swallow it and return the zeroed defaults, never throw.
-    (ctx_d / "qa.md").write_bytes(b"\xff\xfe\x00 not valid utf-8 " + b"x" * 7000)
-    summary2 = agents_mod.context_summary(project_dir, "qa")  # must not raise
-    assert summary2 == {
-        "entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0,
-        "oversized": False, "contextBytes": 0, "lineCount": 0,
-    }
-    # The listing still survives an unreadable context file (record is skipped or
-    # zeroed, but the call itself never raises).
-    agents_mod._list_agents(project_dir)
+async def test_oscron_runs_systemd_journal_secret_scrubbed(client, monkeypatch):
+    """A journald MESSAGE carrying a secret marker is dropped, never surfaced."""
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd=_FAKE_SYSTEMD)
+    journal = "\n".join([
+        json.dumps({"MESSAGE": "Starting job with ~/.midway/cookie leak",
+                    "__REALTIME_TIMESTAMP": "1781471957000000"}),
+        json.dumps({"MESSAGE": "Finished Cleanup.",
+                    "__REALTIME_TIMESTAMP": "1781471959000000", "JOB_RESULT": "done"}),
+    ])
+    _patch_oscron_systemd_runs(monkeypatch, journal=journal, show=None)
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "systemd")
+    body = await (await client.get(f"/api/oscron/{job_id}/runs")).json()
+    blob = json.dumps(body).lower()
+    for marker in oscron_mod._SECRET_MARKERS:
+        assert marker not in blob
 
 
-async def test_reconcile_merge_success_shape_has_etag_and_action(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "merge", "entryIndices": [1, 3],
-              "mergedText": "Reset the cache with a fresh _Cache() in an autouse fixture."},
-    )
-    assert resp.status == 200
-    body = await resp.json()
-    assert body["ok"] is True
-    assert body["action"] == "merge"        # action echoed back for the UI
-    assert isinstance(body["removed"], int) and body["removed"] == 1
-    assert isinstance(body["etag"], str) and body["etag"]  # non-empty fresh etag
-    # The fresh etag the UI must adopt is the file's actual current etag.
-    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
-    assert body["etag"] == after["etag"]
+async def test_oscron_log_slice_systemd_not_available(client, monkeypatch):
+    _patch_oscron(monkeypatch, crontab=(1, ""), systemd=_FAKE_SYSTEMD)
+    jobs = (await (await client.get("/api/oscron")).json())["jobs"]
+    job_id = next(j["id"] for j in jobs if j["source"] == "systemd")
+    body = await (await client.get(f"/api/oscron/{job_id}/log?lineStart=1&lineEnd=2")).json()
+    assert body["lines"] == []
+    assert body["error"] == "not available"
 
 
-async def test_reconcile_keep_success_shape_has_etag_and_action(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "keep", "entryIndices": [1, 3]},
-    )
-    assert resp.status == 200
-    body = await resp.json()
-    assert body["ok"] is True
-    assert body["action"] == "keep"
-    assert isinstance(body["removed"], int) and body["removed"] == 1
-    assert isinstance(body["etag"], str) and body["etag"]
-    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
-    assert body["etag"] == after["etag"]
-
-
-async def test_reconcile_sweep_success_shape_has_etag_and_action(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "qa")
-    _seed_context(
-        workspace, "alpha", "qa",
-        "# qa\n"
-        "- 2026-06-01: LIVE in-process proof: A.\n"
-        "- 2026-06-02: Durable lesson worth keeping.\n",
-    )
-    resp = await client.post(
-        "/api/projects/alpha/agents/qa/context/reconcile",
-        json={"action": "sweep", "entryIndices": [0]},
-    )
-    assert resp.status == 200
-    body = await resp.json()
-    assert body["ok"] is True
-    assert body["action"] == "sweep"
-    assert isinstance(body["removed"], int) and body["removed"] == 1
-    assert isinstance(body["etag"], str) and body["etag"]
-    after = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
-    assert body["etag"] == after["etag"]
-
-
-async def test_reconcile_dismiss_success_shape(client, projects_layout):
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "dismiss", "entryIndices": [1, 3]},
-    )
-    assert resp.status == 200
-    body = await resp.json()
-    # dismiss records the cluster but removes nothing and rewrites nothing, so it
-    # carries no etag -- the UI's dismiss branch must NOT try to adopt one.
-    assert body == {"ok": True, "action": "dismiss", "removed": 0}
-
-
-async def test_reconcile_merge_etag_conflict_full_shape_no_write(client, projects_layout):
-    """The exact path 'Save merged got no response' routed through: a merge with a
-    stale etag -> 409 with the FULL documented body and a byte-IDENTICAL file. The
-    body etag is the real current one (differs from the stale etag, equals a fresh
-    GET) so the panel can adopt it and a second click can succeed."""
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
-    before = ctx_path.read_text(encoding="utf-8")
-
-    stale = "stale-etag-value"
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "merge", "entryIndices": [1, 3],
-              "mergedText": "merged but stale", "etag": stale},
-    )
-    assert resp.status == 409
-    body = await resp.json()
-    # Full documented 409 contract.
-    assert body["error"] == "conflict"
-    assert isinstance(body["message"], str) and body["message"]
-    assert isinstance(body["current"], str)        # current file content for re-review
-    assert isinstance(body["etag"], str) and body["etag"]  # fresh etag to adopt
-    # The adopted etag is the REAL current etag: not the stale one, and it matches
-    # both the on-disk file and a fresh GET /context (the second-click etag source).
-    assert body["etag"] != stale
-    from server import filestore
-    assert body["etag"] == filestore.etag_for(ctx_path)
-    get = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
-    assert body["etag"] == get["etag"]
-    assert body["current"] == get["content"]
-    # No destructive write on conflict -- the file is byte-identical.
-    assert ctx_path.read_text(encoding="utf-8") == before
-
-
-async def test_reconcile_keep_etag_conflict_full_shape_no_write(client, projects_layout):
-    """Keep (drop-the-rest) is etag-guarded identically: a stale etag -> 409 with
-    the full conflict body and a byte-identical file (no silent destructive drop)."""
-    workspace = projects_layout["workspace"]
-    _seed_agent(workspace, "alpha", "backend-dev")
-    _seed_context(workspace, "alpha", "backend-dev")
-    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
-    before = ctx_path.read_text(encoding="utf-8")
-
-    stale = "stale-etag-value"
-    resp = await client.post(
-        "/api/projects/alpha/agents/backend-dev/context/reconcile",
-        json={"action": "keep", "entryIndices": [1, 3], "etag": stale},
-    )
-    assert resp.status == 409
-    body = await resp.json()
-    assert body["error"] == "conflict"
-    assert isinstance(body["message"], str) and body["message"]
-    assert isinstance(body["current"], str)
-    assert isinstance(body["etag"], str) and body["etag"]
-    assert body["etag"] != stale
-    from server import filestore
-    assert body["etag"] == filestore.etag_for(ctx_path)
-    get = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
-    assert body["etag"] == get["etag"]
-    assert body["current"] == get["content"]
-    assert ctx_path.read_text(encoding="utf-8") == before
