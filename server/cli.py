@@ -119,7 +119,7 @@ def main():
 
     # Default: start server (also runs if no subcommand given)
     start_parser = sub.add_parser("start", help="Start the web server")
-    start_parser.add_argument("--port", type=int, default=int(os.environ.get("CLAUDE_WEB_PORT", "7780")))
+    start_parser.add_argument("--port", type=int, default=int(os.environ.get("CLAUDE_WEB_PORT", "9000")))
     start_parser.add_argument("--host", default="127.0.0.1")
     start_parser.add_argument("--no-browser", action="store_true", help="Don't open browser on start")
     start_parser.add_argument(
@@ -140,7 +140,7 @@ def main():
         cmd_start(args)
     else:
         # No subcommand — default to start with defaults
-        args.port = int(os.environ.get("CLAUDE_WEB_PORT", "7780"))
+        args.port = int(os.environ.get("CLAUDE_WEB_PORT", "9000"))
         args.host = "127.0.0.1"
         args.no_browser = False
         args.allow_remote = False

@@ -26,7 +26,7 @@ A sidebar-navigated single-page app backed by a small aiohttp server. Each page 
 | **Plugins** | View installed plugins |
 | **Settings** | Inspect Claude Code settings |
 
-The server runs locally on `127.0.0.1:7780` by default and serves a pre-built React frontend — no Node.js required at runtime.
+The server runs locally on `127.0.0.1:9000` by default and serves a pre-built React frontend — no Node.js required at runtime.
 
 ---
 
@@ -50,9 +50,9 @@ The server runs locally on `127.0.0.1:7780` by default and serves a pre-built Re
 > # on the Cloud Desktop (`--no-browser` skips the no-op browser attempt; plain `claude-web` is fine too):
 > claude-web start --no-browser
 > # on your Mac (new terminal, leave running) — use YOUR desktop's hostname:
-> ssh -N -L 7780:127.0.0.1:7780 dev-dsk-<you>-....amazon.com
+> ssh -N -L 9000:127.0.0.1:9000 dev-dsk-<you>-....amazon.com
 > ```
-> Then open <http://127.0.0.1:7780> in your Mac's browser. (Find your hostname by
+> Then open <http://127.0.0.1:9000> in your Mac's browser. (Find your hostname by
 > running `hostname -f` on the Cloud Desktop.)
 >
 > The detailed steps below are only if you want to do it by hand or something
@@ -139,8 +139,8 @@ python3 -m venv .venv
 For frontend hot-reload during development, run the Vite dev server (proxies
 `/api` to the backend) alongside the backend:
 ```bash
-.venv/bin/claude-web start --no-browser   # backend on :7780
-cd frontend && npm run dev                 # frontend on :9000
+.venv/bin/claude-web start --no-browser   # backend on :9000
+cd frontend && npm run dev                 # frontend on :9001 (proxies /api to :9000)
 ```
 
 ### Run it
@@ -149,11 +149,11 @@ cd frontend && npm run dev                 # frontend on :9000
 claude-web
 ```
 
-The server starts on `http://127.0.0.1:7780` and your browser opens to it. Leave
+The server starts on `http://127.0.0.1:9000` and your browser opens to it. Leave
 the terminal running — closing it (or pressing `Ctrl-C`) stops the server.
 
 > **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
-> `127.0.0.1` there, so opening `127.0.0.1:7780` on your Mac won't reach it.
+> `127.0.0.1` there, so opening `127.0.0.1:9000` on your Mac won't reach it.
 > Instead, on the Cloud Desktop run (`--no-browser` skips the no-op browser
 > attempt on the headless host; plain `claude-web` works too):
 > ```bash
@@ -162,9 +162,9 @@ the terminal running — closing it (or pressing `Ctrl-C`) stops the server.
 > then on your Mac (new terminal, leave it running) forward the port over SSH —
 > use your own desktop's hostname (`hostname -f` shows it):
 > ```bash
-> ssh -N -L 7780:127.0.0.1:7780 dev-dsk-<you>-....amazon.com
+> ssh -N -L 9000:127.0.0.1:9000 dev-dsk-<you>-....amazon.com
 > ```
-> and open <http://127.0.0.1:7780> in your Mac's browser. More detail and
+> and open <http://127.0.0.1:9000> in your Mac's browser. More detail and
 > options in [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
 
 **Other useful commands:**
@@ -194,7 +194,7 @@ toolbox update claude-web
 | Install `curl: ... 401` | Your Midway session isn't being sent. Run `mwinit` (or `mwinit -o`), and make sure the curl includes `-b ~/.midway/cookie` and the URL ends in `?raw=1`. |
 | `AccessDenied` / registry add fails | Run `mwinit` (or `mwinit -o`) and retry. |
 | `claude-web: command not found` after install | Open a new terminal so `~/.toolbox/bin` is on your `PATH`, or run `~/.toolbox/bin/claude-web`. |
-| Browser doesn't open (remote/headless) | Use `claude-web start --no-browser`, then open `http://127.0.0.1:7780` yourself (tunnel/port-forward if remote — see [Accessing from other devices](#accessing-from-other-devices)). |
+| Browser doesn't open (remote/headless) | Use `claude-web start --no-browser`, then open `http://127.0.0.1:9000` yourself (tunnel/port-forward if remote — see [Accessing from other devices](#accessing-from-other-devices)). |
 | Pages are empty | You haven't used Claude Code yet, or your projects live somewhere other than `~/workspace/projects` — set `CLAUDE_WEB_WORKSPACE` (see [Configuration](#configuration)). |
 | Chat page errors | The `claude` binary isn't on your `PATH`. Install Claude Code (Prerequisite 4). |
 
@@ -246,7 +246,7 @@ through to the CLI.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CLAUDE_WEB_PORT` | `7780` | Server port |
+| `CLAUDE_WEB_PORT` | `9000` | Server port |
 | `CLAUDE_WEB_WORKSPACE` | `~/workspace/projects` | Where to look for projects (symlink-resolved) |
 | `CLAUDE_WEB_CONFIG` | `~/.claude-web/config.json` | Config file location |
 | `CLAUDE_WEB_CWD` | `$HOME` | Default working directory for chat |
@@ -259,7 +259,7 @@ through to the CLI.
 The server binds to `127.0.0.1` and has **no authentication** — it can read/write
 your `~/.claude` files and run shell commands. The recommended way to reach it
 from a phone or laptop is to keep it on loopback and forward the port over a
-trusted channel: expose `:7780` through a tunnel from your Cloud Desktop (e.g.
+trusted channel: expose `:9000` through a tunnel from your Cloud Desktop (e.g.
 AWS Tunnels + AEA) or an SSH port-forward, then open the tunnel URL.
 
 ### Accessing from a Mac (Cloud Desktop → laptop)
@@ -267,7 +267,7 @@ AWS Tunnels + AEA) or an SSH port-forward, then open the tunnel URL.
 This is the common setup: the console runs on your Cloud Desktop, but you want
 to use it in your Mac's browser. Because the server stays on `127.0.0.1` of the
 Cloud Desktop, you reach it with an **SSH port-forward** — a secure tunnel that
-maps a port on your Mac to `127.0.0.1:7780` on the desktop. Nothing is exposed
+maps a port on your Mac to `127.0.0.1:9000` on the desktop. Nothing is exposed
 to the network.
 
 1. **On the Cloud Desktop**, start the console. `--no-browser` skips the
@@ -281,16 +281,16 @@ to the network.
 2. **On your Mac**, open a second terminal and forward the port. Use the same
    host you normally SSH to your Cloud Desktop with:
    ```bash
-   ssh -N -L 7780:127.0.0.1:7780 <your-cloud-desktop-host>
+   ssh -N -L 9000:127.0.0.1:9000 <your-cloud-desktop-host>
    ```
    - `<your-cloud-desktop-host>` is whatever you use today, e.g.
      `dev-dsk-$USER-...amazon.com` or an alias from your `~/.ssh/config`.
    - `-N` means "just forward, don't open a shell." Leave it running while you
      use the console; press `Ctrl-C` to disconnect.
-   - If port `7780` is already taken on your Mac, map a different local port:
-     `-L 9000:127.0.0.1:7780`, then use `:9000` in step 3.
+   - If port `9000` is already taken on your Mac, map a different local port:
+     `-L 9100:127.0.0.1:9000`, then use `:9100` in step 3.
 
-3. **On your Mac**, open <http://127.0.0.1:7780> (or `:9000` if you remapped).
+3. **On your Mac**, open <http://127.0.0.1:9000> (or `:9100` if you remapped).
    You're now using the console running on your Cloud Desktop.
 
 > **Tip:** if you connect through Midway/PCSK, make sure your SSH session is

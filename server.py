@@ -36,7 +36,7 @@ def _ensure_env() -> None:
     secret = secrets.token_urlsafe(32)
     ENV_PATH.write_text(
         f"CLAUDE_WEB_SECRET={secret}\n"
-        f"CLAUDE_WEB_PORT=7780\n"
+        f"CLAUDE_WEB_PORT=9000\n"
         f"CLAUDE_WEB_CWD={Path.home()}\n",
         encoding="utf-8",
     )
@@ -275,7 +275,7 @@ def main() -> None:
     secret = os.environ.get("CLAUDE_WEB_SECRET", "")
     if not secret:
         raise SystemExit("CLAUDE_WEB_SECRET not set in .env")
-    port = int(os.environ.get("CLAUDE_WEB_PORT", "7780"))
+    port = int(os.environ.get("CLAUDE_WEB_PORT", "9000"))
     default_cwd = Path(os.environ.get("CLAUDE_WEB_CWD", str(Path.home()))).expanduser().resolve()
     app = make_app(secret, default_cwd)
     print(f"[claude-web] listening on 127.0.0.1:{port}, default cwd={default_cwd}")

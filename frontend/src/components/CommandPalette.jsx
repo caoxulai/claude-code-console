@@ -1,20 +1,24 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FiSearch, FiMessageSquare, FiBookOpen, FiZap, FiFolder, FiServer, FiClock, FiSettings, FiBarChart2, FiList, FiPackage, FiCommand } from 'react-icons/fi';
+import { FiSearch, FiMessageSquare, FiBookOpen, FiZap, FiFolder, FiServer, FiClock, FiSettings, FiBarChart2, FiList, FiPackage, FiGitBranch, FiHome, FiCheckSquare, FiUsers, FiSlack, FiCalendar } from 'react-icons/fi';
 
 const STATIC_ITEMS = [
-  { id: 'nav-dashboard', label: 'Dashboard', icon: FiBarChart2, path: '/', section: 'Pages' },
-  { id: 'nav-sessions', label: 'Sessions', icon: FiList, path: '/sessions', section: 'Pages' },
+  { id: 'nav-dashboard', label: 'Dashboard', icon: FiHome, path: '/', section: 'Pages' },
+  { id: 'nav-usage', label: 'Usage', icon: FiBarChart2, path: '/usage', section: 'Pages' },
+  { id: 'nav-slack', label: 'Slack', icon: FiSlack, path: '/slack', section: 'Pages' },
   { id: 'nav-projects', label: 'Projects', icon: FiFolder, path: '/projects', section: 'Pages' },
-  { id: 'nav-memory', label: 'Memory', icon: FiBookOpen, path: '/memory', section: 'Pages' },
+  { id: 'nav-chat', label: 'Chat', icon: FiMessageSquare, path: '/chat', section: 'Pages' },
+  { id: 'nav-sessions', label: 'Sessions', icon: FiList, path: '/sessions', section: 'Pages' },
+  { id: 'nav-tasks', label: 'Tasks', icon: FiCheckSquare, path: '/tasks', section: 'Pages' },
+  { id: 'nav-agents', label: 'Agents', icon: FiUsers, path: '/agents', section: 'Pages' },
   { id: 'nav-skills', label: 'Skills', icon: FiZap, path: '/skills', section: 'Pages' },
+  { id: 'nav-memory', label: 'Memory', icon: FiBookOpen, path: '/memory', section: 'Pages' },
+  { id: 'nav-hooks', label: 'Hooks', icon: FiGitBranch, path: '/hooks', section: 'Pages' },
   { id: 'nav-mcp', label: 'MCP Servers', icon: FiServer, path: '/mcp', section: 'Pages' },
-  { id: 'nav-hooks', label: 'Hooks', icon: FiCommand, path: '/hooks', section: 'Pages' },
-  { id: 'nav-crons', label: 'Cron Jobs', icon: FiClock, path: '/crons', section: 'Pages' },
   { id: 'nav-plugins', label: 'Plugins', icon: FiPackage, path: '/plugins', section: 'Pages' },
+  { id: 'nav-crons', label: 'Scheduled Jobs', icon: FiClock, path: '/crons', section: 'Pages' },
+  { id: 'nav-system-cron', label: 'OS Crons', icon: FiCalendar, path: '/system-cron', section: 'Pages' },
   { id: 'nav-settings', label: 'Settings', icon: FiSettings, path: '/settings', section: 'Pages' },
-  { id: 'nav-usage', label: 'Token Usage', icon: FiBarChart2, path: '/usage', section: 'Pages' },
-  { id: 'nav-chat', label: 'New Chat', icon: FiMessageSquare, path: '/chat', section: 'Pages' },
 ];
 
 function fuzzyMatch(query, text) {
