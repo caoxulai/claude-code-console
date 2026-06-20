@@ -47,7 +47,7 @@ function CopyButton({ text, title = 'Copy' }) {
   );
 }
 
-const TABS = ['Overview', 'Design', 'Agents', 'README', 'CLAUDE.md', 'Memory', 'Skills/SOPs', 'Tasks'];
+const TABS = ['Overview', 'Proposals', 'Agents', 'README', 'CLAUDE.md', 'Memory', 'Docs', 'Tasks'];
 
 // Map an ADR status to a badge class. `accepted` reads as success, `proposed`
 // as needs-attention (it's awaiting Xulai's review), `superseded` as muted.
@@ -190,11 +190,11 @@ export default function ProjectsPage() {
   const [editingMemory, setEditingMemory] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState('');
 
-  // SOP state
+  // Docs state
   const [selectedSop, setSelectedSop] = useState(null);
   const [sopContent, setSopContent] = useState('');
 
-  // Design decisions state (loaded per-project when the Design tab opens)
+  // Proposals state (loaded per-project when the Proposals tab opens)
   const [design, setDesign] = useState(null);
   const [designLoading, setDesignLoading] = useState(false);
 
@@ -281,9 +281,9 @@ export default function ProjectsPage() {
     if (project) loadProjectTasks(project);
   }, [activeTab, expandedId, projects]);
 
-  // Load the expanded project's design decisions when the Design tab is active.
+  // Load the expanded project's design decisions when the Proposals tab is active.
   useEffect(() => {
-    if (activeTab !== 'Design' || !expandedId) return;
+    if (activeTab !== 'Proposals' || !expandedId) return;
     loadProjectDesign(expandedId);
   }, [activeTab, expandedId]);
 
@@ -505,7 +505,7 @@ export default function ProjectsPage() {
     } catch { /* ignore */ }
   };
 
-  // --- SOP actions ---
+  // --- Docs actions ---
 
   const selectSopFile = async (project, filename) => {
     setSelectedSop(filename);
@@ -514,7 +514,7 @@ export default function ProjectsPage() {
       const json = await res.json();
       setSopContent(json.content);
     } catch {
-      setSopContent('Failed to load SOP file.');
+      setSopContent('Failed to load doc file.');
     }
   };
 
@@ -694,14 +694,14 @@ export default function ProjectsPage() {
               onClick={(e) => {
                 e.stopPropagation();
                 setExpandedId(project.id);
-                setActiveTab('Skills/SOPs');
+                setActiveTab('Docs');
               }}
-              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Skills/SOPs'); })}
+              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Docs'); })}
               style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
               onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
               onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
             >
-              {(project.sopFiles || []).length} {(project.sopFiles || []).length === 1 ? 'SOP' : 'SOPs'}
+              {(project.sopFiles || []).length} {(project.sopFiles || []).length === 1 ? 'doc' : 'docs'}
             </span>
           )}
           {project.taskCount > 0 && (
@@ -756,19 +756,19 @@ export default function ProjectsPage() {
             <span
               className={`badge ${project.proposedDecisionCount > 0 ? 'badge-warn' : ''}`}
               title={project.proposedDecisionCount > 0
-                ? `${project.proposedDecisionCount} design decision(s) awaiting review`
-                : 'Design decisions'}
+                ? `${project.proposedDecisionCount} proposal(s) awaiting review`
+                : 'Proposals'}
               onClick={(e) => {
                 e.stopPropagation();
                 setExpandedId(project.id);
-                setActiveTab('Design');
+                setActiveTab('Proposals');
               }}
-              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Design'); })}
+              {...clickableBadgeProps(() => { setExpandedId(project.id); setActiveTab('Proposals'); })}
               style={{ cursor: 'pointer', transition: 'opacity 0.15s' }}
               onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.7'; }}
               onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
             >
-              {project.proposedDecisionCount > 0 ? `${project.proposedDecisionCount} decisions to review` : 'design'}
+              {project.proposedDecisionCount > 0 ? `${project.proposedDecisionCount} proposals to review` : 'proposals'}
             </span>
           )}
           {project.hasSettings && (
@@ -868,13 +868,13 @@ export default function ProjectsPage() {
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Memory Files</div>
         </div>
         <div
-          onClick={() => setActiveTab('Skills/SOPs')}
+          onClick={() => setActiveTab('Docs')}
           style={statCardStyle}
           onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
           onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{(project.sopFiles || []).length}</div>
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Skills/SOPs</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Docs</div>
         </div>
         <div
           onClick={() => setActiveTab('Tasks')}
@@ -888,14 +888,14 @@ export default function ProjectsPage() {
           </div>
         </div>
         <div
-          onClick={() => setActiveTab('Design')}
+          onClick={() => setActiveTab('Proposals')}
           style={statCardStyle}
           onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
           onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.hasDesignDoc ? (project.designDecisionCount ?? '✓') : '—'}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
-            Design{project.proposedDecisionCount ? ` · ${project.proposedDecisionCount} to review` : ''}
+            Proposals{project.proposedDecisionCount ? ` · ${project.proposedDecisionCount} to review` : ''}
           </div>
         </div>
         <div
@@ -1129,9 +1129,9 @@ export default function ProjectsPage() {
     if (sopFiles.length === 0) {
       return (
         <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
-          <h3>No Skills or SOPs</h3>
+          <h3>No docs</h3>
           <p style={{ color: 'var(--muted)' }}>
-            Add .md files in agent-sops/, skills/, or docs/ to see them here.
+            Add .md files in commands/, agent-sops/, skills/, docs/, or design/ to see them here.
           </p>
         </div>
       );
@@ -1172,7 +1172,7 @@ export default function ProjectsPage() {
         <div style={{ minWidth: 0 }}>
           {!selectedSop ? (
             <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>
-              Select a skill or SOP file to view.
+              Select a doc file to view.
             </div>
           ) : (
             <div>
@@ -1193,7 +1193,7 @@ export default function ProjectsPage() {
 
   const renderDesignTab = (project) => {
     if (designLoading) {
-      return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading design decisions…</div>;
+      return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading proposals…</div>;
     }
 
     const decisions = design?.decisions || [];
@@ -1201,11 +1201,11 @@ export default function ProjectsPage() {
     if (decisions.length === 0) {
       return (
         <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
-          <h3>No design decisions</h3>
+          <h3>No proposals</h3>
           <p style={{ color: 'var(--muted)' }}>
-            Key architectural decisions for this project will appear here once a
+            Architectural proposals for this project will appear here once a
             <code style={{ margin: '0 0.3em' }}>.claude/DESIGN.md</code> exists.
-            It&apos;s an append-only ADR log — each entry records a decision, its rationale,
+            It&apos;s an append-only ADR log — each entry records a proposal, its rationale,
             and the alternatives rejected.
           </p>
         </div>
@@ -1511,12 +1511,12 @@ export default function ProjectsPage() {
       }}>
         {renderTabBar()}
         {activeTab === 'Overview' && renderOverviewTab(project)}
-        {activeTab === 'Design' && renderDesignTab(project)}
+        {activeTab === 'Proposals' && renderDesignTab(project)}
         {activeTab === 'Agents' && renderAgentsTab(project)}
         {activeTab === 'README' && renderReadmeTab(project)}
         {activeTab === 'CLAUDE.md' && renderClaudeMdTab(project)}
         {activeTab === 'Memory' && renderMemoryTab(project)}
-        {activeTab === 'Skills/SOPs' && renderSopsTab(project)}
+        {activeTab === 'Docs' && renderSopsTab(project)}
         {activeTab === 'Tasks' && renderTasksTab(project)}
       </div>
     );

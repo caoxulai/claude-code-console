@@ -471,6 +471,8 @@ def projects_layout(tmp_path: Path, monkeypatch):
     (alpha / "skills" / "s.md").write_text("skill", encoding="utf-8")
     (alpha / "docs").mkdir()
     (alpha / "docs" / "d.md").write_text("doc", encoding="utf-8")
+    (alpha / ".claude" / "design").mkdir(parents=True, exist_ok=True)
+    (alpha / ".claude" / "design" / "design-doc.md").write_text("design doc", encoding="utf-8")
     alpha_sessions = claude_base / slug_for(alpha)
     alpha_sessions.mkdir()
     _write_jsonl(alpha_sessions / "s1.jsonl", [{"type": "mode"}])
@@ -2217,7 +2219,47 @@ def test_read_project_readme_prefers_and_labels_variant(tmp_path):
 async def test_projects_sop_files_collected(client, projects_layout):
     projects = await _get_projects(client)
     names = {f["name"] for f in projects["alpha"]["sopFiles"]}
-    assert names == {"a.md", "s.md", "d.md"}
+    assert names == {"a.md", "s.md", "d.md", "design-doc.md"}
+
+
+async def test_design_dir_files_not_in_design_tab(client, projects_layout):
+    """Files in .claude/design/*.md must appear in sopFiles (Docs tab) but NOT
+    in the /design endpoint's decisions list (Proposals tab).  This confirms
+    no cross-contamination between the two concepts."""
+    workspace = projects_layout["workspace"]
+    # Ensure DESIGN.md exists with an ADR so the endpoint has real data.
+    (workspace / "alpha" / ".claude").mkdir(parents=True, exist_ok=True)
+    (workspace / "alpha" / ".claude" / "DESIGN.md").write_text(
+        _DESIGN_SAMPLE, encoding="utf-8"
+    )
+
+    # The /design endpoint returns parsed ADR decisions from DESIGN.md only.
+    resp = await client.get("/api/projects/alpha/design")
+    assert resp.status == 200
+    data = await resp.json()
+    decision_ids = [d["id"] for d in data["decisions"]]
+    # Sanity: real ADRs are present.
+    assert "D-001" in decision_ids
+    # .claude/design/design-doc.md must NOT appear as a decision.
+    decision_titles = [d["title"] for d in data["decisions"]]
+    assert "design-doc" not in " ".join(decision_titles).lower()
+    # The raw content must not include the design-doc.md content either.
+    assert "design doc" not in (data["content"] or "")
+
+    # Meanwhile, the sopFiles listing DOES include design-doc.md.
+    projects = await _get_projects(client)
+    sop_names = {f["name"] for f in projects["alpha"]["sopFiles"]}
+    assert "design-doc.md" in sop_names
+
+
+async def test_sop_endpoint_serves_design_dir_file(client, projects_layout):
+    """The /sop/{filename} route must serve .claude/design/*.md files that are
+    included in the Docs listing."""
+    resp = await client.get("/api/projects/alpha/sop/design-doc.md")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["name"] == "design-doc.md"
+    assert data["content"] == "design doc"
 
 
 async def test_projects_app_urls_from_config(client, projects_layout):
@@ -9370,7 +9412,7 @@ async def test_projects_listing_is_slim_with_description(client, projects_layout
         assert heavy not in alpha
     # Every other listing field is preserved (spot-check the name-lists + counts).
     assert {m["name"] for m in alpha["memoryFiles"]} == {"m1.md", "m2.md", "m3.md"}
-    assert {f["name"] for f in alpha["sopFiles"]} == {"a.md", "s.md", "d.md"}
+    assert {f["name"] for f in alpha["sopFiles"]} == {"a.md", "s.md", "d.md", "design-doc.md"}
     assert alpha["sessionCount"] == 2
     assert alpha["hasSettings"] is False
     # A project with neither CLAUDE.md nor README reports description = None.

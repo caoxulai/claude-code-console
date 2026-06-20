@@ -302,13 +302,15 @@ def _app_urls_for_project(project_name: str) -> list[dict]:
     return []
 
 
-def _collect_sop_files(project_path: Path) -> list[dict]:
-    """Collect SOP/skill markdown files from known directories in a project.
+def _collect_doc_files(project_path: Path) -> list[dict]:
+    """Collect document markdown files from known directories in a project.
 
     Searches (in order):
+      - <project>/.claude/commands/*.md (project-scoped commands)
       - <project>/agent-sops/*.md (and recursive subdirs)
       - <project>/skills/*.md
       - <project>/docs/*.md
+      - <project>/.claude/design/*.md (collaborative design documents)
     """
     results: list[dict] = []
     seen_paths: set[str] = set()
@@ -341,6 +343,14 @@ def _collect_sop_files(project_path: Path) -> list[dict]:
     docs_dir = project_path / "docs"
     if docs_dir.is_dir():
         for md in sorted(docs_dir.glob("*.md")):
+            if md.is_file() and str(md) not in seen_paths:
+                seen_paths.add(str(md))
+                results.append({"name": md.name, "path": str(md)})
+
+    # .claude/design/*.md — collaborative design documents (flat)
+    design_dir = project_path / ".claude" / "design"
+    if design_dir.is_dir():
+        for md in sorted(design_dir.glob("*.md")):
             if md.is_file() and str(md) not in seen_paths:
                 seen_paths.add(str(md))
                 results.append({"name": md.name, "path": str(md)})
@@ -643,8 +653,8 @@ def _compute_projects() -> list:
         #    sort/badge on recency; it doubles as the internal sort key below.
         last_mtime, last_activity = _last_activity_for_project(jsonl_files)
 
-        # g. SOP/skill files in the project directory
-        sop_files = _collect_sop_files(d)
+        # g. Doc files in the project directory
+        sop_files = _collect_doc_files(d)
 
         # h. Memory files from Claude's project memory dir
         memory_files = _collect_memory_files(session_dir)
@@ -810,8 +820,8 @@ async def get_project_sop(request: web.Request) -> web.Response:
     if not project_dir.is_dir():
         raise web.HTTPNotFound(reason="project directory not found")
 
-    # Search for the file in known SOP directories
-    sop_files = _collect_sop_files(project_dir)
+    # Search for the file in known doc directories
+    sop_files = _collect_doc_files(project_dir)
     matching = [f for f in sop_files if f["name"] == filename]
     if not matching:
         raise web.HTTPNotFound(reason="SOP file not found")
