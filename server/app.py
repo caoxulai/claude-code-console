@@ -8,7 +8,7 @@ from aiohttp import web
 
 from server.cli import resolve_permission_mode
 from server.ws import WebSocketManager
-from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents, slack
+from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents, slack, email
 
 
 def _resolve_frontend_dist() -> Path:
@@ -62,6 +62,7 @@ def create_app() -> web.Application:
     usage.register(app)
     agents.register(app)
     slack.register(app)
+    email.register(app)
 
     # Health check
     app.router.add_get("/healthz", _healthz)

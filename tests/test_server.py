@@ -4511,12 +4511,33 @@ def _reset_slack_scan_guard():
     raise ``RuntimeError: ... is bound to a different event loop``. Clearing both to
     None forces a fresh primitive in the current loop, exactly as if the server just
     started. Autouse so the startup-worker leak is neutralized for every test, not
-    just the ones that touch refresh/scan directly."""
+    just the ones that touch refresh/scan directly.
+
+    The EMAIL module's workers are now ALSO started by create_app() in every test
+    (email.register hooks on_startup), so its loop-bound primitives leak across
+    tests the same way — reset them here too (mirrors test_email.py, which already
+    resets the slack module for the symmetric reason)."""
     slack_mod._scan_in_progress_lock = None
     slack_mod._scan_wake_event = None
+    _reset_email_primitives()
     yield
     slack_mod._scan_in_progress_lock = None
     slack_mod._scan_wake_event = None
+    _reset_email_primitives()
+
+
+def _reset_email_primitives():
+    """Clear the email module's lazily-created, loop-bound asyncio primitives so a
+    primitive from one test's event loop is never reused in the next (the
+    'bound to a different event loop' RuntimeError). Guarded import: a no-op if the
+    email module isn't present."""
+    try:
+        from server.routes import email as email_mod
+    except ImportError:
+        return
+    for attr in ("_scan_in_progress_lock", "_scan_wake_event", "_mcp_connect_lock"):
+        if hasattr(email_mod, attr):
+            setattr(email_mod, attr, None)
 
 
 def _stub_agent(monkeypatch, result):

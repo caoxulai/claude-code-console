@@ -2,10 +2,11 @@ import { useCallback, useEffect, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   FiHome, FiMessageSquare, FiSettings, FiBookOpen, FiZap,
-  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiSlack, FiCalendar
+  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiSlack, FiMail, FiCalendar
 } from 'react-icons/fi';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
 import { countActionable } from '../lib/slackQueue';
+import { countActionable as countEmailActionable } from '../lib/emailQueue';
 
 const NAV_ITEMS = [
   { group: 'Overview', items: [
@@ -14,6 +15,7 @@ const NAV_ITEMS = [
   ]},
   { group: 'Connect', items: [
     { to: '/slack', icon: FiSlack, label: 'Slack' },
+    { to: '/email', icon: FiMail, label: 'Email' },
   ]},
   { group: 'Work', items: [
     { to: '/projects', icon: FiFolder, label: 'Projects' },
@@ -70,6 +72,28 @@ export default function NavBar({ onClose }) {
   useEffect(() => { refreshSlackCount(); }, [refreshSlackCount]);
   useLiveUpdates(['slack_changed', 'slack_deleted'], refreshSlackCount);
 
+  // Unreviewed-Email-items count for the sidebar bubble. Same pattern as Slack:
+  // fetch on mount, refetch on email_changed broadcast. Degrades to hidden on failure.
+  const [emailCount, setEmailCount] = useState(0);
+
+  const refreshEmailCount = useCallback(async () => {
+    try {
+      const res = await fetch('/api/email/queue');
+      if (!res.ok) { setEmailCount(0); return; }
+      const json = await res.json();
+      if (!json || json.available === false || !Array.isArray(json.items)) {
+        setEmailCount(0);
+        return;
+      }
+      setEmailCount(countEmailActionable(json.items));
+    } catch {
+      setEmailCount(0);
+    }
+  }, []);
+
+  useEffect(() => { refreshEmailCount(); }, [refreshEmailCount]);
+  useLiveUpdates(['email_changed'], refreshEmailCount);
+
   return (
     <nav className="navbar" style={{ display: 'flex', flexDirection: 'column' }}>
       <div style={{ flex: 1 }}>
@@ -92,6 +116,14 @@ export default function NavBar({ onClose }) {
                     aria-label={`${slackCount} unreviewed Slack items`}
                   >
                     {slackCount > 99 ? '99+' : slackCount}
+                  </span>
+                )}
+                {item.to === '/email' && emailCount > 0 && (
+                  <span
+                    className="nav-badge"
+                    aria-label={`${emailCount} unreviewed Email items`}
+                  >
+                    {emailCount > 99 ? '99+' : emailCount}
                   </span>
                 )}
               </NavLink>

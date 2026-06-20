@@ -26,6 +26,7 @@ const PluginsPage = lazy(() => import('./pages/PluginsPage'));
 const UsagePage = lazy(() => import('./pages/UsagePage'));
 const AgentsPage = lazy(() => import('./pages/AgentsPage'));
 const SlackPage = lazy(() => import('./pages/SlackPage'));
+const EmailPage = lazy(() => import('./pages/EmailPage'));
 
 function lazyRoute(Component) {
   return (
@@ -60,6 +61,7 @@ export const router = createBrowserRouter([
       { path: 'usage', element: lazyRoute(UsagePage) },
       { path: 'agents', element: lazyRoute(AgentsPage) },
       { path: 'slack', element: lazyRoute(SlackPage) },
+      { path: 'email', element: lazyRoute(EmailPage) },
     ],
   },
 ]);
