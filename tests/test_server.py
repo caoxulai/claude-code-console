@@ -1427,6 +1427,265 @@ async def test_context_traversal_rejected(client, projects_layout):
     assert (await client.post("/api/projects/..%2f../agents/x/context/mark-reviewed")).status == 400
 
 
+# ── T1: mark-reviewed etag guard + reconcile partial-review + oversize ack ────
+# Two "over-clearing / over-nagging" defects. These tests prove the user's INTENT
+# is satisfied (not just the literal words): mark-reviewed must NOT silently bury
+# a never-seen arrival, reconciling ONE cluster must NOT clear unrelated entries'
+# "new" flag, and an oversize badge must have a reachable resolving action.
+
+
+async def test_mark_reviewed_stale_etag_409_does_not_bury_new_entry(client, projects_layout):
+    """Defect 1a: an agent appends a brand-new entry between panel load and the
+    'Mark reviewed' click. Clicking with the STALE etag must 409 (not silently
+    mark the never-seen entry reviewed), write NO marker, and the 409 must carry
+    the fresh content + etag so the panel can reveal the arrival. After the 409
+    the new entry is STILL flagged new."""
+    import time
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    # Panel loads the context (capturing the etag the user holds).
+    loaded = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    stale_etag = loaded["etag"]
+    assert loaded["newEntryCount"] == 4
+
+    # An agent appends a brand-new entry (mtime_ns etags collide without the sleep).
+    time.sleep(0.01)
+    ctx_path.write_text(
+        ctx_path.read_text(encoding="utf-8")
+        + "- 2026-06-20: Brand new arrival the user never saw.\n",
+        encoding="utf-8",
+    )
+
+    # Mark reviewed with the STALE etag → 409, no marker written.
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/mark-reviewed",
+        json={"etag": stale_etag},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "Brand new arrival" in body["current"]
+    assert isinstance(body["etag"], str) and body["etag"]
+
+    # The arrival is STILL flagged new — it was not buried.
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert after["newEntryCount"] == 5
+    assert any("Brand new arrival" in e["text"] for e in after["entries"])
+
+
+async def test_mark_reviewed_second_click_with_fresh_etag_clears_badge(client, projects_layout):
+    """The 409 re-review contract (NOT a blind retry): after the 409 returns the
+    fresh etag, re-clicking with THAT etag clears the badge — the user saw the
+    arrival (it is in body['current']) and confirmed by clicking again."""
+    import time
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "backend-dev.md"
+
+    loaded = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    stale_etag = loaded["etag"]
+    time.sleep(0.01)
+    ctx_path.write_text(
+        ctx_path.read_text(encoding="utf-8") + "- 2026-06-20: Arrival.\n", encoding="utf-8")
+
+    first = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/mark-reviewed",
+        json={"etag": stale_etag})
+    assert first.status == 409
+    fresh_etag = (await first.json())["etag"]
+
+    second = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/mark-reviewed",
+        json={"etag": fresh_etag})
+    assert second.status == 200
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert after["newEntryCount"] == 0
+
+
+async def test_mark_reviewed_no_etag_one_click_happy_path(client, projects_layout):
+    """Happy-path friction guard: a body-less (or etag-less) POST keeps the legacy
+    one-click behavior so the unchanged-file case clears the badge in one click and
+    never demands a confirm."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    # No body at all (legacy client) → 200, badge cleared.
+    resp = await client.post("/api/projects/alpha/agents/backend-dev/context/mark-reviewed")
+    assert resp.status == 200
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert after["newEntryCount"] == 0
+
+
+async def test_reconcile_preserves_unrelated_new_entries(client, projects_layout):
+    """Defect 1b/AC5+AC6: reconciling ONE cluster must clear the badge for the
+    entries that cluster touched (the survivor stays reviewed, AC6) but must NOT
+    clear the 'new' flag on UNRELATED entries the user never reviewed (AC5)."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    # The [1,3] cache cluster is the reconcilable one. Entry 0 (read_json_body) and
+    # entry 2 (write_text etag) are unrelated and were never reviewed.
+    _seed_context(workspace, "alpha", "backend-dev")
+
+    # Nothing reviewed yet → all 4 new.
+    before = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert before["newEntryCount"] == 4
+
+    # Reconcile ONLY the [1,3] cluster (keep newest/correction).
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "keep", "entryIndices": [1, 3]})
+    assert resp.status == 200
+
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    texts = {e["index"]: e["text"] for e in after["entries"]}
+    new_texts = {texts[i] for i in after["newEntryIndices"]}
+    # AC6: the reconciled survivor (the correction) is NOT re-flagged as new.
+    assert all("_Cache()" not in t for t in new_texts), new_texts
+    # AC5: the two UNRELATED entries the user never reviewed STAY flagged new.
+    assert any("read_json_body" in t for t in new_texts), new_texts
+    assert any("expected_etag" in t for t in new_texts), new_texts
+
+
+async def test_reconcile_sweep_preserves_unrelated_new_entries(client, projects_layout):
+    """Defect 1b for the sweep action: sweeping ephemeral entries clears the badge
+    for the swept selection's context but leaves a genuinely-new durable entry the
+    user never reviewed still flagged."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_context(
+        workspace, "alpha", "qa",
+        "# qa\n"
+        "- 2026-06-01: LIVE in-process proof: A.\n"
+        "- 2026-06-02: Durable lesson the user has NOT reviewed.\n"
+        "- 2026-06-03: Scope clean: HEAD unchanged after B.\n",
+    )
+    # Sweep the two ephemeral entries (indices 0 and 2).
+    resp = await client.post(
+        "/api/projects/alpha/agents/qa/context/reconcile",
+        json={"action": "sweep", "entryIndices": [0, 2]})
+    assert resp.status == 200
+
+    after = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    new_texts = {after["entries"][i]["text"] for i in after["newEntryIndices"]}
+    # The unrelated durable entry the user never reviewed stays flagged.
+    assert any("Durable lesson the user has NOT reviewed" in t for t in new_texts), new_texts
+
+
+async def test_oversize_ack_clears_badge_when_fully_reconciled(client, projects_layout):
+    """Defect 2/AC7-AC9: an honestly-large file with NO conflicts and NO ephemeral
+    entries can be acknowledged; afterwards the badge reads informational
+    (oversizeActionable False, oversizeAcknowledged True) in BOTH the context
+    payload and the agent-list row."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    # Many distinct durable lessons (no near-duplicates, no ceremony phrases) so
+    # the file is oversized but has zero conflicts and zero ephemerals.
+    big = "# qa\n" + "".join(
+        f"- 2026-06-{(i % 28) + 1:02d}: Durable lesson {i} about subsystem {i} "
+        f"with unique vocabulary token-{i} widget-{i} gizmo-{i} that does not repeat.\n"
+        for i in range(160)
+    )
+    _seed_context(workspace, "alpha", "qa", big)
+
+    ctx = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert ctx["oversized"] is True
+    assert ctx["oversizeActionable"] is False  # nothing left to reconcile/sweep
+    assert ctx["oversizeAcknowledged"] is False
+
+    ack = await client.post("/api/projects/alpha/agents/qa/context/oversize-ack", json={})
+    assert ack.status == 200
+    assert (await ack.json())["ok"] is True
+
+    # Both the context payload AND the list row now read acknowledged.
+    ctx2 = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert ctx2["oversized"] is True
+    assert ctx2["oversizeActionable"] is False
+    assert ctx2["oversizeAcknowledged"] is True
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["qa"]["oversizeAcknowledged"] is True
+    assert agents["qa"]["oversizeActionable"] is False
+    # The single-agent GET (detail header source) carries the fields too.
+    detail = await (await client.get("/api/projects/alpha/agents/qa")).json()
+    assert detail["oversized"] is True
+    assert detail["oversizeAcknowledged"] is True
+
+
+async def test_oversize_ack_refused_when_actionable_work_remains(client, projects_layout):
+    """Defect 2/AC8 honesty gate: acknowledging is REFUSED (409) when reconciling
+    or sweeping would still shrink the file — the user can't dodge real cleanup.
+    The badge stays actionable (warn)."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    # Oversized AND has ephemeral (ceremony) entries → actionable.
+    big = "# qa\n" + "".join(
+        f"- 2026-06-{(i % 28) + 1:02d}: Durable lesson {i} with unique token-{i} text.\n"
+        for i in range(160)
+    ) + "- 2026-06-15: LIVE in-process proof: hit the endpoint and read it back.\n"
+    _seed_context(workspace, "alpha", "qa", big)
+
+    ctx = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert ctx["oversized"] is True
+    assert ctx["oversizeActionable"] is True  # an ephemeral entry remains to sweep
+
+    ack = await client.post("/api/projects/alpha/agents/qa/context/oversize-ack", json={})
+    assert ack.status == 409
+    body = await ack.json()
+    assert body["error"] == "actionable"
+    # Still flagged actionable, never acknowledged.
+    ctx2 = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert ctx2["oversizeActionable"] is True
+    assert ctx2["oversizeAcknowledged"] is False
+
+
+async def test_oversize_ack_goes_stale_on_material_growth(client, projects_layout):
+    """Defect 2/AC10 (no permanent blindfold): an acknowledgement is silenced only
+    while the file holds near the acknowledged size; once it grows materially
+    (>10%) the signal re-surfaces (oversizeAcknowledged False again)."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    base = "# qa\n" + "".join(
+        f"- 2026-06-{(i % 28) + 1:02d}: Durable lesson {i} with unique token-{i} gizmo-{i} text.\n"
+        for i in range(160)
+    )
+    _seed_context(workspace, "alpha", "qa", base)
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
+
+    ack = await client.post("/api/projects/alpha/agents/qa/context/oversize-ack", json={})
+    assert ack.status == 200
+    assert (await (await client.get("/api/projects/alpha/agents/qa/context")).json())["oversizeAcknowledged"] is True
+
+    # The agent appends a lot more durable content (well over 10% growth).
+    grow = "".join(
+        f"- 2026-07-{(i % 28) + 1:02d}: Newer durable lesson {i} with token-new-{i} text.\n"
+        for i in range(120)
+    )
+    ctx_path.write_text(base + grow, encoding="utf-8")
+
+    after = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert after["oversizeAcknowledged"] is False  # stale → re-surfaced
+
+
+async def test_oversize_ack_traversal_rejected(client, projects_layout):
+    assert (await client.post(
+        "/api/projects/alpha/agents/..%2f..%2fx/context/oversize-ack", json={})).status == 400
+    assert (await client.post(
+        "/api/projects/..%2f../agents/x/context/oversize-ack", json={})).status == 400
+
+
+async def test_oversize_ack_refused_when_not_oversized(client, projects_layout):
+    """A small file is not oversized, so there is nothing to acknowledge → 400."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")
+    resp = await client.post("/api/projects/alpha/agents/backend-dev/context/oversize-ack", json={})
+    assert resp.status == 400
+
+
 # -- T3 QA additions: gaps not covered by the parallel agent-context tests ----
 # The parallel writer covered the realistic-file (ubiquitous-words -> small caps),
 # compact, supersede-keep-newest, ephemeral classifier/endpoint, content-based
@@ -1568,7 +1827,8 @@ def test_context_summary_and_list_never_raise_on_oversized_garbage(tmp_path, mon
     summary2 = agents_mod.context_summary(project_dir, "qa")  # must not raise
     assert summary2 == {
         "entryCount": 0, "newEntryCount": 0, "conflictClusterCount": 0,
-        "oversized": False, "contextBytes": 0, "lineCount": 0,
+        "oversized": False, "oversizeActionable": False, "oversizeAcknowledged": False,
+        "contextBytes": 0, "lineCount": 0,
     }
     # The listing still survives an unreadable context file (record is skipped or
     # zeroed, but the call itself never raises).
@@ -1729,6 +1989,134 @@ async def test_reconcile_keep_etag_conflict_full_shape_no_write(client, projects
     assert body["etag"] == get["etag"]
     assert body["current"] == get["content"]
     assert ctx_path.read_text(encoding="utf-8") == before
+
+
+# -- T4 QA additions: genuine gaps the parallel T1 agent-context block missed ---
+# The parallel "T1: mark-reviewed etag guard + reconcile partial-review + oversize
+# ack" block already covers the happy/stale/second-click mark-reviewed paths, the
+# KEEP and SWEEP partial-review preservation, the oversize-ack honesty gate
+# (clears / refused-actionable / refused-not-oversized), growth-staleness, and the
+# traversal + never-500 cases. These three add the distinct properties that block
+# does NOT assert: (1) the MERGE action's partial-review (a brand-new mergedText
+# entry must end up reviewed -> no re-nag, while unrelated entries stay flagged),
+# (2) oversize-ack is PER-AGENT (acking one role never silences a sibling role),
+# and (3) the ack re-surfaces on NEW actionable work (a freshly-appended conflict
+# cluster), not only on >10% byte growth.
+
+
+async def test_reconcile_merge_preserves_unrelated_and_does_not_renag_merged(client, projects_layout):
+    """Defect 1b for MERGE (AC5 + AC6 + the over-correction trap): merging ONE
+    cluster replaces it with a brand-new mergedText entry. That merged entry was
+    never in any reviewed-hash set, yet it must end up reviewed (NOT re-flagged as
+    new -- it is the user's own just-produced action, AC6), while the UNRELATED
+    entries the user never reviewed must STAY flagged new (AC5). KEEP and SWEEP are
+    covered elsewhere; MERGE exercises the touched-entry carry-forward for a hash
+    that does not exist before the action, which neither of those does."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    # _CONTEXT_SAMPLE: idx0 read_json_body, idx1+idx3 = the [1,3] cache cluster,
+    # idx2 = write_text expected_etag (unrelated). Nothing reviewed -> all 4 new.
+    _seed_context(workspace, "alpha", "backend-dev")
+    before = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert before["newEntryCount"] == 4
+
+    merged_text = "Reset the cache with a fresh _Cache() in an autouse fixture (merged)."
+    resp = await client.post(
+        "/api/projects/alpha/agents/backend-dev/context/reconcile",
+        json={"action": "merge", "entryIndices": [1, 3], "mergedText": merged_text})
+    assert resp.status == 200
+
+    after = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    # The merge collapsed the 2-entry cluster into one -> 3 entries remain.
+    assert len(after["entries"]) == 3
+    new_texts = {after["entries"][i]["text"] for i in after["newEntryIndices"]}
+    # AC6 / over-correction: the brand-new merged entry is reviewed, NOT re-nagged.
+    assert merged_text in {e["text"] for e in after["entries"]}      # it exists
+    assert merged_text not in new_texts                              # but is not "new"
+    # AC5: the two UNRELATED never-reviewed entries STAY flagged new.
+    assert any("read_json_body" in t for t in new_texts), new_texts
+    assert any("expected_etag" in t for t in new_texts), new_texts
+
+
+async def test_oversize_ack_is_per_agent(client, projects_layout):
+    """Defect 2/AC9 (per-agent, not a global blindfold): acknowledging one role's
+    oversized file must NOT silence a sibling role's identical oversize. The ack
+    sidecar is keyed per agent (.reviewed/<name>.oversize), so role B keeps
+    nagging until B is acked independently, and the ack persists across a fresh GET."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    _seed_agent(workspace, "alpha", "backend-dev")
+    # Two honestly-large files (oversized, zero conflicts/ephemerals) for two roles.
+    big = "# {role}\n" + "".join(
+        f"- 2026-06-{(i % 28) + 1:02d}: Durable lesson {i} about subsystem {i} with "
+        f"unique vocabulary token-{i} widget-{i} gizmo-{i} that does not repeat.\n"
+        for i in range(160)
+    )
+    _seed_context(workspace, "alpha", "qa", big.format(role="qa"))
+    _seed_context(workspace, "alpha", "backend-dev", big.format(role="backend-dev"))
+
+    # Acknowledge ONLY qa.
+    ack = await client.post("/api/projects/alpha/agents/qa/context/oversize-ack", json={})
+    assert ack.status == 200
+
+    # qa reads acknowledged; backend-dev is untouched and still NOT acknowledged.
+    qa = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    bd = await (await client.get("/api/projects/alpha/agents/backend-dev/context")).json()
+    assert qa["oversizeAcknowledged"] is True
+    assert bd["oversized"] is True
+    assert bd["oversizeAcknowledged"] is False  # sibling role NOT silenced
+
+    # Persists across a fresh GET, and the list row mirrors the split.
+    qa2 = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert qa2["oversizeAcknowledged"] is True
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["qa"]["oversizeAcknowledged"] is True
+    assert agents["backend-dev"]["oversizeAcknowledged"] is False
+
+
+async def test_oversize_ack_resurfaces_on_new_conflict_cluster(client, projects_layout):
+    """Defect 2/AC10 (no permanent blindfold) via the OTHER re-surface path: the
+    growth-staleness test covers >10% byte growth; this covers NEW actionable work.
+    After acking a fully-reconciled oversized file, appending a genuine near-
+    duplicate pair (a fresh conflict cluster) makes the file actionable again, which
+    re-surfaces the warning (oversizeActionable True, oversizeAcknowledged False) --
+    'I know it's big' must not hide newly-fixable bloat."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "qa")
+    base = "# qa\n" + "".join(
+        f"- 2026-06-{(i % 28) + 1:02d}: Durable lesson {i} about subsystem {i} with "
+        f"unique vocabulary token-{i} widget-{i} gizmo-{i} that does not repeat.\n"
+        for i in range(160)
+    )
+    _seed_context(workspace, "alpha", "qa", base)
+    ctx_path = workspace / "alpha" / ".claude" / "agent-context" / "qa.md"
+
+    ack = await client.post("/api/projects/alpha/agents/qa/context/oversize-ack", json={})
+    assert ack.status == 200
+    acked = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert acked["oversizeActionable"] is False
+    assert acked["oversizeAcknowledged"] is True
+
+    # Append a genuine near-duplicate pair -> a new reconcilable conflict cluster.
+    dup = (
+        "- 2026-08-01: Skeptic sabotage that paid off: backed up oscron.py to /tmp, broke "
+        "the croniter next-run guard, watched the test fail, restored, diff -q byte-identical.\n"
+        "- 2026-08-02: Sabotage that paid off: backed oscron.py to /tmp, broke the croniter "
+        "next-run guard, watched the test fail loud, restored, diff -q byte-identical after.\n"
+    )
+    ctx_path.write_text(base + dup, encoding="utf-8")
+
+    # The fresh near-duplicate pair is a genuine reconcilable cluster.
+    clusters = (await (await client.get(
+        "/api/projects/alpha/agents/qa/context/conflicts")).json())["clusters"]
+    assert len(clusters) >= 1
+    after = await (await client.get("/api/projects/alpha/agents/qa/context")).json()
+    assert after["oversizeActionable"] is True       # new fixable work appeared
+    assert after["oversizeAcknowledged"] is False     # stale ack -> re-surfaced
+    # The list row re-surfaces the same way (badge nags again in BOTH places).
+    agents = {a["slug"]: a for a in await (await client.get("/api/projects/alpha/agents")).json()}
+    assert agents["qa"]["oversizeActionable"] is True
+    assert agents["qa"]["oversizeAcknowledged"] is False
 
 
 async def test_put_design_accepts_proposed_adr(client, projects_layout):

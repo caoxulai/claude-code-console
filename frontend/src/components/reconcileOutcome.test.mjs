@@ -111,4 +111,37 @@ test('entryKey is position-independent and trims text', () => {
   assert.equal(entryKey({ text: 'y' }), '|y');
 });
 
+// Mark-reviewed reuses the SAME decision path as reconcile (no separate helper).
+// These pin the two behaviors the panel relies on so a regression here is caught
+// without a browser: the stale-etag 409 surfaces the never-seen arrival (so the
+// SECOND click is required, never a blind retry), and the unchanged-file happy
+// path clears in one click.
+test('mark-reviewed against a stale etag (409) reveals the unseen arrival, keeps the badge', () => {
+  // Agent appended one entry between load and the click → the file moved.
+  const fresh = [...loaded, { date: '2026-06-05', text: 'arrived after load' }];
+  const r = decideReconcileOutcome({
+    httpStatus: 409,
+    body: { error: 'conflict', etag: 'mr-fresh-etag' },
+    loadedKeys,
+    freshEntries: fresh,
+  });
+  // conflict → panel shows "1 entry arrived… click again", adopts the fresh etag,
+  // and does NOT treat this as success (the new-entry signal must stay up).
+  assert.equal(r.outcome, 'conflict');
+  assert.equal(r.arrivedCount, 1);
+  assert.equal(r.nextEtag, 'mr-fresh-etag');
+  assert.equal(r.clearEditor, false);
+});
+
+test('mark-reviewed on an unchanged file (200) clears in one click', () => {
+  const r = decideReconcileOutcome({
+    httpStatus: 200,
+    body: { ok: true, reviewedCount: 2, etag: 'mr-ok-etag' },
+    loadedKeys,
+    freshEntries: loaded,
+  });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.arrivedCount, 0);
+});
+
 console.log(`\nall green: ${passed} tests passed`);

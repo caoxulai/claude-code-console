@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
-import { FiAlertTriangle, FiCheck, FiScissors, FiTrash2 } from 'react-icons/fi';
+import { FiAlertTriangle, FiCheck, FiInfo, FiScissors, FiTrash2 } from 'react-icons/fi';
 import { decideReconcileOutcome, entryKey } from './reconcileOutcome';
 
 // Self-contained append-only context + conflict-review panel for a single agent.
@@ -161,23 +161,116 @@ export default function AgentContextPanel({ projectId, slug, onChanged }) {
     }
   }, [base, context, load, loadEphemeral, mode, onChanged]);
 
-  const markReviewed = async () => {
+  // Mark-reviewed routes through the SAME etag/409 re-review contract as
+  // reconcile (see postReconcile), NOT a blind retry: if an agent appended a new
+  // entry between load and this click, the stale etag 409s, we reload to reveal
+  // the arrival, show the "N entries arrived… click again" banner, and require a
+  // SECOND deliberate click. So an entry the user never saw is never silently
+  // cleared from the "N new" signal. The unchanged-file happy path clears the
+  // badge in one click (etag matches → 200).
+  const markReviewed = useCallback(async () => {
+    const loadedKeys = new Set((context?.entries || []).map(entryKey));
     setBusy(true);
     setActionError(null);
-    let ok = false;
+    setActedKey('mark-reviewed');
+    let httpStatus = null;
+    let body = {};
     try {
-      const res = await fetch(`${base()}/mark-reviewed`, { method: 'POST' });
-      ok = res.ok;
-    } catch { /* network failure: ok stays false → error notice */ }
-    finally { setBusy(false); }
-    if (ok) {
-      setConflictArrivals(null);
-      await load();
-      onChanged?.();
-    } else {
-      setActionError('Could not reach the server — try again.');
+      try {
+        const res = await fetch(`${base()}/mark-reviewed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ etag: context?.etag }),
+        });
+        httpStatus = res.status;
+        try { body = await res.json(); } catch { body = {}; }
+      } catch { /* network failure / thrown fetch: httpStatus stays null */ }
+
+      if (httpStatus === 409) {
+        // The file moved under us — an entry arrived since we loaded. Reload so
+        // the new entry shows highlighted-new in the list and the count reflects
+        // it, adopt the fresh etag for the second click, then surface the banner.
+        let fresh = { entries: [] };
+        try {
+          const [ctxRes, confRes] = await Promise.all([fetch(base()), fetch(`${base()}/conflicts`)]);
+          fresh = await ctxRes.json();
+          setContext(() => {
+            const next = { ...fresh };
+            if (body && body.etag) next.etag = body.etag;
+            return next;
+          });
+          setConflicts((await confRes.json()).clusters || []);
+          if (mode === 'ephemeral') await loadEphemeral();
+        } catch { /* reload best-effort; the decision below still fires */ }
+        const decision = decideReconcileOutcome({
+          httpStatus, body, loadedKeys, freshEntries: fresh.entries || [],
+        });
+        setConflictArrivals(decision.arrivedCount);
+        return;
+      }
+
+      const decision = decideReconcileOutcome({ httpStatus, body, loadedKeys });
+      if (decision.outcome === 'ok') {
+        setConflictArrivals(null);
+        setActionError(null);
+        setActedKey(null);
+        await load();
+        onChanged?.();
+      } else {
+        // Non-409 failure or network throw: never a silent no-op, and the badge
+        // is NOT cleared. Show the notice and re-enable for another try.
+        setActionError('Could not reach the server — try again.');
+      }
+    } finally {
+      setBusy(false);
     }
-  };
+  }, [base, context, load, loadEphemeral, mode, onChanged]);
+
+  // Acknowledge an honestly-large (oversized but fully-reconciled) context file
+  // so its size badge stops nagging. Etag-guarded + 409 re-review like the other
+  // actions: if the file grew/changed under us the ack is refused and the panel
+  // reloads, because a newly-arrived conflict/ephemeral could make it actionable
+  // again. The backend gates the ack server-side too (it refuses when the file is
+  // still actionable). On success the list + panel refresh so both badge sites
+  // update. POST .../context/oversize-ack mirrors the existing context routes.
+  const acknowledgeOversize = useCallback(async () => {
+    setBusy(true);
+    setActionError(null);
+    setActedKey('oversize-ack');
+    let httpStatus = null;
+    try {
+      try {
+        const res = await fetch(`${base()}/oversize-ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ etag: context?.etag }),
+        });
+        httpStatus = res.status;
+        try { await res.json(); } catch { /* body unused — load() re-reads state */ }
+      } catch { /* network failure / thrown fetch: httpStatus stays null */ }
+
+      if (httpStatus === 409) {
+        // The file changed under us — reconciling/sweeping may now help again,
+        // so the ack was refused. Reload (re-reads the fresh etag + oversize
+        // fields) and surface the generic re-review banner; no blind retry.
+        setConflictArrivals(0);
+        await load();
+        if (mode === 'ephemeral') await loadEphemeral();
+        return;
+      }
+      if (typeof httpStatus === 'number' && httpStatus >= 200 && httpStatus < 300) {
+        setConflictArrivals(null);
+        setActionError(null);
+        setActedKey(null);
+        await load();
+        onChanged?.();
+      } else {
+        setActionError('Could not reach the server — try again.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [base, context, load, loadEphemeral, mode, onChanged]);
 
   // ── Derived view state (hooks must run before any early return) ────────────
   const entries = context?.entries || [];
@@ -210,6 +303,20 @@ export default function AgentContextPanel({ projectId, slug, onChanged }) {
 
   const newCount = newIndexSet ? newIndexSet.size : (context.newEntryCount || 0);
   const oversized = !!context.oversized;
+  // Oversize signal, split by the backend's honesty fields (read defensively so
+  // a not-yet-updated backend, which only sends `oversized`, degrades to the old
+  // warning-only behavior — never crashes):
+  //   - actionable: oversized AND reconciling/sweeping would shrink the file
+  //     (conflicts or ephemerals remain). A fix exists → keep the WARNING badge,
+  //     no Acknowledge button (honesty gate: push the user to reconcile/sweep).
+  //   - !actionable: honestly large, nothing left to fix → NEUTRAL informational
+  //     badge + an "Acknowledge size" button (until acknowledged).
+  // When the backend omits oversizeActionable (old build), treat oversized as
+  // actionable so we never hide a possibly-fixable oversize behind an ack.
+  const oversizeActionable = oversized && (
+    context.oversizeActionable === undefined ? true : !!context.oversizeActionable
+  );
+  const oversizeAcknowledged = !!context.oversizeAcknowledged;
   const entryByIndex = (i) => entries.find((e) => e.index === i);
 
   const segBtn = (active) => ({
@@ -232,13 +339,42 @@ export default function AgentContextPanel({ projectId, slug, onChanged }) {
         {conflicts.length > 0 && (
           <span className="badge"><FiAlertTriangle size={9} style={{ marginRight: 3 }} />{conflicts.length} to reconcile</span>
         )}
-        {oversized && (
+        {/* Oversize signal — honest about whether action would help:
+            actionable → amber warning ("reconcile/sweep would shrink this");
+            acknowledged → quiet neutral chip ("large — acknowledged");
+            honestly-large/unacknowledged → neutral info badge + Acknowledge. */}
+        {oversizeActionable ? (
           <span
             className="badge badge-warn"
-            title="This context file exceeds the size ceiling (~400 lines / ~6KB). Reconcile or sweep stale entries to keep it useful."
+            title="This context file exceeds the size ceiling (~400 lines / ~6KB) AND has conflicts or ephemeral entries left to reconcile/sweep — doing so would shrink it."
           >
             <FiAlertTriangle size={9} style={{ marginRight: 3 }} />oversized — needs reconciliation
           </span>
+        ) : oversized && oversizeAcknowledged ? (
+          <span
+            className="badge"
+            title="This file is honestly large and you've acknowledged it. It won't nag unless new conflicts or ephemeral entries appear."
+          >
+            <FiInfo size={9} style={{ marginRight: 3 }} />large — acknowledged
+          </span>
+        ) : oversized ? (
+          <span
+            className="badge"
+            title="This file is past the size ceiling but everything reconcilable has been handled — it's honestly large. Acknowledge to stop the reminder."
+          >
+            <FiInfo size={9} style={{ marginRight: 3 }} />large (reviewed)
+          </span>
+        ) : null}
+        {oversized && !oversizeActionable && !oversizeAcknowledged && (
+          <button
+            className="btn"
+            onClick={acknowledgeOversize}
+            disabled={busy}
+            title="Stop the size reminder for this honestly-large file. It will resurface if new conflicts or ephemeral entries appear."
+            style={{ fontSize: 'var(--fs-xs)' }}
+          >
+            <FiCheck size={11} style={{ marginRight: 3 }} /> Acknowledge size
+          </button>
         )}
         {newCount > 0 && (
           <button className="btn" onClick={markReviewed} disabled={busy} style={{ fontSize: 'var(--fs-xs)', marginLeft: 'auto' }}>

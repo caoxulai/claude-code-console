@@ -21,6 +21,38 @@ function stripFrontmatter(content) {
   return content.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '').trim();
 }
 
+// Decide how the oversize signal should render, from the backend fields shared
+// by both the list (/agents) and detail (/agents/{name}) responses. Returns
+// null when there's no signal at all. One code path so the list row and the
+// detail header are always consistent (no row-nags-while-header-doesn't drift).
+//
+// Honest, non-nagging semantics (design §4 / §4.4):
+//   - WARNING ('oversized'): oversized AND there's reconcilable work that would
+//     actually shrink the file (oversizeActionable) AND the user hasn't already
+//     acknowledged it. This is the only state that earns the alarm color.
+//   - NEUTRAL ('large' / 'large — acknowledged'): honestly large — nothing left
+//     to reconcile/sweep, or the user acknowledged it. Informational only; must
+//     NOT read as an alarm, so it uses the plain .badge (never badge-warn).
+//
+// Graceful degradation: when the new fields are entirely absent (an older /
+// degraded backend response), fall back to the legacy `oversized` warning so a
+// safe-default row still renders rather than silently dropping the signal.
+function oversizeBadge(item) {
+  if (!item || !item.oversized) return null;
+  const hasNewFields =
+    item.oversizeActionable !== undefined || item.oversizeAcknowledged !== undefined;
+  if (!hasNewFields) {
+    // Legacy/degraded backend: keep the prior warning behavior.
+    return { variant: 'warn', label: 'oversized' };
+  }
+  const acknowledged = !!item.oversizeAcknowledged;
+  const actionable = !!item.oversizeActionable;
+  if (actionable && !acknowledged) {
+    return { variant: 'warn', label: 'oversized' };
+  }
+  return { variant: 'info', label: acknowledged ? 'large — acknowledged' : 'large' };
+}
+
 // Per-project role agents (native .claude/agents/*.md), merged with global
 // ("universal") agents. Pick a project, list its agents, view a role's
 // definition and — via the same entry — its append-only context + review.
@@ -205,15 +237,27 @@ export default function AgentsPage() {
                       <FiAlertTriangle size={9} style={{ marginRight: 3 }} />{a.conflictClusterCount}
                     </span>
                   )}
-                  {a.oversized && (
-                    <span
-                      className="badge badge-warn"
-                      title="Context file over the size ceiling (~6KB/400 lines) — reconcile to keep it lean"
-                      style={{ flexShrink: 0, color: 'var(--warning)' }}
-                    >
-                      <FiAlertTriangle size={9} style={{ marginRight: 3 }} />oversized
-                    </span>
-                  )}
+                  {(() => {
+                    const ob = oversizeBadge(a);
+                    if (!ob) return null;
+                    return ob.variant === 'warn' ? (
+                      <span
+                        className="badge badge-warn"
+                        title="Context file over the size ceiling (~6KB/400 lines) and still has conflicts/ephemerals to reconcile — reconcile to keep it lean"
+                        style={{ flexShrink: 0 }}
+                      >
+                        <FiAlertTriangle size={9} style={{ marginRight: 3 }} />{ob.label}
+                      </span>
+                    ) : (
+                      <span
+                        className="badge"
+                        title="Context file is large but already fully reconciled (no conflicts or ephemerals left to remove) — informational only"
+                        style={{ flexShrink: 0 }}
+                      >
+                        {ob.label}
+                      </span>
+                    );
+                  })()}
                   {a.contextExists && a.newEntryCount === 0 && a.conflictClusterCount === 0 && (
                     <span className="badge" title="Append-only context entries" style={{ flexShrink: 0 }}>
                       <FiBookOpen size={9} style={{ marginRight: 3 }} />{a.contextEntryCount} {a.contextEntryCount === 1 ? 'entry' : 'entries'}
@@ -249,15 +293,28 @@ export default function AgentsPage() {
                 {detail.model && (
                   <span className="badge" title="Model"><FiCpu size={10} style={{ marginRight: 3 }} />{detail.model}</span>
                 )}
-                {detail.oversized && (
-                  <span
-                    className="badge badge-warn"
-                    title="Context file over the size ceiling (~6KB/400 lines) — reconcile to keep it lean"
-                    style={{ color: 'var(--warning)' }}
-                  >
-                    <FiAlertTriangle size={10} style={{ marginRight: 3 }} />oversized — needs reconciliation
-                  </span>
-                )}
+                {(() => {
+                  const ob = oversizeBadge(detail);
+                  if (!ob) return null;
+                  return ob.variant === 'warn' ? (
+                    <span
+                      className="badge badge-warn"
+                      title="Context file over the size ceiling (~6KB/400 lines) and still has conflicts/ephemerals to reconcile — reconcile to keep it lean"
+                    >
+                      <FiAlertTriangle size={10} style={{ marginRight: 3 }} />
+                      {ob.label === 'oversized' ? 'oversized — needs reconciliation' : ob.label}
+                    </span>
+                  ) : (
+                    <span
+                      className="badge"
+                      title="Context file is large but already fully reconciled (no conflicts or ephemerals left to remove) — informational only"
+                    >
+                      {ob.label === 'large — acknowledged'
+                        ? 'large — acknowledged'
+                        : 'large — fully reconciled'}
+                    </span>
+                  );
+                })()}
               </div>
 
               {/* Definition / Context view toggle */}
