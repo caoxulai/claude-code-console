@@ -418,3 +418,54 @@ def test_email_body_cap_32k():
         pytest.skip(
             "No explicit _EMAIL_BODY_CAP constant found — verify cap in scan logic manually"
         )
+
+
+async def test_email_queue_count_matches_actionable(client, email_file):
+    """GET /api/email/queue/count returns {count: N} == the actionable count.
+
+    Seeds a queue spanning every status (the two terminal states + several active
+    ones + a missing/empty status) and asserts the lightweight /count endpoint
+    equals the count of NON-terminal items in the full /queue response — so the
+    NavBar bubble can never drift from countEmailActionable. Terminal = approved
+    or dismissed; a missing/empty status counts.
+    """
+    _seed(email_file, [
+        _make_item("c1", status="needs-classify"),
+        _make_item("c2", status="needs-draft"),
+        _make_item("c3", status="needs-review"),
+        _make_item("c4", status="edited"),
+        _make_item("c5", status="fyi"),          # classification-as-status legacy: still active
+        _make_item("c6", status="approved"),     # terminal — excluded
+        _make_item("c7", status="dismissed"),    # terminal — excluded
+        _make_item("c8", status=""),             # empty status — counts
+    ])
+
+    # Compute the expected count straight from the full queue the UI consumes.
+    items = (await (await client.get("/api/email/queue")).json())["items"]
+    expected = sum(1 for it in items if it.get("status") not in ("approved", "dismissed"))
+    assert expected == 6  # c1..c5 + c8
+
+    resp = await client.get("/api/email/queue/count")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"count": expected}
+    assert isinstance(body["count"], int)
+    # The lightweight endpoint carries NO item payloads.
+    assert "items" not in body
+
+
+async def test_email_queue_count_empty_is_zero(client, email_file):
+    """With no sidecar at all, the count endpoint returns {count: 0} (not 500)."""
+    resp = await client.get("/api/email/queue/count")
+    assert resp.status == 200
+    assert await resp.json() == {"count": 0}
+
+
+async def test_email_queue_count_route_not_shadowed_by_item_id(client, email_file):
+    """'count' is its own route, not captured as a /queue/{item_id} (would 404)."""
+    _seed(email_file, [_make_item("count", status="needs-review")])
+    # If 'count' were captured as item_id, this would hit get_queue/save_draft
+    # handlers; instead it returns the integer count of all 1 actionable items.
+    resp = await client.get("/api/email/queue/count")
+    assert resp.status == 200
+    assert await resp.json() == {"count": 1}

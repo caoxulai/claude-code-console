@@ -236,6 +236,9 @@ def register(app: web.Application):
     # sending anything. The page surfaces this so an unavailable seam shows WHY.
     app.router.add_get("/api/slack/health", get_health)
     app.router.add_get("/api/slack/queue", get_queue)
+    # Lightweight count-only feed for the NavBar bubble (C1): returns just the
+    # actionable count so the badge never fetches the full (large) queue payload.
+    app.router.add_get("/api/slack/queue/count", get_queue_count)
     # PUT the top-level config — currently ONLY the on/off `paused` toggle (D-025).
     # Etag-guarded like the other mutators; broadcasts 'slack_changed' so an open
     # page can show/hide its "Paused" badge live.
@@ -335,8 +338,13 @@ def register(app: web.Application):
     app.on_cleanup.append(_cleanup_persistent_mcp)
 
 
-def _load() -> tuple[dict, str | None]:
-    data, etag = filestore.read_json(SLACK_PATH)
+def _normalize_loaded(data: dict) -> dict:
+    """Normalize a freshly-read sidecar dict in place and return it.
+
+    Shared by the sync ``_load`` and async ``_load_async`` so the two readers can
+    never drift: both ensure ``items`` exists and apply the D-027 in-memory fyi
+    migration identically.
+    """
     if not data:
         data = {"items": []}
     if "items" not in data:
@@ -351,7 +359,28 @@ def _load() -> tuple[dict, str | None]:
         if it.get("status") == "fyi":
             it["classification"] = "fyi"
             it["status"] = "needs-draft"
-    return data, etag
+    return data
+
+
+def _load() -> tuple[dict, str | None]:
+    """Synchronous sidecar read — for BACKGROUND tasks (watcher/workers) only.
+
+    Request-path handlers use ``_load_async`` so the blocking read never stalls
+    the event loop; this sync variant stays for the off-request-path callers.
+    """
+    data, etag = filestore.read_json(SLACK_PATH)
+    return _normalize_loaded(data), etag
+
+
+async def _load_async() -> tuple[dict, str | None]:
+    """Async sibling of ``_load`` — offloads the blocking read to a thread (B10).
+
+    Returns the same ``(data, etag)`` tuple with identical normalization (via
+    ``_normalize_loaded``). Used by REQUEST-PATH handlers so a multi-hundred-KB
+    sidecar read doesn't block the event loop. Background tasks keep ``_load``.
+    """
+    data, etag = await filestore.async_read_json(SLACK_PATH)
+    return _normalize_loaded(data), etag
 
 
 # ── MCP delegation seam ──────────────────────────────────────────────────────
@@ -1874,7 +1903,7 @@ async def get_queue(request: web.Request) -> web.Response:
     freshness. It is ``None`` (omitted) until the first scan ever completes, so the
     page degrades gracefully (no "just now" when nothing was scanned).
     """
-    data, etag = _load()
+    data, etag = await _load_async()
     return web.json_response({
         "items": data["items"],
         "etag": etag,
@@ -1883,6 +1912,28 @@ async def get_queue(request: web.Request) -> web.Response:
         # with .get(..., False), never seeded into _load's default).
         "paused": data.get("paused", False),
     })
+
+
+async def get_queue_count(request: web.Request) -> web.Response:
+    """GET just the actionable-item count — the lightweight NavBar bubble feed (C1).
+
+    Returns ``{"count": N}`` and NOTHING else: NavBar's badge needs only the number,
+    so this avoids shipping the multi-hundred-KB full queue (items carry drafts +
+    3-day history) on every mount and every 'slack_changed' WS event.
+
+    N uses the EXACT same semantics as the frontend ``countActionable``
+    (frontend/src/lib/slackQueue.js): an item COUNTS unless its ``status`` is one of
+    the two terminal states {'sent', 'dismissed'} — a missing/empty status counts.
+    It is a denylist (not an allowlist) so a new active status can never silently
+    fall out of the count and make the badge disagree with the page's "N to review".
+    Reads via ``_load_async`` so it never blocks the event loop.
+    """
+    data, _etag = await _load_async()
+    count = sum(
+        1 for it in data["items"]
+        if it.get("status") not in ("sent", "dismissed")
+    )
+    return web.json_response({"count": count})
 
 
 async def put_config(request: web.Request) -> web.Response:
@@ -1900,7 +1951,7 @@ async def put_config(request: web.Request) -> web.Response:
     if "paused" not in body:
         raise web.HTTPBadRequest(reason="paused field required")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     data["paused"] = bool(body["paused"])
 
     try:
@@ -1940,7 +1991,7 @@ async def refresh_queue(request: web.Request) -> web.Response:
     Either way we return the CURRENT warm etag so the client can re-read the
     persisted queue instantly (it always sees current state right away).
     """
-    _, etag = _load()
+    _, etag = await _load_async()
 
     # A scan already running? Dismiss the manual trigger with a clear, non-error
     # message (the guard is the single mutual-exclusion point shared with the
@@ -3209,7 +3260,7 @@ async def save_draft(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="draft field required")
     new_draft = _scrub(str(body["draft"]))[:_DRAFT_CAP]
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -3251,7 +3302,7 @@ async def dismiss_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -3293,7 +3344,7 @@ async def undismiss_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -3349,7 +3400,7 @@ async def mute_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -3385,7 +3436,7 @@ async def mute_item(request: web.Request) -> web.Response:
 
 async def get_muted(request: web.Request) -> web.Response:
     """GET the muted-threads map (D-025) for a settings/management UI."""
-    data, etag = _load()
+    data, etag = await _load_async()
     return web.json_response({"muted": data.get("mutedThreads", {}), "etag": etag})
 
 
@@ -3404,7 +3455,7 @@ async def unmute_thread(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     muted = data.get("mutedThreads") or {}
     if mute_key not in muted:
         raise web.HTTPNotFound(reason=f"mute key {mute_key} not found")
@@ -3438,7 +3489,7 @@ async def regenerate_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -3548,7 +3599,7 @@ async def approve_item(request: web.Request) -> web.Response:
     if expected_draft is None:
         expected_draft = body.get("baseText")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -3639,7 +3690,7 @@ async def approve_item(request: web.Request) -> web.Response:
     # if THIS item is now 'sent' in the fresh read, a concurrent approve beat us
     # and we must NOT mutate/re-broadcast it as a fresh send.
     if expected_draft is not None:
-        data, current_etag = _load()
+        data, current_etag = await _load_async()
         item = next((it for it in data["items"] if it.get("id") == item_id), None)
         if item is None:
             # The item vanished between send and persist — the send went out but we
@@ -3673,7 +3724,7 @@ async def approve_item(request: web.Request) -> web.Response:
             new_etag = filestore.write_json(SLACK_PATH, data, write_etag)
             break
         except filestore.ConflictError:
-            data, write_etag = _load()
+            data, write_etag = await _load_async()
             item = next((it for it in data["items"] if it.get("id") == item_id), None)
             if item is None:
                 break

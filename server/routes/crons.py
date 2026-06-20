@@ -41,6 +41,7 @@ harness files (scheduled_tasks.json, the transcript) are treated READ-only.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -659,7 +660,13 @@ async def list_runs(request: web.Request) -> web.Response:
     job = _harness_task(job_id)
     harvested: list[dict] = []
     if job is not None:
-        harvested, etag = _backfill_harness_fires(job_id, job, data, etag)
+        # _backfill_harness_fires parses a potentially multi-MB transcript and is
+        # fully synchronous — offload it to a worker thread so it never blocks the
+        # event loop (B3). Pure offload: behavior is byte-identical, and the D-017
+        # incremental backfill keeps repeat GETs cheap.
+        harvested, etag = await asyncio.to_thread(
+            _backfill_harness_fires, job_id, job, data, etag
+        )
 
     runs = list(data["runs"].get(job_id, []))
     # Merge freshly-harvested fires (they may include entries newer than what got

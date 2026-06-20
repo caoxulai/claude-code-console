@@ -1,6 +1,7 @@
 """CRUD /api/memory — manage ~/.claude/projects/.../memory/ files."""
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -90,9 +91,14 @@ def _file_meta(path: Path) -> dict:
     }
 
 
-async def list_files(request: web.Request) -> web.Response:
+def _scan_files() -> list[dict]:
+    """Glob *.md and read each file's metadata (full content + stat).
+
+    Runs the blocking filesystem work synchronously so list_files can offload
+    it to a worker thread via asyncio.to_thread, keeping the event loop free.
+    """
     if not MEMORY_DIR.is_dir():
-        return web.json_response([])
+        return []
     files = []
     for f in sorted(MEMORY_DIR.glob("*.md")):
         try:
@@ -101,6 +107,11 @@ async def list_files(request: web.Request) -> web.Response:
             # A vanished/unreadable or non-UTF-8 file must not 500 the whole
             # listing — skip it rather than fail the endpoint.
             continue
+    return files
+
+
+async def list_files(request: web.Request) -> web.Response:
+    files = await asyncio.to_thread(_scan_files)
     return web.json_response(files)
 
 

@@ -6,6 +6,7 @@ are detected via If-Match and rejected with 409.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -39,6 +40,15 @@ def read_json(path: Path) -> tuple[Any, str | None]:
         return json.loads(text), etag
     except json.JSONDecodeError:
         return {}, etag
+
+
+async def async_read_json(path: Path) -> tuple[Any, str | None]:
+    """Async sibling of read_json: offloads the blocking read to a thread.
+
+    Returns the same (parsed_json, etag) tuple. For request-path handlers that
+    must not block the event loop; background workers keep using read_json.
+    """
+    return await asyncio.to_thread(read_json, path)
 
 
 def write_text(path: Path, content: str, expected_etag: str | None = None) -> str:
@@ -90,6 +100,18 @@ def write_json(path: Path, data: Any, expected_etag: str | None = None) -> str:
     """Atomic JSON write with optional concurrency check."""
     content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     return write_text(path, content, expected_etag)
+
+
+async def async_write_json(
+    path: Path, data: Any, expected_etag: str | None = None
+) -> str:
+    """Async sibling of write_json: offloads the blocking write to a thread.
+
+    Returns the new etag and honors the same optimistic-concurrency check
+    (raises ConflictError on a stale expected_etag). For request-path handlers
+    that must not block the event loop; background workers keep using write_json.
+    """
+    return await asyncio.to_thread(write_json, path, data, expected_etag)
 
 
 def delete_file(path: Path) -> None:

@@ -130,6 +130,16 @@ async def test_chat_threads_app_permission_mode_into_get_or_create(client, tmp_p
 import server.routes.sessions as sessions_mod  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _reset_sessions_caches(monkeypatch):
+    """list_sessions/list_projects share module-level TTL caches. Reset them
+    before every test with fresh holders so one test's scan can't be served to
+    another (e.g. a populated projects scan leaking into an empty-workspace
+    test, or a stale title surviving a fixture's monkeypatched paths)."""
+    monkeypatch.setattr(sessions_mod, "_sessions_cache", sessions_mod._SessionsCache())
+    monkeypatch.setattr(sessions_mod, "_projects_cache", sessions_mod._ProjectsCache())
+
+
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     """Write a list of records as JSONL (one JSON object per line)."""
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
@@ -542,11 +552,16 @@ async def test_projects_session_and_memory_counts(client, projects_layout):
 
 
 async def test_projects_claude_md_and_settings(client, projects_layout):
+    # hasSettings still rides the listing; the full claudeMd body moved to /detail
+    # (B2) so the listing payload stays slim.
     projects = await _get_projects(client)
-    assert "The alpha project." in projects["alpha"]["claudeMd"]
     assert projects["alpha"]["hasSettings"] is False
     assert projects["beta"]["hasSettings"] is True
-    assert projects["beta"]["claudeMd"] is None
+
+    alpha_detail = await (await client.get("/api/projects/alpha/detail")).json()
+    assert "The alpha project." in alpha_detail["claudeMd"]
+    beta_detail = await (await client.get("/api/projects/beta/detail")).json()
+    assert beta_detail["claudeMd"] is None
 
 
 async def test_project_id_path_traversal_rejected(client, projects_layout):
@@ -710,6 +725,25 @@ async def test_list_agents_skips_unreadable_file(client, projects_layout):
     assert resp.status == 200
     names = {a["name"] for a in await resp.json()}
     assert "good" in names  # the readable one survives the unreadable sibling
+
+
+async def test_list_agents_keeps_conflict_cluster_count_on_list_row(client, projects_layout):
+    """B4: offloading the listing to a worker thread must NOT zero the conflict
+    signal. A seeded conflicting context (the _CONTEXT_SAMPLE dated-supersede pair)
+    yields conflictClusterCount > 0 on the LIST row, plus the other cheap counts —
+    the AgentsPage list-row badge depends on this (DEFERRED-COUNT-AS-ZERO trap)."""
+    workspace = projects_layout["workspace"]
+    _seed_agent(workspace, "alpha", "backend-dev")
+    _seed_context(workspace, "alpha", "backend-dev")  # has a real conflict cluster
+
+    resp = await client.get("/api/projects/alpha/agents")
+    assert resp.status == 200
+    agents = {a["slug"]: a for a in await resp.json()}
+    row = agents["backend-dev"]
+    assert row["conflictClusterCount"] > 0  # NOT zeroed by the off-thread offload
+    assert row["contextExists"] is True
+    assert row["contextEntryCount"] == 4
+    assert row["newEntryCount"] == 4  # never reviewed → every entry is new
 
 
 async def test_get_agent_returns_content_and_etag(client, projects_layout):
@@ -2151,16 +2185,18 @@ async def test_projects_listing_surfaces_unreviewed_entries(client, projects_lay
 
 
 async def test_projects_readme_inlined(client, projects_layout):
-    """A root README is inlined as `readme` with its filename in `readmeName`;
-    projects without one report null for both (field always present)."""
-    projects = await _get_projects(client)
+    """A root README is returned by GET /api/projects/{id}/detail as `readme`
+    with its filename in `readmeName` (B2 moved it off the listing); projects
+    without one report null for both (fields always present)."""
     # alpha has a README.md.
-    assert "How to use alpha." in projects["alpha"]["readme"]
-    assert projects["alpha"]["readmeName"] == "README.md"
+    alpha = await (await client.get("/api/projects/alpha/detail")).json()
+    assert "How to use alpha." in alpha["readme"]
+    assert alpha["readmeName"] == "README.md"
     # beta/gamma have no README — both fields present and null.
     for name in ("beta", "gamma"):
-        assert projects[name]["readme"] is None
-        assert projects[name]["readmeName"] is None
+        detail = await (await client.get(f"/api/projects/{name}/detail")).json()
+        assert detail["readme"] is None
+        assert detail["readmeName"] is None
 
 
 def test_read_project_readme_prefers_and_labels_variant(tmp_path):
@@ -2897,6 +2933,15 @@ async def test_memory_list_skips_unreadable_file(client, memory_dir):
     assert "feedback_principle_x.md" in names
 
 
+async def test_memory_list_missing_dir_returns_empty(client, monkeypatch, tmp_path):
+    """When the memory dir does not exist, the (thread-offloaded) listing
+    returns an empty list, not a 500."""
+    monkeypatch.setattr(memory_mod, "MEMORY_DIR", tmp_path / "does-not-exist")
+    resp = await client.get("/api/memory/files")
+    assert resp.status == 200
+    assert await resp.json() == []
+
+
 async def test_memory_delete_protects_index(client, memory_dir):
     # MEMORY.md is the index and must not be deletable.
     resp = await client.delete("/api/memory/files/MEMORY.md")
@@ -3135,6 +3180,29 @@ async def test_skills_put_etag_conflict(client, skills_dirs):
     (skills_dirs["skills"] / "deploy" / "SKILL.md").write_text("external\n", encoding="utf-8")
     resp = await client.put("/api/skills/deploy", json={"content": "mine", "etag": got["etag"]})
     assert resp.status == 409
+
+
+async def test_skills_list_offloads_to_thread(client, skills_dirs, monkeypatch):
+    """B7: the directory traversal + per-file reads run in a worker thread
+    (asyncio.to_thread), not on the event loop, and the response is unchanged."""
+    import asyncio as _asyncio
+
+    real_to_thread = _asyncio.to_thread
+    offloaded = []
+
+    async def _spy_to_thread(fn, *a, **kw):
+        offloaded.append(fn)
+        return await real_to_thread(fn, *a, **kw)
+
+    monkeypatch.setattr(skills_mod.asyncio, "to_thread", _spy_to_thread)
+
+    resp = await client.get("/api/skills")
+    assert resp.status == 200
+    # The synchronous scanner was dispatched off the event loop.
+    assert skills_mod._list_local_skills in offloaded
+    # Shape unchanged — both sources still present.
+    names = {s["name"] for s in await resp.json()}
+    assert {"deploy", "greet"} <= names
 
 
 # --------------------------------------------------------------------------- #
@@ -4281,6 +4349,43 @@ async def test_user_task_edit(client, tasks_layout):
     assert (await client.put("/api/tasks/user", json={"id": "user:nope", "subject": "x"})).status == 404
 
 
+async def test_user_task_create_and_update_broadcast_task_changed(client, tasks_layout, monkeypatch):
+    """Create + update each push a 'task_changed' WS event so open Tasks pages
+    refetch (C4). The callback carries no fields (useLiveUpdates calls it with no
+    args), so the payload is an empty dict; a 404 update broadcasts nothing.
+
+    Mirrors test_slack_watcher_broadcasts_on_external_change: record every
+    broadcast by monkeypatching ws_manager.broadcast.
+    """
+    events: list = []
+
+    async def record(event_type, data=None):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(client.app["ws_manager"], "broadcast", record)
+
+    # Create -> 201 and a task_changed broadcast.
+    resp = await client.post("/api/tasks/user", json={"subject": "Idea", "project": "myproj"})
+    assert resp.status == 201
+    tid = (await resp.json())["task"]["id"]
+    assert any(ev[0] == "task_changed" for ev in events), \
+        "create did not broadcast task_changed"
+
+    # Update an existing task -> 200 and another task_changed broadcast.
+    events.clear()
+    resp = await client.put("/api/tasks/user", json={"id": tid, "subject": "Renamed"})
+    assert resp.status == 200
+    assert any(ev[0] == "task_changed" for ev in events), \
+        "update did not broadcast task_changed"
+
+    # A 404 update (unknown id) must NOT broadcast -- nothing changed.
+    events.clear()
+    resp = await client.put("/api/tasks/user", json={"id": "user:nope", "subject": "x"})
+    assert resp.status == 404
+    assert not any(ev[0] == "task_changed" for ev in events), \
+        "a 404 update must not broadcast task_changed"
+
+
 # --------------------------------------------------------------------------- #
 # CLI bind safety
 #
@@ -4943,6 +5048,50 @@ async def test_slack_queue_empty_when_no_file(client, slack_file):
     assert resp.status == 200
     body = await resp.json()
     assert body["items"] == []
+
+
+async def test_slack_queue_count_no_file_is_zero(client, slack_file):
+    # No sidecar yet → empty queue → count 0 (the NavBar bubble shows nothing).
+    resp = await client.get("/api/slack/queue/count")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"count": 0}
+    assert isinstance(body["count"], int)
+
+
+async def test_slack_queue_count_matches_actionable(client, slack_file):
+    """GET /api/slack/queue/count returns {count:N} where N is the actionable count
+    with the EXACT frontend countActionable semantics (slackQueue.js): an item counts
+    unless its status is one of the two terminal states {'sent','dismissed'} — and a
+    missing/empty status COUNTS. The number must equal what the page computes from the
+    full GET /queue items, so the badge can never drift from "N to review"."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "a", "status": "needs-classify"},   # active → counts
+        {"id": "b", "status": "needs-draft"},       # active → counts
+        {"id": "c", "status": "needs-review"},      # active → counts
+        {"id": "d", "status": "edited"},            # active → counts
+        {"id": "e", "status": "fyi"},               # _load migrates → needs-draft, counts
+        {"id": "f"},                                # missing status → counts
+        {"id": "g", "status": ""},                  # empty status → counts
+        {"id": "h", "status": "sent"},              # terminal → NOT counted
+        {"id": "i", "status": "dismissed"},         # terminal → NOT counted
+    ]}), encoding="utf-8")
+
+    resp = await client.get("/api/slack/queue/count")
+    assert resp.status == 200
+    body = await resp.json()
+    assert isinstance(body["count"], int)
+    # 7 actionable (a,b,c,d,e,f,g); h (sent) + i (dismissed) excluded.
+    assert body == {"count": 7}
+    # No full payloads leak through the count endpoint — just the integer.
+    assert set(body.keys()) == {"count"}
+
+    # And it must agree with counting the live GET /queue items the same way the
+    # frontend does (status not in the terminal set), so the two can never diverge.
+    items = (await (await client.get("/api/slack/queue")).json())["items"]
+    expected = sum(1 for it in items if it.get("status") not in ("sent", "dismissed"))
+    assert body["count"] == expected
 
 
 # NOTE (D-023, in-process scan + manual-refresh trigger): the scanner is the
@@ -9149,5 +9298,204 @@ async def test_slack_scan_prunes_stale_muted_entries(
     saved = json.loads(slack_file.read_text(encoding="utf-8"))
     assert "D_stale" not in saved["mutedThreads"]   # aged out
     assert "D_fresh" in saved["mutedThreads"]        # still live
+
+
+# --- filestore async wrappers (B10) -----------------------------------------
+# async_read_json/async_write_json wrap the sync API in asyncio.to_thread so
+# request-path handlers don't block the loop. They MUST behave identically to
+# the sync versions: same (parsed, etag) tuple, same ConflictError on a stale
+# expected_etag. Background workers keep using the sync read_json/write_json.
+
+async def test_async_write_then_read_json_round_trips(tmp_path):
+    from server import filestore
+
+    path = tmp_path / "store.json"
+    payload = {"items": [1, 2, 3], "name": "café"}  # non-ASCII: ensure_ascii=False
+
+    etag = await filestore.async_write_json(path, payload)
+    assert etag  # a non-empty mtime-based etag
+
+    parsed, read_etag = await filestore.async_read_json(path)
+    assert parsed == payload
+    assert read_etag == etag
+    # Async and sync read agree on the same file.
+    assert filestore.read_json(path) == (parsed, read_etag)
+
+
+async def test_async_read_json_missing_file_is_empty(tmp_path):
+    from server import filestore
+
+    parsed, etag = await filestore.async_read_json(tmp_path / "nope.json")
+    assert parsed == {}
+    assert etag is None
+
+
+async def test_async_write_json_honors_etag_conflict(tmp_path):
+    from server import filestore
+
+    path = tmp_path / "store.json"
+    await filestore.async_write_json(path, {"v": 1})
+    stale_etag = (await filestore.async_read_json(path))[1]
+
+    # An out-of-band write moves the etag (mtime_ns); sleep so it actually changes.
+    _time.sleep(0.01)
+    await filestore.async_write_json(path, {"v": 2})
+
+    # Writing with the now-stale etag is rejected, same as the sync path.
+    with pytest.raises(filestore.ConflictError):
+        await filestore.async_write_json(path, {"v": 3}, stale_etag)
+
+    # The conflicting write did NOT land; the prior value is intact.
+    parsed, _ = await filestore.async_read_json(path)
+    assert parsed == {"v": 2}
+
+
+# --------------------------------------------------------------------------- #
+# B1+B2: sessions/projects offload+cache, head+tail title read, listing/detail
+# split. Appended at EOF (shared-file region) to avoid colliding with the
+# in-flight edits to the two named projects tests above.
+# --------------------------------------------------------------------------- #
+
+
+async def test_projects_listing_is_slim_with_description(client, projects_layout):
+    """B2: the listing carries a one-line `description` and NO full markdown
+    bodies. alpha's CLAUDE.md first prose line is the description; the heavy
+    claudeMd/readme/readmeName keys must be absent from the listing."""
+    projects = await _get_projects(client)
+    alpha = projects["alpha"]
+    # description = first non-empty, non-heading line of CLAUDE.md.
+    assert alpha["description"] == "The alpha project."
+    # The large bodies must NOT ride the listing anymore.
+    for heavy in ("claudeMd", "readme", "readmeName"):
+        assert heavy not in alpha
+    # Every other listing field is preserved (spot-check the name-lists + counts).
+    assert {m["name"] for m in alpha["memoryFiles"]} == {"m1.md", "m2.md", "m3.md"}
+    assert {f["name"] for f in alpha["sopFiles"]} == {"a.md", "s.md", "d.md"}
+    assert alpha["sessionCount"] == 2
+    assert alpha["hasSettings"] is False
+    # A project with neither CLAUDE.md nor README reports description = None.
+    assert projects["gamma"]["description"] is None
+
+
+def test_first_prose_line_skips_headings_and_caps_length(tmp_path):
+    """_first_prose_line returns the first non-empty, non-heading line, trimmed
+    to 200 chars; None when nothing qualifies."""
+    assert sessions_mod._first_prose_line(None) is None
+    assert sessions_mod._first_prose_line("") is None
+    assert sessions_mod._first_prose_line("# Title only\n\n## Subhead") is None
+    assert sessions_mod._first_prose_line("# Title\n\n  Real line.  \n") == "Real line."
+    long = "x" * 500
+    assert sessions_mod._first_prose_line(long) == "x" * 200
+    # CLAUDE.md wins over README when both have prose.
+    assert sessions_mod._project_description("# C\n\nfrom claude", "# R\n\nfrom readme") == "from claude"
+    assert sessions_mod._project_description("# C\n\n# only heading", "# R\n\nfrom readme") == "from readme"
+
+
+async def test_project_detail_returns_full_bodies(client, projects_layout):
+    """B2: GET /api/projects/{id}/detail returns the full claudeMd/readme/
+    readmeName bodies that were removed from the listing."""
+    detail = await (await client.get("/api/projects/alpha/detail")).json()
+    assert detail["id"] == "alpha"
+    assert "The alpha project." in detail["claudeMd"]
+    assert "How to use alpha." in detail["readme"]
+    assert detail["readmeName"] == "README.md"
+
+
+async def test_project_detail_404_for_unknown(client, projects_layout):
+    resp = await client.get("/api/projects/does-not-exist/detail")
+    assert resp.status == 404
+
+
+async def test_project_detail_traversal_rejected(client, projects_layout):
+    """The /detail endpoint shares the _validate_project_id guard — a URL-encoded
+    ..%2f.. project_id must 400, never escaping WORKSPACE_DIR to read an arbitrary
+    CLAUDE.md/README."""
+    resp = await client.get("/api/projects/..%2f../detail")
+    assert resp.status == 400
+
+
+async def test_projects_listing_second_call_is_cached(client, projects_layout):
+    """B2: a warm second /api/projects call is served from the TTL cache — proven
+    by deleting alpha after the first call; the cached response still lists it."""
+    first = await _get_projects(client)
+    assert "alpha" in first
+    # Remove alpha from the workspace; within the TTL the cache still serves it.
+    import shutil
+    shutil.rmtree(projects_layout["workspace"] / "alpha")
+    second = await _get_projects(client)
+    assert "alpha" in second  # served from cache, not a fresh re-walk
+
+
+async def test_sessions_listing_second_call_is_cached(client, projects_base):
+    """B1: a warm second /api/sessions call is served from the per-key TTL cache —
+    proven by deleting a session after the first call; the cached page still has it."""
+    first = await (await client.get("/api/sessions")).json()
+    ids = {s["id"] for s in first["sessions"]}
+    assert "interactive" in ids
+    # Delete the file out-of-band; within the TTL the cached page still lists it.
+    home_dir = projects_base / _slug_from_default(client)
+    (home_dir / "interactive.jsonl").unlink()
+    second = await (await client.get("/api/sessions")).json()
+    assert {s["id"] for s in second["sessions"]} == ids  # served from cache
+
+
+async def test_extract_title_head_tail_for_gui_prepended_and_large_file(client, projects_base, tmp_path):
+    """B1 (accuracy-over-speed): the head+tail _extract_title reader must surface
+    the human title for BOTH a GUI-created session (custom-title PREPENDED at
+    offset 0, per chat.py) and a long (>128KB) session — never falling back to
+    the 8-char id. A tail-only read would regress the prepended case.
+    """
+    home_dir = projects_base / _slug_from_default(client)
+
+    # ~240KB body so a prepended title sits far outside any tail window and an
+    # appended title sits far outside any head window.
+    big_filler = [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 4000}]}}
+        for _ in range(60)
+    ]
+
+    # 1. GUI-created session: title PREPENDED at offset 0 (chat.py order).
+    gui_path = home_dir / "gui.jsonl"
+    _write_jsonl(gui_path, [
+        {"type": "mode", "mode": "normal"},
+        {"type": "custom-title", "customTitle": "GUI Prepended Title", "sessionId": "gui"},
+        {"type": "user", "message": {"content": "go"}},
+        *big_filler,
+    ])
+    assert gui_path.stat().st_size > 128 * 1024  # exercises the windowed (seek) path
+    assert sessions_mod._extract_title(gui_path) == "GUI Prepended Title"
+
+    # 2. Renamed long session: title APPENDED at EOF (set_session_title order).
+    ren_path = home_dir / "renamed_big.jsonl"
+    _write_jsonl(ren_path, [
+        {"type": "mode", "mode": "normal"},
+        {"type": "user", "message": {"content": "go"}},
+        *big_filler,
+        {"type": "custom-title", "customTitle": "Renamed At EOF", "sessionId": "ren"},
+    ])
+    assert ren_path.stat().st_size > 128 * 1024
+    assert sessions_mod._extract_title(ren_path) == "Renamed At EOF"
+
+    # 3. The listing surfaces both human titles, never the id fallback.
+    data = await (await client.get("/api/sessions", params={"project": home_dir.name})).json()
+    titles = {s["id"]: s["title"] for s in data["sessions"]}
+    assert titles["gui"] == "GUI Prepended Title"
+    assert titles["renamed_big"] == "Renamed At EOF"
+
+
+def test_extract_title_custom_overrides_ai_and_last_wins(tmp_path):
+    """Precedence preserved by the windowed reader on a small (whole-read) file:
+    last custom-title wins, and custom-title beats ai-title."""
+    p = tmp_path / "s.jsonl"
+    _write_jsonl(p, [
+        {"type": "ai-title", "aiTitle": "AI guess"},
+        {"type": "custom-title", "customTitle": "First"},
+        {"type": "custom-title", "customTitle": "Second"},
+    ])
+    assert sessions_mod._extract_title(p) == "Second"
+    # ai-title only -> returned when no custom-title present.
+    p2 = tmp_path / "s2.jsonl"
+    _write_jsonl(p2, [{"type": "ai-title", "title": "Only AI"}])
+    assert sessions_mod._extract_title(p2) == "Only AI"
 
 

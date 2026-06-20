@@ -575,6 +575,10 @@ async def create_user_task(request: web.Request) -> web.Response:
         return task
 
     task = await asyncio.to_thread(_do)
+    # Notify open clients so the Tasks view refetches (C4). Outside the thread
+    # because broadcast is async; the callback carries no fields — useLiveUpdates
+    # just refetches — so an empty payload is intentional.
+    await request.app["ws_manager"].broadcast("task_changed", {})
     return web.json_response({"ok": True, "task": _user_task_view(task)}, status=201)
 
 
@@ -626,4 +630,7 @@ async def update_user_task(request: web.Request) -> web.Response:
     updated = await asyncio.to_thread(_do)
     if not updated:
         raise web.HTTPNotFound(reason="task not found")
+    # Only broadcast on a real change (never on a 404). Empty payload: the
+    # frontend callback takes no args and just refetches (C4).
+    await request.app["ws_manager"].broadcast("task_changed", {})
     return web.json_response({"ok": True, "task": _user_task_view(updated)})

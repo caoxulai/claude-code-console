@@ -1,6 +1,7 @@
 """CRUD /api/skills — manage ~/.claude/skills/ and ~/.claude/commands/."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from aiohttp import web
@@ -73,7 +74,11 @@ def _list_local_skills() -> list[dict]:
 
 
 async def list_skills(request: web.Request) -> web.Response:
-    return web.json_response(_list_local_skills())
+    # Offload the directory traversal + per-file read_text() to a worker thread
+    # so a large ~/.claude/skills + ~/.claude/commands inventory never blocks the
+    # event loop (B7). Pure offload — same response shape, no caching.
+    skills = await asyncio.to_thread(_list_local_skills)
+    return web.json_response(skills)
 
 
 async def get_skill(request: web.Request) -> web.Response:

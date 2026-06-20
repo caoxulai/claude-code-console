@@ -1,9 +1,12 @@
 """GET /api/sessions — list sessions across all projects, with proper title extraction."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +36,7 @@ LIVE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 def register(app: web.Application):
     app.router.add_get("/api/config", get_config)
     app.router.add_get("/api/projects", list_projects)
+    app.router.add_get("/api/projects/{project_id}/detail", get_project_detail)
     app.router.add_put("/api/projects/{project_id}/claude-md", save_project_claude_md)
     app.router.add_get("/api/projects/{project_id}/sop/{filename}", get_project_sop)
     app.router.add_get("/api/projects/{project_id}/memory/{filename}", get_project_memory)
@@ -107,28 +111,78 @@ def _has_real_turn(path: Path) -> bool:
     return False
 
 
-def _extract_title(path: Path) -> str | None:
-    """Extract session title from JSONL.
+# Title records live near the file ENDS, never the middle: GUI-created sessions
+# PREPEND the custom-title at offset 0 (chat.py:_mark_session_interactive),
+# user renames APPEND it at EOF (set_session_title), and CLI-written ai-title
+# records sit near the file start. So reading a head window + a tail window
+# catches every title-writer without ever scanning a multi-MB file end-to-end.
+_TITLE_WINDOW_BYTES = 64 * 1024  # bytes read from each of the head and tail
+_TITLE_WHOLE_FILE_MAX = 128 * 1024  # files <= this are read whole (no seek)
 
-    Returns the LAST custom-title if any exist (user renames append new entries),
-    otherwise the last ai-title. This matches CLI --resume behavior.
+
+def _scan_title_records(lines: list[str], custom_title: str | None,
+                        ai_title: str | None) -> tuple[str | None, str | None]:
+    """Fold title records from a list of JSONL lines into (custom_title, ai_title).
+
+    Preserves last-record-wins: each matching record overwrites the prior value.
+    Caller feeds head lines first, then tail lines, so tail records (later in
+    file order) correctly win over head records.
+    """
+    for raw_line in lines:
+        try:
+            rec = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        rtype = rec.get("type")
+        if rtype == "custom-title":
+            custom_title = rec.get("customTitle")
+        elif rtype == "ai-title":
+            ai_title = rec.get("aiTitle") or rec.get("title")
+    return custom_title, ai_title
+
+
+def _extract_title(path: Path) -> str | None:
+    """Extract session title from JSONL using a head+tail windowed read.
+
+    Returns the LAST custom-title if any exist (user renames append new entries,
+    GUI creation prepends one), otherwise the last ai-title — matching CLI
+    --resume behavior with custom-title taking precedence over ai-title.
+
+    Small files (<= ~128KB) are read whole, preserving the original behavior.
+    Larger files read only the first and last 64KB so a 37MB transcript is never
+    scanned end-to-end. The head window catches the GUI-prepended title; the tail
+    window catches an appended rename. KNOWN LIMITATION (acceptable, not in
+    scope): an ai-title buried >64KB from BOTH ends of a huge file would be
+    missed — but no code in this repo writes ai-title, and CLI titles sit near
+    the file start which the head window always covers.
     """
     custom_title = None
     ai_title = None
     try:
-        with open(path) as fh:
-            for raw_line in fh:
-                try:
-                    rec = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                rtype = rec.get("type")
-                if rtype == "custom-title":
-                    custom_title = rec.get("customTitle")
-                elif rtype == "ai-title":
-                    ai_title = rec.get("aiTitle") or rec.get("title")
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            if size <= _TITLE_WHOLE_FILE_MAX:
+                head_bytes = fh.read()
+                tail_bytes = b""
+            else:
+                head_bytes = fh.read(_TITLE_WINDOW_BYTES)
+                fh.seek(-_TITLE_WINDOW_BYTES, os.SEEK_END)
+                tail_bytes = fh.read(_TITLE_WINDOW_BYTES)
     except OSError:
-        pass
+        return None
+
+    # Decode with errors='replace' so a multi-byte char split at a window
+    # boundary can't raise; parse only COMPLETE lines.
+    head_lines = head_bytes.decode("utf-8", errors="replace").splitlines()
+    custom_title, ai_title = _scan_title_records(head_lines, custom_title, ai_title)
+
+    if tail_bytes:
+        # Drop the first (possibly partial) line of the tail chunk — a 64KB seek
+        # from EOF can land mid-line. Whole-file reads have no tail chunk so no
+        # complete head line is ever dropped.
+        tail_lines = tail_bytes.decode("utf-8", errors="replace").splitlines()[1:]
+        custom_title, ai_title = _scan_title_records(tail_lines, custom_title, ai_title)
+
     return custom_title or ai_title
 
 
@@ -325,6 +379,32 @@ def _read_project_readme(project_path: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+_DESCRIPTION_MAX = 200
+
+
+def _first_prose_line(text: str | None) -> str | None:
+    """First non-empty prose line of a markdown doc, trimmed to 200 chars.
+
+    Skips blank lines and ATX headings (leading '#') so the description is the
+    project's first real sentence, not its title. Returns None when nothing
+    qualifies. Used to give the projects LISTING a one-line summary instead of
+    inlining the full multi-KB CLAUDE.md/README body.
+    """
+    if not text:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line[:_DESCRIPTION_MAX]
+    return None
+
+
+def _project_description(claude_md: str | None, readme: str | None) -> str | None:
+    """One-line description for a project: first prose line of CLAUDE.md, else README."""
+    return _first_prose_line(claude_md) or _first_prose_line(readme)
+
+
 def _collect_memory_files(session_dir: Path | None) -> list[dict]:
     """Collect memory file names from a project's Claude memory directory."""
     if not session_dir or not session_dir.is_dir():
@@ -467,12 +547,29 @@ async def get_config(request: web.Request) -> web.Response:
     })
 
 
-async def list_projects(request: web.Request) -> web.Response:
-    """List all real projects from WORKSPACE_DIR with Claude Code activity metadata."""
-    projects = []
+@dataclass
+class _ProjectsCache:
+    response: list | None = None
+    updated_at: float = 0.0
+
+
+_PROJECTS_CACHE_TTL = 5.0  # seconds
+_projects_cache = _ProjectsCache()
+_projects_cache_lock = asyncio.Lock()
+
+
+def _compute_projects() -> list:
+    """Build the projects LISTING (sync). Returns the slim per-project dicts.
+
+    The listing carries a one-line `description` (first prose line of CLAUDE.md,
+    else README) instead of the full markdown bodies — the full claudeMd/readme/
+    readmeName are fetched on demand via GET /api/projects/{id}/detail. Every
+    other field is unchanged. Runs entirely off the event loop via to_thread.
+    """
+    projects: list = []
 
     if not WORKSPACE_DIR.is_dir():
-        return web.json_response([])
+        return projects
 
     # Per-project task counts (keyed by project name). Imported lazily to avoid a
     # circular import (tasks imports sessions._project_label). Failures here must
@@ -493,7 +590,8 @@ async def list_projects(request: web.Request) -> web.Response:
         project_name = d.name
         project_path = str(d)
 
-        # a. Check for CLAUDE.md in the project
+        # a. CLAUDE.md / README — read only for the one-line description; the full
+        #    bodies ride GET /api/projects/{id}/detail, not the listing.
         claude_md_content = None
         claude_md_path = d / "CLAUDE.md"
         if claude_md_path.is_file():
@@ -501,11 +599,8 @@ async def list_projects(request: web.Request) -> web.Response:
                 claude_md_content = claude_md_path.read_text(encoding="utf-8")
             except OSError:
                 pass
-
-        # a2. Check for a root README (inlined like CLAUDE.md, since it's a
-        #     single top-level doc). readme_name preserves the actual filename
-        #     so the UI can label it correctly (README.md vs README.rst, etc.).
-        readme_name, readme_content = _read_project_readme(d)
+        _, readme_content = _read_project_readme(d)
+        description = _project_description(claude_md_content, readme_content)
 
         # b. Check for .claude/settings.json
         has_settings = (d / ".claude" / "settings.json").is_file()
@@ -567,9 +662,10 @@ async def list_projects(request: web.Request) -> web.Response:
             "openTaskCount": tc["open"],
             "lastActivity": last_activity,
             "lastActivityTs": last_mtime,
-            "claudeMd": claude_md_content,
-            "readme": readme_content,
-            "readmeName": readme_name,
+            # Slim one-liner instead of the full claudeMd/readme/readmeName bodies
+            # (those ride /api/projects/{id}/detail). Keeps the listing payload
+            # small without losing the at-a-glance summary the cards show.
+            "description": description,
             "hasSettings": has_settings,
             "appUrl": app_urls[0]["url"] if app_urls else None,
             "appUrls": app_urls,
@@ -590,7 +686,62 @@ async def list_projects(request: web.Request) -> web.Response:
     # lastActivityTs is the raw mtime surfaced above; reuse it as the sort key.
     projects.sort(key=lambda p: (p["lastActivityTs"] is None, -(p["lastActivityTs"] or 0)))
 
-    return web.json_response(projects)
+    return projects
+
+
+async def list_projects(request: web.Request) -> web.Response:
+    """List all real projects from WORKSPACE_DIR with Claude Code activity metadata.
+
+    The full crawl runs in a thread (it stats/reads hundreds of files) and is
+    cached for a few seconds so back-to-back page loads don't re-walk the tree.
+    """
+    global _projects_cache
+    now = time.monotonic()
+    if now - _projects_cache.updated_at < _PROJECTS_CACHE_TTL and _projects_cache.response is not None:
+        return web.json_response(_projects_cache.response)
+
+    async with _projects_cache_lock:
+        now = time.monotonic()
+        if now - _projects_cache.updated_at < _PROJECTS_CACHE_TTL and _projects_cache.response is not None:
+            return web.json_response(_projects_cache.response)
+        projects = await asyncio.to_thread(_compute_projects)
+        _projects_cache = _ProjectsCache(response=projects, updated_at=time.monotonic())
+        return web.json_response(projects)
+
+
+async def get_project_detail(request: web.Request) -> web.Response:
+    """Full CLAUDE.md / README bodies for ONE project, fetched on demand.
+
+    Split out of the listing (B2) so the projects list stays lightweight; the
+    ProjectsPage README / CLAUDE.md tabs fetch this lazily when a card expands.
+    Reuses _read_project_readme and is _validate_project_id-guarded against
+    path traversal like the other project endpoints.
+    """
+    project_id = request.match_info["project_id"]
+    _validate_project_id(project_id)
+
+    project_dir = WORKSPACE_DIR / project_id
+    if not project_dir.is_dir():
+        raise web.HTTPNotFound(reason="project directory not found")
+
+    def _read_detail():
+        claude_md = None
+        claude_md_path = project_dir / "CLAUDE.md"
+        if claude_md_path.is_file():
+            try:
+                claude_md = claude_md_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        readme_name, readme_content = _read_project_readme(project_dir)
+        return claude_md, readme_name, readme_content
+
+    claude_md, readme_name, readme_content = await asyncio.to_thread(_read_detail)
+    return web.json_response({
+        "id": project_id,
+        "claudeMd": claude_md,
+        "readme": readme_content,
+        "readmeName": readme_name,
+    })
 
 
 def _validate_project_id(project_id: str) -> None:
@@ -734,33 +885,29 @@ def _validate_session_id(session_id: str) -> None:
         raise web.HTTPBadRequest(reason="invalid session id")
 
 
-async def list_sessions(request: web.Request) -> web.Response:
-    """List sessions from all projects by default, or filtered to a single project.
+@dataclass
+class _SessionsCache:
+    # response keyed by (project, limit, offset) so different pages don't collide.
+    responses: dict = field(default_factory=dict)
+    updated_at: float = 0.0
 
-    - GET /api/sessions (no params) → return sessions from ALL project dirs.
-      Apply _is_interactive_session only for the home-cwd bucket (where it's needed
-      to match CLI behavior and hide print-mode sessions). For other project dirs,
-      include all sessions unconditionally.
-    - GET /api/sessions?project=<slug> → return all sessions from that specific dir
-      (no interactive filter).
+
+_SESSIONS_CACHE_TTL = 4.0  # seconds
+_sessions_cache = _SessionsCache()
+_sessions_cache_lock = asyncio.Lock()
+
+
+def _compute_sessions(project: str | None, limit: int, offset: int, home_bucket: str) -> dict:
+    """Scan + filter + title-extract for the sessions listing (sync).
+
+    Globs every project dir's *.jsonl, applies the interactive/print-mode/real-turn
+    filters, then extracts a title for only the page being returned. Runs entirely
+    off the event loop via to_thread — it opens hundreds of files and (via
+    _extract_title) reads windows of the page's files.
     """
-    project = request.query.get("project")
-    limit = int(request.query.get("limit", "50"))
-    offset = int(request.query.get("offset", "0"))
-
-    # Determine the home-cwd bucket name (used to decide where interactive filter applies)
-    default_cwd = str(request.app["default_cwd"])
-    home_bucket = _cwd_to_project_dir(default_cwd)
-
     if project:
-        # Specific project requested — show all sessions from that dir (no filter).
-        # Reject path traversal in the project slug (defense in depth; mirrors the
-        # filename checks in get_project_sop/get_project_memory).
-        if ".." in project or "/" in project or "\\" in project:
-            raise web.HTTPBadRequest(reason="invalid project")
         dirs = [CLAUDE_PROJECTS_BASE / project]
     else:
-        # No project param — scan ALL project dirs
         dirs = _get_all_project_dirs()
 
     all_files = []
@@ -807,7 +954,7 @@ async def list_sessions(request: web.Request) -> web.Response:
         rank = matched
         matched += 1
         # Skip files before the requested page, and stop once the page is full.
-        # _extract_title reads the whole file, so only do it for files we return.
+        # _extract_title reads only head/tail windows, so only do it for the page.
         if rank < offset or len(sessions) >= limit:
             continue
         title = _extract_title(f)
@@ -822,7 +969,61 @@ async def list_sessions(request: web.Request) -> web.Response:
             "size": f"{size_kb}KB" if size_kb < 1024 else f"{size_kb // 1024}MB",
         })
 
-    return web.json_response({"sessions": sessions, "total": matched})
+    return {"sessions": sessions, "total": matched}
+
+
+async def list_sessions(request: web.Request) -> web.Response:
+    """List sessions from all projects by default, or filtered to a single project.
+
+    - GET /api/sessions (no params) → return sessions from ALL project dirs.
+      Apply _is_interactive_session only for the home-cwd bucket (where it's needed
+      to match CLI behavior and hide print-mode sessions). For other project dirs,
+      include all sessions unconditionally.
+    - GET /api/sessions?project=<slug> → return all sessions from that specific dir
+      (no interactive filter).
+
+    The scan runs in a thread (it opens hundreds of files) and is cached per
+    (project, limit, offset) for a few seconds so paging/back-to-back loads
+    don't re-walk the tree.
+    """
+    global _sessions_cache
+    project = request.query.get("project")
+    limit = int(request.query.get("limit", "50"))
+    offset = int(request.query.get("offset", "0"))
+
+    # Determine the home-cwd bucket name (used to decide where interactive filter applies)
+    default_cwd = str(request.app["default_cwd"])
+    home_bucket = _cwd_to_project_dir(default_cwd)
+
+    if project:
+        # Specific project requested — show all sessions from that dir (no filter).
+        # Reject path traversal in the project slug (defense in depth; mirrors the
+        # filename checks in get_project_sop/get_project_memory). Validate BEFORE
+        # consulting the cache so a malicious slug always 400s.
+        if ".." in project or "/" in project or "\\" in project:
+            raise web.HTTPBadRequest(reason="invalid project")
+
+    # Cache key includes home_bucket because the filter behavior depends on it
+    # (default_cwd is stable per process, but keying on it keeps the cache correct
+    # if it ever varies, e.g. across test apps).
+    key = (project, limit, offset, home_bucket)
+
+    now = time.monotonic()
+    if now - _sessions_cache.updated_at < _SESSIONS_CACHE_TTL and key in _sessions_cache.responses:
+        return web.json_response(_sessions_cache.responses[key])
+
+    async with _sessions_cache_lock:
+        now = time.monotonic()
+        # Drop the whole keyed map when the TTL lapses so a stale page can't be
+        # served past the window; double-check the requested key inside the lock.
+        if now - _sessions_cache.updated_at >= _SESSIONS_CACHE_TTL:
+            _sessions_cache = _SessionsCache(updated_at=now)
+        elif key in _sessions_cache.responses:
+            return web.json_response(_sessions_cache.responses[key])
+
+        result = await asyncio.to_thread(_compute_sessions, project, limit, offset, home_bucket)
+        _sessions_cache.responses[key] = result
+        return web.json_response(result)
 
 
 async def list_live_sessions(request: web.Request) -> web.Response:

@@ -12,6 +12,7 @@ reuse the same path-traversal guard (`sessions._validate_project_id`) and
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from pathlib import Path
@@ -160,6 +161,32 @@ def _list_agents(project_dir: Path) -> list[dict]:
             if rec:
                 out.append(rec)
     return out
+
+
+# ── Listing thread offload (B4) ──────────────────────────────────────────────
+#
+# `_list_agents` reads every agent .md AND runs `context_summary` per agent,
+# which calls the O(N^2) `detect_conflicts` over each context file — that work is
+# synchronous and CPU-and-IO heavy, and was blocking the event loop on every
+# /api/projects/{id}/agents request. Run it off-thread via `asyncio.to_thread`
+# so the loop stays responsive (the usage.py `asyncio.to_thread` reference).
+#
+# ACCURACY NOTE: the full `context_summary` (including `detect_conflicts`) still
+# runs here — the offload only changes WHERE it runs, not WHAT it computes. So
+# every list row keeps a true `conflictClusterCount`/`newEntryCount`/oversize
+# signal; we never zero or defer the conflict-cluster count (the AgentsPage list
+# badge depends on it — DEFERRED-COUNT-AS-ZERO trap). No TTL cache is added: the
+# agent auto-APPENDS to its context file out-of-band at task end, so any
+# time-windowed cache would make the "N new entries" / conflict badge lie for the
+# window after each task — ACCURACY OVER SPEED, and the per-project scan is cheap
+# (a handful of files) unlike the global usage scan that warrants caching.
+
+
+async def _list_agents_async(project_dir: Path) -> list[dict]:
+    """Off-thread `_list_agents` so the per-agent context scan + conflict
+    detection never blocks the event loop. Never raises (delegates to the
+    never-raising `_list_agents`)."""
+    return await asyncio.to_thread(_list_agents, project_dir)
 
 
 def agent_count(project_dir: Path) -> int:
@@ -637,7 +664,7 @@ async def list_agents(request: web.Request) -> web.Response:
     if not project_dir.is_dir():
         raise web.HTTPNotFound(reason="project directory not found")
 
-    return web.json_response(_list_agents(project_dir))
+    return web.json_response(await _list_agents_async(project_dir))
 
 
 def _resolve_agent_file(project_dir: Path, name: str) -> tuple[Path | None, str]:

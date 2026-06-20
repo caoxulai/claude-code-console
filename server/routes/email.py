@@ -161,14 +161,28 @@ def _one_line(text: str, cap: int = 300) -> str:
     return collapsed[:cap]
 
 
-def _load() -> tuple[dict, str | None]:
-    """Load the email sidecar, returning (data, etag)."""
-    data, etag = filestore.read_json(EMAIL_PATH)
+def _normalize_loaded(data) -> dict:
+    """Apply the in-memory shape normalization shared by _load/_load_async."""
     if not data:
         data = {"items": []}
     if "items" not in data:
         data["items"] = []
-    return data, etag
+    return data
+
+
+def _load() -> tuple[dict, str | None]:
+    """Load the email sidecar, returning (data, etag) -- SYNC (workers/watchers)."""
+    data, etag = filestore.read_json(EMAIL_PATH)
+    return _normalize_loaded(data), etag
+
+
+async def _load_async() -> tuple[dict, str | None]:
+    """Async sibling of _load for REQUEST-PATH handlers (offloads the read to a
+    thread so a slow disk read never blocks the event loop). Background
+    workers/watchers keep using the sync _load(). Returns the same (data, etag).
+    """
+    data, etag = await filestore.async_read_json(EMAIL_PATH)
+    return _normalize_loaded(data), etag
 
 
 # ── MCP config helpers ─────────────────────────────────────────────────────
@@ -1449,7 +1463,7 @@ async def get_health(request: web.Request) -> web.Response:
 
 async def get_queue(request: web.Request) -> web.Response:
     """GET /api/email/queue -- return the email queue."""
-    data, etag = _load()
+    data, etag = await _load_async()
     return web.json_response({
         "items": data["items"],
         "etag": etag,
@@ -1458,13 +1472,47 @@ async def get_queue(request: web.Request) -> web.Response:
     })
 
 
+# Terminal statuses that do NOT count toward "to review" — kept in lockstep with
+# the frontend's countEmailActionable (frontend/src/lib/emailQueue.js). Email's
+# terminal outbound state is 'approved' (NOT 'sent'). An explicit denylist of the
+# two terminal states means a new active status (or a missing/empty status on an
+# older item) ALWAYS counts, so the count can never silently undercount.
+_TERMINAL_STATUSES = ("approved", "dismissed")
+
+
+def _count_actionable(items) -> int:
+    """Count items that still need attention — mirrors frontend countEmailActionable.
+
+    Actionable == status NOT in the terminal set {approved, dismissed}; a
+    missing/empty status counts.
+    """
+    if not isinstance(items, list):
+        return 0
+    return sum(
+        1 for it in items
+        if isinstance(it, dict) and it.get("status") not in _TERMINAL_STATUSES
+    )
+
+
+async def get_queue_count(request: web.Request) -> web.Response:
+    """GET /api/email/queue/count -- just the actionable-item count.
+
+    Lightweight sidebar-badge endpoint: returns ONLY {"count": N} (no item
+    payloads), N computed with the SAME semantics as the frontend's
+    countEmailActionable so the NavBar bubble matches the full-queue count. Reads
+    the sidecar via the async filestore variant so it never blocks the loop.
+    """
+    data, _ = await _load_async()
+    return web.json_response({"count": _count_actionable(data["items"])})
+
+
 async def put_config(request: web.Request) -> web.Response:
     """PUT /api/email/config -- toggle paused state."""
     body = await read_json_body(request)
     if "paused" not in body:
         raise web.HTTPBadRequest(reason="paused field required")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     data["paused"] = bool(body["paused"])
 
     try:
@@ -1490,7 +1538,7 @@ async def save_draft(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="draft field required")
     new_draft = _scrub(str(body["draft"]))[:_DRAFT_CAP]
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -1519,7 +1567,7 @@ async def dismiss_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -1546,7 +1594,7 @@ async def undismiss_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -1578,7 +1626,7 @@ async def regenerate_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -1628,7 +1676,7 @@ async def approve_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -1653,7 +1701,7 @@ async def approve_item(request: web.Request) -> web.Response:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
     except filestore.ConflictError:
         # Re-read and retry once
-        data, current_etag = _load()
+        data, current_etag = await _load_async()
         item = next((it for it in data["items"] if it.get("id") == item_id), None)
         if item and item.get("status") != "approved":
             item["status"] = "approved"
@@ -1680,7 +1728,7 @@ async def mute_item(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
@@ -1715,7 +1763,7 @@ async def unmute_thread(request: web.Request) -> web.Response:
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
 
-    data, current_etag = _load()
+    data, current_etag = await _load_async()
     muted = data.get("mutedThreads") or {}
     if mute_key not in muted:
         raise web.HTTPNotFound(reason=f"mute key {mute_key} not found")
@@ -1744,7 +1792,7 @@ async def refresh_queue(request: web.Request) -> web.Response:
     return 200 with {scanning: false, reason: ...}. Otherwise wake the scan
     worker and return 202 with {scanning: true, etag: ...}.
     """
-    _, etag = _load()
+    _, etag = await _load_async()
 
     if _get_scan_lock().locked():
         return web.json_response(
@@ -1758,7 +1806,7 @@ async def refresh_queue(request: web.Request) -> web.Response:
 
 async def get_muted(request: web.Request) -> web.Response:
     """GET /api/email/muted -- list muted threads for settings UI."""
-    data, etag = _load()
+    data, etag = await _load_async()
     return web.json_response({"muted": data.get("mutedThreads", {}), "etag": etag})
 
 
@@ -1794,6 +1842,10 @@ def register(app: web.Application):
     """Register all /api/email/* routes."""
     app.router.add_get("/api/email/health", get_health)
     app.router.add_get("/api/email/queue", get_queue)
+    # Lightweight count for the NavBar bubble. MUST be registered BEFORE the
+    # parameterized /api/email/queue/{item_id} routes so "count" is not captured
+    # as an item_id.
+    app.router.add_get("/api/email/queue/count", get_queue_count)
     app.router.add_put("/api/email/config", put_config)
     # Manual scan trigger -- MUST be registered BEFORE the parameterized
     # /api/email/queue/{item_id} routes so "refresh" is not captured as item_id.
