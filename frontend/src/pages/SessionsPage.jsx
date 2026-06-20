@@ -7,6 +7,7 @@ import rehypeHighlight from 'rehype-highlight';
 import { SkeletonLine } from '../components/Skeleton';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { useConfigStore } from '../stores/configStore';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 import SessionDiff from '../components/SessionDiff';
 
 function StatusBadge({ status }) {
@@ -324,16 +325,24 @@ export default function SessionsPage() {
     return () => window.removeEventListener('focus', onFocus);
   }, [selectedId, tab, loadTranscript, fetchHistory, fetchLive]);
 
-  // Live-ish sync: while a transcript is open AND the tab is visible, re-read it
-  // so CLI activity shows without switching away. Paused when the tab is hidden
-  // to avoid pointless requests. There is no server-side session_changed
-  // broadcast (the CLI writes the transcript .jsonl directly; the server only
-  // reads it), so this 10s backstop poll is the only liveness mechanism — kept
-  // short enough that a live transcript stays fresh, but slower than the old 4s
-  // to cut idle churn.
+  // Push-based liveness: the server now broadcasts `session_changed` when the
+  // newest transcript on disk advances (the CLI appends to the live session's
+  // .jsonl). The broadcast carries no payload, so we simply re-read the OPEN
+  // transcript on the event — silent:true skips the spinner so there's no
+  // flicker. This is the primary freshness path; the interval below is a slow
+  // backstop in case an event is missed.
+  useLiveUpdates(['session_changed'], () => {
+    if (selectedId) loadTranscript(selectedId, { silent: true });
+  });
+
+  // Backstop poll: while a transcript is open AND the tab is visible, re-read it
+  // so CLI activity shows even if a `session_changed` push is missed (WS drop /
+  // reconnect). Paused when the tab is hidden to avoid pointless requests. Since
+  // the WS push above now freshens the open transcript on CLI activity, this is
+  // a 30s safety net, not the primary liveness mechanism.
   useEffect(() => {
     if (!selectedId) return undefined;
-    const POLL_MS = 10000;
+    const POLL_MS = 30000;
     const tick = () => {
       if (!document.hidden) loadTranscript(selectedId, { silent: true });
     };

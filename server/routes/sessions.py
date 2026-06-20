@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -32,6 +33,8 @@ WORKSPACE_DIR = _resolve_workspace_dir()
 CLAUDE_PROJECTS_BASE = Path.home() / ".claude" / "projects"
 LIVE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 
+logger = logging.getLogger(__name__)
+
 
 def register(app: web.Application):
     app.router.add_get("/api/config", get_config)
@@ -47,6 +50,21 @@ def register(app: web.Application):
     app.router.add_get("/api/sessions/{session_id}/title", get_session_title)
     app.router.add_put("/api/sessions/{session_id}/title", set_session_title)
     app.router.add_delete("/api/sessions/{session_id}", delete_session)
+
+    # ── Session-transcript file-watcher (E2) ──────────────────────────────────
+    # The CLI appends to a transcript .jsonl as it streams; nothing in-process
+    # otherwise observes that write, so SessionsPage previously backstop-polled
+    # the open transcript. This watcher broadcasts 'session_changed' when the
+    # NEWEST transcript's mtime advances (the actively-written/live session is
+    # almost always the newest), letting any open page refetch promptly. It is a
+    # cheap one rglob().max() per tick run OFF the event loop — it spawns no
+    # subprocess. It mirrors slack.py's _slack_watcher lifecycle EXACTLY
+    # (idempotent create + cancel-and-await teardown, sleep-FIRST so it is inert
+    # on startup — app.on_startup fires under aiohttp_client(app) in EVERY test,
+    # so it must never broadcast during the suite). Self-contained: app.py is
+    # untouched.
+    app.on_startup.append(_start_watcher)
+    app.on_cleanup.append(_stop_watcher)
 
 
 def _is_interactive_session(path: Path) -> bool:
@@ -1160,3 +1178,89 @@ async def delete_session(request: web.Request) -> web.Response:
             return web.json_response({"deleted": session_id})
 
     raise web.HTTPNotFound(reason="session not found")
+
+
+# ── Session-transcript file-watcher (E2) ─────────────────────────────────────
+
+SESSION_WATCH_INTERVAL_S = 5
+
+
+def _newest_transcript_mtime() -> int | None:
+    """Newest mtime_ns across every transcript under CLAUDE_PROJECTS_BASE.
+
+    The actively-written (live) session is almost always the newest .jsonl, so
+    its mtime advancing is a cheap proxy for "a transcript changed" without
+    re-statting all ~thousands of files individually against a remembered map.
+    Runs OFF the event loop (via asyncio.to_thread). Returns None — never raises
+    — when the base is missing or every file vanishes mid-scan, so one unreadable
+    file can't kill the watcher loop.
+    """
+    try:
+        return max(
+            (p.stat().st_mtime_ns for p in CLAUDE_PROJECTS_BASE.rglob("*.jsonl")),
+            default=None,
+        )
+    except OSError:
+        return None
+
+
+async def _session_watcher(app) -> None:
+    """Broadcast 'session_changed' when the newest transcript's mtime advances.
+
+    Every SESSION_WATCH_INTERVAL_S it computes the newest transcript mtime_ns
+    (off the event loop) and, when that value STRICTLY advances past the last
+    seen one, broadcasts 'session_changed' over the existing ws manager so any
+    open transcript repaints near-instantly instead of waiting for the client's
+    backstop poll.
+
+    The baseline is seeded on the FIRST tick (a `seeded` flag) so startup emits
+    NO broadcast — critical because app.on_startup fires under aiohttp_client(app)
+    in EVERY test. It mirrors slack.py:_slack_watcher's robustness: it sleeps
+    FIRST (inert on startup), CancelledError propagates so shutdown can
+    cancel+await cleanly, and a per-iteration try/except catches+logs everything
+    else so one bad stat never kills the loop. It spawns no subprocess.
+    """
+    last_mtime: int | None = None
+    seeded = False
+    while True:
+        try:
+            await asyncio.sleep(SESSION_WATCH_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+
+        try:
+            newest = await asyncio.to_thread(_newest_transcript_mtime)
+            if not seeded:
+                # First tick seeds the baseline — no broadcast on startup.
+                last_mtime = newest
+                seeded = True
+            elif newest is not None and (last_mtime is None or newest > last_mtime):
+                last_mtime = newest
+                await app["ws_manager"].broadcast("session_changed", {"watched": True})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — one bad stat must not kill the loop
+            logger.warning("Session file-watcher iteration failed: %s", e)
+
+
+async def _start_watcher(app) -> None:
+    """on_startup: launch the session-transcript file-watcher task (idempotent)."""
+    task = app.get("session_watch_task")
+    if task is None or task.done():
+        app["session_watch_task"] = asyncio.create_task(_session_watcher(app))
+
+
+async def _stop_watcher(app) -> None:
+    """on_cleanup: cancel AND await the watcher so it tears down cleanly.
+
+    Mirrors slack.py:_stop_watcher (the shape that keeps the suite warning-free).
+    The watcher holds no subprocess, so there is only the task to cancel and await.
+    """
+    task = app.pop("session_watch_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

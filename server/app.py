@@ -32,7 +32,7 @@ ALLOWED_CWD_ROOTS = [
 
 
 def create_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_immutable_assets])
 
     # Shared state
     app["ws_manager"] = WebSocketManager()
@@ -84,3 +84,16 @@ async def _spa_handler(_request: web.Request) -> web.Response:
     if index.exists():
         return web.FileResponse(index)
     return web.Response(status=404, text="frontend not built")
+
+
+@web.middleware
+async def _immutable_assets(request: web.Request, handler):
+    # Vite emits content-hashed asset filenames (e.g. index-C1GLvghA.js) under
+    # /assets/, which are safe to cache forever. The /assets/ prefix guard is the
+    # entire safety mechanism: it keeps the un-hashed SPA shell (index.html, served
+    # by _spa_handler from / and arbitrary client-route paths) revalidated, so a new
+    # deploy isn't stranded on a stale shell pointing at deleted bundles (ADR D-034).
+    resp = await handler(request)
+    if request.path.startswith("/assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp

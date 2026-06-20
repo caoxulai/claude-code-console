@@ -524,6 +524,26 @@ def _new_entry_indices(project_dir: Path, name: str, entries: list[dict]) -> lis
     return [e["index"] for e in entries if _entry_hash(e["text"]) not in hashes]
 
 
+# ── Context-summary parse memo (E1) ──────────────────────────────────────────
+#
+# `context_summary` is called per-agent from BOTH the /agents listing and the
+# projects listing, so a multi-tab burst re-runs the O(N) `parse_context_entries`
+# (and feeds the O(N^2) `detect_conflicts`) over the SAME unchanged .md repeatedly.
+# This is a pure read-through memo of ONLY the .md-CONTENT-DERIVED expensive input:
+# the parsed entries, keyed by (project_dir, name, etag) where etag is the .md's
+# st_mtime_ns (filestore.etag_for). On an etag hit we skip parse_context_entries.
+#
+# CACHE BOUNDARY (load-bearing — see ADR D-032 / the D-031 traps): we cache ONLY
+# the parsed entries. The sidecar-driven signals — newEntryCount (.reviewed marker),
+# the dismissed set (.dismissed), and oversizeActionable/Acknowledged (.oversize) —
+# change OUT OF BAND (a user acks/dismisses/reviews WITHOUT touching the .md), so
+# they are RECOMPUTED FRESH ON EVERY CALL. In particular detect_conflicts is
+# RE-RUN against the freshly-read dismissed set every call (the conflict COUNT is
+# never cached: a cluster dismiss lowers the true count without moving the .md
+# mtime, so keying the count on the .md etag alone would serve a stale count).
+_PARSE_CACHE: dict[tuple, list[dict]] = {}
+
+
 def context_summary(project_dir: Path, name: str) -> dict:
     """{entryCount, newEntryCount, conflictClusterCount, oversized,
     oversizeActionable, oversizeAcknowledged, contextBytes, lineCount} for a
@@ -535,8 +555,20 @@ def context_summary(project_dir: Path, name: str) -> dict:
     oversize (warn) from an honestly-large, fully-reconciled one (informational).
     """
     try:
-        content, _ = filestore.read_text(_context_path(project_dir, name))
-        entries = parse_context_entries(content)
+        context_path = _context_path(project_dir, name)
+        content, _ = filestore.read_text(context_path)
+        # Memo ONLY the .md-content-derived parse, keyed by the .md's mtime_ns
+        # etag. On an etag hit reuse the parsed entries (skip the walk); on a miss
+        # (or absent etag) parse and store. The sidecar signals below ALWAYS
+        # recompute fresh so an out-of-band ack/dismiss/review is never stale.
+        etag = filestore.etag_for(context_path)
+        cache_key = (str(project_dir), name, etag)
+        if etag is not None and cache_key in _PARSE_CACHE:
+            entries = _PARSE_CACHE[cache_key]
+        else:
+            entries = parse_context_entries(content)
+            if etag is not None:
+                _PARSE_CACHE[cache_key] = entries
         new_count = len(_new_entry_indices(project_dir, name, entries))
         dismissed = _read_dismissed_keys(project_dir, name)
         context_bytes = len(content.encode("utf-8"))

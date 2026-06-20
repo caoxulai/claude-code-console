@@ -17,6 +17,12 @@
 // ALL count — and a missing/empty status (older items) counts too. This is an
 // explicit denylist of the two terminal states so a new active status can never
 // silently fall out of the count.
+//
+// LOCKSTEP CONTRACT (D-035): this MUST stay in sync with server/routes/slack.py
+// `_count_actionable` / `_TERMINAL_STATUSES` (the GET /api/slack/queue/count backend
+// the NavBar bubble reads). The terminal denylist here and the one there are two
+// halves of one contract — an editor of either side must update the other, or the
+// NavBar badge and the page's "N to review" count drift apart.
 export function isActionable(item) {
   const s = item && item.status;
   return s !== 'sent' && s !== 'dismissed';

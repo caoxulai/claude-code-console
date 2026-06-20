@@ -1914,6 +1914,30 @@ async def get_queue(request: web.Request) -> web.Response:
     })
 
 
+# Terminal statuses that do NOT count toward "to review" — kept in lockstep with
+# the frontend's isActionable/countActionable (frontend/src/lib/slackQueue.js).
+# Slack's terminal outbound state is 'sent' (NOT 'approved' — that's email). An
+# explicit denylist of the two terminal states means a new active status (or a
+# missing/empty status on an older item) ALWAYS counts, so the count can never
+# silently undercount and make the NavBar badge disagree with the page.
+_TERMINAL_STATUSES = ("sent", "dismissed")
+
+
+def _count_actionable(items) -> int:
+    """Count items that still need attention — mirrors frontend isActionable/countActionable.
+
+    Actionable == status NOT in the terminal set {sent, dismissed}; a
+    missing/empty status counts. The frontend twin lives in
+    frontend/src/lib/slackQueue.js — keep in lockstep.
+    """
+    if not isinstance(items, list):
+        return 0
+    return sum(
+        1 for it in items
+        if isinstance(it, dict) and it.get("status") not in _TERMINAL_STATUSES
+    )
+
+
 async def get_queue_count(request: web.Request) -> web.Response:
     """GET just the actionable-item count — the lightweight NavBar bubble feed (C1).
 
@@ -1929,10 +1953,7 @@ async def get_queue_count(request: web.Request) -> web.Response:
     Reads via ``_load_async`` so it never blocks the event loop.
     """
     data, _etag = await _load_async()
-    count = sum(
-        1 for it in data["items"]
-        if it.get("status") not in ("sent", "dismissed")
-    )
+    count = _count_actionable(data["items"])
     return web.json_response({"count": count})
 
 
