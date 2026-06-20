@@ -212,23 +212,8 @@ export default function SessionsPage() {
     return '';
   };
 
-  // Fixed filter options — loaded ONCE on mount from unfiltered "All" data, never changes
-  const [filterOptions, setFilterOptions] = useState([]);
-
-  // Load filter options once on mount (fetch ALL sessions to discover scopes)
-  useEffect(() => {
-    fetch('/api/sessions?limit=200')
-      .then(r => r.json())
-      .then(data => {
-        const names = new Set();
-        (data.sessions || []).forEach(s => {
-          const name = getScopeName(s);
-          if (name !== 'Global') names.add(name);
-        });
-        setFilterOptions(Array.from(names).sort());
-      })
-      .catch(() => {});
-  }, []);
+  // Filter options derived from config (which lists all workspace projects).
+  const filterOptions = (config?.projects || []).map(p => p.name).sort();
 
   // Current filter value derived from searchParams
   const currentFilter = (() => {

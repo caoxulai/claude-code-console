@@ -597,17 +597,13 @@ async def _collect_jobs() -> list[dict]:
     """Gather all OS-cron + systemd jobs (READ-only). Each source degrades to []."""
     jobs: list[dict] = []
 
-    rc, out = await _run_crontab()
-    # Non-zero exit (incl. "no crontab for user"), empty output, or missing binary
-    # ALL mean "no crontab jobs" — never an error.
+    (rc, out), (rc_u, out_u), (rc_s, out_s) = await asyncio.gather(
+        _run_crontab(), _run_systemctl_user(), _run_systemctl_system()
+    )
     if rc == 0 and out.strip():
         jobs.extend(_parse_crontab(out))
-
-    rc_u, out_u = await _run_systemctl_user()
     if rc_u == 0 and out_u.strip():
         jobs.extend(_parse_systemd_timers(out_u, "user"))
-
-    rc_s, out_s = await _run_systemctl_system()
     if rc_s == 0 and out_s.strip():
         jobs.extend(_parse_systemd_timers(out_s, "system"))
 
