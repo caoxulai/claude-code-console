@@ -256,6 +256,12 @@ def register(app: web.Application):
     # Per-item regenerate: re-run draft generation for ONE item, pulling in the
     # accumulated style + topic memory. Never sends.
     app.router.add_post("/api/slack/queue/{item_id}/refresh", regenerate_item)
+    # Polish the CURRENT draft text for fluency while keeping the user's own voice
+    # and language. STATELESS + MCP-FREE: it takes the text in the request body,
+    # never reads Slack, never loads/writes the queue, and never sends. The polished
+    # text is returned for the UI to drop back into the editable box as an unsaved
+    # edit (so the existing diff / Save / Approve flow handles it unchanged).
+    app.router.add_post("/api/slack/polish", polish_text)
     # The ONLY send path: per-item, approval-gated. There is deliberately no
     # bulk/auto-send endpoint, and neither refresh nor save ever sends.
     app.router.add_post("/api/slack/queue/{item_id}/approve", approve_item)
@@ -850,6 +856,28 @@ def _build_agent_prompt(action: str, payload: dict) -> str:
             "generatedDraft must equal draft. threadContext is a brief plain-text summary "
             "of the conversation topic and what they're asking/discussing — NOT the raw messages."
         )
+    elif action == "polish":
+        # MCP-FREE (D-029): polish the user's CURRENT draft text for fluency while
+        # preserving THEIR voice and language. It reasons ONLY over the text already
+        # in the prompt — no tool calls, no fetch, no send — so the subprocess gets
+        # NO --allowedTools and an EMPTY --mcp-config under --strict-mcp-config. The
+        # instruction is deliberately conservative: improve flow/grammar/clarity but
+        # do NOT change meaning, do NOT translate, do NOT formalize the user's style.
+        text = str(payload.get("text", ""))
+        prompt = (
+            "Improve the FLUENCY of the Slack reply below — do NOT call any tools, "
+            "do NOT fetch anything, do NOT send anything. Fix grammar, awkward "
+            "phrasing, and clarity so it reads smoothly, but you MUST preserve MY "
+            "own voice and writing style and the SAME language the text is written "
+            "in (do NOT translate). Do NOT change the meaning, do NOT add or remove "
+            "information, do NOT make it more formal or more casual than I wrote it, "
+            "and keep it roughly the same length. If the text is already fluent, "
+            "return it essentially unchanged.\n\n"
+            "My draft:\n"
+            f"{text}\n\n"
+            'Return ONLY a STRICT JSON object (no prose, no markdown fences): '
+            '{"draft": "<the polished reply text>"}.'
+        )
     elif action == "classify":
         # MCP-FREE (D-025): the classify worker batches needs-classify skeletons and
         # asks the model to label each from the snippet ALONE — no tool calls, no
@@ -931,6 +959,12 @@ def _parse_agent_result(text: str, action: str) -> dict:
     if action == "regenerate":
         if not isinstance(parsed, dict) or "draft" not in parsed:
             return {"available": False, "reason": "Slack regenerate reply missing 'draft'."}
+        return {"available": True, "draft": parsed.get("draft", "")}
+    if action == "polish":
+        # Mirrors 'regenerate' exactly (require a dict with 'draft'); fail-loud on a
+        # missing 'draft' rather than fabricating a polished text.
+        if not isinstance(parsed, dict) or "draft" not in parsed:
+            return {"available": False, "reason": "Slack polish reply missing 'draft'."}
         return {"available": True, "draft": parsed.get("draft", "")}
     if action == "draft":
         # Mirrors 'regenerate' (require a dict with 'draft'), but also passes
@@ -1070,7 +1104,10 @@ async def _drive_agent(action: str, payload: dict) -> dict:
     # --allowedTools and an EMPTY --mcp-config under --strict-mcp-config (zero
     # slack-mcp cold-start). _ALLOWED_TOOLS has no 'classify' entry — it's dead at
     # spawn time when needs_mcp=False (documented, never grants any tool).
-    needs_mcp = action not in ("draft", "regenerate", "classify")
+    # 'polish' (D-029) is MCP-FREE for the same reason: it reasons ONLY over the
+    # draft text already in the prompt (a pure text transform), calls no Slack tool,
+    # and gets NO --allowedTools and an EMPTY --mcp-config under --strict-mcp-config.
+    needs_mcp = action not in ("draft", "regenerate", "classify", "polish")
     if needs_mcp:
         allowed_tools = ",".join(_ALLOWED_TOOLS.get(action, _SLACK_READ_TOOLS))
     else:
@@ -1242,6 +1279,9 @@ async def _run_slack_agent(action: str, payload: dict) -> dict:
         BATCH of needs-classify skeletons (D-025) — the MCP-FREE classify worker's
         path; the subprocess reasons over the snippets already in the skeletons (no
         tool calls), labelling each needs-reply / fyi / actionable.
+      * 'polish' → {available:True, draft:...} — the MCP-FREE per-edit fluency pass
+        (D-029) behind POST /api/slack/polish; the subprocess polishes the draft
+        text already in the prompt (no tool calls, no fetch, no send, no store).
       * 'send' → {available:True, ts:...} after sending EXACTLY ONE message.
 
     FAIL-LOUD (feedback_principle_fail_loud_on_missing_input): on ANY spawn
@@ -2422,15 +2462,20 @@ async def _stop_classify_worker(app) -> None:
 # two read tools (list_dms + get_unreads) DIRECTLY over MCP, normalize datamarks,
 # dedupe by EXACT channelId in Python, write needs-draft skeletons. No LLM, no
 # `claude` subprocess. The unchanged _draft_worker then drafts those skeletons.
-# Statuses below treat 'dismissed' as ALREADY-REPRESENTED so a dismissed
-# conversation is never resurrected (same rule the cron used). 'needs-classify'
-# (D-025) is included so the scan dedupes against an in-flight-classify skeleton
-# (a candidate already awaiting classification is not re-appended as a duplicate).
-# 'fyi' is deliberately ABSENT: an fyi conversation that grows new messages should
-# earn a fresh skeleton (the user may now need to reply), exactly like a never-seen
-# conversation — so an fyi item never suppresses a new candidate.
+# These are the IN-FLIGHT statuses an item can be in while still representing an
+# unresolved conversation; a candidate for a channelId already in one of them is a
+# duplicate and is not re-appended. 'needs-classify' (D-025) is included so the
+# scan dedupes against an in-flight-classify skeleton.
+#
+# 'dismissed' is deliberately ABSENT (D-028): Dismiss means "clear THIS message",
+# not "mute this conversation forever" (that's what Mute is for). A dismissed
+# conversation that grows a NEWER message earns a fresh skeleton — handled in
+# _merge_scan_candidates exactly like a 'sent' item (suppress only while no
+# activity newer than the dismiss). Keeping 'dismissed' here was the bug: a single
+# dismiss silently deafened the channel to all future messages until the item
+# aged out. 'fyi' is likewise absent (it is a classification, not a status).
 _SCAN_ACTIVE_STATUSES = {
-    "needs-classify", "needs-draft", "needs-review", "edited", "dismissed",
+    "needs-classify", "needs-draft", "needs-review", "edited",
 }
 
 
@@ -2756,11 +2801,14 @@ def _merge_scan_candidates(items: list[dict], candidates: list[dict]) -> bool:
       * If an ACTIVE item (status in _SCAN_ACTIVE_STATUSES) already has that exact
         channelId, it is already represented — EXCEPT a 'needs-review' item whose
         incoming activity is NEWER gets needsRedraft + an updated snippet/ts (the
-        same redraft signal the cron used). edited / sent / dismissed are NEVER
-        touched.
+        same redraft signal the cron used). edited is NEVER touched.
       * A 'sent' item does NOT suppress when the conversation's lastActivity is
         newer than the item's sentAt — a genuinely new message gets a fresh
         skeleton.
+      * A 'dismissed' item (D-028) suppresses ONLY while the conversation has no
+        activity newer than the dismissed item's ts — Dismiss clears the current
+        message, it does not mute the thread (use Mute for that). A newer message
+        earns a fresh skeleton, exactly like the 'sent' case.
       * Otherwise it is genuinely new → append a fresh needs-draft skeleton.
     """
     changed = False
@@ -2798,6 +2846,19 @@ def _merge_scan_candidates(items: list[dict], candidates: list[dict]) -> bool:
             None,
         )
         if sent is not None and cand_ts <= _as_int_ms(sent.get("sentAt")):
+            continue
+
+        # Likewise a 'dismissed' item suppresses ONLY while no message is newer
+        # than what was dismissed (D-028). Compare against the dismissed item's ts
+        # (the last message it represented); a strictly-newer candidate resurfaces
+        # the conversation with a fresh skeleton. Dismiss ≠ Mute.
+        dismissed = next(
+            (it for it in items
+             if str(it.get("channelId", "")) == channel_id
+             and it.get("status") == "dismissed"),
+            None,
+        )
+        if dismissed is not None and cand_ts <= _as_int_ms(dismissed.get("ts")):
             continue
 
         items.append(_skeleton_for(cand))
@@ -3432,6 +3493,36 @@ async def regenerate_item(request: web.Request) -> web.Response:
     ws = request.app["ws_manager"]
     await ws.broadcast("slack_changed", {"id": item_id})
     return web.json_response({"available": True, "item": item, "etag": new_etag})
+
+
+async def polish_text(request: web.Request) -> web.Response:
+    """Polish the CURRENT draft text for fluency, preserving the user's voice.
+
+    STATELESS by design (D-029): this is a pure text transform on the text in the
+    request body. It does NOT load or write slack_threads.json (no etag, no status
+    change), does NOT read Slack, and NEVER sends — so it can run on text the user
+    is mid-edit without any concurrency/store concern. The polished text is returned
+    for the UI to drop back into the editable box as an unsaved edit; persisting it
+    goes through the existing Save / Approve flow.
+
+    FAIL-LOUD: an empty/non-string `text` is a 400; an unavailable seam is a 502.
+    Never fabricates a polished result.
+    """
+    body = await read_json_body(request) if request.can_read_body else {}
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise web.HTTPBadRequest(reason="polish requires a non-empty 'text'")
+
+    result = await _run_slack_agent("polish", {"text": text[:_DRAFT_CAP]})
+    if not result.get("available"):
+        # Honest failure — never fabricate a polished draft.
+        return web.json_response(
+            {"available": False, "reason": result.get("reason", "Slack polish unavailable")},
+            status=502,
+        )
+
+    polished = _scrub(str(result.get("draft", "")))[:_DRAFT_CAP]
+    return web.json_response({"available": True, "draft": polished})
 
 
 async def approve_item(request: web.Request) -> web.Response:

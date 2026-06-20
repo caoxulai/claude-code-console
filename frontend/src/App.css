@@ -210,6 +210,23 @@ html, body, #root {
 .form-textarea { min-height: 100px; resize: vertical; }
 .form-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.1); }
 
+/* Quiet draft editor (Slack): a settled draft reads as plain text — no border,
+   no fill — and only reveals its editable affordance (border) on hover. Focus
+   keeps the full accent border + ring from .form-textarea:focus so it's clearly
+   editable while you type. Scoped to .draft-quiet so the shared .form-textarea
+   used elsewhere is untouched. */
+.draft-quiet {
+  border-color: transparent;
+  background: transparent;
+  /* Auto-sized in JS (autoSizeDraft) to fit its content — so a short reply isn't
+     framed by a tall empty box. A low min-height (~2 lines) is the floor before
+     the JS height kicks in; it must be below .form-textarea's 100px to let the
+     box shrink. */
+  min-height: 2.6em;
+}
+.draft-quiet:hover { border-color: var(--border); }
+.draft-quiet:focus { background: var(--bg); }
+
 /* Buttons */
 .btn {
   display: inline-flex;
@@ -234,6 +251,12 @@ html, body, #root {
 .btn-primary:hover { opacity: 0.9; color: #000; border-color: var(--accent); }
 .btn-danger { border-color: var(--error); color: var(--error); }
 .btn-danger:hover { background: var(--error); color: #000; }
+/* Quieter danger: red TEXT for semantics, but the same subtle neutral border as
+   a plain .btn (so it sits visually level with Mute instead of shouting). The
+   full red fill still appears on hover, so the destructive intent is obvious the
+   moment you reach for it. Scoped — the louder .btn-danger stays everywhere else. */
+.btn-quiet-danger { border-color: var(--border); color: var(--error); }
+.btn-quiet-danger:hover { background: var(--error); border-color: var(--error); color: #000; }
 .btn-ghost { background: transparent; border-color: transparent; }
 .btn-ghost:hover { background: var(--surface2); border-color: transparent; color: var(--text); }
 .btn-sm { padding: 0.3em 0.6em; font-size: var(--fs-xs); }

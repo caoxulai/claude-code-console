@@ -4707,6 +4707,58 @@ async def test_slack_regenerate_replaces_draft_when_available(client, slack_file
     assert body["item"]["status"] == "needs-review"
 
 
+async def test_slack_polish_returns_polished_text_without_touching_store(client, slack_file, monkeypatch):
+    """POST /api/slack/polish is STATELESS (D-029): it returns polished text from
+    the 'polish' seam and does NOT load or write slack_threads.json — so even when
+    a queue file exists with an item, the file is left BYTE-FOR-BYTE unchanged."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "my rough draft",
+        "generatedDraft": "my rough draft", "status": "edited", "ts": 1,
+    }]}), encoding="utf-8")
+    before = slack_file.read_text(encoding="utf-8")
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "my polished draft"})
+    resp = await client.post("/api/slack/polish", json={"text": "my rough draft"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["available"] is True
+    assert body["draft"] == "my polished draft"
+    # The seam was asked to POLISH the exact text we sent — never to read Slack.
+    assert agent.calls == [("polish", {"text": "my rough draft"})]
+    # The store is untouched: no status flip, no draft overwrite, byte-identical.
+    assert slack_file.read_text(encoding="utf-8") == before
+
+
+async def test_slack_polish_empty_text_is_400(client, slack_file, monkeypatch):
+    """Fail-loud: polishing requires non-empty text — an empty/whitespace/missing
+    'text' is a 400 and the seam is NEVER spawned."""
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "x"})
+    for bad in ({"text": ""}, {"text": "   "}, {}):
+        resp = await client.post("/api/slack/polish", json=bad)
+        assert resp.status == 400
+    assert agent.calls == []  # never reached the seam
+
+
+async def test_slack_polish_unavailable_does_not_fabricate(client, slack_file, monkeypatch):
+    """An unavailable polish seam returns 502 with available:false — never
+    fabricating a polished result."""
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    resp = await client.post("/api/slack/polish", json={"text": "some text"})
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["available"] is False
+
+
+async def test_slack_polish_never_sends(client, slack_file, monkeypatch):
+    """SECURITY: the polish path must NEVER send. The seam is only ever asked for
+    the 'polish' action — never 'send'/'post_message'."""
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "polished"})
+    resp = await client.post("/api/slack/polish", json={"text": "draft"})
+    assert resp.status == 200
+    assert agent.calls and all(action == "polish" for action, _ in agent.calls)
+
+
 async def test_slack_approve_unavailable_does_not_mark_sent(client, slack_file, monkeypatch):
     """An unavailable send seam must NOT fabricate a send-success: 502, and the
     item stays unsent."""
@@ -5796,6 +5848,34 @@ def test_slack_draft_prompt_forbids_tool_calls_and_keeps_return_shape():
     assert "do NOT send" in prompt
 
 
+def test_slack_polish_prompt_forbids_tools_translation_and_keeps_voice():
+    """D-029: the 'polish' prompt forbids ANY tool call / fetch / send, embeds the
+    user's text, requires preserving their voice and SAME language (no translation),
+    and asks for the {draft} strict-JSON shape."""
+    prompt = slack_mod._build_agent_prompt("polish", {"text": "MY_DRAFT_TEXT"})
+    assert "do NOT call any tools" in prompt
+    assert "do NOT fetch anything" in prompt
+    assert "do NOT send" in prompt
+    # Preserve voice + language; never translate or change meaning.
+    assert "do NOT translate" in prompt
+    assert "preserve MY" in prompt
+    assert "Do NOT change the meaning" in prompt
+    # The user's actual text is embedded and the return shape is enforced.
+    assert "MY_DRAFT_TEXT" in prompt
+    assert '"draft"' in prompt
+
+
+def test_slack_polish_parse_requires_draft():
+    """_parse_agent_result('polish') mirrors 'regenerate' exactly: a dict with
+    'draft' is available; a missing 'draft' is fail-loud (no fabrication)."""
+    ok = slack_mod._parse_agent_result(json.dumps({"draft": "polished"}), "polish")
+    assert ok["available"] is True and ok["draft"] == "polished"
+    bad = slack_mod._parse_agent_result(json.dumps({"nope": 1}), "polish")
+    assert bad["available"] is False and "draft" not in bad
+    empty = slack_mod._parse_agent_result("", "polish")
+    assert empty["available"] is False
+
+
 def test_slack_draft_parse_passes_through_history_and_generated():
     """_parse_agent_result('draft') mirrors 'regenerate' (require dict + 'draft')
     and additionally passes through history3d (list) + generatedDraft, defaulting
@@ -6620,20 +6700,34 @@ def test_slack_merge_does_not_flag_edited_item():
     assert items[0]["draft"] == "MY WORDS"  # untouched
 
 
-def test_slack_merge_never_resurrects_dismissed():
-    """A dismissed conversation is treated as ALREADY-REPRESENTED (D-014 soft
-    state): a new candidate for its exact channelId does NOT append a fresh
-    skeleton and does NOT flip it back to actionable."""
-    items = [{
+def test_slack_merge_dismissed_suppresses_until_newer_activity():
+    """A 'dismissed' item suppresses a candidate ONLY while the conversation has no
+    activity NEWER than the dismissed item's ts (D-028). Dismiss clears the current
+    message; it does not mute the thread. A candidate whose ts <= the dismissed
+    item's ts is suppressed and the item is left untouched; a candidate with NEWER
+    activity earns a fresh needs-classify skeleton."""
+    # Case A: no newer activity (cand ts <= dismissed ts) -> suppressed, untouched.
+    items_a = [{
+        "id": "a", "channelId": "D1", "channelType": "dm", "status": "dismissed",
+        "snippet": "old", "ts": _MS,
+    }]
+    cands_a = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+                "channel": "c", "snippet": "same", "ts": _MS_OLDER}]  # not newer
+    assert slack_mod._merge_scan_candidates(items_a, cands_a) is False
+    assert len(items_a) == 1
+    assert items_a[0]["status"] == "dismissed"  # untouched
+
+    # Case B: newer activity (cand ts > dismissed ts) -> a fresh skeleton is added,
+    # the dismissed item stays (a genuinely new message after the dismiss).
+    items_b = [{
         "id": "a", "channelId": "D1", "channelType": "dm", "status": "dismissed",
         "snippet": "old", "ts": _MS_OLDER,
     }]
-    cands = [{"channelId": "D1", "channelType": "dm", "sender": "a",
-              "channel": "c", "snippet": "newer", "ts": _MS_NEWER}]
-    changed = slack_mod._merge_scan_candidates(items, cands)
-    assert changed is False
-    assert len(items) == 1
-    assert items[0]["status"] == "dismissed"  # NOT resurrected
+    cands_b = [{"channelId": "D1", "channelType": "dm", "sender": "a",
+                "channel": "c", "snippet": "new message!", "ts": _MS_NEWER}]  # newer
+    assert slack_mod._merge_scan_candidates(items_b, cands_b) is True
+    statuses = sorted(it["status"] for it in items_b)
+    assert statuses == ["dismissed", "needs-classify"]  # dismissed stays, skeleton joins
 
 
 def test_slack_merge_sent_item_suppresses_until_newer_activity():
@@ -6758,16 +6852,21 @@ async def test_slack_scan_worker_dedupes_against_existing_and_flags_stale(
     assert saved["stale"]["snippet"] == "and more"
 
 
-async def test_slack_scan_worker_never_resurrects_dismissed_or_sent(
+async def test_slack_scan_worker_resurfaces_dismissed_and_sent_on_newer_activity(
     client, slack_file, reset_scan_ts, monkeypatch
 ):
-    """ONE scan cycle must NOT resurrect a dismissed conversation, and must NOT
-    re-card a 'sent' conversation whose activity is not newer than the send — but
-    a 'sent' conversation with NEWER activity DOES earn a fresh skeleton."""
+    """ONE scan cycle: a 'dismissed' or 'sent' conversation is suppressed only while
+    it has NO activity newer than the dismiss/send. A message NEWER than what was
+    dismissed/sent earns a fresh skeleton (D-028: Dismiss clears the current
+    message, it does not mute the thread); older activity stays suppressed."""
     now = int(_time.time() * 1000)
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [
-        {"id": "dis", "channelId": "D_dismissed", "channelType": "dm",
+        # Dismissed with NO newer activity than the dismiss: stays suppressed.
+        {"id": "disold", "channelId": "D_dis_old", "channelType": "dm",
+         "status": "dismissed", "snippet": "go away", "ts": now},
+        # Dismissed WITH newer activity than the dismiss: resurfaces (D-028).
+        {"id": "disnew", "channelId": "D_dis_new", "channelType": "dm",
          "status": "dismissed", "snippet": "go away", "ts": now - 9000},
         {"id": "sentold", "channelId": "D_sent_old", "channelType": "dm",
          "status": "sent", "sentAt": now, "finalText": "done", "ts": now},
@@ -6777,8 +6876,11 @@ async def test_slack_scan_worker_never_resurrects_dismissed_or_sent(
 
     now_s = now / 1000.0
     unreads = {"channels": [
-        # Dismissed conversation with brand-new activity: must NOT resurrect.
-        {"channelId": "D_dismissed", "name": "d",
+        # Dismissed conversation, NO newer activity than the dismiss: suppressed.
+        {"channelId": "D_dis_old", "name": "d1",
+         "messages": [{"user": "U1", "text": "old", "ts": f"{now_s - 5:.6f}"}]},
+        # Dismissed conversation WITH newer activity than the dismiss: resurfaces.
+        {"channelId": "D_dis_new", "name": "d2",
          "messages": [{"user": "U1", "text": "still here", "ts": f"{now_s - 0.01:.6f}"}]},
         # Sent conversation, NO newer activity than the send: suppressed.
         {"channelId": "D_sent_old", "name": "s1",
@@ -6793,15 +6895,16 @@ async def test_slack_scan_worker_never_resurrects_dismissed_or_sent(
     by_channel: dict = {}
     for it in saved:
         by_channel.setdefault(it["channelId"], []).append(it)
-    # Dismissed conversation: still exactly one item, still dismissed.
-    assert len(by_channel["D_dismissed"]) == 1
-    assert by_channel["D_dismissed"][0]["status"] == "dismissed"
+    # Dismissed-no-newer: still exactly the one dismissed item (no new skeleton).
+    assert len(by_channel["D_dis_old"]) == 1
+    assert by_channel["D_dis_old"][0]["status"] == "dismissed"
+    # Dismissed-with-newer: the dismissed item PLUS a fresh needs-classify skeleton.
+    assert sorted(it["status"] for it in by_channel["D_dis_new"]) == ["dismissed", "needs-classify"]
     # Sent-no-newer: still exactly the one sent item (no new skeleton).
     assert len(by_channel["D_sent_old"]) == 1
     assert by_channel["D_sent_old"][0]["status"] == "sent"
     # Sent-with-newer: the sent item PLUS a fresh needs-classify skeleton (D-025).
-    statuses = sorted(it["status"] for it in by_channel["D_sent_new"])
-    assert statuses == ["needs-classify", "sent"]
+    assert sorted(it["status"] for it in by_channel["D_sent_new"]) == ["needs-classify", "sent"]
 
 
 async def test_slack_scan_worker_read_failure_leaves_queue_untouched(
@@ -7913,6 +8016,17 @@ async def test_slack_drive_agent_regenerate_spawn_is_mcp_free_but_strict(monkeyp
     _assert_strict_empty_mcp_config(spawned[0], spawned.configs[0])
 
 
+async def test_slack_drive_agent_polish_spawn_is_mcp_free_but_strict(monkeypatch):
+    """A 'polish' spawn is MCP-free like draft/regenerate (D-029): no --allowedTools,
+    and an EMPTY --mcp-config under --strict-mcp-config so it loads no slack-mcp and
+    can never read or send on Slack — it only transforms the text in its prompt."""
+    spawned = _capture_spawn_args(monkeypatch, json.dumps({"draft": "polished"}))
+    result = await slack_mod._drive_agent("polish", {"text": "rough text"})
+    assert result["available"] is True
+    assert "--allowedTools" not in spawned[0]
+    _assert_strict_empty_mcp_config(spawned[0], spawned.configs[0])
+
+
 async def test_slack_drive_agent_send_spawn_keeps_mcp_config(monkeypatch):
     """CONTRAST (the one intentional exception): a 'send' spawn DOES carry
     --mcp-config + --allowedTools (it needs the post_message write tool the
@@ -8295,6 +8409,10 @@ def test_slack_classify_status_and_active_sets():
     assert "fyi" in slack_mod._VALID_CLASSIFICATIONS
     assert "needs-classify" in slack_mod._SCAN_ACTIVE_STATUSES
     assert "fyi" not in slack_mod._SCAN_ACTIVE_STATUSES
+    # D-028: 'dismissed' is NOT an in-flight active status — a dismissed
+    # conversation that grows a newer message must resurface (suppress-until-newer
+    # in _merge_scan_candidates), not be silently deafened forever.
+    assert "dismissed" not in slack_mod._SCAN_ACTIVE_STATUSES
 
 
 def test_slack_load_migrates_legacy_fyi_status(slack_file):
@@ -8643,3 +8761,5 @@ async def test_slack_scan_prunes_stale_muted_entries(
     saved = json.loads(slack_file.read_text(encoding="utf-8"))
     assert "D_stale" not in saved["mutedThreads"]   # aged out
     assert "D_fresh" in saved["mutedThreads"]        # still live
+
+

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import {
   FiRefreshCw, FiSend, FiRotateCw, FiTrash2, FiSave, FiChevronDown, FiChevronRight,
   FiCheckCircle, FiAlertCircle, FiClock, FiXCircle, FiBellOff, FiPause, FiPlay,
+  FiFeather,
 } from 'react-icons/fi';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
 import { isActionable, reviewGroup } from '../lib/slackQueue';
@@ -264,19 +265,25 @@ export default function SlackPage() {
   // "Recent history (3d)" block uses. (Empty sections render nothing regardless.)
   const [sentOpen, setSentOpen] = useState(false);
   const [dismissedOpen, setDismissedOpen] = useState(false);
+  const [mutedOpen, setMutedOpen] = useState(false);
+  // The muted-threads map from GET /api/slack/muted: { muteKey: unixSeconds }.
+  // Shown in its own collapsible section so the user can review and unmute them.
+  const [muted, setMuted] = useState({});
+  const [unmutingKey, setUnmutingKey] = useState(null);
   // The item whose draft is being actively edited, plus its working text. While
   // an edit is in flight we suppress live-update refetches so we don't clobber
   // the textarea (mirrors CronsPage's `if (!editingId && !showNew)` guard).
   const [editingId, setEditingId] = useState(null);
   const [draftText, setDraftText] = useState('');
-  const [busyId, setBusyId] = useState(null); // item mid approve/regenerate/dismiss
+  const [busyId, setBusyId] = useState(null); // item mid approve/dismiss/mute
+  const [polishingId, setPolishingId] = useState(null); // item mid fluency-polish
 
-  // Ids whose draft is currently being generated (on-demand on expand, or via
-  // the explicit Regenerate button). Drives the per-row "drafting…" indicator
-  // and the header progress summary. Held as a Set so several can be in flight
-  // at once. (A legacy queue item or a regenerate-in-flight can still transiently
-  // present needs-draft / drafting state even though the cron now produces fully
-  // drafted items, so this state is retained.)
+  // Ids whose draft is currently being generated (via the per-row Generate /
+  // Retry draft button). Drives the per-row "drafting…" indicator and the header
+  // progress summary. Held as a Set so several can be in flight at once. (A legacy
+  // queue item or a draft-in-flight can still transiently present needs-draft /
+  // drafting state even though the cron now produces fully drafted items, so this
+  // state is retained.)
   const [draftingIds, setDraftingIds] = useState(() => new Set());
   // Ids whose most recent draft attempt failed/was unavailable. Surfaces a
   // "draft failed — retry" affordance per row; never a fabricated draft. Cleared
@@ -288,13 +295,13 @@ export default function SlackPage() {
   // attempt starts for that id; only populated on non-OK / available:false / 4xx.
   const [sendFailedIds, setSendFailedIds] = useState(() => new Map());
   // Mirror of draftingIds for synchronous reads (state updates are async, so a
-  // ref avoids double-dispatching the same id on the on-demand/regenerate path).
+  // ref avoids double-dispatching the same id on the on-demand draft path).
   const draftingRef = useRef(draftingIds);
   draftingRef.current = draftingIds;
 
   // Seam-health (GET /api/slack/health): whether the delegation subprocess is
-  // actually wired. Drives the header badge and gates the per-item on-demand /
-  // regenerate draft path (no point spawning subprocesses that will just fail).
+  // actually wired. Drives the header badge and gates the per-item on-demand
+  // draft path (no point spawning subprocesses that will just fail).
   const [health, setHealth] = useState(null);
 
   // PER-ITEM pending sends — a map keyed by item id:
@@ -318,6 +325,21 @@ export default function SlackPage() {
   const pendingSendsRef = useRef(pendingSends);
   pendingSendsRef.current = pendingSends;
   const anyPending = Object.keys(pendingSends).length > 0;
+
+  // The draft <textarea>, auto-sized to its content so a short reply isn't framed
+  // by a tall empty box (the old fixed min-height:100px wasted ~3 blank lines on a
+  // 1-line draft). `autoSizeDraft` shrinks-then-grows to the content's scrollHeight
+  // (capped), and is called on edit AND on programmatic text changes (expand /
+  // Polish) via the effect below so the box always fits whatever it's showing.
+  const draftRef = useRef(null);
+  const autoSizeDraft = () => {
+    const ta = draftRef.current;
+    if (!ta) return;
+    ta.style.height = 'auto';
+    // +2px avoids a 1px scrollbar flicker; cap keeps a pathologically long draft
+    // from eating the panel (it scrolls past the cap).
+    ta.style.height = Math.min(ta.scrollHeight + 2, 320) + 'px';
+  };
 
   const fetchHealth = async () => {
     try {
@@ -360,7 +382,7 @@ export default function SlackPage() {
     }
   };
 
-  useEffect(() => { refresh(); fetchHealth(); }, []);
+  useEffect(() => { refresh(); fetchHealth(); refreshMuted(); }, []);
 
   // Live refresh, but never while a draft is open in the editor — that would
   // discard the in-progress edit.
@@ -373,6 +395,9 @@ export default function SlackPage() {
     clearRef(scanHintRef);
     setScanning(false);
     if (!editingId) refresh();
+    // The muted map can change from a scan-driven mute/unmute or a prune; keep
+    // the management section current. Cheap GET; safe to run even while editing.
+    refreshMuted();
   });
 
   // Clear ONLY one id's timers (fire timer + countdown interval), without
@@ -469,6 +494,15 @@ export default function SlackPage() {
     const id = setInterval(() => setTick(t => t + 1), SCAN_LABEL_TICK_MS);
     return () => clearInterval(id);
   }, []);
+
+  // Auto-size the draft textarea whenever the row it belongs to opens or its
+  // displayed text changes by a NON-typing path — expanding a row, or Polish
+  // replacing the text. (Typing is sized inline in the textarea's onChange.) The
+  // textarea only exists while a row is expanded, so this no-ops otherwise.
+  useEffect(() => {
+    autoSizeDraft();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandedId, editingId, draftText, items]);
 
   // Manual Refresh triggers a REAL Slack scan and returns immediately. POST
   // /refresh wakes the in-process scan worker (the same `_scan_once` work the
@@ -722,7 +756,7 @@ export default function SlackPage() {
           status = retry.status;
           json = retry.json;
         } else {
-          // The item ACTUALLY changed underneath us (an edit / regenerate /
+          // The item ACTUALLY changed underneath us (an edit / re-draft /
           // someone sent it) — do not silently resend stale text; surface it.
           setError('Conflict: this item changed before the send. Re-review and approve again.');
           return;
@@ -782,19 +816,18 @@ export default function SlackPage() {
     timersRef.current[id] = { timer, interval };
   };
 
-  // Generate (or regenerate) a single item's draft via the per-item seam call
-  // POST /api/slack/queue/{id}/refresh — the SAME path used for both the
-  // on-demand draft (expanding a legacy needs-draft row) and the explicit
-  // Regenerate button. These are USER-TRIGGERED and remain after the drain was
-  // removed. The backend flips needs-draft → needs-review on success and is
-  // fail-loud per item (502 / available:false). One short request per item;
-  // never a giant call, never /approve — this can NOT send.
+  // Generate a single item's draft via the per-item seam call
+  // POST /api/slack/queue/{id}/refresh — the path used by the per-row Generate /
+  // Retry draft button (expanding a legacy needs-draft row, or retrying after a
+  // failure). USER-TRIGGERED. The backend flips needs-draft → needs-review on
+  // success and is fail-loud per item (502 / available:false). One short request
+  // per item; never a giant call, never /approve — this can NOT send.
   //
   // Per-item fail-loud: on failure the row is left in needs-draft and added to
   // draftFailedIds so a "draft failed — retry" affordance shows; we never
   // fabricate a draft. `quiet` suppresses the error banner (the row's own retry
-  // affordance is the signal); the explicit Regenerate button passes quiet=false
-  // so the user sees why their click did nothing.
+  // affordance is the signal); the explicit Generate/Retry button passes
+  // quiet=false so the user sees why their click did nothing.
   const generateDraft = async (id, { quiet = false } = {}) => {
     if (draftingRef.current.has(id)) return; // already in flight
     setDraftingIds(prev => { const n = new Set(prev); n.add(id); return n; });
@@ -832,12 +865,44 @@ export default function SlackPage() {
     }
   };
 
-  // The explicit Regenerate button: same per-item path, but it also clears any
-  // in-progress edit (the user asked for a fresh draft) and surfaces failures
-  // loudly.
-  const regenerate = async (id) => {
-    setEditingId(null);
-    await generateDraft(id, { quiet: false });
+  // "Polish": take the text CURRENTLY in this row's box, ask the stateless
+  // MCP-free /api/slack/polish seam to improve its fluency while keeping the user's
+  // own voice and language, and drop the result back into the box as an UNSAVED
+  // edit (we set editingId + draftText, never touching the stored draft). This is
+  // a pure text transform — it never reads Slack, never sends, never writes the
+  // queue — so it runs on whatever the user is looking at: their own edits if
+  // editing, otherwise the stored draft. Fail-loud: on any failure we surface the
+  // banner and leave the text exactly as it was (never fabricate).
+  const polishDraft = async (id) => {
+    const item = items.find(it => it.id === id);
+    if (!item) return;
+    const source = (editingId === id) ? draftText : (item.draft || '');
+    if (!source.trim()) {
+      setError('Nothing to polish yet — write or generate a draft first.');
+      return;
+    }
+    setPolishingId(id);
+    setError(null);
+    try {
+      const res = await fetch('/api/slack/polish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: source }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok || !json || json.available === false) {
+        setError(`Couldn't polish the draft: ${(json && json.reason) || 'unavailable'}`);
+        return;
+      }
+      // Land the polished text as an editable, unsaved edit so the existing diff
+      // vs. the generated baseline + Save + Approve flow handle it unchanged.
+      setEditingId(id);
+      setDraftText(json.draft || '');
+    } catch {
+      setError("Couldn't polish the draft.");
+    } finally {
+      setPolishingId(null);
+    }
   };
 
   // Dismiss SOFT-dismisses the item: the backend sets status='dismissed' and
@@ -881,33 +946,118 @@ export default function SlackPage() {
   // item's status to 'dismissed' — so the same dismiss repaint/Undo path applies
   // (the row moves into the Dismissed section). Etag-guarded; reuses the exact
   // setBusyId/error handling as dismiss(). Per-item only — there is no bulk-mute.
+  // POST the mute with a given etag. Returns { ok, status, json } so the caller
+  // can decide whether to retry on a 409. NEVER sends — it only flips the item to
+  // dismissed and records the mute key server-side.
+  const postMute = async (id, withEtag) => {
+    const res = await fetch(`/api/slack/queue/${encodeURIComponent(id)}/mute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ etag: withEtag }),
+    });
+    const json = await res.json().catch(() => null);
+    return { ok: res.ok, status: res.status, json };
+  };
+
   const mute = async (id) => {
     cancelPendingSend(id); // a pending send for this row is no longer valid
     setBusyId(id);
     try {
-      const res = await fetch(`/api/slack/queue/${encodeURIComponent(id)}/mute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ etag }),
-      });
+      let res = await postMute(id, etag);
+
+      // A 409 means the queue was rewritten under us — almost always the periodic
+      // scan worker bumping the file's etag (it rewrites slack_threads.json every
+      // cycle), NOT a real user-edit collision. Mute is a TARGETED single-item op:
+      // the backend re-reads fresh state and flips THIS item by id, so it never
+      // clobbers a concurrent scan append. Re-read the fresh etag and retry ONCE
+      // (the server-side etag guard remains the backstop). See
+      // feedback_principle_no_blind_overwrite_shared_store.
       if (res.status === 409) {
-        setError('Conflict: the queue was modified elsewhere. Refreshing…');
+        const fresh = await fetch('/api/slack/queue')
+          .then(r => r.json())
+          .catch(() => null);
+        if (fresh && fresh.etag) {
+          setEtag(fresh.etag);
+          setItems(Array.isArray(fresh.items) ? fresh.items : []);
+          res = await postMute(id, fresh.etag);
+        }
+      }
+
+      if (res.json && res.json.etag) setEtag(res.json.etag);
+
+      if (!res.ok) {
+        // Surface WHY rather than a blanket "failed" — the backend sends a JSON
+        // reason for the cases the user can act on (404 the row is gone, 409 a
+        // real ongoing conflict, 400 unroutable).
+        const why =
+          res.status === 404 ? 'that message is no longer in the queue (it may have been re-scanned) — refreshing'
+          : res.status === 409 ? 'the queue is being updated right now — try again in a moment'
+          : (res.json && res.json.reason) || `mute failed (HTTP ${res.status})`;
+        setError(`Couldn't mute the thread: ${why}.`);
         refresh();
         return;
       }
-      if (!res.ok) {
-        setError('Failed to mute the thread.');
-        return;
-      }
-      const json = await res.json().catch(() => null);
-      if (json && json.etag) setEtag(json.etag);
+
       if (expandedId === id) { setExpandedId(null); setEditingId(null); }
       setError(null);
       refresh();
+      refreshMuted(); // keep the Muted-threads section in sync
     } catch {
-      setError('Failed to mute the thread.');
+      setError("Couldn't mute the thread — the request did not complete.");
     } finally {
       setBusyId(null);
+    }
+  };
+
+  // Load the muted-threads map for the management section. Best-effort: a failure
+  // just leaves the section empty rather than blocking the page.
+  const refreshMuted = async () => {
+    try {
+      const res = await fetch('/api/slack/muted');
+      const json = await res.json().catch(() => null);
+      setMuted(json && json.muted && typeof json.muted === 'object' ? json.muted : {});
+    } catch {
+      /* best-effort — leave whatever we had */
+    }
+  };
+
+  // Unmute one thread: DELETE /api/slack/muted/{key}. Un-muting only stops future
+  // scans from skipping the conversation — it does NOT resurrect any dismissed
+  // item (a genuinely new message earns a fresh skeleton). 409 → re-read & retry
+  // once, mirroring mute (the scan worker bumps the shared file's etag).
+  const unmute = async (key) => {
+    setUnmutingKey(key);
+    const del = (withEtag) =>
+      fetch(`/api/slack/muted/${encodeURIComponent(key)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ etag: withEtag }),
+      });
+    try {
+      let res = await del(etag);
+      if (res.status === 409) {
+        const fresh = await fetch('/api/slack/queue').then(r => r.json()).catch(() => null);
+        if (fresh && fresh.etag) {
+          setEtag(fresh.etag);
+          res = await del(fresh.etag);
+        }
+      }
+      const json = await res.json().catch(() => null);
+      if (json && json.etag) setEtag(json.etag);
+      if (!res.ok) {
+        // 404 → the key was already gone (e.g. aged out / unmuted elsewhere); just
+        // resync the list rather than alarm the user.
+        if (res.status !== 404) {
+          setError(`Couldn't unmute that thread (HTTP ${res.status}).`);
+        }
+      } else {
+        setError(null);
+      }
+      refreshMuted();
+    } catch {
+      setError("Couldn't unmute that thread — the request did not complete.");
+    } finally {
+      setUnmutingKey(null);
     }
   };
 
@@ -954,6 +1104,7 @@ export default function SlackPage() {
       border: 'none', padding: 0,
     };
     const isBusy = busyId === item.id;
+    const isPolishing = polishingId === item.id;
     const isSent = item.status === 'sent';
     // A soft-dismissed item: preserved history, never sent. Read-only like sent
     // (show its draft) but with an Undo affordance to restore it. Treated as a
@@ -1203,12 +1354,39 @@ export default function SlackPage() {
             )
           ) : (
             <textarea
-              className="form-textarea"
+              ref={draftRef}
+              className="form-textarea draft-quiet"
               value={editing ? draftText : (item.draft || '')}
-              onChange={e => { setEditingId(item.id); setDraftText(e.target.value); }}
+              onChange={e => { setEditingId(item.id); setDraftText(e.target.value); autoSizeDraft(); }}
               placeholder="The drafted reply will appear here. Edit it before approving — your edits teach the style preferences."
               style={{ width: '100%' }}
             />
+          )}
+          {/* --- Draft tools — operate on the text in the box above ---------- */}
+          {/* Polish (rewrite for fluency) and Save edit sit WITH the textarea
+              because they shape the draft, distinct from the disposition row
+              (Send / Dismiss / Mute) below. Shown ONLY once the draft has been
+              edited (dirty): an untouched machine draft needs no polishing or
+              saving, so this whole row stays hidden until you change the text.
+              (Polishing also sets the text, which keeps `dirty` true — so Polish
+              stays available for repeated passes.) */}
+          {!isReadOnly && !undrafted && !pending && dirty && (
+            <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.5em' }}>
+              <button
+                className="btn"
+                disabled={isBusy || isPolishing}
+                onClick={() => polishDraft(item.id)}
+                title="Rewrite the current text to read more fluently while keeping your own wording and language"
+              >
+                <FiFeather size={13} /> {isPolishing ? 'Polishing…' : 'Polish'}
+              </button>
+              <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
+                <FiSave size={13} /> Save edit
+              </button>
+              <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
+                Unsaved edits — Send will use the edited text.
+              </span>
+            </div>
           )}
         </div>
 
@@ -1260,11 +1438,11 @@ export default function SlackPage() {
             text. The Generate-draft button lives in the Draft-reply section. */}
         {undrafted && !isReadOnly && (
           <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center' }}>
-            <button className="btn btn-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
+            <button className="btn btn-quiet-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
               <FiTrash2 size={13} /> Dismiss
             </button>
             <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this thread — dismiss it and stop surfacing future messages from this thread">
-              <FiBellOff size={13} /> Mute thread
+              <FiBellOff size={13} /> Mute
             </button>
           </div>
         )}
@@ -1285,34 +1463,32 @@ export default function SlackPage() {
               </button>
             </div>
           ) : (
+            // Disposition row — what HAPPENS to this conversation. Send (the
+            // primary action) sits on the left; the dismissive actions
+            // (Dismiss / Mute) are pushed to the right via marginLeft:auto so a
+            // destructive click is never adjacent to Send. Draft-shaping tools
+            // (Polish / Save edit) live up with the textarea, not here.
             <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center' }}>
-              {dirty && (
-                <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
-                  <FiSave size={13} /> Save edit
-                </button>
-              )}
               <button
                 className="btn btn-primary"
                 disabled={isBusy}
                 onClick={() => approveAndSend(item.id)}
-                title="Approve and send this reply on Slack (with a brief undo window)"
+                title="Send this reply on Slack (with a brief undo window)"
               >
-                <FiSend size={13} /> Approve &amp; Send
+                <FiSend size={13} /> Send
               </button>
-              <button className="btn" disabled={isBusy} onClick={() => regenerate(item.id)} title="Regenerate this draft">
-                <FiRotateCw size={13} /> Regenerate
-              </button>
-              <button className="btn btn-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
+              <button
+                className="btn btn-quiet-danger"
+                disabled={isBusy}
+                onClick={() => dismiss(item.id)}
+                title="Dismiss without replying"
+                style={{ marginLeft: 'auto' }}
+              >
                 <FiTrash2 size={13} /> Dismiss
               </button>
               <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this thread — dismiss it and stop surfacing future messages from this thread">
-                <FiBellOff size={13} /> Mute thread
+                <FiBellOff size={13} /> Mute
               </button>
-              {dirty && (
-                <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
-                  Unsaved edits — Approve &amp; Send will use the edited text.
-                </span>
-              )}
             </div>
           )
         )}
@@ -1470,6 +1646,19 @@ export default function SlackPage() {
   const sentItems = items.filter(it => it.status === 'sent');
   const dismissedItems = items.filter(it => it.status === 'dismissed');
 
+  // Muted-threads management (D-025): the keys of the muted map, newest first,
+  // plus a resolver from a mute key to a friendly label. A mute key is a
+  // channelId (or channelId_threadTs); we look up any queue item on the same
+  // channel to borrow its human-readable source/channel label, falling back to
+  // the raw key when nothing matches.
+  const mutedKeys = Object.keys(muted).sort((a, b) => (muted[b] || 0) - (muted[a] || 0));
+  const mutedLabel = (key) => {
+    const channelId = String(key).split('_')[0];
+    const match = items.find(it => it.channelId === channelId);
+    if (match) return sourceLabel(match) + (match.sender ? ` — ${match.sender}` : '');
+    return 'Muted conversation';
+  };
+
   const replyItems = needsReviewItems.filter(it => reviewGroup(it) === 'reply');
   const fyiItems = needsReviewItems.filter(it => reviewGroup(it) === 'fyi');
   const classifyingItems = needsReviewItems.filter(it => reviewGroup(it) === 'classifying');
@@ -1536,8 +1725,10 @@ export default function SlackPage() {
             aria-label={paused ? 'Slack scanning paused — resume' : 'Slack scanning running — pause'}
             style={{
               position: 'relative', display: 'inline-flex', alignItems: 'center',
-              width: '96px', height: '24px', flex: 'none', padding: 0,
-              borderRadius: '12px', border: 'none',
+              // Height matched to the Refresh .btn (below) so the two controls sit
+              // as one harmonized pair; radius = height/2 keeps the full-pill shape.
+              width: '104px', height: '34px', flex: 'none', padding: 0,
+              borderRadius: '17px', border: 'none',
               background: paused ? 'var(--warning)' : 'var(--accent2)',
               cursor: pausing ? 'default' : 'pointer',
               opacity: pausing ? 0.6 : 1,
@@ -1546,7 +1737,7 @@ export default function SlackPage() {
               // thumb right + label left when running, thumb left + label right when
               // paused. flexDirection flips to keep the label clear of the thumb.
               flexDirection: paused ? 'row-reverse' : 'row',
-              color: '#000', fontSize: '0.78em', fontWeight: 700,
+              color: '#000', fontSize: '0.82em', fontWeight: 700,
             }}
           >
             {/* Sliding thumb (icon inside). Sits at the leading edge per direction. */}
@@ -1554,18 +1745,25 @@ export default function SlackPage() {
               aria-hidden="true"
               style={{
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                width: '20px', height: '20px', margin: '0 2px', flex: 'none',
+                width: '28px', height: '28px', margin: '0 3px', flex: 'none',
                 borderRadius: '50%', background: 'var(--bg)', color: 'var(--text)',
               }}
             >
-              {paused ? <FiPause size={11} /> : <FiPlay size={11} />}
+              {paused ? <FiPause size={13} /> : <FiPlay size={13} />}
             </span>
             {/* Label fills the remaining track, centered in its half. */}
             <span style={{ flex: 1, textAlign: 'center', letterSpacing: '0.02em' }}>
               {paused ? 'Paused' : 'Running'}
             </span>
           </button>
-          <button className="btn btn-primary" onClick={refreshQueue} disabled={refreshing}>
+          {/* Fixed height matches the toggle so the pair reads as one control
+              group; scoped inline so the global .btn (used everywhere) is unchanged. */}
+          <button
+            className="btn btn-primary"
+            onClick={refreshQueue}
+            disabled={refreshing}
+            style={{ height: '34px' }}
+          >
             <FiRefreshCw size={14} /> {scanning ? 'Scanning…' : 'Refresh'}
           </button>
         </div>
@@ -1749,6 +1947,60 @@ export default function SlackPage() {
           {dismissedOpen && (
             <div className="card" style={{ marginTop: '0.5em' }}>
               {renderTable(dismissedItems)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* --- Muted threads (collapsible, collapsed by default) ------------- */}
+      {/* The threads whose future messages the scan skips. Each row shows a
+          friendly label (resolved from any queue item on the same channel) and
+          an Unmute button. Empty map renders nothing. */}
+      {mutedKeys.length > 0 && (
+        <div style={{ marginTop: 'var(--space-md)' }}>
+          <button type="button" style={collapsibleStyle} onClick={() => setMutedOpen(v => !v)}>
+            {mutedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+            <FiBellOff size={13} /> Muted threads ({mutedKeys.length})
+          </button>
+          {mutedOpen && (
+            <div className="card" style={{ marginTop: '0.5em' }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Thread</th>
+                    <th style={{ textAlign: 'center' }}>Muted</th>
+                    <th style={{ textAlign: 'center' }}>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mutedKeys.map(key => (
+                    <tr key={key}>
+                      <td>
+                        <span>{mutedLabel(key)}</span>
+                        <span style={{ color: 'var(--muted)', fontSize: '0.78em', marginLeft: '0.5em' }}>
+                          {key}
+                        </span>
+                      </td>
+                      <td style={{ color: 'var(--muted)', fontSize: '0.85em', textAlign: 'center' }}>
+                        {relativeTime(muted[key] ? muted[key] * 1000 : null)}
+                      </td>
+                      <td style={{ textAlign: 'center' }}>
+                        <button
+                          className="btn"
+                          disabled={unmutingKey === key}
+                          onClick={() => unmute(key)}
+                          title="Unmute — let future messages in this thread surface again"
+                        >
+                          <FiBellOff size={13} /> {unmutingKey === key ? 'Unmuting…' : 'Unmute'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div style={{ color: 'var(--muted)', fontSize: '0.78em', padding: '0.4em 0.6em 0' }}>
+                Unmuting only lets future messages surface again — it does not restore any dismissed message. Muted threads also expire automatically after 30 days.
+              </div>
             </div>
           )}
         </div>
