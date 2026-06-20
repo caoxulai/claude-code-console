@@ -43,7 +43,7 @@ _DEFAULT_PRICE = (5.0, 25.0)
 _CACHE_READ_MULT = 0.1
 _CACHE_WRITE_MULT = 1.25
 
-_CACHE_TTL = 60  # seconds
+_CACHE_TTL = 120  # seconds
 
 
 def register(app: web.Application):
@@ -126,11 +126,14 @@ class _Record:
     agent: str | None
     tool_names: list[str]
     tool_input_sizes: list[int]
+    source_file: str = ""
 
 
 @dataclass
 class _Cache:
     records: list[_Record] = field(default_factory=list)
+    file_mtimes: dict[str, tuple[int, int]] = field(default_factory=dict)  # path -> (mtime_ns, size)
+    seen: set[str] = field(default_factory=set)
     responses: dict = field(default_factory=dict)  # pre-computed endpoint responses
     updated_at: float = 0.0
 
@@ -139,76 +142,129 @@ _cache = _Cache()
 _cache_lock = asyncio.Lock()
 
 
-def _scan_all_files() -> list[_Record]:
-    """Parse all JSONL files and extract deduplicated assistant records."""
+def _parse_file(path: str, seen: set[str]) -> list[_Record]:
+    """Parse a single JSONL file, returning new deduplicated records."""
+    new_records: list[_Record] = []
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return new_records
+    with fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") != "assistant":
+                continue
+
+            uid = rec.get("uuid")
+            if uid is not None:
+                if uid in seen:
+                    continue
+                seen.add(uid)
+
+            msg = rec.get("message")
+            if not isinstance(msg, dict):
+                continue
+
+            model = msg.get("model") or "unknown"
+            if model == "<synthetic>":
+                continue
+
+            usage = msg.get("usage")
+            inp = out = cr = cw = 0
+            if isinstance(usage, dict):
+                inp = usage.get("input_tokens", 0) or 0
+                out = usage.get("output_tokens", 0) or 0
+                cr = usage.get("cache_read_input_tokens", 0) or 0
+                cw = usage.get("cache_creation_input_tokens", 0) or 0
+
+            # Extract tool_use names for the tools endpoint
+            tool_names: list[str] = []
+            tool_input_sizes: list[int] = []
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_names.append(block.get("name", "unknown"))
+                        tool_inp = block.get("input")
+                        tool_input_sizes.append(len(json.dumps(tool_inp)) if tool_inp else 0)
+
+            new_records.append(_Record(
+                timestamp=rec.get("timestamp") or "",
+                model=model,
+                inp=inp,
+                out=out,
+                cache_read=cr,
+                cache_write=cw,
+                cwd=rec.get("cwd"),
+                is_sidechain=bool(rec.get("isSidechain")),
+                agent=rec.get("attributionAgent") if rec.get("isSidechain") else None,
+                tool_names=tool_names,
+                tool_input_sizes=tool_input_sizes,
+                source_file=path,
+            ))
+
+    return new_records
+
+
+def _scan_incremental(
+    prev_records: list[_Record],
+    prev_file_mtimes: dict[str, tuple[int, int]],
+    prev_seen: set[str],
+) -> tuple[list[_Record], dict[str, tuple[int, int]], set[str]]:
+    """Incremental scan: only re-parse new or changed files.
+
+    On the first call (empty prev state) this degrades to a full scan.
+    Deletion of files (rare) triggers a full rescan to keep the seen set
+    consistent — we cannot efficiently evict orphaned UUIDs without storing
+    them per-file, and a full rescan on deletion is acceptable given its rarity.
+    """
     if not CLAUDE_PROJECTS_BASE.is_dir():
-        return []
+        return [], {}, set()
 
-    records: list[_Record] = []
-    seen: set[str] = set()
-
+    # Discover current files and their (mtime_ns, size) fingerprints.
+    # We track both mtime and size because on some filesystems an append
+    # within the same timestamp granularity won't advance mtime_ns.
+    current_files: dict[str, tuple[int, int]] = {}
     for f in CLAUDE_PROJECTS_BASE.rglob("*.jsonl"):
+        path_str = str(f)
         try:
-            fh = open(f, encoding="utf-8", errors="replace")
+            st = f.stat()
+            current_files[path_str] = (st.st_mtime_ns, st.st_size)
         except OSError:
             continue
-        with fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") != "assistant":
-                    continue
 
-                uid = rec.get("uuid")
-                if uid is not None:
-                    if uid in seen:
-                        continue
-                    seen.add(uid)
+    # Detect deleted files — if any were deleted, do a full rescan to keep
+    # the seen set in sync (prevents orphaned-UUID suppression trap).
+    deleted = set(prev_file_mtimes.keys()) - set(current_files.keys())
+    if deleted:
+        seen: set[str] = set()
+        file_mtimes: dict[str, tuple[int, int]] = {}
+        all_records: list[_Record] = []
+        for path_str, fingerprint in current_files.items():
+            file_mtimes[path_str] = fingerprint
+            file_records = _parse_file(path_str, seen)
+            all_records.extend(file_records)
+        return all_records, file_mtimes, seen
 
-                msg = rec.get("message")
-                if not isinstance(msg, dict):
-                    continue
+    # No deletions — fast incremental path
+    records = list(prev_records)
+    seen = set(prev_seen)
+    file_mtimes = dict(prev_file_mtimes)
 
-                model = msg.get("model") or "unknown"
-                if model == "<synthetic>":
-                    continue
+    for path_str, fingerprint in current_files.items():
+        prev_fingerprint = file_mtimes.get(path_str)
+        if prev_fingerprint == fingerprint:
+            # Unchanged — skip
+            continue
+        # New or changed file: parse it, UUID dedup filters already-known records
+        new_records = _parse_file(path_str, seen)
+        records.extend(new_records)
+        file_mtimes[path_str] = fingerprint
 
-                usage = msg.get("usage")
-                inp = out = cr = cw = 0
-                if isinstance(usage, dict):
-                    inp = usage.get("input_tokens", 0) or 0
-                    out = usage.get("output_tokens", 0) or 0
-                    cr = usage.get("cache_read_input_tokens", 0) or 0
-                    cw = usage.get("cache_creation_input_tokens", 0) or 0
-
-                # Extract tool_use names for the tools endpoint
-                tool_names: list[str] = []
-                tool_input_sizes: list[int] = []
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            tool_names.append(block.get("name", "unknown"))
-                            tool_inp = block.get("input")
-                            tool_input_sizes.append(len(json.dumps(tool_inp)) if tool_inp else 0)
-
-                records.append(_Record(
-                    timestamp=rec.get("timestamp") or "",
-                    model=model,
-                    inp=inp,
-                    out=out,
-                    cache_read=cr,
-                    cache_write=cw,
-                    cwd=rec.get("cwd"),
-                    is_sidechain=bool(rec.get("isSidechain")),
-                    agent=rec.get("attributionAgent") if rec.get("isSidechain") else None,
-                    tool_names=tool_names,
-                    tool_input_sizes=tool_input_sizes,
-                ))
-
-    return records
+    return records, file_mtimes, seen
 
 
 def _compute_usage(records: list[_Record]) -> dict:
@@ -328,12 +384,26 @@ async def _ensure_cache() -> dict:
         if now - _cache.updated_at < _CACHE_TTL and _cache.responses:
             return _cache.responses
 
-        def _scan_and_compute():
-            records = _scan_all_files()
-            return records, _build_all_responses(records)
+        # Capture prev state for the incremental scan
+        prev_records = _cache.records
+        prev_file_mtimes = _cache.file_mtimes
+        prev_seen = _cache.seen
 
-        records, responses = await asyncio.to_thread(_scan_and_compute)
-        _cache = _Cache(records=records, responses=responses, updated_at=time.monotonic())
+        def _scan_and_compute():
+            records, file_mtimes, seen = _scan_incremental(
+                prev_records, prev_file_mtimes, prev_seen
+            )
+            responses = _build_all_responses(records)
+            return records, file_mtimes, seen, responses
+
+        records, file_mtimes, seen, responses = await asyncio.to_thread(_scan_and_compute)
+        _cache = _Cache(
+            records=records,
+            file_mtimes=file_mtimes,
+            seen=seen,
+            responses=responses,
+            updated_at=time.monotonic(),
+        )
         return responses
 
 

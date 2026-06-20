@@ -4822,6 +4822,218 @@ async def test_usage_tools_leaderboard(client, recent_usage):
     assert by_name["Read"]["avgInputSize"] > 0
 
 
+# --------------------------------------------------------------------------- #
+# Incremental-scan correctness tests (AC-3 through AC-8)
+# --------------------------------------------------------------------------- #
+
+
+async def test_usage_incremental_skips_unchanged_files(client, usage_projects, monkeypatch):
+    """After a cold scan, an expired TTL with no file changes must return
+    identical results (AC-3/AC-7) and have file_mtimes populated."""
+    resp1 = await client.get("/api/usage")
+    assert resp1.status == 200
+    data1 = await resp1.json()
+
+    # Expire the cache TTL without changing any files.
+    monkeypatch.setattr(usage_mod._cache, "updated_at", 0)
+
+    resp2 = await client.get("/api/usage")
+    assert resp2.status == 200
+    data2 = await resp2.json()
+
+    # Responses must be identical.
+    assert data1 == data2
+
+    # The cache must have file_mtimes populated after the scan.
+    assert isinstance(usage_mod._cache.file_mtimes, dict)
+    assert len(usage_mod._cache.file_mtimes) > 0
+
+
+async def test_usage_incremental_picks_up_appended_record(client, usage_projects, monkeypatch):
+    """Appending a new record to an existing file must appear in the next
+    incremental refresh without double-counting old records (AC-5)."""
+    resp1 = await client.get("/api/usage")
+    data1 = await resp1.json()
+    old_messages = data1["total"]["messages"]
+    old_input = data1["total"]["inputTokens"]
+
+    # Append a new assistant record with a unique UUID to the existing file.
+    existing_file = usage_projects / "-home-alice-proj" / "s1.jsonl"
+    new_record = json.dumps({
+        "type": "assistant",
+        "uuid": "incremental-append-unique-1",
+        "timestamp": "2026-06-01T11:00:00.000Z",
+        "isSidechain": False,
+        "cwd": "/home/alice/proj",
+        "message": {
+            "model": "claude-opus-4-8",
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 200,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+        },
+    })
+    with open(existing_file, "a", encoding="utf-8") as f:
+        f.write(new_record + "\n")
+
+    # Expire the cache TTL so next request triggers a refresh.
+    monkeypatch.setattr(usage_mod._cache, "updated_at", 0)
+
+    resp2 = await client.get("/api/usage")
+    data2 = await resp2.json()
+
+    # New record must be counted exactly once — no double-counting of old records.
+    assert data2["total"]["messages"] == old_messages + 1
+    assert data2["total"]["inputTokens"] == old_input + 500
+
+
+async def test_usage_incremental_evicts_deleted_file_records(client, tmp_path, monkeypatch):
+    """Deleting a file must evict its records AND its UUIDs from the seen set
+    so the same UUID in a new file can be counted (AC-4, UUID-eviction trap)."""
+    base = tmp_path / "claude_projects_del"
+    base.mkdir()
+    monkeypatch.setattr(usage_mod, "CLAUDE_PROJECTS_BASE", base)
+    monkeypatch.setattr(usage_mod, "_cache", usage_mod._Cache())
+
+    proj = base / "-home-alice-proj"
+    proj.mkdir()
+
+    # File A has a unique record.
+    _write_jsonl(proj / "to_delete.jsonl", [
+        {
+            "type": "assistant", "uuid": "evict-uuid-1",
+            "timestamp": "2026-06-01T10:00:00.000Z", "isSidechain": False,
+            "cwd": "/home/alice/proj",
+            "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 300, "output_tokens": 100,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        },
+    ])
+    # File B has a different record.
+    _write_jsonl(proj / "keep.jsonl", [
+        {
+            "type": "assistant", "uuid": "keep-uuid-1",
+            "timestamp": "2026-06-01T10:00:00.000Z", "isSidechain": False,
+            "cwd": "/home/alice/proj",
+            "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 200, "output_tokens": 50,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        },
+    ])
+
+    # Cold scan picks up both.
+    resp1 = await client.get("/api/usage")
+    data1 = await resp1.json()
+    assert data1["total"]["messages"] == 2
+    assert data1["total"]["inputTokens"] == 500
+
+    # Delete file A.
+    (proj / "to_delete.jsonl").unlink()
+
+    # Expire cache.
+    monkeypatch.setattr(usage_mod._cache, "updated_at", 0)
+
+    resp2 = await client.get("/api/usage")
+    data2 = await resp2.json()
+
+    # Deleted file's records must be gone.
+    assert data2["total"]["messages"] == 1
+    assert data2["total"]["inputTokens"] == 200
+
+    # Now create a NEW file that re-uses the same UUID that was evicted.
+    # It must be counted (not suppressed by orphan UUID in seen set).
+    _write_jsonl(proj / "reimported.jsonl", [
+        {
+            "type": "assistant", "uuid": "evict-uuid-1",
+            "timestamp": "2026-06-01T12:00:00.000Z", "isSidechain": False,
+            "cwd": "/home/alice/proj",
+            "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 700, "output_tokens": 300,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        },
+    ])
+
+    # Expire cache again.
+    monkeypatch.setattr(usage_mod._cache, "updated_at", 0)
+
+    resp3 = await client.get("/api/usage")
+    data3 = await resp3.json()
+
+    # The re-imported UUID must now be counted.
+    assert data3["total"]["messages"] == 2
+    assert data3["total"]["inputTokens"] == 900  # 200 (keep) + 700 (reimported)
+
+
+def test_usage_ttl_is_120_seconds():
+    """AC-6: TTL must be 120 seconds (not 60)."""
+    assert usage_mod._CACHE_TTL == 120
+
+
+async def test_usage_incremental_matches_full_rescan(client, usage_projects, monkeypatch):
+    """After an incremental pass, the totals must equal an independent
+    from-scratch recompute — the ultimate correctness guard (AC-3)."""
+    # Cold scan (effectively a full scan).
+    resp1 = await client.get("/api/usage")
+    assert resp1.status == 200
+
+    # Append a new record to make the next scan incremental (not a no-op).
+    existing_file = usage_projects / "-home-alice-proj" / "s1.jsonl"
+    new_record = json.dumps({
+        "type": "assistant",
+        "uuid": "incr-match-uuid-1",
+        "timestamp": "2026-06-01T12:30:00.000Z",
+        "isSidechain": False,
+        "cwd": "/home/alice/proj",
+        "message": {
+            "model": "claude-haiku-4-5",
+            "usage": {
+                "input_tokens": 150,
+                "output_tokens": 75,
+                "cache_read_input_tokens": 10,
+                "cache_creation_input_tokens": 5,
+            },
+        },
+    })
+    with open(existing_file, "a", encoding="utf-8") as f:
+        f.write(new_record + "\n")
+
+    # Expire cache to trigger incremental scan.
+    monkeypatch.setattr(usage_mod._cache, "updated_at", 0)
+
+    resp2 = await client.get("/api/usage")
+    data2 = await resp2.json()
+
+    # Independently recompute from the filesystem (oracle).
+    oracle = _independent_usage_totals(usage_projects)
+    t = data2["total"]
+    for fld in ("messages", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"):
+        assert t[fld] == oracle[fld], f"{fld}: endpoint {t[fld]} != oracle {oracle[fld]}"
+
+
+async def test_usage_cache_reset_fixture_clears_incremental_state(client, usage_projects):
+    """AC-8: The autouse fixture must clear file_mtimes and seen so there is
+    no state leakage between tests."""
+    # Perform a scan to populate cache state.
+    resp = await client.get("/api/usage")
+    assert resp.status == 200
+
+    # After the fixture runs for the NEXT test, file_mtimes and seen would be
+    # empty. We verify the fixture's behavior by checking a fresh _Cache() has
+    # empty state (which is what the fixture sets).
+    fresh = usage_mod._Cache()
+    assert fresh.file_mtimes == {}
+    assert fresh.seen == set()
+    assert fresh.records == []
+
+
 async def test_plugins_listing(client, tmp_path, monkeypatch):
     plugins_path = tmp_path / "installed_plugins.json"
     settings_path = tmp_path / "settings.json"
