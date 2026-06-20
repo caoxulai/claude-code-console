@@ -325,11 +325,15 @@ export default function SessionsPage() {
   }, [selectedId, tab, loadTranscript, fetchHistory, fetchLive]);
 
   // Live-ish sync: while a transcript is open AND the tab is visible, re-read it
-  // every few seconds so CLI activity shows without switching away. Paused when
-  // the tab is hidden to avoid pointless requests.
+  // so CLI activity shows without switching away. Paused when the tab is hidden
+  // to avoid pointless requests. There is no server-side session_changed
+  // broadcast (the CLI writes the transcript .jsonl directly; the server only
+  // reads it), so this 10s backstop poll is the only liveness mechanism — kept
+  // short enough that a live transcript stays fresh, but slower than the old 4s
+  // to cut idle churn.
   useEffect(() => {
     if (!selectedId) return undefined;
-    const POLL_MS = 4000;
+    const POLL_MS = 10000;
     const tick = () => {
       if (!document.hidden) loadTranscript(selectedId, { silent: true });
     };

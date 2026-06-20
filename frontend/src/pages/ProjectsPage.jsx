@@ -216,12 +216,63 @@ export default function ProjectsPage() {
     try {
       const res = await fetch('/api/projects');
       const json = await res.json();
-      setProjects(Array.isArray(json) ? json : []);
+      // Carry forward any already-loaded /detail body so an unrelated listing
+      // refresh (e.g. after a design/agent edit) doesn't blank an open
+      // README/CLAUDE.md tab and refetch. The save/create handlers explicitly
+      // invalidate the edited project's detail when its body actually changed.
+      setProjects(prev => {
+        const cache = new Map(prev.map(p => [p.id, p]));
+        return (Array.isArray(json) ? json : []).map(p => {
+          const old = cache.get(p.id);
+          if (old?.detailLoaded) {
+            return { ...p, claudeMd: old.claudeMd, readme: old.readme, readmeName: old.readmeName, detailLoaded: true };
+          }
+          return p;
+        });
+      });
     } catch { /* ignore */ }
     setLoading(false);
   };
 
   useEffect(() => { fetchProjects(); }, []);
+
+  // The projects LISTING no longer inlines the full CLAUDE.md / README bodies
+  // (it carries only a short `description`); the full content is fetched
+  // on-demand from GET /api/projects/{id}/detail when a project's README or
+  // CLAUDE.md tab is opened. We merge the bodies onto the in-memory project
+  // object and flag `detailLoaded` so the tabs can gate their empty-states on
+  // detail HAVING loaded — critically, the "Create CLAUDE.md" button and the
+  // "No README" state must NEVER show while detail is still in flight (showing
+  // Create for a project that HAS a CLAUDE.md would template-overwrite the real
+  // file on click). Cached on the object: re-expanding does not refetch.
+  const loadProjectDetail = async (projectId) => {
+    const current = projects.find(p => p.id === projectId);
+    if (!current || current.detailLoaded || current.detailLoading) return;
+    // Mark in-flight so concurrent triggers (toggleCard + the tab effect) don't
+    // double-fetch.
+    setProjects(prev => prev.map(p => p.id === projectId ? { ...p, detailLoading: true } : p));
+    let detail = {};
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/detail`);
+      // Only trust a real JSON detail payload. If the endpoint isn't present
+      // yet (the SPA fallback serves index.html, content-type text/html), keep
+      // whatever the listing already provided rather than blanking the body.
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.includes('application/json')) {
+        const json = await res.json();
+        if (json && typeof json === 'object') {
+          // Merge only the detail-owned fields, and only when present, so a
+          // partial/old payload can't clobber listing-provided content.
+          for (const key of ['claudeMd', 'readme', 'readmeName']) {
+            if (key in json) detail[key] = json[key];
+          }
+        }
+      }
+    } catch { /* keep listing-provided fields */ }
+    setProjects(prev => prev.map(p =>
+      p.id === projectId ? { ...p, ...detail, detailLoaded: true, detailLoading: false } : p
+    ));
+  };
 
   // Load the expanded project's tasks whenever the Tasks tab is active.
   useEffect(() => {
@@ -242,6 +293,15 @@ export default function ProjectsPage() {
     loadProjectAgents(expandedId);
   }, [activeTab, expandedId]);
 
+  // Lazy-load the full CLAUDE.md / README bodies when either content tab opens.
+  // (`loadProjectDetail` no-ops if already loaded/in-flight.) This covers both
+  // the expand path and the badges that jump straight to a tab via
+  // setExpandedId without going through toggleCard.
+  useEffect(() => {
+    if (!expandedId) return;
+    if (activeTab === 'README' || activeTab === 'CLAUDE.md') loadProjectDetail(expandedId);
+  }, [activeTab, expandedId, projects]);
+
   const toggleCard = (projectId) => {
     if (expandedId === projectId) {
       setExpandedId(null);
@@ -259,6 +319,9 @@ export default function ProjectsPage() {
       setAgents([]);
       setExpandedAgent(null);
       setAgentDetail(null);
+      // Warm the full CLAUDE.md / README bodies so the content tabs render
+      // instantly when opened (no-ops if already cached on the object).
+      loadProjectDetail(projectId);
     }
   };
 
@@ -371,6 +434,16 @@ export default function ProjectsPage() {
     setClaudeMdDraft(project.claudeMd || '');
   };
 
+  // After writing CLAUDE.md, drop the cached detail body for this project so it
+  // is re-fetched fresh from /detail (the file's content just changed); seed
+  // the just-written content immediately so the view doesn't flash empty. The
+  // CLAUDE.md tab effect re-fires on the projects change and reloads /detail.
+  const applyClaudeMdWrite = (projectId, content) => {
+    setProjects(prev => prev.map(p =>
+      p.id === projectId ? { ...p, claudeMd: content, detailLoaded: false, detailLoading: false } : p
+    ));
+  };
+
   const createClaudeMd = async (project) => {
     try {
       await fetch(`/api/projects/${encodeURIComponent(project.id)}/claude-md`, {
@@ -378,8 +451,9 @@ export default function ProjectsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: CLAUDE_MD_TEMPLATE }),
       });
-      await fetchProjects();
       setEditingClaudeMd(false);
+      applyClaudeMdWrite(project.id, CLAUDE_MD_TEMPLATE);
+      await fetchProjects();
     } catch { /* ignore */ }
   };
 
@@ -391,6 +465,7 @@ export default function ProjectsPage() {
         body: JSON.stringify({ content: claudeMdDraft }),
       });
       setEditingClaudeMd(false);
+      applyClaudeMdWrite(project.id, claudeMdDraft);
       await fetchProjects();
     } catch { /* ignore */ }
   };
@@ -854,6 +929,17 @@ export default function ProjectsPage() {
   );
 
   const renderReadmeTab = (project) => {
+    // README body rides the on-demand /detail fetch, not the listing. Show a
+    // loading state until detail resolves so we don't flash "No README" for a
+    // project that actually has one.
+    if (!project.detailLoaded) {
+      return (
+        <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>
+          Loading README…
+        </div>
+      );
+    }
+
     if (!project.readme) {
       return (
         <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
@@ -882,6 +968,19 @@ export default function ProjectsPage() {
   };
 
   const renderClaudeMdTab = (project) => {
+    // The full CLAUDE.md body rides the on-demand /detail fetch, not the
+    // listing. Until detail has loaded we must NOT render the "No CLAUDE.md"
+    // empty-state — its Create button would template-overwrite an existing
+    // CLAUDE.md (createClaudeMd PUTs CLAUDE_MD_TEMPLATE). Show a loading state
+    // instead; offer Create ONLY once detail loaded and confirmed it's absent.
+    if (!project.detailLoaded && !editingClaudeMd) {
+      return (
+        <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>
+          Loading CLAUDE.md…
+        </div>
+      );
+    }
+
     if (!project.claudeMd && !editingClaudeMd) {
       return (
         <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>

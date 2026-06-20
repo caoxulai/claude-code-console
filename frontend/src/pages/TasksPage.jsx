@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { FiCheckCircle, FiCircle, FiLoader, FiList, FiX, FiRotateCcw, FiTrash2, FiZap, FiPlus, FiSave, FiEdit3, FiChevronRight, FiChevronDown } from 'react-icons/fi';
 import { SkeletonLine } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
 import SessionPickerModal from '../components/SessionPickerModal';
 
 const STATUS_META = {
@@ -20,7 +21,7 @@ const TIME_RANGES = [
   { key: 'all', label: 'All time' },
 ];
 
-const POLL_MS = 5000;
+const POLL_MS = 60000;
 
 export default function TasksPage() {
   const [tasks, setTasks] = useState(null);
@@ -80,8 +81,13 @@ export default function TasksPage() {
   // Refetch on mount and whenever a filter changes.
   useEffect(() => { fetchTasks(); }, [fetchTasks]);
 
-  // Background poll so new/updated/completed tasks appear without a manual
-  // reload. Silent (no skeleton) and paused while the tab is hidden.
+  // Live push: the backend broadcasts `task_changed` on task create/update, so
+  // refetch immediately instead of waiting on the poll. The hook calls back with
+  // no args, so just re-run the existing fetch (it reads current filters).
+  useLiveUpdates(['task_changed'], () => fetchTasks({ silent: true }));
+
+  // Slow backstop poll so the list can't get permanently stuck if a WS event is
+  // missed. Silent (no skeleton) and paused while the tab is hidden.
   useEffect(() => {
     const tick = () => { if (!document.hidden) fetchTasks({ silent: true }); };
     const id = setInterval(tick, POLL_MS);

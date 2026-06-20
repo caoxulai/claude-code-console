@@ -1,6 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FiSearch, FiMessageSquare, FiBookOpen, FiZap, FiFolder, FiServer, FiClock, FiSettings, FiBarChart2, FiList, FiPackage, FiGitBranch, FiHome, FiCheckSquare, FiUsers, FiSlack, FiCalendar } from 'react-icons/fi';
+import { useLiveUpdates } from '../hooks/useLiveUpdates';
+
+// Module-level cache for the dynamic items (sessions + memory + projects). The
+// open effect rebuilt these from three fetches on EVERY Cmd/Ctrl+K; a short TTL
+// makes reopening within the window instant with no network. WS events for the
+// underlying data invalidate it; the TTL is the hard staleness bound.
+let _itemsCache = null;
+let _itemsCacheAt = 0;
+const ITEMS_TTL_MS = 15000;
 
 const STATIC_ITEMS = [
   { id: 'nav-dashboard', label: 'Dashboard', icon: FiHome, path: '/', section: 'Pages' },
@@ -57,7 +66,12 @@ export default function CommandPalette() {
       setQuery('');
       setSelected(0);
       setTimeout(() => inputRef.current?.focus(), 50);
-      // Fetch dynamic items (sessions + memory + projects)
+      // Serve fresh cache immediately (instant reopen within the TTL, no fetch).
+      if (_itemsCache && Date.now() - _itemsCacheAt < ITEMS_TTL_MS) {
+        setDynamicItems(_itemsCache);
+        return;
+      }
+      // Cache miss/expired: rebuild dynamic items (sessions + memory + projects).
       Promise.all([
         fetch('/api/sessions?limit=20').then(r => r.json()).catch(() => ({})),
         fetch('/api/memory/files').then(r => r.json()).catch(() => []),
@@ -94,10 +108,20 @@ export default function CommandPalette() {
             section: 'Projects',
           });
         });
+        _itemsCache = items;
+        _itemsCacheAt = Date.now();
         setDynamicItems(items);
       });
     }
   }, [open, navigate]);
+
+  // Invalidate the cache when the underlying data changes so the next open
+  // refetches. Harmless if these events never fire — the TTL still bounds
+  // staleness.
+  useLiveUpdates(['session_changed', 'project_changed'], () => {
+    _itemsCache = null;
+    _itemsCacheAt = 0;
+  });
 
   const allItems = [...STATIC_ITEMS, ...dynamicItems];
   const filtered = query

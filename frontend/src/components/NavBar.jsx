@@ -5,8 +5,6 @@ import {
   FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiSlack, FiMail, FiCalendar
 } from 'react-icons/fi';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
-import { countActionable } from '../lib/slackQueue';
-import { countActionable as countEmailActionable } from '../lib/emailQueue';
 
 const NAV_ITEMS = [
   { group: 'Overview', items: [
@@ -49,21 +47,25 @@ export default function NavBar({ onClose }) {
   // mounted (it lives in the persistent Layout shell), so it — not the lazy
   // SlackPage — owns the count. Fetched once on mount and refetched on every
   // slack_changed / slack_deleted broadcast so the bubble stays live even while
-  // the user is on another tab. Degrades to 0 (bubble hidden) on any failure: a
-  // throw, a non-2xx, available:false, or a missing/non-array items list. We
-  // never show a stale or guessed number.
+  // the user is on another tab. We hit the lightweight GET /api/slack/queue/count
+  // (just {count:N}) rather than the full ~275KB queue payload — the backend
+  // applies the SAME actionable filter (countActionable semantics) so the number
+  // is identical. The broadcast carries no count, so the WS callback simply
+  // re-fires this tiny fetch. Degrades to 0 (bubble hidden) on any failure: a
+  // throw, a non-2xx, or a missing/non-numeric count. We never show a stale or
+  // guessed number.
   const [slackCount, setSlackCount] = useState(0);
 
   const refreshSlackCount = useCallback(async () => {
     try {
-      const res = await fetch('/api/slack/queue');
+      const res = await fetch('/api/slack/queue/count');
       if (!res.ok) { setSlackCount(0); return; }
       const json = await res.json();
-      if (!json || json.available === false || !Array.isArray(json.items)) {
+      if (!json || typeof json.count !== 'number') {
         setSlackCount(0);
         return;
       }
-      setSlackCount(countActionable(json.items));
+      setSlackCount(json.count);
     } catch {
       setSlackCount(0);
     }
@@ -73,19 +75,21 @@ export default function NavBar({ onClose }) {
   useLiveUpdates(['slack_changed', 'slack_deleted'], refreshSlackCount);
 
   // Unreviewed-Email-items count for the sidebar bubble. Same pattern as Slack:
-  // fetch on mount, refetch on email_changed broadcast. Degrades to hidden on failure.
+  // hit the lightweight GET /api/email/queue/count on mount and on every
+  // email_changed broadcast, instead of the full ~178KB queue. Degrades to hidden
+  // on failure.
   const [emailCount, setEmailCount] = useState(0);
 
   const refreshEmailCount = useCallback(async () => {
     try {
-      const res = await fetch('/api/email/queue');
+      const res = await fetch('/api/email/queue/count');
       if (!res.ok) { setEmailCount(0); return; }
       const json = await res.json();
-      if (!json || json.available === false || !Array.isArray(json.items)) {
+      if (!json || typeof json.count !== 'number') {
         setEmailCount(0);
         return;
       }
-      setEmailCount(countEmailActionable(json.items));
+      setEmailCount(json.count);
     } catch {
       setEmailCount(0);
     }
