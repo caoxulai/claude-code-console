@@ -47,7 +47,7 @@ function CopyButton({ text, title = 'Copy' }) {
   );
 }
 
-const TABS = ['Overview', 'Proposals', 'Agents', 'README', 'CLAUDE.md', 'Memory', 'Docs', 'Tasks'];
+const TABS = ['Overview', 'README', 'Docs', 'Proposals', 'Tasks', 'Agents', 'Memory', 'CLAUDE.md'];
 
 // Map an ADR status to a badge class. `accepted` reads as success, `proposed`
 // as needs-attention (it's awaiting Xulai's review), `superseded` as muted.
@@ -850,24 +850,6 @@ export default function ProjectsPage() {
         marginBottom: 'var(--space-md)',
       }}>
         <div
-          onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
-          style={statCardStyle}
-          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
-        >
-          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.sessionCount}</div>
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Sessions</div>
-        </div>
-        <div
-          onClick={() => setActiveTab('Memory')}
-          style={statCardStyle}
-          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
-        >
-          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.memoryCount}</div>
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Memory Files</div>
-        </div>
-        <div
           onClick={() => setActiveTab('Docs')}
           style={statCardStyle}
           onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
@@ -875,17 +857,6 @@ export default function ProjectsPage() {
         >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{(project.sopFiles || []).length}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Docs</div>
-        </div>
-        <div
-          onClick={() => setActiveTab('Tasks')}
-          style={statCardStyle}
-          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
-        >
-          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.taskCount ?? 0}</div>
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
-            Tasks{project.openTaskCount ? ` · ${project.openTaskCount} open` : ''}
-          </div>
         </div>
         <div
           onClick={() => setActiveTab('Proposals')}
@@ -899,6 +870,17 @@ export default function ProjectsPage() {
           </div>
         </div>
         <div
+          onClick={() => setActiveTab('Tasks')}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.taskCount ?? 0}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
+            Tasks{project.openTaskCount ? ` · ${project.openTaskCount} open` : ''}
+          </div>
+        </div>
+        <div
           onClick={() => setActiveTab('Agents')}
           style={statCardStyle}
           onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
@@ -908,6 +890,24 @@ export default function ProjectsPage() {
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
             Agents{project.unreviewedAgentEntries ? ` · ${project.unreviewedAgentEntries} to review` : ''}
           </div>
+        </div>
+        <div
+          onClick={() => setActiveTab('Memory')}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.memoryCount}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Memory Files</div>
+        </div>
+        <div
+          onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
+          style={statCardStyle}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+        >
+          <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.sessionCount}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Sessions</div>
         </div>
         <div
           onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
