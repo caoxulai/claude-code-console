@@ -1,5 +1,9 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { FiList, FiX, FiTrash2, FiZap, FiPlus, FiSave, FiChevronRight, FiChevronDown } from 'react-icons/fi';
+import { useNavigate } from 'react-router-dom';
+import { FiList, FiX, FiTrash2, FiZap, FiPlus, FiSave, FiChevronRight, FiChevronDown, FiMessageSquare } from 'react-icons/fi';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import { SkeletonLine } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
@@ -13,6 +17,28 @@ const STAGES = [
   { key: 'done', label: 'Done', action: null, target: null },
 ];
 
+// --- Prompt templates (pure functions, never produce 'null'/'undefined' strings) ---
+
+function clarifyPrompt(task) {
+  const subject = task.subject || 'Untitled';
+  const description = task.description || '';
+  const project = task.project || 'global';
+  return `I have a TODO item I'd like to clarify before planning:\n\nSubject: ${subject}\nNotes: ${description}\nProject: ${project}\n\nHelp me refine this into a clear, actionable scope. Ask me questions to understand constraints, acceptance criteria, and edge cases. When we're aligned, summarize the final scope as a structured output I can use.`;
+}
+
+function planPrompt(task) {
+  const subject = task.subject || 'Untitled';
+  const context = task.clarification?.summary || task.description || '';
+  const criteria = Array.isArray(task.clarification?.acceptanceCriteria)
+    ? task.clarification.acceptanceCriteria.join('\n')
+    : 'Not yet defined';
+  return `/dev-plan ${subject}\n\nContext:\n${context}\n\nAcceptance criteria:\n${criteria}`;
+}
+
+// Build the slug Claude Code uses for a project's session directory.
+function projectPathToSlug(path) {
+  return '-' + path.replace(/^\//, '').replace(/\//g, '-');
+}
 
 const PRIORITY_STYLES = {
   p1: { background: 'var(--danger, #d9534f)', color: '#fff' },
@@ -31,19 +57,24 @@ function PriorityBadge({ priority }) {
 }
 
 // --- Task row with hover state ---
-function TaskRow({ task, stage, isLast, openMenuId, setOpenMenuId, onAdvance, onDelete, onTrigger }) {
+function TaskRow({ task, stage, isLast, isExpanded, openMenuId, setOpenMenuId, onPrimaryAction, onAdvance, onDelete, onTrigger, onToggleExpand }) {
   const [hovered, setHovered] = useState(false);
   return (
     <div
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
+      onClick={(e) => {
+        // Only expand when clicking the row itself, not buttons/menus
+        if (e.target.closest('button') || e.target.closest('[data-no-expand]')) return;
+        onToggleExpand(task.id);
+      }}
       style={{
         padding: 'var(--space-sm) var(--space-md)',
-        borderBottom: isLast ? 'none' : '1px solid var(--border)',
+        borderBottom: (isLast && !isExpanded) ? 'none' : '1px solid var(--border)',
         opacity: stage.key === 'done' ? 0.65 : 1,
         background: hovered ? 'var(--surface2)' : 'transparent',
         transition: 'background 0.15s',
-        cursor: 'default',
+        cursor: 'pointer',
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
@@ -72,8 +103,8 @@ function TaskRow({ task, stage, isLast, openMenuId, setOpenMenuId, onAdvance, on
         {/* Primary action button (filled) */}
         {stage.action && (
           <button
-            onClick={() => onAdvance(task, stage.target)}
-            title={`Advance to ${stage.target}`}
+            onClick={(e) => { e.stopPropagation(); onPrimaryAction(task, stage); }}
+            title={stage.key === 'draft' ? 'Advance to clarifying & open chat' : stage.key === 'clarifying' ? 'Open chat with dev-plan prompt' : `Advance to ${stage.target}`}
             style={{
               background: 'var(--accent)',
               color: '#fff',
@@ -132,9 +163,9 @@ function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDel
   };
 
   return (
-    <div ref={menuRef} style={{ position: 'relative', flexShrink: 0 }}>
+    <div ref={menuRef} style={{ position: 'relative', flexShrink: 0 }} data-no-expand>
       <button
-        onClick={() => setOpenMenuId(isOpen ? null : task.id)}
+        onClick={(e) => { e.stopPropagation(); setOpenMenuId(isOpen ? null : task.id); }}
         title="More actions"
         aria-label="More actions"
         style={{
@@ -156,15 +187,15 @@ function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDel
           {/* Trigger Goal */}
           <button
             style={menuItemStyle}
-            onClick={() => { onTrigger(task); setOpenMenuId(null); }}
+            onClick={(e) => { e.stopPropagation(); onTrigger(task); setOpenMenuId(null); }}
           >
             <FiZap size={12} style={{ color: 'var(--accent)' }} /> Trigger Goal
           </button>
-          {/* Mark Done — hidden if already done */}
+          {/* Mark Done -- hidden if already done */}
           {stage.key !== 'done' && (
             <button
               style={menuItemStyle}
-              onClick={() => { onAdvance(task, 'done'); setOpenMenuId(null); }}
+              onClick={(e) => { e.stopPropagation(); onAdvance(task, 'done'); setOpenMenuId(null); }}
             >
               <span style={{ fontSize: '12px' }}>&#10003;</span> Mark Done
             </button>
@@ -172,7 +203,7 @@ function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDel
           {/* Delete */}
           <button
             style={{ ...menuItemStyle, color: 'var(--danger, #d9534f)' }}
-            onClick={() => { onDelete(task); setOpenMenuId(null); }}
+            onClick={(e) => { e.stopPropagation(); onDelete(task); setOpenMenuId(null); }}
           >
             <FiTrash2 size={12} /> Delete
           </button>
@@ -182,13 +213,142 @@ function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDel
   );
 }
 
+// --- Inline detail panel for task ---
+function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
+  const [description, setDescription] = useState(task.description || '');
+  const [clarSummary, setClarSummary] = useState(task.clarification?.summary || '');
+  const [planSpec, setPlanSpec] = useState(task.plan?.spec || '');
+
+  // Sync local state when task data changes externally
+  useEffect(() => {
+    setDescription(task.description || '');
+    setClarSummary(task.clarification?.summary || '');
+    setPlanSpec(task.plan?.spec || '');
+  }, [task.description, task.clarification?.summary, task.plan?.spec]);
+
+  const hasPlanStored = !!task.plan?.spec;
+  const stage = task.stage || 'draft';
+
+  return (
+    <div style={{
+      borderTop: '1px solid var(--border)',
+      padding: 'var(--space-md)',
+      background: 'var(--surface2)',
+    }}>
+      {/* Description */}
+      <div style={{ marginBottom: 'var(--space-md)' }}>
+        <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
+          Description
+        </label>
+        <textarea
+          className="form-textarea"
+          value={description}
+          onChange={e => setDescription(e.target.value)}
+          style={{ minHeight: '60px', fontSize: 'var(--fs-sm)' }}
+        />
+        <button
+          className="btn"
+          disabled={saving || description === (task.description || '')}
+          onClick={() => onSave(task.id, { description })}
+          style={{ marginTop: 'var(--space-xs)', fontSize: 'var(--fs-xs)' }}
+        >
+          <FiSave size={12} /> Save Description
+        </button>
+      </div>
+
+      {/* Clarification summary */}
+      <div style={{ marginBottom: 'var(--space-md)' }}>
+        <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
+          Clarification Summary
+        </label>
+        <textarea
+          className="form-textarea"
+          value={clarSummary}
+          onChange={e => setClarSummary(e.target.value)}
+          placeholder="Paste or type the refined scope from your clarification chat..."
+          style={{ minHeight: '80px', fontSize: 'var(--fs-sm)' }}
+        />
+        <button
+          className="btn"
+          disabled={saving || clarSummary === (task.clarification?.summary || '')}
+          onClick={() => onSave(task.id, { clarification: { ...task.clarification, summary: clarSummary, resolvedAt: Date.now() } })}
+          style={{ marginTop: 'var(--space-xs)', fontSize: 'var(--fs-xs)' }}
+        >
+          <FiSave size={12} /> Save Clarification
+        </button>
+      </div>
+
+      {/* Plan spec */}
+      <div style={{ marginBottom: 'var(--space-md)' }}>
+        <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
+          Plan Spec
+        </label>
+        {hasPlanStored ? (
+          <div style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 'var(--space-sm)', fontSize: 'var(--fs-sm)', maxHeight: '300px', overflow: 'auto' }}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+              {task.plan.spec}
+            </ReactMarkdown>
+          </div>
+        ) : (
+          <>
+            <textarea
+              className="form-textarea"
+              value={planSpec}
+              onChange={e => setPlanSpec(e.target.value)}
+              placeholder="Paste the dev-plan output or type a plan spec..."
+              style={{ minHeight: '80px', fontSize: 'var(--fs-sm)' }}
+            />
+          </>
+        )}
+      </div>
+
+      {/* Approve Plan button - only visible when stage is clarifying */}
+      {stage === 'clarifying' && (
+        <button
+          className="btn btn-primary"
+          disabled={saving || (!hasPlanStored && !planSpec.trim())}
+          onClick={() => onApprovePlan(task.id, hasPlanStored ? task.plan.spec : planSpec.trim())}
+          style={{ fontSize: 'var(--fs-sm)', marginBottom: 'var(--space-sm)' }}
+        >
+          Approve Plan
+        </button>
+      )}
+
+      {/* Session links */}
+      {(task.clarification?.sessionId || task.plan?.sessionId) && (
+        <div style={{ marginTop: 'var(--space-sm)', display: 'flex', gap: 'var(--space-md)', flexWrap: 'wrap' }}>
+          {task.clarification?.sessionId && (
+            <a
+              href={`/sessions?id=${encodeURIComponent(task.clarification.sessionId)}`}
+              style={{ fontSize: 'var(--fs-xs)', color: 'var(--accent)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+            >
+              <FiMessageSquare size={12} /> Clarification session
+            </a>
+          )}
+          {task.plan?.sessionId && (
+            <a
+              href={`/sessions?id=${encodeURIComponent(task.plan.sessionId)}`}
+              style={{ fontSize: 'var(--fs-xs)', color: 'var(--accent)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+            >
+              <FiMessageSquare size={12} /> Plan session
+            </a>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const POLL_MS = 60000;
 
 export default function TasksPage() {
+  const navigate = useNavigate();
   const [tasks, setTasks] = useState(null);
   const [projects, setProjects] = useState([]);
   const [error, setError] = useState(null);
   const [openMenuId, setOpenMenuId] = useState(null);
+  const [expandedTaskId, setExpandedTaskId] = useState(null);
+  const [saving, setSaving] = useState(false);
 
   // Filters
   const [projectFilter, setProjectFilter] = useState('all');
@@ -199,7 +359,7 @@ export default function TasksPage() {
   const toggleGroup = (stage) =>
     setCollapsedGroups(prev => ({ ...prev, [stage]: !prev[stage] }));
 
-  // Multi-session picker for "trigger goal" (when a project has >1 session).
+  // Multi-session picker for "trigger goal" and "clarify/plan" navigation.
   const [picker, setPicker] = useState(null);
   const triggerGoal = useTriggerGoal({ onPickSession: setPicker });
 
@@ -253,7 +413,7 @@ export default function TasksPage() {
     return () => window.removeEventListener('focus', onFocus);
   }, [fetchTasks]);
 
-  // Advance a task's stage.
+  // Advance a task's stage. Returns true on success, false on failure.
   const advanceTask = useCallback(async (task, targetStage) => {
     try {
       const res = await fetch(`/api/tasks/user/${encodeURIComponent(task.id)}/advance`, {
@@ -264,12 +424,130 @@ export default function TasksPage() {
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         setError(data.message || data.error || `Failed to advance task (${res.status}).`);
-        return;
+        return false;
       }
       setError(null);
       fetchTasks({ silent: true });
+      return true;
     } catch {
       setError('Failed to advance task.');
+      return false;
+    }
+  }, [fetchTasks]);
+
+  // Navigate to chat with a pre-composed prompt, scoped to the task's project.
+  const openChatForTask = useCallback(async (prompt, task) => {
+    if (!task.projectPath) {
+      navigate('/chat', { state: { prefillPrompt: prompt } });
+      return;
+    }
+    const slug = projectPathToSlug(task.projectPath);
+    let sessions = [];
+    try {
+      const res = await fetch(`/api/sessions?project=${encodeURIComponent(slug)}&limit=50`);
+      const json = await res.json();
+      sessions = Array.isArray(json.sessions) ? json.sessions : [];
+    } catch {
+      navigate('/chat', { state: { prefillPrompt: prompt } });
+      return;
+    }
+
+    if (sessions.length === 0) {
+      navigate('/chat', { state: { prefillPrompt: prompt } });
+    } else if (sessions.length === 1) {
+      const search = `?resume=${encodeURIComponent(sessions[0].id)}`;
+      navigate(`/chat${search}`, { state: { prefillPrompt: prompt } });
+    } else {
+      // Multiple sessions: show picker
+      setPicker({
+        task,
+        prompt,
+        sessions,
+        resume: (id) => {
+          const search = `?resume=${encodeURIComponent(id)}`;
+          navigate(`/chat${search}`, { state: { prefillPrompt: prompt } });
+        },
+      });
+    }
+  }, [navigate]);
+
+  // Primary button action dispatch based on stage.
+  const handlePrimaryAction = useCallback(async (task, stage) => {
+    if (stage.key === 'draft') {
+      // Clarify: advance THEN navigate on success
+      const ok = await advanceTask(task, 'clarifying');
+      if (ok) {
+        openChatForTask(clarifyPrompt(task), task);
+      }
+    } else if (stage.key === 'clarifying') {
+      // Plan: navigate only, NO advance
+      openChatForTask(planPrompt(task), task);
+    } else if (stage.key === 'planned') {
+      // Execute: just advance stage (Phase 4 will wire to /dev-team)
+      advanceTask(task, 'executing');
+    }
+  }, [advanceTask, openChatForTask]);
+
+  // Save partial task fields via PUT.
+  const saveTaskFields = useCallback(async (taskId, fields) => {
+    setSaving(true);
+    try {
+      const res = await fetch('/api/tasks/user', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: taskId, ...fields }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.message || data.error || 'Failed to save.');
+        return false;
+      }
+      setError(null);
+      fetchTasks({ silent: true });
+      return true;
+    } catch {
+      setError('Failed to save task.');
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [fetchTasks]);
+
+  // Approve plan: PUT the plan spec + approvedAt, THEN advance to planned.
+  const approvePlan = useCallback(async (taskId, specText) => {
+    setSaving(true);
+    try {
+      // Step 1: save plan spec + approvedAt
+      const putRes = await fetch('/api/tasks/user', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: taskId, plan: { spec: specText, approvedAt: Date.now() } }),
+      });
+      if (!putRes.ok) {
+        const data = await putRes.json().catch(() => ({}));
+        setError(data.message || data.error || 'Failed to save plan.');
+        return;
+      }
+
+      // Step 2: advance stage to planned
+      const advRes = await fetch(`/api/tasks/user/${encodeURIComponent(taskId)}/advance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stage: 'planned' }),
+      });
+      if (!advRes.ok) {
+        const data = await advRes.json().catch(() => ({}));
+        setError(data.message || data.error || 'Plan saved but failed to advance stage.');
+        return;
+      }
+
+      setError(null);
+      setExpandedTaskId(null);
+      fetchTasks({ silent: true });
+    } catch {
+      setError('Failed to approve plan.');
+    } finally {
+      setSaving(false);
     }
   }, [fetchTasks]);
 
@@ -284,11 +562,12 @@ export default function TasksPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId: task._sessionId, taskId: task.id }),
       });
+      if (expandedTaskId === task.id) setExpandedTaskId(null);
       fetchTasks({ silent: true });
     } catch {
       setError('Failed to delete task.');
     }
-  }, [fetchTasks]);
+  }, [fetchTasks, expandedTaskId]);
 
   // Create a new TODO.
   const createUserTask = useCallback(async () => {
@@ -325,6 +604,11 @@ export default function TasksPage() {
       else next.add(key);
       return next;
     });
+  };
+
+  // Toggle expanded detail panel.
+  const toggleExpand = (taskId) => {
+    setExpandedTaskId(prev => prev === taskId ? null : taskId);
   };
 
   // Group tasks by stage in fixed STAGES order.
@@ -484,17 +768,29 @@ export default function TasksPage() {
               {!collapsed && (
                 <div className="card" style={{ padding: 0 }}>
                   {items.map((t, i) => (
-                    <TaskRow
-                      key={t.id}
-                      task={t}
-                      stage={stage}
-                      isLast={i === items.length - 1}
-                      openMenuId={openMenuId}
-                      setOpenMenuId={setOpenMenuId}
-                      onAdvance={advanceTask}
-                      onDelete={deleteTask}
-                      onTrigger={triggerGoal}
-                    />
+                    <div key={t.id}>
+                      <TaskRow
+                        task={t}
+                        stage={stage}
+                        isLast={i === items.length - 1 && expandedTaskId !== t.id}
+                        isExpanded={expandedTaskId === t.id}
+                        openMenuId={openMenuId}
+                        setOpenMenuId={setOpenMenuId}
+                        onPrimaryAction={handlePrimaryAction}
+                        onAdvance={advanceTask}
+                        onDelete={deleteTask}
+                        onTrigger={triggerGoal}
+                        onToggleExpand={toggleExpand}
+                      />
+                      {expandedTaskId === t.id && (
+                        <TaskDetailPanel
+                          task={t}
+                          onSave={saveTaskFields}
+                          onApprovePlan={approvePlan}
+                          saving={saving}
+                        />
+                      )}
+                    </div>
                   ))}
                 </div>
               )}
@@ -509,4 +805,3 @@ export default function TasksPage() {
     </div>
   );
 }
-
