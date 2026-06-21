@@ -8,6 +8,7 @@ import { SkeletonLine } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
 import SessionPickerModal from '../components/SessionPickerModal';
+import ClarifyChat from '../components/ClarifyChat';
 
 const STAGES = [
   { key: 'draft', label: 'Draft', action: 'Clarify', target: 'clarifying' },
@@ -18,13 +19,9 @@ const STAGES = [
 ];
 
 // --- Prompt templates (pure functions, never produce 'null'/'undefined' strings) ---
-
-function clarifyPrompt(task) {
-  const subject = task.subject || 'Untitled';
-  const description = task.description || '';
-  const project = task.project || 'global';
-  return `I have a TODO item I'd like to clarify before planning:\n\nSubject: ${subject}\nNotes: ${description}\nProject: ${project}\n\nHelp me refine this into a clear, actionable scope. Ask me questions to understand constraints, acceptance criteria, and edge cases. When we're aligned, summarize the final scope as a structured output I can use.`;
-}
+// The clarify prompt (with the structured-summary marker instruction) now lives
+// inside ClarifyChat, which owns the inline clarification conversation. Plan
+// still composes its /dev-plan prompt here and navigates to /chat.
 
 function planPrompt(task) {
   const subject = task.subject || 'Untitled';
@@ -216,18 +213,17 @@ function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDel
 // --- Inline detail panel for task ---
 function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
   const [description, setDescription] = useState(task.description || '');
-  const [clarSummary, setClarSummary] = useState(task.clarification?.summary || '');
   const [planSpec, setPlanSpec] = useState(task.plan?.spec || '');
 
   // Sync local state when task data changes externally
   useEffect(() => {
     setDescription(task.description || '');
-    setClarSummary(task.clarification?.summary || '');
     setPlanSpec(task.plan?.spec || '');
-  }, [task.description, task.clarification?.summary, task.plan?.spec]);
+  }, [task.description, task.plan?.spec]);
 
   const hasPlanStored = !!task.plan?.spec;
   const stage = task.stage || 'draft';
+  const clarSummary = task.clarification?.summary;
 
   return (
     <div style={{
@@ -256,27 +252,34 @@ function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
         </button>
       </div>
 
-      {/* Clarification summary */}
-      <div style={{ marginBottom: 'var(--space-md)' }}>
-        <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
-          Clarification Summary
-        </label>
-        <textarea
-          className="form-textarea"
-          value={clarSummary}
-          onChange={e => setClarSummary(e.target.value)}
-          placeholder="Paste or type the refined scope from your clarification chat..."
-          style={{ minHeight: '80px', fontSize: 'var(--fs-sm)' }}
-        />
-        <button
-          className="btn"
-          disabled={saving || clarSummary === (task.clarification?.summary || '')}
-          onClick={() => onSave(task.id, { clarification: { ...task.clarification, summary: clarSummary, resolvedAt: Date.now() } })}
-          style={{ marginTop: 'var(--space-xs)', fontSize: 'var(--fs-xs)' }}
-        >
-          <FiSave size={12} /> Save Clarification
-        </button>
-      </div>
+      {/* Clarification: read-only summary if saved, else the inline mini-chat.
+          A saved summary must NOT re-mount ClarifyChat — re-mounting would
+          re-run Claude and could overwrite the saved scope (AC-9/AC-10). */}
+      {clarSummary ? (
+        <div style={{ marginBottom: 'var(--space-md)' }}>
+          <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
+            Clarification Summary
+          </label>
+          <div style={{
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            padding: 'var(--space-sm)',
+            fontSize: 'var(--fs-sm)',
+            whiteSpace: 'pre-wrap',
+            lineHeight: 1.5,
+          }}>
+            {clarSummary}
+          </div>
+        </div>
+      ) : stage === 'clarifying' ? (
+        <div style={{ marginBottom: 'var(--space-md)' }}>
+          <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
+            Clarification
+          </label>
+          <ClarifyChat task={task} onSave={onSave} />
+        </div>
+      ) : null}
 
       {/* Plan spec */}
       <div style={{ marginBottom: 'var(--space-md)' }}>
@@ -474,10 +477,13 @@ export default function TasksPage() {
   // Primary button action dispatch based on stage.
   const handlePrimaryAction = useCallback(async (task, stage) => {
     if (stage.key === 'draft') {
-      // Clarify: advance THEN navigate on success
+      // Clarify: advance THEN expand the detail panel on success (NO nav).
+      // The inline ClarifyChat in the panel auto-sends the first prompt.
+      // On failure advanceTask already setError(...) and returns false, so
+      // the error banner shows and the panel does NOT open (no stuck state).
       const ok = await advanceTask(task, 'clarifying');
       if (ok) {
-        openChatForTask(clarifyPrompt(task), task);
+        setExpandedTaskId(task.id);
       }
     } else if (stage.key === 'clarifying') {
       // Plan: navigate only, NO advance
