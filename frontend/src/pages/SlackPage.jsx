@@ -1441,7 +1441,7 @@ export default function SlackPage() {
             <button className="btn btn-quiet-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
               <FiTrash2 size={13} /> Dismiss
             </button>
-            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this thread — dismiss it and stop surfacing future messages from this thread">
+            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this conversation — dismiss and stop surfacing future messages from this channel/DM">
               <FiBellOff size={13} /> Mute
             </button>
           </div>
@@ -1486,7 +1486,7 @@ export default function SlackPage() {
               >
                 <FiTrash2 size={13} /> Dismiss
               </button>
-              <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this thread — dismiss it and stop surfacing future messages from this thread">
+              <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this conversation — dismiss and stop surfacing future messages from this channel/DM">
                 <FiBellOff size={13} /> Mute
               </button>
             </div>
@@ -1655,7 +1655,11 @@ export default function SlackPage() {
   const mutedLabel = (key) => {
     const channelId = String(key).split('_')[0];
     const match = items.find(it => it.channelId === channelId);
-    if (match) return sourceLabel(match) + (match.sender ? ` — ${match.sender}` : '');
+    if (match) {
+      const src = sourceLabel(match);
+      if (src === 'DM' && match.sender) return `DM · ${match.sender}`;
+      return src;
+    }
     return 'Muted conversation';
   };
 
@@ -1960,14 +1964,14 @@ export default function SlackPage() {
         <div style={{ marginTop: 'var(--space-md)' }}>
           <button type="button" style={collapsibleStyle} onClick={() => setMutedOpen(v => !v)}>
             {mutedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
-            <FiBellOff size={13} /> Muted threads ({mutedKeys.length})
+            <FiBellOff size={13} /> Muted conversations ({mutedKeys.length})
           </button>
           {mutedOpen && (
             <div className="card" style={{ marginTop: '0.5em' }}>
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>Thread</th>
+                    <th>Conversation</th>
                     <th style={{ textAlign: 'center' }}>Muted</th>
                     <th style={{ textAlign: 'center' }}>Action</th>
                   </tr>
@@ -1989,7 +1993,7 @@ export default function SlackPage() {
                           className="btn"
                           disabled={unmutingKey === key}
                           onClick={() => unmute(key)}
-                          title="Unmute — let future messages in this thread surface again"
+                          title="Unmute — let future messages in this conversation surface again"
                         >
                           <FiBellOff size={13} /> {unmutingKey === key ? 'Unmuting…' : 'Unmute'}
                         </button>
@@ -1999,7 +2003,7 @@ export default function SlackPage() {
                 </tbody>
               </table>
               <div style={{ color: 'var(--muted)', fontSize: '0.78em', padding: '0.4em 0.6em 0' }}>
-                Unmuting only lets future messages surface again — it does not restore any dismissed message. Muted threads also expire automatically after 30 days.
+                Unmuting only lets future messages surface again — it does not restore any dismissed message. Muted conversations also expire automatically after 30 days.
               </div>
             </div>
           )}
