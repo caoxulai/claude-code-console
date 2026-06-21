@@ -302,15 +302,39 @@ def _app_urls_for_project(project_name: str) -> list[dict]:
     return []
 
 
+def _extract_doc_date(path: Path) -> str:
+    """Scan the first 5 lines of a doc file for a date field.
+
+    Accepts 'Date: YYYY-MM-DD' or '**Date:** YYYY-MM-DD' (with or without
+    markdown bold).  Returns the date string for sorting (newest first),
+    or empty string so undated files sort to the end.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            for _ in range(5):
+                line = f.readline()
+                if not line:
+                    break
+                stripped = line.strip().replace("**", "")
+                if stripped.startswith("Date:"):
+                    return stripped[5:].strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+    return ""
+
+
 def _collect_doc_files(project_path: Path) -> list[dict]:
     """Collect document markdown files from known directories in a project.
 
-    Searches (in order):
+    Searches:
       - <project>/.claude/commands/*.md (project-scoped commands)
       - <project>/agent-sops/*.md (and recursive subdirs)
       - <project>/skills/*.md
       - <project>/docs/*.md
       - <project>/.claude/design/*.md (collaborative design documents)
+
+    Returns results sorted newest-first by the Date: line (second line of
+    each file). Files without a date sort to the end.
     """
     results: list[dict] = []
     seen_paths: set[str] = set()
@@ -355,6 +379,7 @@ def _collect_doc_files(project_path: Path) -> list[dict]:
                 seen_paths.add(str(md))
                 results.append({"name": md.name, "path": str(md)})
 
+    results.sort(key=lambda r: _extract_doc_date(Path(r["path"])), reverse=True)
     return results
 
 
