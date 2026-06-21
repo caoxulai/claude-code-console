@@ -4105,10 +4105,8 @@ def test_enqueue_matcher_rule():
 # --------------------------------------------------------------------------- #
 # Tasks routes (/api/tasks)
 #
-# Read-only view of ~/.claude/tasks/<sessionId>/<taskId>.json, enriched with a
-# project name (mapped via the session's transcript under ~/.claude/projects)
-# and the file mtime. Dismissal is claude-web view-state in ~/.claude-web; the
-# source task files are never modified.
+# User-created TODO backlog with lifecycle stages. CLI tasks served separately
+# via /api/tasks/agent. Dismissed machinery removed — clean break.
 # --------------------------------------------------------------------------- #
 import time as _time  # noqa: E402
 
@@ -4149,12 +4147,10 @@ def tasks_layout(tmp_path: Path, monkeypatch) -> Path:
     so.mkdir()
     _write_json(so / "1.json", {"id": "1", "subject": "Mystery", "status": "pending"})
 
-    dismissed = tmp_path / ".claude-web" / "dismissed_tasks.json"
     user_tasks = tmp_path / ".claude-web" / "tasks.json"
 
     monkeypatch.setattr(tasks_mod, "TASKS_DIR", tasks_dir)
     monkeypatch.setattr(tasks_mod, "CLAUDE_PROJECTS_BASE", projects)
-    monkeypatch.setattr(tasks_mod, "DISMISSED_PATH", dismissed)
     monkeypatch.setattr(tasks_mod, "USER_TASKS_PATH", user_tasks)
     # _known_projects() reads WORKSPACE_DIR (imported into tasks at load time);
     # point it at the fixture's workspace/projects so "myproj" is a valid target.
@@ -4187,71 +4183,151 @@ async def test_tasks_empty_when_no_dir(client, tmp_path, monkeypatch):
     assert data["projects"] == []
 
 
-async def test_tasks_project_attribution(client, tasks_layout):
+async def test_tasks_returns_only_user_tasks(client, tasks_layout):
+    """GET /api/tasks returns ONLY user-created tasks, not CLI tasks."""
+    # With no user tasks created yet, the list is empty even though CLI tasks
+    # exist on disk.
     data = await (await client.get("/api/tasks")).json()
-    by_subject = {t["subject"]: t for t in data["tasks"]}
-    # Session with a transcript maps to its project name (dir basename).
-    assert by_subject["Build feature"]["project"] == "myproj"
-    # Orphan session (no transcript) falls back to a clear sentinel.
-    assert by_subject["Mystery"]["project"] == "(unknown)"
-    # Distinct projects surfaced for the filter dropdown.
-    assert "myproj" in data["projects"]
+    assert data["tasks"] == []
+    assert data["projects"] == []
+
+    # Create a user task — now it appears.
+    await client.post("/api/tasks/user", json={"subject": "My TODO", "project": "myproj"})
+    data = await (await client.get("/api/tasks")).json()
+    assert len(data["tasks"]) == 1
+    assert data["tasks"][0]["subject"] == "My TODO"
+    assert data["tasks"][0]["source"] == "user"
 
 
-async def test_tasks_project_filter(client, tasks_layout):
-    data = await (await client.get("/api/tasks?project=myproj")).json()
-    assert {t["subject"] for t in data["tasks"]} == {"Build feature", "Old done task"}
-    assert all(t["project"] == "myproj" for t in data["tasks"])
-
-
-async def test_tasks_time_filter_excludes_old(client, tasks_layout):
-    # Backdate the orphan task file well beyond a 1-day window.
-    old = tasks_layout / "sess-orphan" / "1.json"
-    old_ts = _time.time() - 10 * 86400
-    os.utime(old, (old_ts, old_ts))
-    data = await (await client.get("/api/tasks?sinceDays=1")).json()
+async def test_tasks_agent_endpoint_returns_cli_tasks(client, tasks_layout):
+    """GET /api/tasks/agent returns CLI tasks with project attribution."""
+    data = await (await client.get("/api/tasks/agent")).json()
     subjects = {t["subject"] for t in data["tasks"]}
-    assert "Mystery" not in subjects          # too old
-    assert "Build feature" in subjects        # recent
+    assert "Build feature" in subjects
+    assert "Mystery" in subjects
+    # Project attribution works.
+    by_subject = {t["subject"]: t for t in data["tasks"]}
+    assert by_subject["Build feature"]["project"] == "myproj"
+    assert by_subject["Mystery"]["project"] == "(unknown)"
+    # Source is claude.
+    assert all(t["source"] == "claude" for t in data["tasks"])
 
 
-async def test_tasks_dismiss_hides_and_persists(client, tasks_layout):
-    # Dismiss the completed task.
-    resp = await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+async def test_tasks_agent_project_filter(client, tasks_layout):
+    """GET /api/tasks/agent?project=<name> filters by project."""
+    data = await (await client.get("/api/tasks/agent?project=myproj")).json()
+    assert all(t["project"] == "myproj" for t in data["tasks"])
+    assert {t["subject"] for t in data["tasks"]} == {"Build feature", "Old done task"}
+
+
+async def test_tasks_advance_valid_transitions(client, tasks_layout):
+    """POST /api/tasks/user/{id}/advance correctly transitions stages."""
+    # Create a task (starts at draft).
+    resp = await client.post("/api/tasks/user", json={"subject": "Advance me", "project": "myproj"})
+    tid = (await resp.json())["task"]["id"]
+
+    # draft → clarifying
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "clarifying"})
     assert resp.status == 200
+    assert (await resp.json())["task"]["stage"] == "clarifying"
 
-    # Default list excludes it; the count reflects it.
-    data = await (await client.get("/api/tasks")).json()
-    assert "Old done task" not in {t["subject"] for t in data["tasks"]}
-    assert data["dismissedCount"] == 1
-
-    # includeDismissed=1 brings it back, flagged dismissed.
-    data = await (await client.get("/api/tasks?includeDismissed=1")).json()
-    old = next(t for t in data["tasks"] if t["subject"] == "Old done task")
-    assert old["dismissed"] is True
-
-    # Undismiss restores it to the default view.
-    resp = await client.post("/api/tasks/undismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+    # clarifying → planned
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "planned"})
     assert resp.status == 200
-    data = await (await client.get("/api/tasks")).json()
-    assert "Old done task" in {t["subject"] for t in data["tasks"]}
+    assert (await resp.json())["task"]["stage"] == "planned"
+
+    # planned → executing
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "executing"})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["stage"] == "executing"
+
+    # executing → done
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "done"})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["stage"] == "done"
+
+    # done → archived
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "archived"})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["stage"] == "archived"
 
 
-async def test_tasks_dismiss_does_not_touch_source_file(client, tasks_layout):
-    """Dismissal is view-state only — the ~/.claude/tasks JSON is untouched."""
-    src = tasks_layout / "sess-proj" / "2.json"
-    before = src.read_text()
-    await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj", "taskId": "2"})
-    assert src.read_text() == before  # unchanged on disk
+async def test_tasks_advance_invalid_returns_400(client, tasks_layout):
+    """Invalid stage transitions return 400."""
+    resp = await client.post("/api/tasks/user", json={"subject": "Stuck", "project": "myproj"})
+    tid = (await resp.json())["task"]["id"]
 
+    # draft → executing (skip planned) is invalid
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "executing"})
+    assert resp.status == 400
+    data = await resp.json()
+    assert data["error"] == "invalid_transition"
 
-async def test_tasks_dismiss_requires_fields(client, tasks_layout):
-    resp = await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj"})
+    # Advance to done first, then try to go back to draft (backward)
+    await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "done"})
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "draft"})
+    assert resp.status == 400
+
+    # Invalid stage name
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "bogus"})
+    assert resp.status == 400
+
+    # Missing stage
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={})
     assert resp.status == 400
 
 
+async def test_tasks_advance_unknown_task_is_404(client, tasks_layout):
+    resp = await client.post("/api/tasks/user/user:nonexistent/advance", json={"stage": "done"})
+    assert resp.status == 404
+
+
+async def test_tasks_advance_rejects_traversal(client, tasks_layout):
+    """Path-traversal in advance task_id is rejected."""
+    # '..' as a substring triggers rejection.
+    resp = await client.post("/api/tasks/user/foo..bar/advance", json={"stage": "done"})
+    assert resp.status == 400
+    # URL-encoded slashes that decode into the match_info are also rejected.
+    resp = await client.post("/api/tasks/user/a%2F..%2Fb/advance", json={"stage": "done"})
+    assert resp.status == 400
+
+
+async def test_tasks_stage_filter(client, tasks_layout):
+    """GET /api/tasks?stage=<s> filters by stage (comma-separated multi)."""
+    # Create tasks at different stages.
+    r1 = await client.post("/api/tasks/user", json={"subject": "Draft one", "project": "myproj"})
+    r2 = await client.post("/api/tasks/user", json={"subject": "Planned one", "project": "myproj"})
+    tid2 = (await r2.json())["task"]["id"]
+    await client.post(f"/api/tasks/user/{tid2}/advance", json={"stage": "planned"})
+
+    # Filter for draft only.
+    data = await (await client.get("/api/tasks?stage=draft")).json()
+    assert all(t["stage"] == "draft" for t in data["tasks"])
+    assert "Draft one" in {t["subject"] for t in data["tasks"]}
+
+    # Filter for planned only.
+    data = await (await client.get("/api/tasks?stage=planned")).json()
+    assert all(t["stage"] == "planned" for t in data["tasks"])
+    assert "Planned one" in {t["subject"] for t in data["tasks"]}
+
+    # Multi-stage filter.
+    data = await (await client.get("/api/tasks?stage=draft,planned")).json()
+    stages = {t["stage"] for t in data["tasks"]}
+    assert stages <= {"draft", "planned"}
+
+
+async def test_tasks_dismissed_endpoints_removed(client, tasks_layout):
+    """The dismissed endpoints are gone — POST returns 405 (no matching route)."""
+    # POST routes no longer registered — aiohttp returns 405 (Method Not Allowed)
+    # because the SPA catch-all only handles GET.
+    resp = await client.post("/api/tasks/dismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+    assert resp.status == 405
+    resp = await client.post("/api/tasks/undismiss", json={"sessionId": "sess-proj", "taskId": "2"})
+    assert resp.status == 405
+
+
 async def test_tasks_complete_writes_source_file(client, tasks_layout):
-    """Mark-complete writes status:'completed' to the source task JSON."""
+    """Mark-complete on a CLI task writes status:'completed' to its source JSON."""
     src = tasks_layout / "sess-proj" / "1.json"
     assert json.loads(src.read_text())["status"] == "in_progress"
 
@@ -4296,17 +4372,10 @@ async def test_tasks_complete_rejects_traversal(client, tasks_layout):
     assert resp.status == 400
 
 
-async def test_tasks_carry_project_path(client, tasks_layout):
-    """Tasks expose projectPath so the UI can build a session slug for trigger-goal."""
-    data = await (await client.get("/api/tasks")).json()
-    bf = next(t for t in data["tasks"] if t["subject"] == "Build feature")
-    assert bf["projectPath"] and bf["projectPath"].endswith("/myproj")
-
-
 # --- Console-created (user) tasks ----------------------------------------- #
 
-async def test_user_task_create_and_appears_in_list(client, tasks_layout):
-    """Creating a user task stores it in ~/.claude-web and merges into /api/tasks."""
+async def test_user_task_create_has_stage_and_priority(client, tasks_layout):
+    """Newly created tasks have stage='draft', priority, tags, etc."""
     resp = await client.post("/api/tasks/user", json={
         "subject": "My idea", "description": "flesh out later", "project": "myproj",
     })
@@ -4316,15 +4385,63 @@ async def test_user_task_create_and_appears_in_list(client, tasks_layout):
     assert created["project"] == "myproj"
     assert created["projectPath"].endswith("/myproj")
     assert created["id"].startswith("user:")
-    assert created["status"] == "pending"
+    # New schema fields.
+    assert created["stage"] == "draft"
+    assert created["priority"] == "p2"
+    assert created["tags"] == []
+    assert created["clarification"] is None
+    assert created["plan"] is None
+    assert created["execution"] is None
+    # No 'status' field.
+    assert "status" not in created
 
-    # It shows up in the list, tagged source=user, and the Claude tasks remain.
+    # It shows up in the list.
     data = await (await client.get("/api/tasks")).json()
-    subjects = {t["subject"] for t in data["tasks"]}
-    assert "My idea" in subjects
-    assert "Build feature" in subjects  # Claude tasks unaffected
     mine = next(t for t in data["tasks"] if t["subject"] == "My idea")
     assert mine["source"] == "user" and mine["_sessionId"] == tasks_mod.USER_SESSION_ID
+
+
+async def test_user_task_create_with_priority(client, tasks_layout):
+    """Creating with a custom priority works."""
+    resp = await client.post("/api/tasks/user", json={
+        "subject": "Urgent", "project": "myproj", "priority": "p1",
+    })
+    assert resp.status == 201
+    assert (await resp.json())["task"]["priority"] == "p1"
+
+    # Invalid priority is rejected.
+    resp = await client.post("/api/tasks/user", json={
+        "subject": "Bad", "project": "myproj", "priority": "p99",
+    })
+    assert resp.status == 400
+
+
+async def test_user_task_backward_compat_defaults_stage(client, tasks_layout, tmp_path):
+    """Legacy tasks with 'status' field get migrated to 'stage' on load."""
+    # Write a legacy-format task directly.
+    user_tasks_path = tasks_mod.USER_TASKS_PATH
+    user_tasks_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = {
+        "tasks": [
+            {"id": "user:legacy1", "subject": "Old task", "status": "pending",
+             "project": "myproj", "createdAt": 1000, "updatedAt": 1000},
+            {"id": "user:legacy2", "subject": "Done task", "status": "completed",
+             "project": "myproj", "createdAt": 2000, "updatedAt": 2000},
+        ]
+    }
+    user_tasks_path.write_text(json.dumps(legacy))
+
+    data = await (await client.get("/api/tasks")).json()
+    by_id = {t["id"]: t for t in data["tasks"]}
+    # pending → draft
+    assert by_id["user:legacy1"]["stage"] == "draft"
+    assert "status" not in by_id["user:legacy1"]
+    # completed → done
+    assert by_id["user:legacy2"]["stage"] == "done"
+    assert "status" not in by_id["user:legacy2"]
+    # Priority defaults applied.
+    assert by_id["user:legacy1"]["priority"] == "p2"
+    assert by_id["user:legacy1"]["tags"] == []
 
 
 async def test_user_task_not_written_to_claude_tasks(client, tasks_layout):
@@ -4363,18 +4480,21 @@ async def test_user_task_global_no_project(client, tasks_layout):
 
 
 async def test_user_task_complete_and_delete(client, tasks_layout):
+    """Complete sets stage='done'; delete removes from the store."""
     created = (await (await client.post("/api/tasks/user", json={"subject": "Idea", "project": "myproj"})).json())["task"]
     tid = created["id"]
 
-    # Complete updates the store entry's status.
+    # Complete updates the store entry's stage to 'done'.
     resp = await client.post("/api/tasks/complete", json={"sessionId": tasks_mod.USER_SESSION_ID, "taskId": tid})
     assert resp.status == 200
-    assert (await resp.json())["task"]["status"] == "completed"
+    completed = (await resp.json())["task"]
+    assert completed["stage"] == "done"
+    assert "status" not in completed
 
     # Delete removes it from the store.
     resp = await client.post("/api/tasks/delete", json={"sessionId": tasks_mod.USER_SESSION_ID, "taskId": tid})
     assert resp.status == 200
-    data = await (await client.get("/api/tasks?includeDismissed=1")).json()
+    data = await (await client.get("/api/tasks")).json()
     assert tid not in {t["id"] for t in data["tasks"]}
 
 
@@ -4391,14 +4511,46 @@ async def test_user_task_edit(client, tasks_layout):
     assert (await client.put("/api/tasks/user", json={"id": "user:nope", "subject": "x"})).status == 404
 
 
-async def test_user_task_create_and_update_broadcast_task_changed(client, tasks_layout, monkeypatch):
-    """Create + update each push a 'task_changed' WS event so open Tasks pages
-    refetch (C4). The callback carries no fields (useLiveUpdates calls it with no
-    args), so the payload is an empty dict; a 404 update broadcasts nothing.
+async def test_user_task_edit_priority_and_tags(client, tasks_layout):
+    """PUT /api/tasks/user can update priority, tags, and structured fields."""
+    created = (await (await client.post("/api/tasks/user", json={"subject": "Edit me", "project": "myproj"})).json())["task"]
+    tid = created["id"]
 
-    Mirrors test_slack_watcher_broadcasts_on_external_change: record every
-    broadcast by monkeypatching ws_manager.broadcast.
-    """
+    # Update priority.
+    resp = await client.put("/api/tasks/user", json={"id": tid, "priority": "p1"})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["priority"] == "p1"
+
+    # Update tags.
+    resp = await client.put("/api/tasks/user", json={"id": tid, "tags": ["backend", "urgent"]})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["tags"] == ["backend", "urgent"]
+
+    # Update clarification (dict).
+    resp = await client.put("/api/tasks/user", json={"id": tid, "clarification": {"summary": "Done"}})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["clarification"] == {"summary": "Done"}
+
+    # Set clarification to null.
+    resp = await client.put("/api/tasks/user", json={"id": tid, "clarification": None})
+    assert resp.status == 200
+    assert (await resp.json())["task"]["clarification"] is None
+
+    # Invalid priority rejected.
+    resp = await client.put("/api/tasks/user", json={"id": tid, "priority": "p99"})
+    assert resp.status == 400
+
+    # Invalid tags rejected.
+    resp = await client.put("/api/tasks/user", json={"id": tid, "tags": "not-a-list"})
+    assert resp.status == 400
+
+    # Invalid clarification type rejected.
+    resp = await client.put("/api/tasks/user", json={"id": tid, "clarification": "not-a-dict"})
+    assert resp.status == 400
+
+
+async def test_user_task_create_and_update_broadcast_task_changed(client, tasks_layout, monkeypatch):
+    """Create + update + advance each push a 'task_changed' WS event."""
     events: list = []
 
     async def record(event_type, data=None):
@@ -4419,6 +4571,13 @@ async def test_user_task_create_and_update_broadcast_task_changed(client, tasks_
     assert resp.status == 200
     assert any(ev[0] == "task_changed" for ev in events), \
         "update did not broadcast task_changed"
+
+    # Advance -> 200 and a task_changed broadcast.
+    events.clear()
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "clarifying"})
+    assert resp.status == 200
+    assert any(ev[0] == "task_changed" for ev in events), \
+        "advance did not broadcast task_changed"
 
     # A 404 update (unknown id) must NOT broadcast -- nothing changed.
     events.clear()

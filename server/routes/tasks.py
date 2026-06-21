@@ -1,19 +1,10 @@
-"""GET /api/tasks — read-only view of Claude Code task tracking.
+"""GET /api/tasks — user-created TODO backlog + CLI task read-only mirror.
 
-Claude Code writes one JSON file per task under
-~/.claude/tasks/<sessionId>/<taskId>.json. This endpoint aggregates them and
-enriches each task with:
-
-  - project: a human project name, derived by mapping the task's session id to
-    the project whose transcript carries that session (Claude encodes the cwd as
-    the project dir name under ~/.claude/projects). The mapping requires scanning
-    the projects tree, so it's cached with a short TTL (see _session_project_map).
-  - mtime: the task file's modification time, used for the time-range filter.
-
-Dismissal is a claude-web-side view-state concern only: the user can hide
-completed tasks, persisted in ~/.claude-web/dismissed_tasks.json. We NEVER
-modify or delete the underlying ~/.claude/tasks files — they are Claude Code's
-own state.
+User tasks live in ~/.claude-web/tasks.json with lifecycle stages
+(draft|clarifying|planned|executing|done|archived). CLI tasks (written by
+Claude Code under ~/.claude/tasks/<sessionId>/<taskId>.json) are served via a
+separate GET /api/tasks/agent endpoint — we NEVER modify those files except for
+the explicit complete/delete actions on their own path.
 """
 from __future__ import annotations
 
@@ -34,23 +25,22 @@ from server.routes.sessions import _project_label, WORKSPACE_DIR
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 CLAUDE_PROJECTS_BASE = Path.home() / ".claude" / "projects"
 
-# The dismissed-task list and the user-created task store live alongside the
-# claude-web config file (default ~/.claude-web/config.json), so they follow
-# CLAUDE_WEB_CONFIG if overridden.
+# The user-created task store lives alongside the claude-web config file
+# (default ~/.claude-web/config.json), so it follows CLAUDE_WEB_CONFIG if
+# overridden.
 _CONFIG_PATH = Path(os.environ.get(
     "CLAUDE_WEB_CONFIG",
     Path.home() / ".claude-web" / "config.json",
 ))
-DISMISSED_PATH = _CONFIG_PATH.parent / "dismissed_tasks.json"
 # Console-created tasks live here — NEVER in ~/.claude/tasks (that is Claude
 # Code's own state, which we keep read-only except for the explicit
 # complete/delete actions on its files).
 USER_TASKS_PATH = _CONFIG_PATH.parent / "tasks.json"
 
 # Synthetic _sessionId used for all console-created tasks, so they flow through
-# the same list/complete/delete/dismiss/trigger-goal plumbing as Claude tasks
-# without special-casing every call site. It is NOT a real session id; the
-# user-task endpoints route on the "user:" id prefix instead of the filesystem.
+# the same list/complete/delete/trigger-goal plumbing as Claude tasks without
+# special-casing every call site. It is NOT a real session id; the user-task
+# endpoints route on the "user:" id prefix instead of the filesystem.
 USER_SESSION_ID = "claude-web-user"
 
 # Dirs under ~/.claude/projects that are not real projects (mirrors
@@ -59,17 +49,30 @@ _EXCLUDED_DIRS = {"subagents", "transcripts", "memory"}
 
 _MAP_TTL = 60  # seconds — how long the sessionId→project map stays warm
 
+# Valid stages and priorities for user tasks.
+VALID_STAGES = {"draft", "clarifying", "planned", "executing", "done", "archived"}
+VALID_PRIORITIES = {"p1", "p2", "p3"}
+
+# Forward-only stage transitions. Key = current stage, value = set of valid
+# target stages.
+VALID_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"clarifying", "planned", "done", "archived"},
+    "clarifying": {"planned", "done", "archived"},
+    "planned": {"executing", "done", "archived"},
+    "executing": {"done", "archived"},
+    "done": {"archived"},
+}
+
 
 def register(app: web.Application):
     app.router.add_get("/api/tasks", list_tasks)
-    app.router.add_get("/api/tasks/dismissed", get_dismissed)
-    app.router.add_post("/api/tasks/dismiss", dismiss_task)
-    app.router.add_post("/api/tasks/undismiss", undismiss_task)
+    app.router.add_get("/api/tasks/agent", list_agent_tasks)
     app.router.add_post("/api/tasks/complete", complete_task)
     app.router.add_post("/api/tasks/delete", delete_task)
     # Console-created (user) tasks — stored in ~/.claude-web/tasks.json.
     app.router.add_post("/api/tasks/user", create_user_task)
     app.router.add_put("/api/tasks/user", update_user_task)
+    app.router.add_post("/api/tasks/user/{task_id}/advance", advance_task)
 
 
 def _validate_id(value: str, label: str) -> None:
@@ -175,24 +178,6 @@ async def _session_project_map() -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Dismissed-task view state (claude-web side, never touches ~/.claude/tasks)
-# ---------------------------------------------------------------------------
-
-def _task_key(session_id: str, task_id: str) -> str:
-    return f"{session_id}/{task_id}"
-
-
-def _load_dismissed() -> set[str]:
-    data, _etag = filestore.read_json(DISMISSED_PATH)
-    keys = data.get("dismissed") if isinstance(data, dict) else None
-    return set(keys) if isinstance(keys, list) else set()
-
-
-def _save_dismissed(keys: set[str]) -> None:
-    filestore.write_json(DISMISSED_PATH, {"dismissed": sorted(keys)})
-
-
-# ---------------------------------------------------------------------------
 # User-created task store (~/.claude-web/tasks.json) — claude-web's own data
 # ---------------------------------------------------------------------------
 #
@@ -203,9 +188,39 @@ def _save_dismissed(keys: set[str]) -> None:
 # source = "user" so the UI can badge them and the existing actions can route.
 
 def _load_user_tasks() -> list[dict]:
+    """Load user tasks with backward-compat migration.
+
+    Tasks missing the new 'stage' field get defaults applied. The old 'status'
+    field is removed on load (not persisted back until next write).
+    """
     data, _etag = filestore.read_json(USER_TASKS_PATH)
     items = data.get("tasks") if isinstance(data, dict) else None
-    return items if isinstance(items, list) else []
+    if not isinstance(items, list):
+        return []
+
+    for t in items:
+        # Migrate: status → stage
+        if "stage" not in t:
+            old_status = t.get("status")
+            if old_status == "completed":
+                t["stage"] = "done"
+            else:
+                t["stage"] = "draft"
+        # Ensure new fields exist with defaults
+        if "priority" not in t:
+            t["priority"] = "p2"
+        if "tags" not in t:
+            t["tags"] = []
+        if "clarification" not in t:
+            t["clarification"] = None
+        if "plan" not in t:
+            t["plan"] = None
+        if "execution" not in t:
+            t["execution"] = None
+        # Remove the old status field — stage replaces it entirely
+        t.pop("status", None)
+
+    return items
 
 
 def _save_user_tasks(tasks: list[dict]) -> None:
@@ -254,13 +269,13 @@ def _scan_tasks() -> list[dict]:
         if not session_dir.is_dir():
             continue
         for task_file in session_dir.glob("*.json"):
-            data, _etag = filestore.read_json(task_file)
-            if not isinstance(data, dict) or not data:
-                continue
             try:
+                data, _etag = filestore.read_json(task_file)
+                if not isinstance(data, dict) or not data:
+                    continue
                 mtime = task_file.stat().st_mtime
-            except OSError:
-                mtime = 0.0
+            except (OSError, UnicodeDecodeError):
+                continue
             data["_sessionId"] = session_dir.name
             data["_mtime"] = mtime
             tasks.append(data)
@@ -272,12 +287,13 @@ def project_task_counts() -> dict[str, dict]:
     other routes (e.g. /api/projects) to enrich their payload.
 
     Returns {projectName: {"total": n, "open": n}} where "open" excludes
-    completed tasks. Uses the cached session→project map if warm, else builds it
-    once. Dismissed tasks still count (the count reflects real task state, not
-    the user's view filter). Safe to call from a thread.
+    completed/done tasks. Uses the cached session→project map if warm, else
+    builds it once. Safe to call from a thread.
     """
     mapping = _map_cache if _map_cache else _build_session_project_map()
     counts: dict[str, dict] = {}
+
+    # Count CLI tasks (these still use the 'status' field).
     for t in _scan_tasks():
         proj = mapping.get(t["_sessionId"])
         name = proj["name"] if proj else "(unknown)"
@@ -285,73 +301,60 @@ def project_task_counts() -> dict[str, dict]:
         c["total"] += 1
         if t.get("status") != "completed":
             c["open"] += 1
+
+    # Also count user tasks (use 'stage' field).
+    for t in _load_user_tasks():
+        name = t.get("project") or "(global)"
+        c = counts.setdefault(name, {"total": 0, "open": 0})
+        c["total"] += 1
+        if t.get("stage") not in ("done", "archived"):
+            c["open"] += 1
+
     return counts
 
 
 async def list_tasks(request: web.Request) -> web.Response:
-    """List tasks with project attribution and optional filters.
+    """List user-created tasks with optional filters.
 
     Query params (all optional):
-      - project=<name>   only tasks whose mapped project equals <name>
-      - sinceDays=<n>    only tasks whose file mtime is within the last n days
-      - includeDismissed=1  include tasks the user has hidden (default: exclude)
+      - project=<name>   only tasks whose project equals <name>
+      - stage=<s>        only tasks with matching stage (comma-separated multi)
 
-    The response also returns the set of distinct project names (so the UI can
-    populate a filter) and the dismissed count, computed before filtering.
+    Returns {tasks, projects} where projects is the distinct set for a filter
+    dropdown.
     """
     project_filter = request.query.get("project")
-    since_days = request.query.get("sinceDays")
-    include_dismissed = request.query.get("includeDismissed") == "1"
+    stage_filter_raw = request.query.get("stage")
+    stage_filter: set[str] | None = None
+    if stage_filter_raw:
+        stage_filter = {s.strip() for s in stage_filter_raw.split(",") if s.strip()}
 
-    claude_tasks, mapping, dismissed, user_tasks = await asyncio.gather(
-        asyncio.to_thread(_scan_tasks),
-        _session_project_map(),
-        asyncio.to_thread(_load_dismissed),
-        asyncio.to_thread(_load_user_tasks),
-    )
+    user_tasks = await asyncio.to_thread(_load_user_tasks)
 
-    # Enrich Claude Code tasks with their project (name + path) from the map.
-    for t in claude_tasks:
-        proj = mapping.get(t["_sessionId"])
-        t["project"] = proj["name"] if proj else "(unknown)"
-        t["projectPath"] = proj["path"] if proj else None
-        t["source"] = "claude"
-
-    # User tasks already carry their own project; shape them to match.
-    tasks = claude_tasks + [_user_task_view(u) for u in user_tasks]
-
-    # Dismissed flag applies uniformly (key = "<sessionId>/<id>").
-    for t in tasks:
-        t["dismissed"] = _task_key(t["_sessionId"], str(t.get("id", ""))) in dismissed
+    # Shape user tasks for response.
+    tasks = [_user_task_view(u) for u in user_tasks]
 
     # Distinct projects (before per-request filtering) for the filter dropdown.
     projects = sorted({t["project"] for t in tasks})
-    dismissed_count = sum(1 for t in tasks if t["dismissed"])
 
     # Apply filters.
-    cutoff = None
-    if since_days:
-        try:
-            n = float(since_days)
-            if n > 0:
-                cutoff = time.time() - n * 86400
-        except ValueError:
-            cutoff = None
-
     def keep(t: dict) -> bool:
-        if not include_dismissed and t["dismissed"]:
-            return False
         if project_filter and t["project"] != project_filter:
             return False
-        if cutoff is not None and t["_mtime"] < cutoff:
+        if stage_filter and t.get("stage") not in stage_filter:
             return False
         return True
 
     filtered = [t for t in tasks if keep(t)]
 
-    # Sort: in_progress first, then most recently modified, then id.
+    # Sort: active stages first (draft, clarifying, planned, executing), then
+    # done/archived, then most recently modified.
+    _stage_order = {
+        "draft": 0, "clarifying": 1, "planned": 2, "executing": 3,
+        "done": 4, "archived": 5,
+    }
     filtered.sort(key=lambda t: (
-        0 if t.get("status") == "in_progress" else 1,
+        _stage_order.get(t.get("stage", "draft"), 9),
         -t["_mtime"],
         t.get("id", ""),
     ))
@@ -359,68 +362,105 @@ async def list_tasks(request: web.Request) -> web.Response:
     return web.json_response({
         "tasks": filtered,
         "projects": projects,
-        "dismissedCount": dismissed_count,
     })
 
 
-async def get_dismissed(request: web.Request) -> web.Response:
-    dismissed = await asyncio.to_thread(_load_dismissed)
-    return web.json_response({"dismissed": sorted(dismissed)})
+async def list_agent_tasks(request: web.Request) -> web.Response:
+    """List CLI tasks (from Claude Code sessions) with project attribution.
 
+    Query params (optional):
+      - project=<name>   only tasks for the named project
 
-async def dismiss_task(request: web.Request) -> web.Response:
-    """Hide a task from the default view. Body: {sessionId, taskId}.
-
-    View-state only — the underlying ~/.claude/tasks file is untouched.
+    Returns {tasks: [...]}. Read-only, no mutation.
     """
+    project_filter = request.query.get("project")
+
+    cli_tasks, mapping = await asyncio.gather(
+        asyncio.to_thread(_scan_tasks),
+        _session_project_map(),
+    )
+
+    # Enrich CLI tasks with their project (name + path) from the map.
+    for t in cli_tasks:
+        proj = mapping.get(t["_sessionId"])
+        t["project"] = proj["name"] if proj else "(unknown)"
+        t["projectPath"] = proj["path"] if proj else None
+        t["source"] = "claude"
+
+    # Apply project filter.
+    if project_filter:
+        cli_tasks = [t for t in cli_tasks if t["project"] == project_filter]
+
+    # Sort: in_progress first, then most recently modified, then id.
+    cli_tasks.sort(key=lambda t: (
+        0 if t.get("status") == "in_progress" else 1,
+        -t["_mtime"],
+        t.get("id", ""),
+    ))
+
+    return web.json_response({"tasks": cli_tasks})
+
+
+async def advance_task(request: web.Request) -> web.Response:
+    """Advance a user task to a new stage.
+
+    POST /api/tasks/user/{task_id}/advance
+    Body: {stage: "<target>"}
+
+    Validates forward-only transitions per VALID_TRANSITIONS. Returns 400 on
+    invalid transition, 404 if task not found.
+    """
+    task_id = request.match_info["task_id"]
+    _validate_id(task_id, "task_id")
+
     body = await read_json_body(request)
-    session_id = body.get("sessionId")
-    task_id = body.get("taskId")
-    if not session_id or task_id is None:
-        raise web.HTTPBadRequest(reason="sessionId and taskId required")
+    target_stage = body.get("stage")
+    if not target_stage or target_stage not in VALID_STAGES:
+        raise web.HTTPBadRequest(
+            reason=f"stage must be one of: {', '.join(sorted(VALID_STAGES))}"
+        )
 
-    def _do() -> set[str]:
-        dismissed = _load_dismissed()
-        dismissed.add(_task_key(str(session_id), str(task_id)))
-        _save_dismissed(dismissed)
-        return dismissed
+    def _do() -> dict | None:
+        tasks = _load_user_tasks()
+        for t in tasks:
+            if str(t.get("id")) == str(task_id):
+                current_stage = t.get("stage", "draft")
+                allowed = VALID_TRANSITIONS.get(current_stage, set())
+                if target_stage not in allowed:
+                    return {"error": "invalid_transition", "current": current_stage, "target": target_stage}
+                t["stage"] = target_stage
+                t["updatedAt"] = int(time.time() * 1000)
+                _save_user_tasks(tasks)
+                return {"task": t}
+        return None
 
-    dismissed = await asyncio.to_thread(_do)
-    return web.json_response({"dismissed": sorted(dismissed)})
+    result = await asyncio.to_thread(_do)
+    if result is None:
+        raise web.HTTPNotFound(reason="task not found")
+    if "error" in result:
+        return web.json_response(
+            {"error": result["error"], "message": f"Cannot transition from '{result['current']}' to '{result['target']}'"},
+            status=400,
+        )
 
-
-async def undismiss_task(request: web.Request) -> web.Response:
-    """Un-hide a previously dismissed task. Body: {sessionId, taskId}."""
-    body = await read_json_body(request)
-    session_id = body.get("sessionId")
-    task_id = body.get("taskId")
-    if not session_id or task_id is None:
-        raise web.HTTPBadRequest(reason="sessionId and taskId required")
-
-    def _do() -> set[str]:
-        dismissed = _load_dismissed()
-        dismissed.discard(_task_key(str(session_id), str(task_id)))
-        _save_dismissed(dismissed)
-        return dismissed
-
-    dismissed = await asyncio.to_thread(_do)
-    return web.json_response({"dismissed": sorted(dismissed)})
+    await request.app["ws_manager"].broadcast("task_changed", {})
+    return web.json_response({"ok": True, "task": _user_task_view(result["task"])})
 
 
 # ---------------------------------------------------------------------------
 # Mutating endpoints — REAL writes to Claude Code's task files
 # ---------------------------------------------------------------------------
 #
-# Unlike dismiss/undismiss (claude-web view-state), these change the source
-# ~/.claude/tasks/<sessionId>/<taskId>.json. They are deliberately narrow: only
-# the named task file is touched, and only after path-traversal validation.
+# These change the source ~/.claude/tasks/<sessionId>/<taskId>.json. They are
+# deliberately narrow: only the named task file is touched, and only after
+# path-traversal validation.
 
 async def complete_task(request: web.Request) -> web.Response:
     """Mark a task complete.
 
     Body: {sessionId, taskId}. For Claude Code tasks, writes status:"completed"
-    to the source ~/.claude/tasks file. For console-created tasks (sessionId ==
-    USER_SESSION_ID), updates the entry in ~/.claude-web/tasks.json. 404 if absent.
+    to the source ~/.claude/tasks file (their own schema). For console-created
+    tasks (sessionId == USER_SESSION_ID), sets stage='done'. 404 if absent.
     """
     body = await read_json_body(request)
     session_id = body.get("sessionId")
@@ -434,7 +474,7 @@ async def complete_task(request: web.Request) -> web.Response:
             tasks = _load_user_tasks()
             for t in tasks:
                 if str(t.get("id")) == str(task_id):
-                    t["status"] = "completed"
+                    t["stage"] = "done"
                     t["updatedAt"] = int(time.time() * 1000)
                     _save_user_tasks(tasks)
                     return t
@@ -442,6 +482,7 @@ async def complete_task(request: web.Request) -> web.Response:
         updated = await asyncio.to_thread(_do_user)
         if not updated:
             raise web.HTTPNotFound(reason="task not found")
+        await request.app["ws_manager"].broadcast("task_changed", {})
         return web.json_response({"ok": True, "task": _user_task_view(updated)})
 
     path = _task_file(str(session_id), str(task_id))
@@ -464,6 +505,7 @@ async def complete_task(request: web.Request) -> web.Response:
         return web.json_response({"error": "conflict", "message": str(e)}, status=409)
     if not updated:
         raise web.HTTPNotFound(reason="task not found")
+    await request.app["ws_manager"].broadcast("task_changed", {})
     return web.json_response({"ok": True, "task": updated})
 
 
@@ -472,8 +514,8 @@ async def delete_task(request: web.Request) -> web.Response:
 
     For Claude Code tasks, removes only that one ~/.claude/tasks JSON file (never
     the session directory). For console-created tasks (sessionId ==
-    USER_SESSION_ID), removes the entry from ~/.claude-web/tasks.json. Also drops
-    any dismissed-list entry so stale view-state doesn't linger. 404 if absent.
+    USER_SESSION_ID), removes the entry from ~/.claude-web/tasks.json. 404 if
+    absent.
     """
     body = await read_json_body(request)
     session_id = body.get("sessionId")
@@ -489,16 +531,12 @@ async def delete_task(request: web.Request) -> web.Response:
             if len(kept) == len(tasks):
                 return False
             _save_user_tasks(kept)
-            dismissed = _load_dismissed()
-            key = _task_key(USER_SESSION_ID, str(task_id))
-            if key in dismissed:
-                dismissed.discard(key)
-                _save_dismissed(dismissed)
             return True
         deleted = await asyncio.to_thread(_do_user)
         if not deleted:
             raise web.HTTPNotFound(reason="task not found")
-        return web.json_response({"ok": True, "deleted": _task_key(USER_SESSION_ID, str(task_id))})
+        await request.app["ws_manager"].broadcast("task_changed", {})
+        return web.json_response({"ok": True, "deleted": f"{USER_SESSION_ID}/{task_id}"})
 
     path = _task_file(str(session_id), str(task_id))
 
@@ -506,18 +544,13 @@ async def delete_task(request: web.Request) -> web.Response:
         if not path.is_file():
             return False
         filestore.delete_file(path)
-        # Clean up any dismissed-list entry for the now-gone task.
-        dismissed = _load_dismissed()
-        key = _task_key(str(session_id), str(task_id))
-        if key in dismissed:
-            dismissed.discard(key)
-            _save_dismissed(dismissed)
         return True
 
     deleted = await asyncio.to_thread(_do)
     if not deleted:
         raise web.HTTPNotFound(reason="task not found")
-    return web.json_response({"ok": True, "deleted": _task_key(str(session_id), str(task_id))})
+    await request.app["ws_manager"].broadcast("task_changed", {})
+    return web.json_response({"ok": True, "deleted": f"{session_id}/{task_id}"})
 
 
 # ---------------------------------------------------------------------------
@@ -549,13 +582,18 @@ def _validate_user_task_body(body: dict) -> tuple[str, str, str | None, str | No
 
 
 async def create_user_task(request: web.Request) -> web.Response:
-    """Create a console task. Body: {subject, description?, project}.
+    """Create a console task. Body: {subject, description?, project?, priority?}.
 
-    Stored in ~/.claude-web/tasks.json with a "user:<token>" id and status
-    "pending". Returns the created task in the standard list record shape.
+    Stored in ~/.claude-web/tasks.json with a "user:<token>" id and stage
+    "draft". Returns the created task in the standard list record shape.
     """
     body = await read_json_body(request)
     subject, description, project, project_path = _validate_user_task_body(body)
+
+    # Validate optional priority.
+    priority = body.get("priority", "p2")
+    if priority not in VALID_PRIORITIES:
+        raise web.HTTPBadRequest(reason=f"priority must be one of: {', '.join(sorted(VALID_PRIORITIES))}")
 
     def _do() -> dict:
         tasks = _load_user_tasks()
@@ -564,7 +602,12 @@ async def create_user_task(request: web.Request) -> web.Response:
             "id": f"user:{secrets.token_hex(4)}",
             "subject": subject,
             "description": description,
-            "status": "pending",
+            "stage": "draft",
+            "priority": priority,
+            "tags": [],
+            "clarification": None,
+            "plan": None,
+            "execution": None,
             "project": project,
             "projectPath": project_path,
             "createdAt": now,
@@ -575,15 +618,15 @@ async def create_user_task(request: web.Request) -> web.Response:
         return task
 
     task = await asyncio.to_thread(_do)
-    # Notify open clients so the Tasks view refetches (C4). Outside the thread
-    # because broadcast is async; the callback carries no fields — useLiveUpdates
-    # just refetches — so an empty payload is intentional.
     await request.app["ws_manager"].broadcast("task_changed", {})
     return web.json_response({"ok": True, "task": _user_task_view(task)}, status=201)
 
 
 async def update_user_task(request: web.Request) -> web.Response:
-    """Edit a console task. Body: {id, subject?, description?, project?}.
+    """Edit a console task.
+
+    Body: {id, subject?, description?, project?, priority?, tags?,
+           clarification?, plan?, execution?}.
 
     Only console-created tasks can be edited. 404 if the id isn't in the store.
     """
@@ -611,6 +654,28 @@ async def update_user_task(request: web.Request) -> web.Response:
         else:
             project_name = None  # empty → global
 
+    # Validate priority if provided.
+    priority = body.get("priority")
+    if priority is not None and priority not in VALID_PRIORITIES:
+        raise web.HTTPBadRequest(reason=f"priority must be one of: {', '.join(sorted(VALID_PRIORITIES))}")
+
+    # Validate tags if provided.
+    tags = body.get("tags")
+    if tags is not None:
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            raise web.HTTPBadRequest(reason="tags must be a list of strings")
+
+    # Validate structured fields if provided.
+    clarification = body.get("clarification")
+    if "clarification" in body and clarification is not None and not isinstance(clarification, dict):
+        raise web.HTTPBadRequest(reason="clarification must be a dict or null")
+    plan = body.get("plan")
+    if "plan" in body and plan is not None and not isinstance(plan, dict):
+        raise web.HTTPBadRequest(reason="plan must be a dict or null")
+    execution = body.get("execution")
+    if "execution" in body and execution is not None and not isinstance(execution, dict):
+        raise web.HTTPBadRequest(reason="execution must be a dict or null")
+
     def _do() -> dict | None:
         tasks = _load_user_tasks()
         for t in tasks:
@@ -622,6 +687,16 @@ async def update_user_task(request: web.Request) -> web.Response:
                 if project_provided:
                     t["project"] = project_name
                     t["projectPath"] = project_path
+                if priority is not None:
+                    t["priority"] = priority
+                if tags is not None:
+                    t["tags"] = tags
+                if "clarification" in body:
+                    t["clarification"] = clarification
+                if "plan" in body:
+                    t["plan"] = plan
+                if "execution" in body:
+                    t["execution"] = execution
                 t["updatedAt"] = int(time.time() * 1000)
                 _save_user_tasks(tasks)
                 return t
@@ -630,7 +705,5 @@ async def update_user_task(request: web.Request) -> web.Response:
     updated = await asyncio.to_thread(_do)
     if not updated:
         raise web.HTTPNotFound(reason="task not found")
-    # Only broadcast on a real change (never on a 404). Empty payload: the
-    # frontend callback takes no args and just refetches (C4).
     await request.app["ws_manager"].broadcast("task_changed", {})
     return web.json_response({"ok": True, "task": _user_task_view(updated)})
