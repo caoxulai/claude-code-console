@@ -208,7 +208,9 @@ export default function ProjectsPage() {
 
   // Tasks state (loaded per-project when the Tasks tab opens)
   const [projectTasks, setProjectTasks] = useState([]);
+  const [agentTasks, setAgentTasks] = useState([]);
   const [tasksLoading, setTasksLoading] = useState(false);
+  const [agentTasksLoading, setAgentTasksLoading] = useState(false);
   const [picker, setPicker] = useState(null);
   const triggerGoal = useTriggerGoal({ onPickSession: setPicker });
 
@@ -315,6 +317,7 @@ export default function ProjectsPage() {
       setSelectedSop(null);
       setSopContent('');
       setProjectTasks([]);
+      setAgentTasks([]);
       setDesign(null);
       setAgents([]);
       setExpandedAgent(null);
@@ -522,16 +525,33 @@ export default function ProjectsPage() {
 
   // Tasks are filtered by project NAME (how /api/tasks attributes them). A
   // project's directory name is its project name, so project.name is the key.
+  // Fetches BOTH user TODOs (backlog) and CLI agent tasks in parallel.
   const loadProjectTasks = async (project, { silent = false } = {}) => {
-    if (!silent) setTasksLoading(true);
-    try {
-      const res = await fetch(`/api/tasks?project=${encodeURIComponent(project.name)}&includeDismissed=1`);
-      const json = await res.json();
-      setProjectTasks(Array.isArray(json.tasks) ? json.tasks : []);
-    } catch {
+    if (!silent) { setTasksLoading(true); setAgentTasksLoading(true); }
+    const name = encodeURIComponent(project.name);
+    const [userRes, agentRes] = await Promise.allSettled([
+      fetch(`/api/tasks?project=${name}`),
+      fetch(`/api/tasks/agent?project=${name}`),
+    ]);
+    // User TODOs (backlog)
+    if (userRes.status === 'fulfilled' && userRes.value.ok) {
+      try {
+        const json = await userRes.value.json();
+        setProjectTasks(Array.isArray(json.tasks) ? json.tasks : []);
+      } catch { if (!silent) setProjectTasks([]); }
+    } else {
       if (!silent) setProjectTasks([]);
     }
-    if (!silent) setTasksLoading(false);
+    // CLI agent tasks
+    if (agentRes.status === 'fulfilled' && agentRes.value.ok) {
+      try {
+        const json = await agentRes.value.json();
+        setAgentTasks(Array.isArray(json.tasks) ? json.tasks : Array.isArray(json) ? json : []);
+      } catch { if (!silent) setAgentTasks([]); }
+    } else {
+      if (!silent) setAgentTasks([]);
+    }
+    if (!silent) { setTasksLoading(false); setAgentTasksLoading(false); }
   };
 
   const completeProjectTask = async (project, task) => {
@@ -552,6 +572,16 @@ export default function ProjectsPage() {
         body: JSON.stringify({ sessionId: task._sessionId, taskId: task.id }),
       });
       loadProjectTasks(project, { silent: true });
+    } catch { /* ignore */ }
+  };
+
+  const advanceProjectTask = async (project, task, targetStage) => {
+    try {
+      const res = await fetch(`/api/tasks/user/${encodeURIComponent(task.id)}/advance`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stage: targetStage }),
+      });
+      if (res.ok) loadProjectTasks(project, { silent: true });
     } catch { /* ignore */ }
   };
 
@@ -1438,64 +1468,165 @@ export default function ProjectsPage() {
   };
 
   const renderTasksTab = (project) => {
-    if (tasksLoading) {
+    if (tasksLoading && agentTasksLoading) {
       return <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-sm)', padding: 'var(--space-md)' }}>Loading tasks…</div>;
     }
-    if (projectTasks.length === 0) {
-      return (
-        <div className="empty-state" style={{ padding: 'var(--space-lg)' }}>
-          <h3>No tasks</h3>
-          <p style={{ color: 'var(--muted)' }}>
-            Tasks Claude Code creates in this project&apos;s sessions appear here.
-          </p>
-        </div>
-      );
-    }
 
-    const statusBadge = (s) => {
+    const stageBadgeStyle = (stage) => {
+      const map = {
+        draft: { background: 'var(--surface2)', color: 'var(--muted)' },
+        clarifying: { background: '#e8d4f0', color: '#6b21a8' },
+        planned: { background: '#dbeafe', color: '#1d4ed8' },
+        executing: { background: '#fef3c7', color: '#92400e' },
+        done: { background: '#d1fae5', color: '#065f46' },
+        archived: { background: 'var(--surface2)', color: 'var(--muted)' },
+      };
+      return map[stage] || map.draft;
+    };
+
+    const priorityBadgeStyle = (priority) => {
+      const map = {
+        p1: { background: '#fee2e2', color: '#991b1b' },
+        p2: { background: '#fef3c7', color: '#92400e' },
+        p3: { background: 'var(--surface2)', color: 'var(--muted)' },
+      };
+      return map[priority] || map.p2;
+    };
+
+    // Determine which advance action is available for a given stage.
+    const advanceAction = (stage) => {
+      if (stage === 'draft') return { label: 'Clarify', target: 'clarifying' };
+      if (stage === 'clarifying') return { label: 'Plan', target: 'planned' };
+      if (stage === 'planned') return { label: 'Execute', target: 'executing' };
+      return null;
+    };
+
+    const agentStatusBadge = (s) => {
       if (s === 'completed') return 'badge-ok';
       if (s === 'in_progress') return 'badge-warn';
       return '';
     };
 
+    const taskActionBtnStyle = (extra = {}) => ({
+      background: 'none', border: 'none', cursor: 'pointer',
+      display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em',
+      ...extra,
+    });
+
     return (
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-        {projectTasks.map((t, i) => (
-          <div
-            key={`${t._sessionId}-${t.id}`}
-            style={{
-              padding: '0.7em 1em',
-              borderBottom: i < projectTasks.length - 1 ? '1px solid var(--border)' : 'none',
-              opacity: t.dismissed ? 0.5 : t.status === 'completed' ? 0.7 : 1,
-              display: 'flex', justifyContent: 'space-between', gap: '1em', alignItems: 'flex-start',
-            }}
-          >
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div style={{ fontWeight: 600, fontSize: '0.9em', textDecoration: t.status === 'completed' ? 'line-through' : 'none' }}>
-                {t.subject || `Task ${t.id}`}
-              </div>
-              {t.description && (
-                <div style={{ fontSize: '0.78em', color: 'var(--muted)', marginTop: '0.2em', lineHeight: 1.5 }}>{t.description}</div>
-              )}
-            </div>
-            <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.3em' }}>
-              <span className={`badge ${statusBadge(t.status)}`}>{t.status}</span>
-              <div style={{ display: 'flex', gap: '0.6em', alignItems: 'center' }}>
-                <button onClick={() => triggerGoal(t)} title="Trigger a /goal in this project" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}>
-                  <FiZap size={11} /> goal
-                </button>
-                {t.status !== 'completed' && (
-                  <button onClick={() => completeProjectTask(project, t)} title="Mark complete" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--muted)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}>
-                    <FiCheckCircle size={11} /> done
-                  </button>
-                )}
-                <button onClick={() => deleteProjectTask(project, t)} title="Delete task file" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--danger, #d9534f)', display: 'flex', alignItems: 'center', gap: '0.2em', fontSize: '0.7em' }}>
-                  <FiTrash2 size={11} /> delete
-                </button>
-              </div>
-            </div>
+      <div>
+        {/* Backlog section — user TODOs */}
+        <h4 style={{ fontSize: 'var(--fs-sm)', fontWeight: 600, margin: '0 0 0.5em' }}>Backlog</h4>
+        {projectTasks.length === 0 ? (
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', padding: 'var(--space-sm) 0' }}>
+            No TODO items for this project yet. Create one from the TODO page.
           </div>
-        ))}
+        ) : (
+          <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+            {projectTasks.map((t, i) => {
+              const stage = t.stage || 'draft';
+              const priority = t.priority || 'p2';
+              const action = advanceAction(stage);
+              return (
+                <div
+                  key={t.id}
+                  style={{
+                    padding: '0.7em 1em',
+                    borderBottom: i < projectTasks.length - 1 ? '1px solid var(--border)' : 'none',
+                    opacity: stage === 'done' ? 0.7 : 1,
+                    display: 'flex', justifyContent: 'space-between', gap: '1em', alignItems: 'flex-start',
+                  }}
+                >
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em', flexWrap: 'wrap' }}>
+                      <span style={{
+                        display: 'inline-block', fontSize: '0.65em', fontWeight: 600,
+                        padding: '1px 6px', borderRadius: '999px',
+                        ...stageBadgeStyle(stage),
+                      }}>{stage}</span>
+                      <span style={{
+                        display: 'inline-block', fontSize: '0.65em', fontWeight: 600,
+                        padding: '1px 6px', borderRadius: '999px',
+                        ...priorityBadgeStyle(priority),
+                      }}>{priority.toUpperCase()}</span>
+                      <span style={{ fontWeight: 600, fontSize: '0.9em', textDecoration: stage === 'done' ? 'line-through' : 'none' }}>
+                        {t.subject || `Task ${t.id}`}
+                      </span>
+                    </div>
+                    {t.description && (
+                      <div style={{ fontSize: '0.78em', color: 'var(--muted)', marginTop: '0.2em', lineHeight: 1.5 }}>{t.description}</div>
+                    )}
+                  </div>
+                  <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: '0.6em', flexWrap: 'wrap' }}>
+                    {action && stage !== 'done' && (
+                      <button
+                        onClick={() => advanceProjectTask(project, t, action.target)}
+                        title={`Advance to ${action.target}`}
+                        style={taskActionBtnStyle({ color: 'var(--accent)', fontWeight: 600 })}
+                      >
+                        {action.label} &rarr;
+                      </button>
+                    )}
+                    {stage !== 'done' && (
+                      <button
+                        onClick={() => advanceProjectTask(project, t, 'done')}
+                        title="Mark done"
+                        style={taskActionBtnStyle({ color: 'var(--muted)' })}
+                      >
+                        <FiCheckCircle size={11} /> Done
+                      </button>
+                    )}
+                    <button onClick={() => triggerGoal(t)} title="Trigger a /goal in this project" style={taskActionBtnStyle({ color: 'var(--accent)' })}>
+                      <FiZap size={11} /> goal
+                    </button>
+                    <button onClick={() => deleteProjectTask(project, t)} title="Delete task" style={taskActionBtnStyle({ color: 'var(--danger, #d9534f)' })}>
+                      <FiTrash2 size={11} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Visual separator */}
+        <div style={{ borderTop: '1px solid var(--border)', margin: '1.2em 0' }} />
+
+        {/* Agent Tasks section — CLI tasks, read-only */}
+        <h4 style={{ fontSize: 'var(--fs-sm)', fontWeight: 400, color: 'var(--muted)', margin: '0 0 0.5em' }}>
+          Agent Tasks (from sessions)
+        </h4>
+        {agentTasksLoading && agentTasks.length === 0 ? (
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', padding: 'var(--space-sm) 0' }}>Loading agent tasks…</div>
+        ) : agentTasks.length === 0 ? (
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', padding: 'var(--space-sm) 0' }}>No agent tasks</div>
+        ) : (
+          <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+            {agentTasks.map((t, i) => (
+              <div
+                key={`${t._sessionId || 'cli'}-${t.id}`}
+                style={{
+                  padding: '0.7em 1em',
+                  borderBottom: i < agentTasks.length - 1 ? '1px solid var(--border)' : 'none',
+                  opacity: t.status === 'completed' ? 0.7 : 1,
+                  display: 'flex', justifyContent: 'space-between', gap: '1em', alignItems: 'flex-start',
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: '0.9em', textDecoration: t.status === 'completed' ? 'line-through' : 'none' }}>
+                    {t.subject || `Task ${t.id}`}
+                  </div>
+                  {t.description && (
+                    <div style={{ fontSize: '0.78em', color: 'var(--muted)', marginTop: '0.2em', lineHeight: 1.5 }}>{t.description}</div>
+                  )}
+                </div>
+                <div style={{ flexShrink: 0 }}>
+                  <span className={`badge ${agentStatusBadge(t.status)}`}>{t.status || 'pending'}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   };

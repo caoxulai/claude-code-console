@@ -19,7 +19,7 @@ const NAV_ITEMS = [
     { to: '/projects', icon: FiFolder, label: 'Projects' },
     { to: '/chat', icon: FiMessageSquare, label: 'Chat' },
     { to: '/sessions', icon: FiList, label: 'Sessions' },
-    { to: '/tasks', icon: FiCheckSquare, label: 'Tasks' },
+    { to: '/tasks', icon: FiCheckSquare, label: 'TODO' },
   ]},
   { group: 'AI Core', items: [
     { to: '/agents', icon: FiUsers, label: 'Agents' },
