@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { FiList, FiX, FiTrash2, FiZap, FiPlus, FiSave, FiChevronRight, FiChevronDown } from 'react-icons/fi';
 import { SkeletonLine } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
@@ -30,12 +30,165 @@ function PriorityBadge({ priority }) {
   );
 }
 
+// --- Task row with hover state ---
+function TaskRow({ task, stage, isLast, openMenuId, setOpenMenuId, onAdvance, onDelete, onTrigger }) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        padding: 'var(--space-sm) var(--space-md)',
+        borderBottom: isLast ? 'none' : '1px solid var(--border)',
+        opacity: stage.key === 'done' ? 0.65 : 1,
+        background: hovered ? 'var(--surface2)' : 'transparent',
+        transition: 'background 0.15s',
+        cursor: 'default',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
+        {/* Priority badge (leftmost) */}
+        <PriorityBadge priority={task.priority} />
+
+        {/* Subject + description (flex-1, takes remaining space) */}
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{
+            fontWeight: 600, fontSize: 'var(--fs-sm)',
+            textDecoration: stage.key === 'done' ? 'line-through' : 'none',
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>
+            {task.subject || `Task ${task.id}`}
+          </div>
+          {task.description && (
+            <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginTop: '2px', lineHeight: 1.4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {task.description}
+            </div>
+          )}
+        </div>
+
+        {/* Project badge */}
+        {task.project && <span className="badge" style={{ flexShrink: 0 }}>{task.project}</span>}
+
+        {/* Primary action button (filled) */}
+        {stage.action && (
+          <button
+            onClick={() => onAdvance(task, stage.target)}
+            title={`Advance to ${stage.target}`}
+            style={{
+              background: 'var(--accent)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '4px',
+              padding: '0.2em 0.6em',
+              fontSize: 'var(--fs-xs)',
+              fontWeight: 600,
+              cursor: 'pointer',
+              flexShrink: 0,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {stage.action} &rarr;
+          </button>
+        )}
+
+        {/* Overflow menu (always present) */}
+        <OverflowMenu
+          task={task}
+          stage={stage}
+          openMenuId={openMenuId}
+          setOpenMenuId={setOpenMenuId}
+          onAdvance={onAdvance}
+          onDelete={onDelete}
+          onTrigger={onTrigger}
+        />
+      </div>
+    </div>
+  );
+}
+
+// --- Overflow "..." menu ---
+function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDelete, onTrigger }) {
+  const menuRef = useRef(null);
+  const isOpen = openMenuId === task.id;
+
+  // Click-outside handler: close menu when clicking outside, without stopPropagation.
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleClick = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) {
+        setOpenMenuId(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [isOpen, setOpenMenuId]);
+
+  const menuItemStyle = {
+    display: 'flex', alignItems: 'center', gap: 'var(--space-xs)',
+    padding: 'var(--space-xs) var(--space-sm)',
+    background: 'none', border: 'none', width: '100%', textAlign: 'left',
+    cursor: 'pointer', fontSize: 'var(--fs-xs)', color: 'var(--text)',
+    borderRadius: '3px',
+  };
+
+  return (
+    <div ref={menuRef} style={{ position: 'relative', flexShrink: 0 }}>
+      <button
+        onClick={() => setOpenMenuId(isOpen ? null : task.id)}
+        title="More actions"
+        aria-label="More actions"
+        style={{
+          background: 'none', border: 'none', cursor: 'pointer',
+          fontSize: '1.2em', lineHeight: 1, padding: '0.1em 0.3em',
+          color: 'var(--muted)', borderRadius: '4px',
+        }}
+      >
+        &#x22EF;
+      </button>
+      {isOpen && (
+        <div style={{
+          position: 'absolute', right: 0, top: '100%', zIndex: 100,
+          background: 'var(--surface)', border: '1px solid var(--border)',
+          borderRadius: 'var(--radius)', boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+          minWidth: '150px', padding: 'var(--space-xs)',
+          marginTop: '4px',
+        }}>
+          {/* Trigger Goal */}
+          <button
+            style={menuItemStyle}
+            onClick={() => { onTrigger(task); setOpenMenuId(null); }}
+          >
+            <FiZap size={12} style={{ color: 'var(--accent)' }} /> Trigger Goal
+          </button>
+          {/* Mark Done — hidden if already done */}
+          {stage.key !== 'done' && (
+            <button
+              style={menuItemStyle}
+              onClick={() => { onAdvance(task, 'done'); setOpenMenuId(null); }}
+            >
+              <span style={{ fontSize: '12px' }}>&#10003;</span> Mark Done
+            </button>
+          )}
+          {/* Delete */}
+          <button
+            style={{ ...menuItemStyle, color: 'var(--danger, #d9534f)' }}
+            onClick={() => { onDelete(task); setOpenMenuId(null); }}
+          >
+            <FiTrash2 size={12} /> Delete
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const POLL_MS = 60000;
 
 export default function TasksPage() {
   const [tasks, setTasks] = useState(null);
   const [projects, setProjects] = useState([]);
   const [error, setError] = useState(null);
+  const [openMenuId, setOpenMenuId] = useState(null);
 
   // Filters
   const [projectFilter, setProjectFilter] = useState('all');
@@ -329,45 +482,19 @@ export default function TasksPage() {
                 <span className="badge" style={{ fontSize: 'var(--fs-xs)' }}>{items.length}</span>
               </button>
               {!collapsed && (
-                <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+                <div className="card" style={{ padding: 0 }}>
                   {items.map((t, i) => (
-                    <div
+                    <TaskRow
                       key={t.id}
-                      style={{
-                        padding: 'var(--space-sm) var(--space-md)',
-                        borderBottom: i < items.length - 1 ? '1px solid var(--border)' : 'none',
-                        opacity: stage.key === 'done' ? 0.65 : 1,
-                      }}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-md)', alignItems: 'flex-start' }}>
-                        <div style={{ minWidth: 0, flex: 1 }}>
-                          <div style={{
-                            fontWeight: 600, fontSize: 'var(--fs-sm)',
-                            textDecoration: stage.key === 'done' ? 'line-through' : 'none',
-                          }}>
-                            {t.subject || `Task ${t.id}`}
-                          </div>
-                          {t.description && (
-                            <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginTop: 'var(--space-xs)', lineHeight: 1.5 }}>
-                              {t.description}
-                            </div>
-                          )}
-                        </div>
-                        <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 'var(--space-xs)' }}>
-                          <div style={{ display: 'flex', gap: 'var(--space-xs)', alignItems: 'center' }}>
-                            <PriorityBadge priority={t.priority} />
-                            {t.project && <span className="badge">{t.project}</span>}
-                          </div>
-                          <TaskActions
-                            task={t}
-                            stage={stage}
-                            onAdvance={advanceTask}
-                            onDelete={deleteTask}
-                            onTrigger={triggerGoal}
-                          />
-                        </div>
-                      </div>
-                    </div>
+                      task={t}
+                      stage={stage}
+                      isLast={i === items.length - 1}
+                      openMenuId={openMenuId}
+                      setOpenMenuId={setOpenMenuId}
+                      onAdvance={advanceTask}
+                      onDelete={deleteTask}
+                      onTrigger={triggerGoal}
+                    />
                   ))}
                 </div>
               )}
@@ -383,44 +510,3 @@ export default function TasksPage() {
   );
 }
 
-// Per-task action buttons.
-function actionBtn(extra = {}) {
-  return {
-    background: 'none', border: 'none', cursor: 'pointer',
-    color: 'var(--muted)', display: 'flex', alignItems: 'center',
-    gap: 'var(--space-xs)', fontSize: 'var(--fs-xs)', padding: '0.1em 0', ...extra,
-  };
-}
-
-function TaskActions({ task, stage, onAdvance, onDelete, onTrigger }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6em', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-      <button onClick={() => onTrigger(task)} title="Trigger a /goal in this project's session" style={actionBtn({ color: 'var(--accent)' })}>
-        <FiZap size={11} /> goal
-      </button>
-      {/* Context-aware advance button: shows the NEXT stage action */}
-      {stage.action && (
-        <button
-          onClick={() => onAdvance(task, stage.target)}
-          title={`Advance to ${stage.target}`}
-          style={actionBtn({ color: 'var(--accent)' })}
-        >
-          {stage.action} &rarr;
-        </button>
-      )}
-      {/* Done button available on any non-done item */}
-      {stage.key !== 'done' && (
-        <button
-          onClick={() => onAdvance(task, 'done')}
-          title="Mark done"
-          style={actionBtn()}
-        >
-          Done &#10003;
-        </button>
-      )}
-      <button onClick={() => onDelete(task)} title="Delete the task (permanent)" style={actionBtn({ color: 'var(--danger, #d9534f)' })}>
-        <FiTrash2 size={11} /> delete
-      </button>
-    </div>
-  );
-}
