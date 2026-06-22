@@ -7723,6 +7723,8 @@ async def _run_one_scan_cycle(app, monkeypatch, *, unreads):
     async def fake_scan_read(name, arguments):
         if name == "get_unreads":
             return unreads
+        if name == "list_dms":
+            return {"dms": []}
         if name == "get_messages":
             return {"messages": []}
         raise AssertionError(f"unexpected scan tool {name!r}")
@@ -9227,6 +9229,8 @@ async def _run_one_manual_scan(app, monkeypatch, *, unreads):
     async def fake_scan_read(name, arguments):
         if name == "get_unreads":
             return unreads
+        if name == "list_dms":
+            return {"dms": []}
         if name == "get_messages":
             return {"messages": []}
         raise AssertionError(f"unexpected scan tool {name!r}")

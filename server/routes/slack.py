@@ -464,7 +464,7 @@ _SCAN_WINDOW_MS = 24 * 60 * 60 * 1000  # 24h on first scan (no prior ts); catche
 
 # Small overlap subtracted from the worker's tracked last-scan timestamp so a
 # conversation that became active right around a scan boundary isn't missed.
-_SCAN_OVERLAP_MS = 30 * 1000
+_SCAN_OVERLAP_MS = 60 * 1000
 
 # How many DMs/group DMs list_dms is asked to return per scan.
 _SCAN_LIST_DMS_LIMIT = 30
@@ -3071,8 +3071,46 @@ async def _scan_once(app) -> None:
     unreads_payload = await _scan_read("get_unreads", {})
     candidates = _mention_candidates(unreads_payload)
 
+    # list_dms surfaces DMs that get_unreads misses (cross-workspace enterprise-grid
+    # DMs where the two users share no common workspace team are invisible to
+    # get_unreads but visible to list_dms). For each list_dms candidate NOT already
+    # covered by get_unreads, fetch the latest message to verify: (a) the channel
+    # has readable messages, and (b) the last sender is not us.
+    dms_payload = await _scan_read("list_dms", {"limit": _SCAN_LIST_DMS_LIMIT})
+    dm_cands = _dm_candidates(dms_payload, now_ms)
+    seen_ids = {c["channelId"] for c in candidates}
+    for dc in dm_cands:
+        if dc["channelId"] in seen_ids:
+            continue
+        cid = dc["channelId"]
+        try:
+            peek = await _scan_read("get_messages", {"channel": cid, "limit": 1})
+            msgs = (peek.get("messages") if isinstance(peek, dict) else peek) or []
+            if not msgs:
+                continue
+            last_msg = msgs[0] if isinstance(msgs, list) else {}
+            # user field may be a string ("xulaicao") or an enriched dict ({name: ...})
+            raw_user = last_msg.get("user") or last_msg.get("sender") or ""
+            if isinstance(raw_user, dict):
+                last_author = raw_user.get("name") or raw_user.get("id") or ""
+            else:
+                last_author = str(raw_user)
+            if last_author.lower() == "xulaicao":
+                continue
+            dc["sender"] = _scrub(last_author)[:_SNIPPET_CAP] or dc["sender"]
+            dc["snippet"] = _scrub(
+                _resolve_mentions(_strip_slack_xml(str(last_msg.get("text", ""))))
+            )[:_SNIPPET_CAP] or dc["snippet"]
+        except Exception:  # noqa: BLE001 — skip unreadable DMs
+            continue
+        candidates.append(dc)
+        seen_ids.add(cid)
+
     # Filter out bot senders that never need replies.
     candidates = [c for c in candidates if not _is_bot_sender(c.get("sender", ""))]
+
+    # Filter out conversations where we are the last sender — nothing to reply to.
+    candidates = [c for c in candidates if c.get("sender", "").lower() != "xulaicao"]
 
     data, current_etag = _load()
 
