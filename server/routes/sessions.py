@@ -14,6 +14,7 @@ from pathlib import Path
 from aiohttp import web
 
 from server.routes import read_json_body
+from server.routes.workers import register_worker, mark_worker_run
 
 
 def _resolve_workspace_dir() -> Path:
@@ -1272,6 +1273,7 @@ async def _session_watcher(app) -> None:
             elif newest is not None and (last_mtime is None or newest > last_mtime):
                 last_mtime = newest
                 await app["ws_manager"].broadcast("session_changed", {"watched": True})
+            mark_worker_run(app, 'Session Watcher')
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad stat must not kill the loop
@@ -1283,6 +1285,7 @@ async def _start_watcher(app) -> None:
     task = app.get("session_watch_task")
     if task is None or task.done():
         app["session_watch_task"] = asyncio.create_task(_session_watcher(app))
+        register_worker(app, 'Session Watcher', 'session_watch_task', SESSION_WATCH_INTERVAL_S, project=None, description='Pushes live updates to the browser when session transcripts change')
 
 
 async def _stop_watcher(app) -> None:

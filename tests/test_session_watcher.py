@@ -46,6 +46,7 @@ def _build_app() -> tuple[web.Application, _RecordingWsManager]:
     app = web.Application()
     ws = _RecordingWsManager()
     app["ws_manager"] = ws
+    app["_worker_registry"] = []
     sessions_mod.register(app)
     return app, ws
 

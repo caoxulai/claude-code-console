@@ -132,6 +132,7 @@ from aiohttp import web
 
 from server import filestore
 from server.routes import read_json_body
+from server.routes.workers import register_worker, mark_worker_run
 from server.session_manager import is_auth_error
 
 # Direct-Python MCP client (D-018): the deterministic scan worker drives the
@@ -2066,6 +2067,7 @@ async def _slack_watcher(app) -> None:
             elif etag != last_etag:
                 last_etag = etag
                 await app["ws_manager"].broadcast("slack_changed", {"watched": True})
+            mark_worker_run(app, 'Slack Watcher')
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad read must not kill the loop
@@ -2077,6 +2079,7 @@ async def _start_watcher(app) -> None:
     task = app.get("slack_watch_task")
     if task is None or task.done():
         app["slack_watch_task"] = asyncio.create_task(_slack_watcher(app))
+        register_worker(app, 'Slack Watcher', 'slack_watch_task', SLACK_WATCH_INTERVAL_S, project='claude-web', description='Pushes live updates to the browser when the Slack queue changes')
 
 
 async def _stop_watcher(app) -> None:
@@ -2317,6 +2320,7 @@ async def _draft_worker(app) -> None:
                 continue
 
             await _draft_pending(app, sem)
+            mark_worker_run(app, 'Slack Draft Worker')
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the loop
@@ -2328,6 +2332,7 @@ async def _start_draft_worker(app) -> None:
     task = app.get("slack_draft_task")
     if task is None or task.done():
         app["slack_draft_task"] = asyncio.create_task(_draft_worker(app))
+        register_worker(app, 'Slack Draft Worker', 'slack_draft_task', SLACK_DRAFT_POLL_INTERVAL_S, project='claude-web', description='Generates draft replies for Slack messages awaiting your review')
 
 
 async def _stop_draft_worker(app) -> None:
@@ -2498,6 +2503,7 @@ async def _classify_worker(app) -> None:
                 continue
 
             await _classify_pending(app)
+            mark_worker_run(app, 'Slack Classify Worker')
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the loop
@@ -2509,6 +2515,7 @@ async def _start_classify_worker(app) -> None:
     task = app.get("slack_classify_task")
     if task is None or task.done():
         app["slack_classify_task"] = asyncio.create_task(_classify_worker(app))
+        register_worker(app, 'Slack Classify Worker', 'slack_classify_task', SLACK_CLASSIFY_POLL_INTERVAL_S, project='claude-web', description='Sorts new Slack messages into actionable vs. ignorable')
 
 
 async def _stop_classify_worker(app) -> None:
@@ -3206,6 +3213,7 @@ async def _scan_worker(app) -> None:
             if manual:
                 await _classify_pending(app)
                 await _draft_pending(app, sem)
+            mark_worker_run(app, 'Slack Scanner')
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the loop
@@ -3233,6 +3241,7 @@ async def _start_scan_worker(app) -> None:
     task = app.get("slack_scan_task")
     if task is None or task.done():
         app["slack_scan_task"] = asyncio.create_task(_scan_worker(app))
+        register_worker(app, 'Slack Scanner', 'slack_scan_task', SLACK_SCAN_INTERVAL_S, project='claude-web', description='Fetches new Slack messages from monitored channels')
 
 
 async def _stop_scan_worker(app) -> None:

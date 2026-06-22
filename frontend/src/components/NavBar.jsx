@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   FiHome, FiMessageSquare, FiSettings, FiBookOpen, FiZap,
-  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiSlack, FiMail, FiCalendar
+  FiGitBranch, FiServer, FiClock, FiList, FiCheckSquare, FiPackage, FiFolder, FiBarChart2, FiUsers, FiSlack, FiMail, FiCalendar, FiActivity
 } from 'react-icons/fi';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
@@ -34,6 +34,7 @@ const NAV_ITEMS = [
   { group: 'System', items: [
     { to: '/crons', icon: FiClock, label: 'Scheduled Jobs' },
     { to: '/system-cron', icon: FiCalendar, label: 'OS Crons' },
+    { to: '/workers', icon: FiActivity, label: 'Workers' },
     { to: '/settings', icon: FiSettings, label: 'Settings' },
   ]},
 ];

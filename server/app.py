@@ -8,7 +8,7 @@ from aiohttp import web
 
 from server.cli import resolve_permission_mode
 from server.ws import WebSocketManager
-from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents, slack, email
+from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents, slack, email, workers
 
 
 def _resolve_frontend_dist() -> Path:
@@ -47,7 +47,9 @@ def create_app() -> web.Application:
     # WebSocket
     app.router.add_get("/ws", app["ws_manager"].handle)
 
-    # API routes
+    # API routes — workers registry FIRST so app['_worker_registry'] exists
+    # before other modules call register_worker() during their register().
+    workers.register(app)
     chat.register(app)
     sessions.register(app)
     settings.register(app)
