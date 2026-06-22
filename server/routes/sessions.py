@@ -1103,6 +1103,23 @@ async def list_live_sessions(request: web.Request) -> web.Response:
     return web.json_response(live)
 
 
+def _read_transcript_records(path: Path) -> list:
+    """Read a transcript JSONL into a list of parsed records (off the event loop).
+
+    Tolerates a malformed line (skips it) exactly like the previous inline read,
+    so one bad line never aborts the whole transcript. Call via
+    asyncio.to_thread so the open()+per-line json.loads never blocks the loop.
+    """
+    records = []
+    with open(path) as fh:
+        for line in fh:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
 async def get_transcript(request: web.Request) -> web.Response:
     """Stream a session transcript as JSON array (paginated by line count)."""
     session_id = request.match_info["session_id"]
@@ -1129,13 +1146,12 @@ async def get_transcript(request: web.Request) -> web.Response:
 
     # Parse all records (session files are local and at most a few thousand
     # lines, so a full read is cheap and lets us compute total + tail slice).
-    records = []
-    with open(path) as fh:
-        for line in fh:
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    # The read + per-line json.loads runs OFF the event loop: a synchronous
+    # open()+parse here blocks every concurrent SSE stream and API call for the
+    # duration of the parse, which is exactly the "app hangs" symptom on every
+    # ClarifyChat resume of a large transcript. Mirrors every other heavy reader
+    # in this file, which already offload via asyncio.to_thread.
+    records = await asyncio.to_thread(_read_transcript_records, path)
 
     total = len(records)
     if tail:

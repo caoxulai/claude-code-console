@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { FiSend, FiSquare, FiCheckCircle, FiChevronDown, FiChevronRight, FiSave } from 'react-icons/fi';
 import { useChat } from '../hooks/useChat';
+import { parseTranscriptToMessages } from '../utils/transcript';
 
 // Regex that detects the structured scope summary Claude is instructed to emit.
 // It MUST only ever be run against Claude's ASSISTANT text — NEVER the user's
@@ -32,15 +33,27 @@ function buildClarifyPrompt(task) {
 
 /**
  * ClarifyChat — a self-contained inline clarification mini-chat embedded in the
- * TODO detail panel. It auto-sends a clarification prompt once, streams Claude's
- * reply, auto-detects a ---CLARIFICATION---…---END--- summary in the completed
- * assistant text, and saves it back to the task exactly once. A collapsed
- * "Save manually" disclosure is the fallback when Claude never emits markers.
+ * TODO detail panel. On mount it picks EXACTLY ONE branch: if the task already
+ * carries a clarification.sessionId it RESUMES that backend session and reloads
+ * the transcript from disk (so switching nav tabs mid-conversation no longer
+ * restarts a fresh session); otherwise it auto-sends the clarification prompt
+ * once. It streams Claude's reply, auto-detects a ---CLARIFICATION---…---END---
+ * summary in the completed assistant text (and re-scans once on resume, since a
+ * pure resume has no streaming true->false edge), and saves it back to the task
+ * exactly once. A collapsed "Save manually" disclosure is the fallback when
+ * Claude never emits markers.
  *
  * ISOLATION: useChat() is called INSIDE this component. useChat holds ALL of its
  * state in per-call useState/useRef (messages/streaming/sessionId + abortRef) —
  * there is no module-level store and no React context — so a fresh useChat() per
  * mount is fully isolated from ChatPage and from a sibling task's mini-chat.
+ *
+ * THREE DISTINCT GUARDS (must never mask one another):
+ *   initRef    — gates the ONE mount branch (resume-reload OR auto-send), so
+ *                neither double-fires under React.StrictMode.
+ *   savedIdRef — gates the early one-time id-only PUT that persists sessionId
+ *                the instant the session starts (does NOT lock the input).
+ *   savedRef   — gates the summary save exactly once (locks the input).
  *
  * Props:
  *   task   — the task object (must NOT have clarification.summary; the panel
@@ -48,60 +61,54 @@ function buildClarifyPrompt(task) {
  *   onSave — TasksPage.saveTaskFields(taskId, fields): the shared PUT + refetch.
  */
 export default function ClarifyChat({ task, onSave }) {
-  const { messages, streaming, sessionId, send, stop } = useChat();
+  const { messages, streaming, sessionId, send, stop, resume, setMessages } = useChat();
 
   const [input, setInput] = useState('');
   const [saved, setSaved] = useState(false);
+  // True once the mount effect chose the RESUME branch — used so a still-partial
+  // reloaded history is shown as-is instead of the "Starting…" empty-state.
+  const [resumed, setResumed] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualText, setManualText] = useState('');
   const [manualSaving, setManualSaving] = useState(false);
 
   const scrollRef = useRef(null);
-  // Guards the one-shot auto-send. A REF (not state) so it survives the board's
-  // constant re-renders (task_changed refetch / 60s poll / focus refetch) AND
-  // React StrictMode's double-invoke of effects in dev.
-  const sentRef = useRef(false);
-  // Guards the one-shot auto-save so a second fenced block (or a re-scan as text
-  // accumulates) can never fire a second PUT that overwrites the first summary.
+  // Guards the ONE mount branch (resume-reload OR auto-send) exactly once. A REF
+  // (not state) so it survives the board's constant re-renders (task_changed
+  // refetch / 60s poll / focus refetch) AND React StrictMode's double-invoke of
+  // effects in dev. Replaces the old sentRef — neither branch may double-fire.
+  const initRef = useRef(false);
+  // Guards the EARLY one-time id-only PUT that persists clarification.sessionId
+  // the instant the session starts. DISTINCT from savedRef: it must NOT lock the
+  // input or it would pre-empt the later summary save.
+  const savedIdRef = useRef(false);
+  // Guards the one-shot summary auto-save so a second fenced block (or a re-scan
+  // as text accumulates) can never fire a second PUT that overwrites the first
+  // summary.
   const savedRef = useRef(false);
   // Tracks the previous streaming value so we can detect the true->false edge
   // (a turn just completed) and scan ONLY then.
   const prevStreamingRef = useRef(false);
 
-  // --- Auto-send the first prompt exactly once ---
-  useEffect(() => {
-    if (sentRef.current) return;
-    sentRef.current = true;
-    const prompt = buildClarifyPrompt(task);
-    // Omit cwd entirely when the task has no project so the backend uses its
-    // default — never pass a literal undefined string (streamChat drops a
-    // falsy cwd, so `|| undefined` is correct).
-    send(prompt, { cwd: task.projectPath || undefined });
-    // Intentionally NOT keyed on `task`/`send` — the ref guard is the source of
-    // truth; re-arming on those would risk a duplicate session per re-render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // --- Auto-detect the structured summary on a completed assistant turn ---
-  useEffect(() => {
-    const justCompleted = prevStreamingRef.current && !streaming;
-    prevStreamingRef.current = streaming;
-    if (!justCompleted || savedRef.current) return;
-
-    // Scan ONLY the latest assistant message's text. useChat stores the full
-    // cumulative turn text in that message's content, so the completed turn is
-    // available here. NEVER scan user messages (the prompt echo names the
-    // markers) and NEVER scan mid-stream (this only runs on the completed edge).
+  // Scan the latest assistant text for a complete ---CLARIFICATION---…---END---
+  // block and, if found and not already saved, fire the one-shot summary save.
+  // Shared by the streaming true->false edge AND the post-resume re-scan so the
+  // two paths can never drift. `msgs` is passed explicitly because the resume
+  // path scans the freshly-reloaded history (not the closure's stale messages).
+  // `id` is the session id to persist (the live sessionId or the resumed id).
+  const trySaveSummary = useCallback((msgs, id) => {
+    if (savedRef.current) return;
+    // Scan ONLY the latest assistant message's text. NEVER scan user messages
+    // (the prompt echo names the markers verbatim).
     let assistantText = '';
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant') {
-        assistantText = messages[i].content || '';
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'assistant') {
+        assistantText = msgs[i].content || '';
         break;
       }
     }
     const match = MARKER_RE.exec(assistantText);
     if (!match) return;
-
     const summary = match[1].trim();
     if (!summary) return;
 
@@ -111,16 +118,106 @@ export default function ClarifyChat({ task, onSave }) {
     // Spread the task's existing clarification: the backend REPLACES
     // clarification wholesale (tasks.py: t['clarification'] = clarification — no
     // merge), so a bare object would drop sibling keys (e.g. acceptanceCriteria
-    // that planPrompt reads). sessionId is THIS mini-chat's session id.
+    // that planPrompt reads).
     onSave(task.id, {
       clarification: {
         ...task.clarification,
         summary,
-        sessionId,
+        sessionId: id || sessionId || task.clarification?.sessionId,
         resolvedAt: Date.now(),
       },
     });
-  }, [streaming, messages, sessionId, task.id, task.clarification, onSave]);
+  }, [onSave, task.id, task.clarification, sessionId]);
+
+  // --- Mount branch: resume + reload OR auto-send, exactly once ---
+  // Picks EXACTLY ONE branch from the task snapshot captured at mount, guarded
+  // by initRef so neither double-fires under React.StrictMode.
+  useEffect(() => {
+    if (initRef.current) return;
+    initRef.current = true;
+
+    const resumeId = task.clarification?.sessionId;
+    if (resumeId) {
+      // RESUME branch: re-attach useChat to the existing backend session and
+      // reload its transcript from disk. Do NOT auto-send. Mirrors ChatPage.
+      resume(resumeId);
+      setResumed(true);
+      // RESUME-WARM (B3): a session reaped after the 30-min TTL means the first
+      // real send pays a full `claude --resume` cold boot synchronously in front
+      // of the user. Fire a best-effort pre-warm NOW so that boot overlaps with
+      // the user reading the reloaded transcript; by the time they reply the
+      // backend has a warm process to claim. Fire-and-forget: a failed/absent
+      // endpoint is silent (.catch), it never blocks the UI, and it sets NONE of
+      // the save guards. Guarded once by the same initRef-gated mount effect.
+      fetch('/api/chat/prewarm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resume: resumeId, cwd: task.projectPath || undefined }),
+      }).catch(() => {});
+      fetch(`/api/sessions/${encodeURIComponent(resumeId)}/transcript?limit=500&offset=0&tail=true`)
+        .then(r => r.json())
+        .then(data => {
+          const history = parseTranscriptToMessages(data.messages || []);
+          // Tolerate an empty/short transcript gracefully (flush lag): never
+          // blank an existing view — only set when we actually have content.
+          if (history.length === 0) return;
+          setMessages(history);
+          // POST-RESUME SUMMARY SCAN: a pure resume starts streaming=false with
+          // no true->false edge, so the streaming-edge effect never fires. If
+          // Claude emitted a complete block WHILE THE USER WAS AWAY it would be
+          // reloaded but never saved, stranding the task in 'clarifying' — so
+          // re-scan the reloaded history here.
+          trySaveSummary(history, resumeId);
+        })
+        .catch(() => {
+          // Transcript fetch failed: the branch was already chosen (resume), so
+          // do NOT fall through to auto-send and do NOT blank the view. The next
+          // send (re-attaching via resume:sessionId) or a session refetch fills
+          // it in.
+        });
+    } else {
+      // AUTO-SEND branch: no session yet — start one. Omit cwd entirely when the
+      // task has no project so the backend uses its default (streamChat drops a
+      // falsy cwd, so `|| undefined` is correct).
+      const prompt = buildClarifyPrompt(task);
+      send(prompt, { cwd: task.projectPath || undefined });
+    }
+    // Ref-guarded one-shot: intentionally deps [] so a re-render can't re-arm it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Persist clarification.sessionId early, exactly once ---
+  // Fires the moment useChat surfaces a non-null sessionId on the AUTO-SEND
+  // branch — so a nav-tab switch mid-stream leaves a recoverable id on disk.
+  // Skips when the id already equals the persisted one (the RESUME branch, where
+  // it would be a redundant write). Guarded by savedIdRef (DISTINCT from
+  // savedRef) so it does NOT lock the input or pre-empt the later summary save.
+  // Reads the LATEST task.clarification (a current prop, in the deps) and spreads
+  // it — the backend REPLACES clarification wholesale, so a bare {sessionId}
+  // would clobber sibling keys (acceptanceCriteria/summary). No-blind-overwrite.
+  useEffect(() => {
+    if (!sessionId || savedIdRef.current) return;
+    if (sessionId === task.clarification?.sessionId) {
+      // Already persisted (resumed session) — mark done, skip the redundant PUT.
+      savedIdRef.current = true;
+      return;
+    }
+    savedIdRef.current = true;
+    onSave(task.id, {
+      clarification: { ...task.clarification, sessionId },
+    });
+  }, [sessionId, onSave, task.id, task.clarification]);
+
+  // --- Auto-detect the structured summary on a completed assistant turn ---
+  // Fires on the live streaming true->false edge (a turn just finished) for both
+  // the initial turn and the next send after a resume. The post-resume re-scan
+  // (above) covers the no-edge case.
+  useEffect(() => {
+    const justCompleted = prevStreamingRef.current && !streaming;
+    prevStreamingRef.current = streaming;
+    if (!justCompleted) return;
+    trySaveSummary(messages, sessionId);
+  }, [streaming, messages, sessionId, trySaveSummary]);
 
   // --- Auto-scroll the message area to the newest content ---
   useEffect(() => {
@@ -130,6 +227,16 @@ export default function ClarifyChat({ task, onSave }) {
   }, [messages, streaming]);
 
   const disabled = streaming || saved;
+
+  // HONEST COLD-START COPY (B4/AC-8): the ~2-9s spawn/boot window before the
+  // first token must read as progress, not a frozen panel, and must NEVER claim
+  // completion before real text arrives. While streaming with no assistant text
+  // yet (the subprocess is still spawning / Claude hasn't emitted a token) show
+  // "Starting Claude…"; the indicator flips to "Claude is working" only once
+  // real assistant content has actually arrived. Derive (not state) from the
+  // current messages so it can never assert "done" ahead of the stream.
+  const hasAssistantText = messages.some(m => m.role === 'assistant' && (m.content || '').trim());
+  const workingLabel = (streaming && !hasAssistantText) ? 'Starting Claude…' : 'Claude is working';
 
   const handleSend = useCallback(() => {
     const prompt = input.trim();
@@ -191,9 +298,21 @@ export default function ClarifyChat({ task, onSave }) {
           display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)',
         }}
       >
-        {messages.length === 0 && !streaming && (
+        {messages.length === 0 && !streaming && !resumed && (
           <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--muted)' }}>
             Starting the clarification conversation…
+          </div>
+        )}
+        {messages.length === 0 && !streaming && resumed && (
+          // RESUME window: transcript fetch + first reply. A STATIC line reads as
+          // hung, so reuse the streaming thinking-indicator spinner — it's honest
+          // (work is genuinely in flight: reloading the conversation) and never
+          // claims completion.
+          <div className="thinking-indicator" style={{ fontSize: 'var(--fs-xs)' }}>
+            <span className="thinking-dot" />
+            <span className="thinking-dot" />
+            <span className="thinking-dot" />
+            <span style={{ marginLeft: '0.3em' }}>Resuming the clarification conversation…</span>
           </div>
         )}
         {messages.map((msg, i) => (
@@ -204,7 +323,7 @@ export default function ClarifyChat({ task, onSave }) {
             <span className="thinking-dot" />
             <span className="thinking-dot" />
             <span className="thinking-dot" />
-            <span style={{ marginLeft: '0.3em' }}>Claude is working</span>
+            <span style={{ marginLeft: '0.3em' }}>{workingLabel}</span>
           </div>
         )}
       </div>

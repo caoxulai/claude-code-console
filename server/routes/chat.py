@@ -10,8 +10,12 @@ from aiohttp import web
 
 from server.cli import load_config
 from server.routes import read_json_body
-
-from server.session_manager import SessionManager
+from server.routes.workers import register_worker
+from server.session_manager import (
+    SessionManager,
+    _REAPER_INTERVAL_SECONDS,
+    _SESSION_IDLE_TTL_SECONDS,
+)
 
 
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
@@ -48,18 +52,52 @@ def register(app: web.Application):
     app.router.add_post("/api/chat", chat_handler)
     app.router.add_post("/api/chat/stop", stop_session_handler)
     app.router.add_post("/api/chat/restart", restart_session_handler)
+    app.router.add_post("/api/chat/prewarm", prewarm_handler)
 
     # Create session manager and attach to app
     if "session_manager" not in app:
         app["session_manager"] = SessionManager()
 
-    # Cleanup on shutdown
+    # ── Idle-session reaper ───────────────────────────────────────────────────
+    # The single-reader design (see session_manager.py) deliberately keeps an
+    # abandoned clarify session's subprocess alive until its turn finishes, then
+    # lets it idle. Without a periodic sweep those idle subprocesses accumulate
+    # without bound (AC-8). The reaper bounds that leak. Launch it from a startup
+    # hook (fires under aiohttp_client(app) in every test, but _reaper_loop sleeps
+    # FIRST so it is inert during the suite) and tear it down on shutdown via
+    # stop_all -> stop_reaper.
+    app.on_startup.append(_start_reaper)
+
+    # Cleanup on shutdown (stop_all also stops the reaper)
     app.on_shutdown.append(_on_shutdown)
+
+
+async def _start_reaper(app: web.Application):
+    """on_startup: launch the idle-session reaper and register it for /api/workers.
+
+    SessionManager owns the task (manager._reaper_task); we mirror it onto
+    app['session_reaper_task'] so the worker registry's _derive_status — which
+    reads app[taskKey] — reports the reaper's live status alongside the other
+    background workers.
+    """
+    manager: SessionManager = app["session_manager"]
+    app["session_reaper_task"] = manager.start_reaper()
+    register_worker(
+        app,
+        "Session Reaper",
+        "session_reaper_task",
+        _REAPER_INTERVAL_SECONDS,
+        project=None,
+        description="Shuts down idle chat sessions after 30 min of inactivity",
+    )
 
 
 async def _on_shutdown(app: web.Application):
     if "session_manager" in app:
         await app["session_manager"].stop_all()
+    # The reaper task is owned/torn-down by stop_all -> stop_reaper; drop the
+    # app mirror so a restarted app re-registers cleanly.
+    app.pop("session_reaper_task", None)
 
 
 def _resolve_cwd(raw: str | None, app: web.Application) -> str:
@@ -147,6 +185,60 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
         _mark_session_interactive(session.session_id, prompt[:50].split('\n')[0])
 
     return resp
+
+
+async def prewarm_handler(request: web.Request) -> web.Response:
+    """Pre-boot a `claude` subprocess so the user's first turn skips the cold start.
+
+    Measured cold start is ~1.9s credential-export hook + ~2.2s Node/plugin boot
+    before the first event, then model latency on top. ClarifyChat fires this when
+    its detail panel mounts so the boot overlaps with the user reading the panel;
+    by the time they type (or the chat auto-starts) a warm process is waiting.
+
+    Two modes:
+      - resume present: a resumed chat whose session was reaped after the idle
+        TTL pays a full second cold start on its next reply. We land the live
+        `claude --resume <id>` process in the manager's _sessions now (via
+        get_or_create, which is idempotent for an already-live id), so the user's
+        first real send reuses the warm process. Resume is cwd-scoped, so this
+        correctly runs in the session's original cwd.
+      - else: warm a spare for the fresh-clarify flow via manager.prewarm(cwd),
+        keyed by cwd so the auto-started chat in that project grabs it.
+
+    Purely additive and best-effort: a failed warm is NEVER user-visible — we
+    return {warmed: false} (HTTP 200) and the cold path still works. This handler
+    does not touch the SSE contract, chat_handler, or the reaper.
+    """
+    body = await read_json_body(request)
+    cwd = _resolve_cwd(body.get("cwd"), request.app)
+    permission_mode = _resolve_permission_mode(request.app)
+    manager: SessionManager = request.app["session_manager"]
+
+    resume = body.get("resume")
+    if resume:
+        # Reject path-traversal in a client-supplied resume id before it reaches
+        # `--resume <id>` (mirrors chat_handler; defense in depth).
+        if "/" in resume or "\\" in resume or ".." in resume:
+            raise web.HTTPBadRequest(reason="invalid session id")
+
+    try:
+        if resume:
+            # Land the live --resume process in _sessions so the first real send
+            # reuses it (get_or_create returns the existing live session on the
+            # second call, so this is safe to fire speculatively).
+            await manager.get_or_create(
+                session_id=resume,
+                cwd=cwd,
+                permission_mode=permission_mode,
+            )
+        else:
+            await manager.prewarm(cwd, permission_mode)
+    except Exception:
+        # Best-effort: never surface a warm failure to the user; the cold path
+        # always still works on the subsequent /api/chat.
+        return web.json_response({"warmed": False})
+
+    return web.json_response({"warmed": True})
 
 
 async def stop_session_handler(request: web.Request) -> web.Response:

@@ -212,14 +212,12 @@ function OverflowMenu({ task, stage, openMenuId, setOpenMenuId, onAdvance, onDel
 
 // --- Inline detail panel for task ---
 function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
-  const [description, setDescription] = useState(task.description || '');
   const [planSpec, setPlanSpec] = useState(task.plan?.spec || '');
 
   // Sync local state when task data changes externally
   useEffect(() => {
-    setDescription(task.description || '');
     setPlanSpec(task.plan?.spec || '');
-  }, [task.description, task.plan?.spec]);
+  }, [task.plan?.spec]);
 
   const hasPlanStored = !!task.plan?.spec;
   const stage = task.stage || 'draft';
@@ -231,27 +229,6 @@ function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
       padding: 'var(--space-md)',
       background: 'var(--surface2)',
     }}>
-      {/* Description */}
-      <div style={{ marginBottom: 'var(--space-md)' }}>
-        <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
-          Description
-        </label>
-        <textarea
-          className="form-textarea"
-          value={description}
-          onChange={e => setDescription(e.target.value)}
-          style={{ minHeight: '60px', fontSize: 'var(--fs-sm)' }}
-        />
-        <button
-          className="btn"
-          disabled={saving || description === (task.description || '')}
-          onClick={() => onSave(task.id, { description })}
-          style={{ marginTop: 'var(--space-xs)', fontSize: 'var(--fs-xs)' }}
-        >
-          <FiSave size={12} /> Save Description
-        </button>
-      </div>
-
       {/* Clarification: read-only summary if saved, else the inline mini-chat.
           A saved summary must NOT re-mount ClarifyChat — re-mounting would
           re-run Claude and could overwrite the saved scope (AC-9/AC-10). */}
@@ -370,7 +347,6 @@ export default function TasksPage() {
   const [showNew, setShowNew] = useState(false);
   const [allProjects, setAllProjects] = useState([]);
   const [newSubject, setNewSubject] = useState('');
-  const [newDescription, setNewDescription] = useState('');
   const [newProject, setNewProject] = useState('');
   const [newPriority, setNewPriority] = useState('p2');
 
@@ -584,7 +560,6 @@ export default function TasksPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           subject: newSubject.trim(),
-          description: newDescription.trim(),
           project: newProject,
           priority: newPriority,
         }),
@@ -592,7 +567,6 @@ export default function TasksPage() {
       if (!res.ok) { setError('Failed to create task.'); return; }
       setShowNew(false);
       setNewSubject('');
-      setNewDescription('');
       setNewProject('');
       setNewPriority('p2');
       setError(null);
@@ -600,7 +574,7 @@ export default function TasksPage() {
     } catch {
       setError('Failed to create task.');
     }
-  }, [newSubject, newDescription, newProject, newPriority, fetchTasks]);
+  }, [newSubject, newProject, newPriority, fetchTasks]);
 
   // Stage filter toggle.
   const toggleStageFilter = (key) => {
@@ -655,23 +629,13 @@ export default function TasksPage() {
             TODOs live in claude-web and appear here. Use the action buttons to advance them through stages.
           </p>
           <div className="form-group">
-            <label className="form-label">Subject</label>
+            <label className="form-label">Idea</label>
             <input
               className="form-input"
-              placeholder="What needs doing?"
+              placeholder="What do you want to do? (you'll refine it in Clarify)"
               value={newSubject}
               onChange={e => setNewSubject(e.target.value)}
               autoFocus
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Description <span style={{ color: 'var(--muted)', fontWeight: 400 }}>(optional)</span></label>
-            <textarea
-              className="form-textarea"
-              placeholder="More detail — this becomes the /goal body when you trigger it."
-              value={newDescription}
-              onChange={e => setNewDescription(e.target.value)}
-              style={{ minHeight: '70px' }}
             />
           </div>
           <div style={{ display: 'flex', gap: 'var(--space-md)', flexWrap: 'wrap' }}>
@@ -695,7 +659,7 @@ export default function TasksPage() {
             <button className="btn btn-primary" onClick={createUserTask} disabled={!newSubject.trim()}>
               <FiSave size={14} /> Save
             </button>
-            <button className="btn" onClick={() => { setShowNew(false); setNewSubject(''); setNewDescription(''); setNewProject(''); setNewPriority('p2'); }}>
+            <button className="btn" onClick={() => { setShowNew(false); setNewSubject(''); setNewProject(''); setNewPriority('p2'); }}>
               <FiX size={14} /> Cancel
             </button>
           </div>
