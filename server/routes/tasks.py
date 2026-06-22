@@ -9,6 +9,7 @@ the explicit complete/delete actions on their own path.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import secrets
 import time
@@ -19,7 +20,15 @@ from aiohttp import web
 from server.routes import read_json_body
 
 from server import filestore
-from server.routes.sessions import _project_label, WORKSPACE_DIR
+from server.routes.sessions import (
+    _get_all_project_dirs,
+    _project_label,
+    _validate_session_id,
+    WORKSPACE_DIR,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 TASKS_DIR = Path.home() / ".claude" / "tasks"
@@ -622,6 +631,38 @@ async def create_user_task(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "task": _user_task_view(task)}, status=201)
 
 
+async def _cleanup_clarify_session(session_manager, session_id: str) -> None:
+    """Best-effort teardown of a finished clarify session.
+
+    Called ONLY after the finalized clarification (summary, sessionId stripped)
+    has already been durably written to tasks.json. Both steps are independent
+    and best-effort: a failure is logged, never raised, so a cleanup problem can
+    NEVER fail the PUT (the summary is already saved). Deletion is irreversible,
+    so we touch exactly the one session's warm subprocess + its exact transcript.
+
+    (1) Stop the warm `claude` subprocess immediately (idempotent — no-ops if the
+        id isn't a live session, so a stale re-finalize is harmless).
+    (2) Unlink the EXACT <session_id>.jsonl transcript under any project dir
+        (never glob/prefix); _validate_session_id guards a traversal id.
+    """
+    # (1) Stop the warm subprocess — independent of the unlink below.
+    try:
+        await session_manager.stop(session_id)
+    except Exception:  # noqa: BLE001 — best-effort, never fail the PUT
+        logger.exception("clarify cleanup: stop(%s) failed", session_id)
+
+    # (2) Delete the transcript .jsonl — independent of the stop above.
+    try:
+        _validate_session_id(session_id)
+        for d in _get_all_project_dirs():
+            candidate = d / f"{session_id}.jsonl"
+            if candidate.exists():
+                candidate.unlink()
+                break
+    except Exception:  # noqa: BLE001 — covers OSError, HTTPBadRequest, etc.
+        logger.exception("clarify cleanup: transcript unlink(%s) failed", session_id)
+
+
 async def update_user_task(request: web.Request) -> web.Response:
     """Edit a console task.
 
@@ -676,6 +717,16 @@ async def update_user_task(request: web.Request) -> web.Response:
     if "execution" in body and execution is not None and not isinstance(execution, dict):
         raise web.HTTPBadRequest(reason="execution must be a dict or null")
 
+    # Pre-compute whether the incoming clarification carries a non-empty summary.
+    # The actual finalize decision also needs the PRIOR stored sessionId, which
+    # is only known inside _do() (after the matched task is read), so the
+    # sessionId resolution + stripping happens there.
+    summary_present = (
+        "clarification" in body
+        and isinstance(clarification, dict)
+        and bool(str(clarification.get("summary") or "").strip())
+    )
+
     def _do() -> dict | None:
         tasks = _load_user_tasks()
         for t in tasks:
@@ -691,19 +742,49 @@ async def update_user_task(request: web.Request) -> web.Response:
                     t["priority"] = priority
                 if tags is not None:
                     t["tags"] = tags
+                finalize_id = None
                 if "clarification" in body:
-                    t["clarification"] = clarification
+                    if summary_present:
+                        # FINALIZE TRIGGER: summary present + a sessionId
+                        # resolvable from the incoming dict OR the prior stored
+                        # task. The stored clarification has sessionId STRIPPED so
+                        # the link disappears and a later summary-but-no-sessionId
+                        # PUT resolves nothing → idempotent no-op.
+                        incoming_sid = str(clarification.get("sessionId") or "").strip()
+                        prior = t.get("clarification") or {}
+                        prior_sid = str((prior.get("sessionId") if isinstance(prior, dict) else "") or "").strip()
+                        finalize_id = incoming_sid or prior_sid or None
+                        if finalize_id:
+                            stored = {k: v for k, v in clarification.items() if k != "sessionId"}
+                            t["clarification"] = stored
+                        else:
+                            t["clarification"] = clarification
+                    else:
+                        t["clarification"] = clarification
                 if "plan" in body:
                     t["plan"] = plan
                 if "execution" in body:
                     t["execution"] = execution
                 t["updatedAt"] = int(time.time() * 1000)
+                # COMMIT POINT: durably record the finalized (sessionId-less)
+                # state BEFORE any cleanup. If this raises, the exception
+                # propagates out of to_thread and the handler does NO cleanup —
+                # nothing is stopped or unlinked for a save that didn't persist.
                 _save_user_tasks(tasks)
-                return t
+                return {"task": t, "finalize_id": finalize_id}
         return None
 
-    updated = await asyncio.to_thread(_do)
-    if not updated:
+    result = await asyncio.to_thread(_do)
+    if result is None:
         raise web.HTTPNotFound(reason="task not found")
+    updated = result["task"]
+
+    # Best-effort clarify-session cleanup — ONLY after the durable write above
+    # succeeded and a finalize id was resolved. The helper swallows every error,
+    # so this can never fail the PUT (the 200 + saved summary are guaranteed).
+    finalize_id = result.get("finalize_id")
+    if finalize_id:
+        await _cleanup_clarify_session(request.app["session_manager"], finalize_id)
+
     await request.app["ws_manager"].broadcast("task_changed", {})
     return web.json_response({"ok": True, "task": _user_task_view(updated)})

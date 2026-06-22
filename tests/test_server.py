@@ -10030,3 +10030,291 @@ async def test_cleanup_endpoint_path_traversal_not_possible(client):
     assert "deleted" in data
 
 
+
+
+# ---------------------------------------------------------------------------
+# Clarify-session finalize cleanup (delete-everything on summary save)
+# ---------------------------------------------------------------------------
+#
+# When the inline clarification mini-chat finishes and a Clarification Summary is
+# saved, the backend (update_user_task) must, AFTER the durable write: stop the
+# warm `claude` subprocess, delete the <sessionId>.jsonl transcript, and drop the
+# stored clarification.sessionId so the "Clarification session" link disappears.
+# The summary itself remains. Cleanup is best-effort and never fails the PUT.
+
+
+async def _make_clarifying_task(client, project="myproj") -> str:
+    """Create a user task and advance it to 'clarifying'; return its id."""
+    resp = await client.post("/api/tasks/user", json={"subject": "Clarify me", "project": project})
+    tid = (await resp.json())["task"]["id"]
+    resp = await client.post(f"/api/tasks/user/{tid}/advance", json={"stage": "clarifying"})
+    assert resp.status == 200
+    return tid
+
+
+def _proj_dir(tasks_layout: Path) -> Path:
+    """Return the single real project transcript dir under the fixture base."""
+    base = tasks_layout.parent / "projects"
+    dirs = [d for d in base.iterdir() if d.is_dir() and any(d.glob("*.jsonl"))]
+    assert dirs, "fixture project transcript dir not found"
+    return dirs[0]
+
+
+async def test_clarify_finalize_stops_session_and_deletes_transcript(
+    client, tasks_layout, monkeypatch
+):
+    """AC-4/AC-5/AC-11a: a summary+sessionId PUT stops the session and unlinks
+    the transcript .jsonl from disk."""
+    # _get_all_project_dirs() scans sessions_mod.CLAUDE_PROJECTS_BASE — point it
+    # at the fixture base so it sees our project transcript dir.
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-1"
+    transcript = _proj_dir(tasks_layout) / f"{clar_sid}.jsonl"
+    transcript.write_text('{"type":"user"}\n')
+    assert transcript.exists()
+
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {
+                "summary": "# Scope\nDo the thing.",
+                "sessionId": clar_sid,
+                "acceptanceCriteria": ["a", "b"],
+            },
+        })
+    assert resp.status == 200
+    fake_manager.stop.assert_awaited_once_with(clar_sid)
+    assert not transcript.exists()
+
+
+async def test_clarify_finalize_keeps_summary_drops_sessionId_preserves_siblings(
+    client, tasks_layout, monkeypatch
+):
+    """AC-1/AC-2/AC-10/AC-11b: summary saved verbatim, sessionId gone, sibling
+    keys (resolvedAt, acceptanceCriteria) intact."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-2"
+    _proj_dir(tasks_layout).joinpath(f"{clar_sid}.jsonl").write_text("{}\n")
+    summary_md = "# Scope\n\n- one\n- two"
+
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {
+                "summary": summary_md,
+                "sessionId": clar_sid,
+                "resolvedAt": 1234567890,
+                "acceptanceCriteria": ["x", "y"],
+            },
+        })
+    assert resp.status == 200
+    clar = (await resp.json())["task"]["clarification"]
+    assert clar["summary"] == summary_md
+    assert clar.get("sessionId") is None
+    assert clar["resolvedAt"] == 1234567890
+    assert clar["acceptanceCriteria"] == ["x", "y"]
+
+    # Re-read via GET to confirm the persisted store also lacks sessionId.
+    data = await (await client.get("/api/tasks")).json()
+    stored = next(t for t in data["tasks"] if t["id"] == tid)
+    assert stored["clarification"]["summary"] == summary_md
+    assert stored["clarification"].get("sessionId") is None
+
+
+async def test_clarify_finalize_preserves_plan_session(client, tasks_layout, monkeypatch):
+    """AC-3: finalizing the clarification must not touch the plan session or its
+    transcript; stop is called ONLY with the clarify id."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-3"
+    plan_sid = "plan-sess-3"
+    pd = _proj_dir(tasks_layout)
+    clar_t = pd / f"{clar_sid}.jsonl"
+    plan_t = pd / f"{plan_sid}.jsonl"
+    clar_t.write_text("{}\n")
+    plan_t.write_text("{}\n")
+
+    # Seed a plan with a sessionId.
+    await client.put("/api/tasks/user", json={
+        "id": tid,
+        "plan": {"sessionId": plan_sid, "spec": "the plan"},
+    })
+
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"summary": "# done", "sessionId": clar_sid},
+        })
+    assert resp.status == 200
+    fake_manager.stop.assert_awaited_once_with(clar_sid)
+    assert not clar_t.exists()
+    assert plan_t.exists()
+
+    data = await (await client.get("/api/tasks")).json()
+    stored = next(t for t in data["tasks"] if t["id"] == tid)
+    assert stored["plan"]["sessionId"] == plan_sid
+
+
+async def test_clarify_finalize_cleanup_failure_still_200(client, tasks_layout, monkeypatch):
+    """AC-7/AC-11c: a cleanup failure (stop raises, or transcript missing) must
+    still return 200 with the summary saved."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    # Sub-case (a): stop raises.
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-4a"
+    _proj_dir(tasks_layout).joinpath(f"{clar_sid}.jsonl").write_text("{}\n")
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock(side_effect=RuntimeError("boom"))
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"summary": "# saved anyway", "sessionId": clar_sid},
+        })
+    assert resp.status == 200
+    assert (await resp.json())["task"]["clarification"]["summary"] == "# saved anyway"
+
+    # Sub-case (b): transcript missing (never written) — unlink finds nothing.
+    tid2 = await _make_clarifying_task(client)
+    fake_manager2 = AsyncMock()
+    fake_manager2.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager2}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid2,
+            "clarification": {"summary": "# also saved", "sessionId": "clar-missing"},
+        })
+    assert resp.status == 200
+    assert (await resp.json())["task"]["clarification"]["summary"] == "# also saved"
+    fake_manager2.stop.assert_awaited_once_with("clar-missing")
+
+
+async def test_clarify_finalize_idempotent_second_put_no_cleanup(client, tasks_layout, monkeypatch):
+    """AC-9/AC-11d: after finalize (sessionId stripped), a second PUT carrying a
+    summary but NO sessionId must not stop or unlink anything."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-5"
+    _proj_dir(tasks_layout).joinpath(f"{clar_sid}.jsonl").write_text("{}\n")
+
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"summary": "# first", "sessionId": clar_sid},
+        })
+        assert resp.status == 200
+        fake_manager.stop.assert_awaited_once_with(clar_sid)
+
+        # Second PUT: summary edited, NO sessionId. Prior stored sessionId is
+        # already stripped → no id resolvable → no cleanup.
+        fake_manager.stop.reset_mock()
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"summary": "# edited", "acceptanceCriteria": ["z"]},
+        })
+    assert resp.status == 200
+    clar = (await resp.json())["task"]["clarification"]
+    assert clar["summary"] == "# edited"
+    assert clar.get("sessionId") is None
+    fake_manager.stop.assert_not_awaited()
+
+
+async def test_clarify_no_finalize_on_blank_summary_or_no_sessionId(client, tasks_layout, monkeypatch):
+    """AC-8: a whitespace-only summary, or a real summary with no resolvable
+    sessionId, must NOT trigger cleanup."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    # Blank summary + a sessionId → no finalize.
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-6"
+    transcript = _proj_dir(tasks_layout) / f"{clar_sid}.jsonl"
+    transcript.write_text("{}\n")
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"summary": "   ", "sessionId": clar_sid},
+        })
+    assert resp.status == 200
+    fake_manager.stop.assert_not_awaited()
+    assert transcript.exists()
+
+    # Real summary but no sessionId anywhere (incoming + no prior stored) → no finalize.
+    tid2 = await _make_clarifying_task(client)
+    fake_manager2 = AsyncMock()
+    fake_manager2.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager2}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid2,
+            "clarification": {"summary": "real scope"},
+        })
+    assert resp.status == 200
+    fake_manager2.stop.assert_not_awaited()
+
+
+async def test_clarify_no_finalize_on_early_id_only_put(client, tasks_layout, monkeypatch):
+    """DELETES-ON-EVERY-PUT guard: the early-persist PUT (sessionId, NO summary)
+    must NOT kill the live in-progress session or delete its transcript."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    tid = await _make_clarifying_task(client)
+    clar_sid = "clar-sess-7"
+    transcript = _proj_dir(tasks_layout) / f"{clar_sid}.jsonl"
+    transcript.write_text("{}\n")
+
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"sessionId": clar_sid},
+        })
+    assert resp.status == 200
+    fake_manager.stop.assert_not_awaited()
+    assert transcript.exists()
+    # The stored clarification keeps its sessionId (the link stays live).
+    data = await (await client.get("/api/tasks")).json()
+    stored = next(t for t in data["tasks"] if t["id"] == tid)
+    assert stored["clarification"]["sessionId"] == clar_sid
+
+
+async def test_clarify_finalize_rejects_traversal_sessionId(client, tasks_layout, monkeypatch):
+    """AC-12: a malformed resolved sessionId ('/' or '..') is caught-and-logged
+    by _validate_session_id inside the cleanup try/except — no unlink, no raise,
+    PUT still 200 (summary saved). stop() is still attempted (idempotent)."""
+    base = tasks_layout.parent / "projects"
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", base)
+
+    tid = await _make_clarifying_task(client)
+    bad_sid = "../escape"
+
+    fake_manager = AsyncMock()
+    fake_manager.stop = AsyncMock()
+    with patch.dict(client.app, {"session_manager": fake_manager}):
+        resp = await client.put("/api/tasks/user", json={
+            "id": tid,
+            "clarification": {"summary": "# scope", "sessionId": bad_sid},
+        })
+    assert resp.status == 200
+    assert (await resp.json())["task"]["clarification"]["summary"] == "# scope"
