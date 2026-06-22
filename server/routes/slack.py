@@ -454,7 +454,7 @@ _HISTORY3D_TEXT_CAP = 2000
 # Comfortably bounds the per-scan cost while keeping the queue fresh; the worker
 # tracks its own last-scan timestamp so the activity window doesn't depend on the
 # (now-retired) cron's lastFiredAt.
-SLACK_SCAN_INTERVAL_S = 300  # 5 minutes — balances freshness vs Slack auth rate limits
+SLACK_SCAN_INTERVAL_S = 120  # 2 minutes — persistent session eliminates SAML auth cost
 
 # Activity window fallback: when the worker has no prior-scan timestamp yet (first
 # cycle after startup), a DM/group-DM counts as a scan candidate if its

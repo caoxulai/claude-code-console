@@ -556,12 +556,19 @@ def context_summary(project_dir: Path, name: str) -> dict:
     """
     try:
         context_path = _context_path(project_dir, name)
-        content, _ = filestore.read_text(context_path)
+        content, etag = filestore.read_text(context_path)
         # Memo ONLY the .md-content-derived parse, keyed by the .md's mtime_ns
         # etag. On an etag hit reuse the parsed entries (skip the walk); on a miss
         # (or absent etag) parse and store. The sidecar signals below ALWAYS
         # recompute fresh so an out-of-band ack/dismiss/review is never stale.
-        etag = filestore.etag_for(context_path)
+        #
+        # The etag MUST be the one read_text returns alongside `content` (a single
+        # consistent read), NOT a fresh filestore.etag_for() recompute. read_text
+        # returns ('', None) for an unreadable/non-UTF-8 file, so etag is None and
+        # we never cache-hit on stale parsed entries while content is '' (which
+        # would emit entryCount:N with contextBytes:0 — internally inconsistent).
+        # Recomputing the etag independently also reopened a TOCTOU window on a
+        # same-mtime_ns-tick rewrite.
         cache_key = (str(project_dir), name, etag)
         if etag is not None and cache_key in _PARSE_CACHE:
             entries = _PARSE_CACHE[cache_key]

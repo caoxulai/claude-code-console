@@ -23,11 +23,17 @@ def etag_for(path: Path) -> str | None:
 
 
 def read_text(path: Path) -> tuple[str, str | None]:
-    """Return (content, etag). If file doesn't exist, return ('', None)."""
+    """Return (content, etag). If the file is missing or unreadable as UTF-8
+    text, return ('', None).
+
+    UnicodeDecodeError (a binary/non-UTF-8 file) is treated the same as a
+    missing file: callers all handle the ('', None) empty state, so this keeps
+    a corrupt file from 500ing endpoints that read it (matching the graceful
+    degradation the agent list/summary paths already apply)."""
     try:
         content = path.read_text(encoding="utf-8")
         return content, etag_for(path)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return "", None
 
 
