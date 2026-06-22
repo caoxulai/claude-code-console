@@ -220,6 +220,102 @@ async def test_email_undismiss_non_dismissed_is_409(client, email_file):
     assert resp.status == 409
 
 
+@pytest.fixture
+def content_etag(monkeypatch):
+    """Make the filestore etag track file *content*, not mtime.
+
+    Production etags are `st_mtime_ns`, so a conflict only fires when two writes
+    land in different nanosecond ticks — which is why the dismiss-all bug is
+    nondeterministic both live (UAT saw [200,409,409,409]) and in a fast test
+    loop (consecutive writes can share an mtime, hiding the bug). Keying the etag
+    on content makes every successful write deterministically change the etag —
+    exactly the mtime-tick the UAT observed live — so a loop that reuses one
+    stale etag is GUARANTEED to 409 every item after the first.
+    """
+    import hashlib
+    from server import filestore
+
+    def content_etag_for(path):
+        try:
+            return hashlib.sha1(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    monkeypatch.setattr(filestore, "etag_for", content_etag_for)
+    return content_etag_for
+
+
+async def test_email_dismiss_all_clears_every_item(client, email_file, content_etag):
+    """AC-9: 'Dismiss all (N)' must clear EVERY item in the declared group, not
+    just the first.
+
+    Reproduces the exact frontend dismissAll loop: read ONE queue etag, then
+    sequentially DELETE each item. The first write changes the file's etag, so a
+    naive loop that reuses the original etag for every item 409s items #2..N
+    (backend guard is `expected_etag or current_etag`, which does NOT fall back to
+    current for a stale-but-truthy etag) and silently leaves most undismissed.
+
+    The fixed loop threads the etag forward from each response and, on a 409,
+    re-reads the fresh queue etag and retries that one item. With the
+    content-keyed etag fixture this is deterministic: the OLD reuse-one-etag loop
+    leaves 3 of 4 undismissed; the fixed loop dismisses all 4.
+    """
+    items = [_make_item(f"i{n}", sender=f"S{n}") for n in range(1, 5)]
+    _seed(email_file, items)
+
+    # The page closure holds exactly one etag, captured from the queue load.
+    cur = (await (await client.get("/api/email/queue")).json())["etag"]
+
+    for it in items:
+        resp = await client.delete(
+            f"/api/email/queue/{it['id']}", json={"etag": cur})
+        if resp.status == 409:
+            # Etag raced — re-read and retry this one item, mirroring the fixed
+            # dismissAll fallback.
+            cur = (await (await client.get("/api/email/queue")).json())["etag"]
+            resp = await client.delete(
+                f"/api/email/queue/{it['id']}", json={"etag": cur})
+        assert resp.status == 200, f"{it['id']} failed: HTTP {resp.status}"
+        cur = (await resp.json())["etag"]
+
+    # EVERY item is dismissed — none survived (the AC-9 acceptance bar).
+    final = (await (await client.get("/api/email/queue")).json())["items"]
+    assert {it["id"]: it["status"] for it in final} == {
+        "i1": "dismissed", "i2": "dismissed",
+        "i3": "dismissed", "i4": "dismissed",
+    }
+    # Persisted to disk, not just in-memory.
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert all(it["status"] == "dismissed" for it in saved)
+
+
+async def test_email_dismiss_all_reused_stale_etag_leaves_items(client, email_file, content_etag):
+    """Pin the regression: the OLD dismissAll loop (reuse ONE closure etag for
+    every DELETE, no 409 fallback) leaves items #2..N undismissed.
+
+    This is the negative control for AC-9 — it asserts the broken pattern is
+    genuinely broken so the positive test above proves the fix, not just a benign
+    timing window. Documents WHY threading the etag matters.
+    """
+    items = [_make_item(f"i{n}", sender=f"S{n}") for n in range(1, 5)]
+    _seed(email_file, items)
+
+    stale = (await (await client.get("/api/email/queue")).json())["etag"]
+    statuses = []
+    for it in items:
+        # The bug: setEtag inside the loop is a next-render no-op, so the loop
+        # keeps sending the ORIGINAL etag and never falls back on 409.
+        resp = await client.delete(
+            f"/api/email/queue/{it['id']}", json={"etag": stale})
+        statuses.append(resp.status)
+
+    # First write succeeds; the rest conflict because the etag is now stale.
+    assert statuses == [200, 409, 409, 409]
+    final = (await (await client.get("/api/email/queue")).json())["items"]
+    dismissed = sum(1 for it in final if it["status"] == "dismissed")
+    assert dismissed == 1, "broken loop should leave 3 of 4 undismissed"
+
+
 async def test_email_regenerate_replaces_draft(client, email_file, monkeypatch):
     """Monkeypatched agent returns a new draft, item flips to needs-review."""
     _seed(email_file, [_make_item("i1", status="edited", draft="old")])
@@ -469,3 +565,382 @@ async def test_email_queue_count_route_not_shadowed_by_item_id(client, email_fil
     resp = await client.get("/api/email/queue/count")
     assert resp.status == 200
     assert await resp.json() == {"count": 1}
+
+
+# ─── Maturity: thread history, rich prompt, topic memory, polish ──────────────
+
+
+@pytest.fixture
+def topics_dir(tmp_path: Path, monkeypatch) -> Path:
+    """Repoint the per-contact topic-memory dir at tmp_path."""
+    d = tmp_path / "email" / "email_topics"
+    monkeypatch.setattr(email_mod, "_email_topics_dir", lambda: d)
+    return d
+
+
+# --- (1a) thread-history extraction ------------------------------------------
+
+
+def test_extract_thread_history_orders_oldest_to_newest():
+    """_extract_thread_history builds [{sender,timestamp,body}] oldest->newest.
+
+    The Outlook MCP email_read response carries multiple emails for a multi-turn
+    conversation under content.emails[]; we render structured turns ordered oldest
+    first (the array arrives newest-first like the inbox), cap body length, and
+    never fabricate a turn for an email with no body.
+    """
+    payload = {
+        "success": True,
+        "content": {
+            "emails": [
+                {"sender": "John", "receivedDateTime": "2026-06-03T10:00:00Z",
+                 "body": "Third (newest) message"},
+                {"sender": "Me", "receivedDateTime": "2026-06-02T10:00:00Z",
+                 "body": "Second message"},
+                {"sender": "John", "receivedDateTime": "2026-06-01T10:00:00Z",
+                 "body": "First (oldest) message"},
+            ]
+        },
+    }
+    turns = email_mod._extract_thread_history(payload)
+    assert isinstance(turns, list)
+    assert [t["body"] for t in turns] == [
+        "First (oldest) message", "Second message", "Third (newest) message",
+    ]
+    assert all(set(t.keys()) >= {"sender", "timestamp", "body"} for t in turns)
+
+
+def test_extract_thread_history_caps_body_and_count():
+    """Each turn body is capped at 4k chars and the array at 20 turns."""
+    emails = [
+        {"sender": f"s{i}", "receivedDateTime": f"t{i}", "body": "x" * 5000}
+        for i in range(30)
+    ]
+    turns = email_mod._extract_thread_history({"content": {"emails": emails}})
+    assert len(turns) <= 20
+    assert all(len(t["body"]) <= 4096 for t in turns)
+
+
+def test_extract_thread_history_handles_garbage_without_fabricating():
+    """A non-dict / empty / secret-only payload yields [] (never a fake turn)."""
+    assert email_mod._extract_thread_history(None) == []
+    assert email_mod._extract_thread_history("just a string") == []
+    assert email_mod._extract_thread_history({"content": {"emails": []}}) == []
+    # An email with no body must not become a turn.
+    turns = email_mod._extract_thread_history(
+        {"content": {"emails": [{"sender": "x", "body": ""}]}}
+    )
+    assert turns == []
+
+
+# --- (1b) rich draft prompt (the AC-3 unit-testable seam) --------------------
+
+
+def test_build_email_draft_prompt_includes_history_style_and_topics(
+    email_file, topics_dir, monkeypatch
+):
+    """_build_email_draft_prompt injects threadHistory + style + per-contact topics.
+
+    This is the standalone builder that makes the rich-draft contract testable
+    while the agent seam is stubbed: its assembled text must carry the full thread
+    turns, the learned style store, and the contact's topic memory.
+    """
+    # Seed the style store and the contact's topic file.
+    email_file.parent.mkdir(parents=True, exist_ok=True)
+    email_mod.filestore.write_text(email_mod._style_path(), "Be warm and concise.")
+    topics_dir.mkdir(parents=True, exist_ok=True)
+    slug = email_mod._slugify_contact("john@example.com")
+    email_mod.filestore.write_text(topics_dir / f"{slug}.md", "Discussed Q3 launch timing.")
+
+    item = _make_item(
+        sender="john@example.com",
+        subject="Re: Launch",
+        threadHistory=[
+            {"sender": "John", "timestamp": "t1", "body": "When can we ship?"},
+            {"sender": "Me", "timestamp": "t2", "body": "Aiming for Friday."},
+        ],
+    )
+    prompt = email_mod._build_email_draft_prompt(item)
+    assert "When can we ship?" in prompt          # thread history reaches the prompt
+    assert "Aiming for Friday." in prompt
+    assert "Be warm and concise." in prompt        # learned style reaches the prompt
+    assert "Discussed Q3 launch timing." in prompt  # per-contact topic memory reaches it
+    # A multi-turn history implies a re-draft (single cohesive reply) instruction.
+    low = prompt.lower()
+    assert "language" in low                        # decisive language rule present
+
+
+def test_build_email_draft_prompt_scrubs_secrets():
+    """The assembled prompt is scrubbed — credential lines never ride along."""
+    item = _make_item(
+        sender="x@example.com",
+        threadHistory=[{"sender": "a", "timestamp": "t", "body": "ok"}],
+        emailBody="line one\nauthorization: Bearer abc123\nline three",
+    )
+    prompt = email_mod._build_email_draft_prompt(item)
+    assert "Bearer abc123" not in prompt
+    assert "authorization:" not in prompt.lower()
+
+
+def test_draft_prompt_flows_through_build_prompt():
+    """_build_prompt('draft') uses payload['prompt'] as its base when present."""
+    base = "SENTINEL-PROMPT-CONTENT-123"
+    out = email_mod._build_prompt("draft", {"prompt": base, "item": _make_item()})
+    assert base in out
+
+
+# --- (1c) per-contact topic slugification + read ------------------------------
+
+
+def test_slugify_contact_normalizes():
+    """_slugify_contact: lowercase, non-alphanum->dash, collapse runs, strip ends."""
+    f = email_mod._slugify_contact
+    assert f("John Doe") == "john-doe"
+    assert f("john@example.com") == "john-example-com"
+    assert f("  Multiple   Spaces  ") == "multiple-spaces"
+    assert f("a__b--c") == "a-b-c"
+    assert f("---lead-and-trail---") == "lead-and-trail"
+
+
+def test_slugify_shared_by_read_write(email_file, topics_dir):
+    """read/append/prompt all resolve the SAME file via the shared slug."""
+    email_file.parent.mkdir(parents=True, exist_ok=True)
+    topics_dir.mkdir(parents=True, exist_ok=True)
+    contact = "John Doe <john@example.com>"
+    slug = email_mod._slugify_contact(contact)
+    email_mod.filestore.write_text(topics_dir / f"{slug}.md", "shared note")
+    assert "shared note" in email_mod.read_email_topic_summary(contact)
+
+
+# --- (1c) GET/PUT /api/email/topics/{contact} --------------------------------
+
+
+async def test_email_topics_get_empty_for_unseen_contact(client, email_file, topics_dir):
+    """GET topics for a never-seen contact returns empty content (NOT 404)."""
+    resp = await client.get("/api/email/topics/john-doe")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["content"] == ""
+
+
+async def test_email_topics_put_then_get_roundtrips(client, email_file, topics_dir):
+    """PUT writes a contact's topic note; GET reads it back."""
+    resp = await client.put("/api/email/topics/jane-doe", json={"content": "Talked about budgets."})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    resp = await client.get("/api/email/topics/jane-doe")
+    assert (await resp.json())["content"] == "Talked about budgets."
+
+
+async def test_email_topics_put_conflict_returns_409(client, email_file, topics_dir):
+    """A stale etag on PUT topics returns the 409-with-current+etag shape."""
+    await client.put("/api/email/topics/jane-doe", json={"content": "first"})
+    resp = await client.put("/api/email/topics/jane-doe",
+                            json={"content": "second", "etag": "stale-etag"})
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "current" in body and "etag" in body
+
+
+async def test_email_topics_handler_rejects_traversal_chars(client, email_file, topics_dir):
+    """A contact segment that REACHES the handler carrying a path-traversal char
+    (backslash, or an encoded slash that decodes to one) is rejected with 400 by
+    _validate_contact BEFORE slugifying. (Literal '..'/'/' segments are collapsed
+    by the HTTP routing layer and never reach the handler — covered below.)"""
+    for bad in ("x%5Cy", "foo%2Fbar"):  # -> 'x\\y', 'foo/bar' at the handler
+        resp = await client.get(f"/api/email/topics/{bad}")
+        assert resp.status == 400, f"GET {bad!r} should be rejected, got {resp.status}"
+        resp = await client.put(f"/api/email/topics/{bad}", json={"content": "evil"})
+        assert resp.status == 400, f"PUT {bad!r} should be rejected, got {resp.status}"
+
+
+async def test_email_topics_traversal_never_escapes_topics_dir(
+    client, email_file, topics_dir, tmp_path
+):
+    """No contact input (literal or encoded traversal) ever reads/writes a file
+    OUTSIDE the topics dir — the slug strips path chars, and the guard rejects the
+    rest. Plant a canary a traversal would otherwise hit and prove it's untouched."""
+    canary = tmp_path / "passwd_canary.md"
+    canary.write_text("SECRET", encoding="utf-8")
+    for bad in ("../etc/passwd", "..", "a/b", "x%5Cy", "%2e%2e"):
+        await client.put(f"/api/email/topics/{bad}", json={"content": "evil"})
+        await client.get(f"/api/email/topics/{bad}")
+    assert canary.read_text(encoding="utf-8") == "SECRET", "traversal escaped the topics dir"
+    # Every file the handler created lives inside the topics dir and is a slug.md.
+    if topics_dir.exists():
+        for p in topics_dir.glob("*"):
+            assert p.suffix == ".md" and "/" not in p.stem and "\\" not in p.stem
+
+
+# --- (1d) approve appends a per-contact topic note ----------------------------
+
+
+async def test_email_approve_appends_topic_note(client, email_file, topics_dir, monkeypatch):
+    """Approving an email appends a one-line note to the sender's topic file."""
+    _seed(email_file, [_make_item("i1", sender="john@example.com",
+                                  subject="Re: Launch", draft="Sounds good, Friday works.")])
+    _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200
+    slug = email_mod._slugify_contact("john@example.com")
+    note_path = topics_dir / f"{slug}.md"
+    assert note_path.exists(), "approve should have written the contact topic file"
+    content = note_path.read_text(encoding="utf-8")
+    assert "Re: Launch" in content or "Launch" in content
+    assert content.strip(), "topic note should be non-empty"
+
+
+async def test_email_approve_topic_note_failure_is_best_effort(
+    client, email_file, topics_dir, monkeypatch
+):
+    """A topic-write failure NEVER fails the approve (best-effort, logged)."""
+    _seed(email_file, [_make_item("i1", draft="final")])
+    _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(email_mod, "_append_email_topic_note", boom)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "approved"
+
+
+async def test_email_approve_still_only_saves_draft_never_sends(
+    client, email_file, topics_dir, monkeypatch
+):
+    """Approve remains draft-save + clipboard ONLY — no reply/send action."""
+    _seed(email_file, [_make_item("i1", draft="final")])
+    agent = _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    await client.post("/api/email/queue/i1/approve", json={})
+    actions = [c[0] for c in agent.calls]
+    assert "reply" not in actions and "send" not in actions
+    assert "save_draft" in actions
+
+
+# --- (2a) polish endpoint -----------------------------------------------------
+
+
+async def test_email_polish_returns_polished(client, email_file, monkeypatch):
+    """POST /api/email/polish returns {available, draft} on a successful seam."""
+    _stub_agent(monkeypatch, {"available": True, "draft": "Polished, fluent text."})
+    resp = await client.post("/api/email/polish", json={"text": "rough  draft txt"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["available"] is True
+    assert body["draft"] == "Polished, fluent text."
+
+
+async def test_email_polish_empty_text_is_400(client, email_file, monkeypatch):
+    """Empty/non-string text is a 400 (never spawns the seam)."""
+    agent = _stub_agent(monkeypatch, {"available": True, "draft": "x"})
+    for bad in ({"text": ""}, {"text": "   "}, {"text": 123}, {}):
+        resp = await client.post("/api/email/polish", json=bad)
+        assert resp.status == 400
+    assert agent.calls == [], "400 must short-circuit before the seam"
+
+
+async def test_email_polish_unavailable_is_502_not_fabricated(client, email_file, monkeypatch):
+    """An unavailable seam is a 502 — never fabricate a polished result."""
+    _stub_agent(monkeypatch, {"available": False, "reason": "not wired"})
+    resp = await client.post("/api/email/polish", json={"text": "some draft"})
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["available"] is False
+
+
+async def test_email_polish_does_not_touch_sidecar(client, email_file, monkeypatch):
+    """Polish is stateless: it never reads/writes the email_threads.json sidecar."""
+    _seed(email_file, [_make_item("i1", status="needs-review")])
+    before = email_file.read_text(encoding="utf-8")
+    _stub_agent(monkeypatch, {"available": True, "draft": "polished"})
+    resp = await client.post("/api/email/polish", json={"text": "draft text"})
+    assert resp.status == 200
+    assert email_file.read_text(encoding="utf-8") == before, "polish must not write the sidecar"
+
+
+def test_email_polish_action_prompt_preserves_language():
+    """The 'polish' _build_prompt instruction preserves voice + language."""
+    out = email_mod._build_prompt("polish", {"text": "hola, como estas"}).lower()
+    assert "hola, como estas" in out
+    assert "translate" in out  # the conservative "do NOT translate" guard
+
+
+def test_email_polish_parse_failloud_on_missing_draft():
+    """_parse_agent_result('polish') fails loud when 'draft' is missing."""
+    res = email_mod._parse_agent_result('{"notdraft": 1}', "polish")
+    assert res["available"] is False
+    ok = email_mod._parse_agent_result('{"draft": "hi"}', "polish")
+    assert ok["available"] is True and ok["draft"] == "hi"
+
+
+# --- (1a) scan attaches threadHistory from a multi-message conversation -------
+
+
+async def test_scan_attaches_thread_history(email_file, monkeypatch):
+    """_scan_once attaches a structured threadHistory from email_read.
+
+    Mocks the read-only MCP client to return one new inbox conversation and a
+    multi-message email_read body so the scan stores threadHistory turns on the
+    skeleton without the draft worker needing any further MCP call.
+    """
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "email_inbox":
+            return {"messages": [{
+                "conversationId": "CONV-multi",
+                "topic": "Re: Roadmap",
+                "senders": ["John"],
+                "preview": "latest snippet",
+            }]}
+        if name == "email_read":
+            return {"content": {"emails": [
+                {"sender": "John", "receivedDateTime": "t3", "body": "newest turn"},
+                {"sender": "Me", "receivedDateTime": "t2", "body": "middle turn"},
+                {"sender": "John", "receivedDateTime": "t1", "body": "oldest turn"},
+            ]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 1
+    th = saved[0].get("threadHistory")
+    assert isinstance(th, list) and len(th) == 3
+    assert [t["body"] for t in th] == ["oldest turn", "middle turn", "newest turn"]
+
+
+async def test_scan_history_failure_is_nonfatal(email_file, monkeypatch):
+    """A failing email_read does NOT fail the scan and never fabricates turns."""
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "email_inbox":
+            return {"messages": [{
+                "conversationId": "CONV-x", "topic": "Hi", "senders": ["A"],
+                "preview": "snip",
+            }]}
+        if name == "email_read":
+            raise email_mod.EmailMcpError("read blew up")
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 1  # item still created from the snippet
+    assert not saved[0].get("threadHistory")  # no fabricated turns

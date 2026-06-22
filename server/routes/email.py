@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import logging
 import os
@@ -69,6 +70,17 @@ def _style_path() -> Path:
     return EMAIL_PATH.parent / "email_style.md"
 
 
+def _email_topics_dir() -> Path:
+    """Per-contact topic-memory dir, sibling to the sidecar.
+
+    The KEY divergence from Slack (which keys topics by raw display name): email
+    contacts are addresses, so we slugify them into one file per contact
+    (``email_topics/<slug>.md``). The slug derivation (_slugify_contact) is shared
+    by read/write/append/prompt so all paths resolve the SAME file.
+    """
+    return EMAIL_PATH.parent / "email_topics"
+
+
 # ── Constants ───────────────────────────────────────────────────────────────
 
 # emailBody cap: spec mandates capping at 32k chars when storing items.
@@ -76,6 +88,13 @@ _EMAIL_BODY_CAP = 32768
 
 _SNIPPET_CAP = 2000
 _DRAFT_CAP = 8000
+
+# threadHistory caps (spec 1a): a multi-turn conversation is stored on the item
+# as [{sender, timestamp, body}] turns so the draft worker needs no further MCP
+# call. Each turn body is capped and the turn count is bounded so a long thread
+# can't bloat the sidecar.
+_THREAD_TURN_BODY_CAP = 4096
+_THREAD_HISTORY_MAX_TURNS = 20
 
 # Lines that may carry credentials -- never persisted or surfaced.
 _SECRET_MARKERS = ("~/.midway", ".midway", "cookie", "mwinit", "aws_secret", "authorization:")
@@ -160,6 +179,83 @@ def _one_line(text: str, cap: int = 300) -> str:
     """Collapse multi-line text to a single capped line."""
     collapsed = re.sub(r"\s+", " ", (text or "").strip())
     return collapsed[:cap]
+
+
+def _slugify_contact(contact: str) -> str:
+    """Slugify a contact into a filesystem-safe topic-file stem.
+
+    lowercase, non-alphanumeric -> dash, collapse dash runs, strip leading/
+    trailing dashes. SHARED by read/write/append/prompt so they all resolve the
+    SAME ``email_topics/<slug>.md`` file. An empty slug (e.g. all punctuation)
+    returns "" — callers reject it rather than writing a dotfile.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", str(contact or "").strip().lower())
+    return slug.strip("-")
+
+
+def _validate_contact(contact: str) -> None:
+    """Reject a URL contact segment with path-traversal chars BEFORE slugifying.
+
+    Mirrors slack._validate_contact — ``contact`` comes from the URL and indexes a
+    topic file. The traversal guard runs first; slugification is a second line of
+    defense (it would also strip these), but we fail loud on an obvious attack.
+    """
+    if not contact or ".." in contact or "/" in contact or "\\" in contact:
+        raise web.HTTPBadRequest(reason="invalid contact")
+
+
+def read_email_style_notes() -> str:
+    """Read the human-readable learned-style store (empty string if absent)."""
+    content, _ = filestore.read_text(_style_path())
+    return content
+
+
+def read_email_topic_summary(contact: str) -> str:
+    """Read a contact's running topic/context summary (empty if absent).
+
+    Resolves the file via the SHARED slug so it matches what _append_email_topic_note
+    writes and what get_topics/put_topics serve.
+    """
+    slug = _slugify_contact(contact)
+    if not slug:
+        return ""
+    content, _ = filestore.read_text(_email_topics_dir() / f"{slug}.md")
+    return content
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _ensure_heading(content: str, heading: str) -> str:
+    return content if content.strip() else f"{heading}\n"
+
+
+def _append_email_topic_note(contact: str, item: dict, final_draft: str) -> None:
+    """Append a one-line dated note to a contact's topic file (APPEND-ONLY).
+
+    Mirrors slack._append_topic_note: read -> ensure the heading -> append a note
+    capturing the subject + a brief draft summary -> write. Resolves the file via
+    the SHARED slug (so read/append/prompt all agree). It RE-READS then appends so
+    a concurrent note isn't blind-overwritten, and NEVER rewrites/deletes prior
+    notes — reconciling duplicates is a human action. This is read back into the
+    draft prompt (read_email_topic_summary) so future drafts reference prior
+    context.
+    """
+    slug = _slugify_contact(contact)
+    if not slug:
+        return
+    path = _email_topics_dir() / f"{slug}.md"
+    contact_label = _scrub(_one_line(str(contact or ""), 200)) or "this contact"
+    content, _ = filestore.read_text(path)
+    content = _ensure_heading(content, f"# Topics with {contact_label}")
+    subject = _scrub(_one_line(str(item.get("subject", "")), 200))
+    note = (
+        f"- {_today()}: Re: {subject or '(no subject)'} — "
+        f"I replied: {_one_line(str(final_draft))}."
+    )
+    new_content = content.rstrip("\n") + "\n" + _scrub(note) + "\n"
+    filestore.write_text(path, new_content)
 
 
 def _normalize_loaded(data) -> dict:
@@ -553,33 +649,61 @@ def _build_prompt(action: str, payload: dict) -> str:
             "Include every id above exactly once."
         )
     elif action in ("draft", "regenerate"):
-        item = payload.get("item") or {}
-        subject = _one_line(str(item.get("subject", "")), 300)
-        sender = _one_line(str(item.get("sender", "")), 200)
-        body = str(item.get("emailBody", ""))[:_EMAIL_BODY_CAP]
-        snippet = str(item.get("snippet", ""))[:_SNIPPET_CAP]
-        # Use full body if available, else snippet
-        context = body if body.strip() else snippet
-        # Load style notes if available
-        style_content = ""
-        try:
-            style_text, _ = filestore.read_text(_style_path())
-            if style_text:
-                style_content = f"\n\n## Style notes\n{style_text}"
-        except (OSError, UnicodeDecodeError):
-            pass
+        # When the caller pre-assembled the rich style+topic+threadHistory prompt
+        # (_build_email_draft_prompt), use it verbatim as the base. Fall back to the
+        # inline build only when no prompt was injected (older call sites/tests).
+        base = str(payload.get("prompt", "")).strip()
+        if not base:
+            item = payload.get("item") or {}
+            subject = _one_line(str(item.get("subject", "")), 300)
+            sender = _one_line(str(item.get("sender", "")), 200)
+            body = str(item.get("emailBody", ""))[:_EMAIL_BODY_CAP]
+            snippet = str(item.get("snippet", ""))[:_SNIPPET_CAP]
+            # Use full body if available, else snippet
+            context = body if body.strip() else snippet
+            # Load style notes if available
+            style_content = ""
+            try:
+                style_text, _ = filestore.read_text(_style_path())
+                if style_text:
+                    style_content = f"\n\n## Style notes\n{style_text}"
+            except (OSError, UnicodeDecodeError):
+                pass
+            base = (
+                f"{style_content}\n\n"
+                f"## Email to reply to\n"
+                f"From: {sender}\n"
+                f"Subject: {subject}\n\n"
+                f"{context}"
+            )
         prompt = (
             "Draft a reply to this email in MY voice using ONLY the context below "
             "-- do NOT call any tools, do NOT fetch anything, do NOT send anything."
-            f"{style_content}\n\n"
-            f"## Email to reply to\n"
-            f"From: {sender}\n"
-            f"Subject: {subject}\n\n"
-            f"{context}\n\n"
+            f"\n\n{base}\n\n"
             "Return ONLY a STRICT JSON object (no prose, no markdown fences): "
             '{"draft": "<the reply text>", "generatedDraft": "<the same reply text>", '
             '"threadContext": "<a 1-2 sentence summary of what the email is about>"}. '
             "generatedDraft must equal draft."
+        )
+    elif action == "polish":
+        # MCP-FREE: polish the user's CURRENT draft for fluency while preserving
+        # THEIR voice and language. It reasons ONLY over the text in the prompt — no
+        # tool calls, no fetch, no send. Deliberately conservative: improve
+        # flow/grammar/clarity but do NOT change meaning, translate, or formalize.
+        text = str(payload.get("text", ""))
+        prompt = (
+            "Improve the FLUENCY of the email reply below — do NOT call any tools, "
+            "do NOT fetch anything, do NOT send anything. Fix grammar, awkward "
+            "phrasing, and clarity so it reads smoothly, but you MUST preserve MY "
+            "own voice and writing style and the SAME language the text is written "
+            "in (do NOT translate). Do NOT change the meaning, do NOT add or remove "
+            "information, do NOT make it more formal or more casual than I wrote it, "
+            "and keep it roughly the same length. If the text is already fluent, "
+            "return it essentially unchanged.\n\n"
+            "My draft:\n"
+            f"{text}\n\n"
+            'Return ONLY a STRICT JSON object (no prose, no markdown fences): '
+            '{"draft": "<the polished reply text>"}.'
         )
     elif action == "save_draft":
         item = payload.get("item") or {}
@@ -632,6 +756,11 @@ def _parse_agent_result(text: str, action: str) -> dict:
             "generatedDraft": parsed.get("generatedDraft", parsed.get("draft", "")),
             "threadContext": parsed.get("threadContext", ""),
         }
+    if action == "polish":
+        # Fail loud on a missing 'draft' rather than fabricating a polished text.
+        if not isinstance(parsed, dict) or "draft" not in parsed:
+            return {"available": False, "reason": "Email polish reply missing 'draft'."}
+        return {"available": True, "draft": parsed.get("draft", "")}
     if action == "save_draft":
         if not isinstance(parsed, dict):
             return {"available": False, "reason": "Email save_draft reply was not a dict."}
@@ -1037,6 +1166,177 @@ def _extract_email_body(payload) -> str:
     return str(body) if body else ""
 
 
+def _extract_thread_history(payload) -> list[dict]:
+    """Build a structured threadHistory array from an email_read MCP response.
+
+    Same response shape _extract_email_body parses ({content:{emails:[...]}}); the
+    Outlook MCP returns the conversation's messages newest-first, so we reverse to
+    oldest->newest. Each turn is ``{sender, timestamp, body}`` with the body
+    scrubbed and capped at _THREAD_TURN_BODY_CAP, and the array bounded to the
+    _THREAD_HISTORY_MAX_TURNS newest turns. An email with no body is NOT emitted
+    (we never fabricate a turn). Returns [] for any unexpected/empty payload so the
+    caller can fall back to the snippet/body alone.
+    """
+    if not isinstance(payload, dict):
+        return []
+    content = payload.get("content")
+    emails = None
+    if isinstance(content, dict):
+        emails = content.get("emails") or content.get("messages")
+    if not isinstance(emails, list) or not emails:
+        return []
+
+    turns: list[dict] = []
+    for idx, msg in enumerate(emails):
+        if not isinstance(msg, dict):
+            continue
+        body = str(msg.get("body", "") or "")
+        body = _scrub(body)[:_THREAD_TURN_BODY_CAP].strip()
+        if not body:
+            continue  # never fabricate a turn for a body-less message
+        sender = msg.get("sender") or msg.get("from") or ""
+        if isinstance(sender, dict):
+            sender = sender.get("name") or sender.get("email") or ""
+        timestamp = (
+            msg.get("receivedDateTime") or msg.get("timestamp")
+            or msg.get("sentDateTime") or msg.get("date") or ""
+        )
+        ts_str = _one_line(str(timestamp), 100)
+        turns.append({
+            "_idx": idx,
+            "_sort": _parse_ts(ts_str),
+            "sender": _scrub(_one_line(str(sender), 200)),
+            "timestamp": ts_str,
+            "body": body,
+        })
+
+    # Order oldest -> newest. When EVERY turn has a parseable timestamp, sort by it
+    # (authoritative, robust to whatever order the MCP returned). Otherwise the
+    # email_read array is newest-first by convention, so reverse the delivered
+    # order. Then cap to the most recent _THREAD_HISTORY_MAX_TURNS turns.
+    if turns and all(t["_sort"] is not None for t in turns):
+        turns.sort(key=lambda t: (t["_sort"], t["_idx"]))
+    else:
+        turns.reverse()
+    ordered = [{"sender": t["sender"], "timestamp": t["timestamp"], "body": t["body"]}
+               for t in turns]
+    return ordered[-_THREAD_HISTORY_MAX_TURNS:]
+
+
+def _parse_ts(value: str):
+    """Best-effort parse of an email timestamp into a sortable datetime.
+
+    Handles ISO-8601 (incl. a trailing 'Z'); returns None when unparseable so the
+    caller falls back to the MCP's delivered (newest-first) ordering.
+    """
+    s = (value or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_thread_history(thread_history) -> str:
+    """Render a threadHistory array (oldest->newest) as readable lines.
+
+    Tolerant of missing keys; returns "" for an empty/non-list input so the
+    caller can fall back to the single body/snippet block.
+    """
+    if not isinstance(thread_history, list) or not thread_history:
+        return ""
+    lines = []
+    for turn in thread_history[-_THREAD_HISTORY_MAX_TURNS:]:
+        if not isinstance(turn, dict):
+            continue
+        sender = str(turn.get("sender", "") or "?")
+        ts = str(turn.get("timestamp", "") or "")
+        body = _one_line(str(turn.get("body", "")), _THREAD_TURN_BODY_CAP)
+        prefix = f"{sender} ({ts})" if ts else sender
+        lines.append(f"- {prefix}: {body}")
+    return "\n".join(lines)
+
+
+# Exact re-draft instruction (mirrors slack._REDRAFT_INSTRUCTION) appended when a
+# thread has more than one turn: compose ONE cohesive reply addressing the whole
+# conversation rather than answering each message in isolation.
+_EMAIL_REDRAFT_INSTRUCTION = (
+    "This conversation has multiple messages. Read the FULL thread above and write "
+    "ONE cohesive reply that addresses everything still open — do not reply to each "
+    "message separately, and do not repeat points already settled earlier in the thread."
+)
+
+
+def _build_email_draft_prompt(item: dict) -> str:
+    """Assemble the draft-generation prompt for one email queue item.
+
+    Mirrors slack.build_draft_prompt: injects (1) the FULL threadHistory (rendered
+    oldest->newest), (2) the learned-style store, (3) the per-contact topic memory,
+    a DECISIVE language rule judged from the INCOMING turns (not the style
+    samples), and a re-draft instruction when the thread has >1 turn. This
+    standalone builder's OUTPUT is unit-testable on its own — that's how the
+    style+topic+history reaches the prompt even while ``_run_email_agent`` is
+    stubbed. The assembled text is scrubbed so no credential material rides along.
+    """
+    sender = str(item.get("sender", ""))
+    subject = str(item.get("subject", ""))
+    snippet = str(item.get("snippet", ""))
+    body = str(item.get("emailBody", ""))
+    thread_history = item.get("threadHistory") or []
+
+    style = read_email_style_notes().strip()
+    topics = read_email_topic_summary(sender).strip()
+
+    history_block = _format_thread_history(thread_history)
+    is_redraft = isinstance(thread_history, list) and len(thread_history) > 1
+
+    parts = [
+        "You are drafting an email reply in MY voice. Match my style; be concise "
+        "and professional.",
+        "",
+        "## My learned writing style",
+        "(These samples teach TONE and PHRASING only — NOT which language to reply "
+        "in. The reply language is decided ONLY by the incoming conversation, per "
+        "the rule at the bottom.)",
+        "",
+        style or "(no style notes yet — keep it concise, direct, and warm, matching "
+        "the conversation's own register)",
+        "",
+        f"## What {sender or 'this contact'} and I have discussed",
+        topics or "(no prior context captured yet)",
+        "",
+        "## Email to reply to",
+        f"From: {sender}",
+        f"Subject: {subject}",
+    ]
+    if history_block:
+        parts += [
+            "",
+            "## Full conversation thread (oldest → newest)",
+            history_block,
+        ]
+    else:
+        parts += [
+            "",
+            "## Message",
+            (body.strip() or snippet.strip() or "(no body available)"),
+        ]
+    if is_redraft:
+        parts += ["", _EMAIL_REDRAFT_INSTRUCTION]
+    parts += [
+        "",
+        "## LANGUAGE RULE (decisive — overrides any language seen in my style samples)",
+        "Reply in the SAME language the OTHER people are using in the incoming "
+        "message and the conversation thread above. English thread → reply in "
+        "English. Chinese thread → reply in Chinese. Mixed → mirror that mix. Judge "
+        "ONLY from what they wrote, never from my style samples.",
+        "",
+        "Write only the reply text.",
+    ]
+    return _scrub("\n".join(parts))
+
+
 async def _scan_once(app) -> None:
     """Run ONE deterministic email scan: fetch inbox -> dedupe -> fetch bodies -> write.
 
@@ -1082,7 +1382,10 @@ async def _scan_once(app) -> None:
             continue
         new_items.append(raw)
 
-    # For each new email, pre-fetch body via email_read
+    # For each new email, pre-fetch body + thread history via email_read. The
+    # SAME response (content.emails[]) yields BOTH the concatenated body
+    # (_extract_email_body) and the structured multi-turn threadHistory
+    # (_extract_thread_history), so the draft worker needs no further MCP call.
     for raw in new_items:
         conv_id = str(raw.get("conversationId", "") or raw.get("id", ""))
         if conv_id:
@@ -1093,8 +1396,12 @@ async def _scan_once(app) -> None:
                 body_text = _extract_email_body(body_payload)
                 if body_text:
                     raw["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+                history = _extract_thread_history(body_payload)
+                if history:
+                    raw["threadHistory"] = history
             except (EmailMcpError, Exception) as e:
-                # Non-fatal: we can still classify from snippet alone
+                # Non-fatal: we can still classify/draft from the snippet alone, and
+                # we NEVER fabricate turns — threadHistory simply stays absent.
                 logger.debug("Email body fetch failed for %s: %s", conv_id, _scrub(str(e)))
 
     # Write needs-classify skeletons
@@ -1102,6 +1409,8 @@ async def _scan_once(app) -> None:
         skeleton = _skeleton_for(raw)
         if raw.get("emailBody"):
             skeleton["emailBody"] = raw["emailBody"]
+        if raw.get("threadHistory"):
+            skeleton["threadHistory"] = raw["threadHistory"]
         data["items"].append(skeleton)
 
     # Update lastScanAt
@@ -1297,7 +1606,11 @@ async def _draft_one(app, sem: asyncio.Semaphore, item_id: str) -> None:
         if item.get("status") not in ("needs-draft",):
             return  # Moved on since we were selected
 
-        result = await _run_email_agent("draft", {"id": item_id, "item": item})
+        result = await _run_email_agent("draft", {
+            "id": item_id,
+            "item": item,
+            "prompt": _build_email_draft_prompt(item),
+        })
 
     if not result.get("available"):
         logger.info(
@@ -1641,6 +1954,7 @@ async def regenerate_item(request: web.Request) -> web.Response:
     result = await _run_email_agent("regenerate", {
         "id": item_id,
         "item": item,
+        "prompt": _build_email_draft_prompt(item),
     })
     if not result.get("available"):
         return web.json_response(
@@ -1700,6 +2014,16 @@ async def approve_item(request: web.Request) -> web.Response:
     })
 
     draft_saved = result.get("draftSaved", False) if result.get("available") else False
+
+    # Topic memory (best-effort, logged): record what we just replied about so
+    # future drafts to this contact reference prior context. It RE-READS then
+    # appends (filestore handles its own etag) so a concurrent note isn't
+    # blind-overwritten. A topic-write failure must NEVER block or fail the
+    # approve — approve stays draft-save + clipboard ONLY (no send path).
+    try:
+        _append_email_topic_note(item.get("sender", ""), item, final_draft)
+    except Exception as e:  # noqa: BLE001 — best-effort; never fail the approve
+        logger.warning("Email approve: topic-note append failed: %s", _scrub(str(e)))
 
     # Mark approved regardless of whether the save succeeded
     item["status"] = "approved"
@@ -1843,6 +2167,85 @@ async def put_style(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "content": content, "etag": new_etag})
 
 
+async def get_topics(request: web.Request) -> web.Response:
+    """GET /api/email/topics/{contact} -- read a contact's topic memory.
+
+    Returns empty content (NOT 404) for a never-seen contact so the UI can render
+    a blank editor. The {contact} segment is traversal-checked BEFORE slugifying.
+    """
+    contact = request.match_info["contact"]
+    _validate_contact(contact)
+    slug = _slugify_contact(contact)
+    if not slug:
+        raise web.HTTPBadRequest(reason="invalid contact")
+    path = _email_topics_dir() / f"{slug}.md"
+    content, etag = filestore.read_text(path)
+    return web.json_response(
+        {"contact": contact, "slug": slug, "content": content, "etag": etag, "path": str(path)}
+    )
+
+
+async def put_topics(request: web.Request) -> web.Response:
+    """PUT /api/email/topics/{contact} -- write a contact's topic memory.
+
+    Etag-guarded: a stale write returns the 409-with-current+etag shape (matches
+    put_style). The {contact} segment is traversal-checked BEFORE slugifying.
+    """
+    contact = request.match_info["contact"]
+    _validate_contact(contact)
+    slug = _slugify_contact(contact)
+    if not slug:
+        raise web.HTTPBadRequest(reason="invalid contact")
+    body = await read_json_body(request)
+    content = body.get("content")
+    if content is None:
+        raise web.HTTPBadRequest(reason="content field required")
+    expected_etag = body.get("etag")
+    content = _scrub(str(content))
+    path = _email_topics_dir() / f"{slug}.md"
+
+    try:
+        new_etag = filestore.write_text(path, content, expected_etag)
+    except filestore.ConflictError as e:
+        current, current_etag = filestore.read_text(path)
+        return web.json_response(
+            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            status=409,
+        )
+    return web.json_response(
+        {"ok": True, "contact": contact, "slug": slug, "content": content, "etag": new_etag}
+    )
+
+
+async def polish_text(request: web.Request) -> web.Response:
+    """POST /api/email/polish -- a stateless fluency rewrite of the draft text.
+
+    Mirrors slack.polish_text: a pure text transform on the request-body text. It
+    does NOT load or write email_threads.json (no etag, no status change), does NOT
+    read email, and NEVER sends — so it can run on text the user is mid-edit. The
+    polished text is returned for the UI to drop back as an unsaved edit; persisting
+    it goes through the existing Save / Approve flow.
+
+    FAIL-LOUD: an empty/non-string `text` is a 400; an unavailable seam is a 502.
+    Never fabricates a polished result.
+    """
+    body = await read_json_body(request) if request.can_read_body else {}
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise web.HTTPBadRequest(reason="polish requires a non-empty 'text'")
+
+    result = await _run_email_agent("polish", {"text": text[:_DRAFT_CAP]})
+    if not result.get("available"):
+        # Honest failure — never fabricate a polished draft.
+        return web.json_response(
+            {"available": False, "reason": result.get("reason", "Email polish unavailable")},
+            status=502,
+        )
+
+    polished = _scrub(str(result.get("draft", "")))[:_DRAFT_CAP]
+    return web.json_response({"available": True, "draft": polished})
+
+
 # ── Registration ────────────────────────────────────────────────────────────
 
 def register(app: web.Application):
@@ -1868,6 +2271,11 @@ def register(app: web.Application):
     app.router.add_delete("/api/email/muted/{mute_key}", unmute_thread)
     app.router.add_get("/api/email/style", get_style)
     app.router.add_put("/api/email/style", put_style)
+    # Per-contact topic memory (read/write the running summary for one contact).
+    app.router.add_get("/api/email/topics/{contact}", get_topics)
+    app.router.add_put("/api/email/topics/{contact}", put_topics)
+    # Stateless per-edit fluency pass (MCP-free, never touches the sidecar).
+    app.router.add_post("/api/email/polish", polish_text)
 
     # Worker lifecycle
     app.on_startup.append(_start_scan_worker)

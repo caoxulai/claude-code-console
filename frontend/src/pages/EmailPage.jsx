@@ -2,24 +2,15 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import {
   FiRefreshCw, FiRotateCw, FiTrash2, FiSave, FiChevronDown, FiChevronRight,
   FiCheckCircle, FiAlertCircle, FiClock, FiBellOff, FiPause, FiPlay,
-  FiClipboard, FiMail,
+  FiClipboard, FiFeather,
 } from 'react-icons/fi';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
-
-// --- Email-specific actionable/grouping logic (mirrors slackQueue.js but
-// terminal state is 'approved' instead of 'sent') ---
-
-function isActionable(item) {
-  const s = item && item.status;
-  return s !== 'approved' && s !== 'dismissed';
-}
-
-function reviewGroup(item) {
-  if (!isActionable(item)) return null;
-  if (item && item.status === 'needs-classify') return 'classifying';
-  if (item && item.classification === 'fyi') return 'fyi';
-  return 'reply';
-}
+// Single source of truth for COUNTING/GROUPING (kept in lockstep with the NavBar
+// bubble and server/routes/email.py — see D-035). The page no longer re-defines
+// these inline so the page sections and the bubble can never drift.
+import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
+// Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
+import { threadTurns, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight } from './emailDetail';
 
 // --- Constants ---
 
@@ -129,6 +120,26 @@ export default function EmailPage() {
   const [editingId, setEditingId] = useState(null);
   const [draftText, setDraftText] = useState('');
   const [busyId, setBusyId] = useState(null);
+  const [polishingId, setPolishingId] = useState(null); // item mid fluency-polish
+
+  // The draft <textarea>, auto-sized to its content so a short reply isn't framed
+  // by a tall empty box. autoSizeDraft() shrinks-then-grows to scrollHeight
+  // (capped); it runs on edit (in the textarea's onChange) AND on programmatic
+  // text changes (row expand / Polish) via the effect below.
+  const draftRef = useRef(null);
+  const autoSizeDraft = () => {
+    const ta = draftRef.current;
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = autoSizeHeight(ta.scrollHeight, 320) + 'px';
+  };
+
+  // Muted-conversations management. GET /api/email/muted returns
+  // { muteKey: unixSeconds }; shown in its own collapsible section so the user can
+  // review and unmute. Best-effort — a failed fetch just leaves the section empty.
+  const [muted, setMuted] = useState({});
+  const [unmutingKey, setUnmutingKey] = useState(null);
+  const [mutedOpen, setMutedOpen] = useState(false);
 
   const [draftingIds, setDraftingIds] = useState(() => new Set());
   const [draftFailedIds, setDraftFailedIds] = useState(() => new Set());
@@ -233,12 +244,27 @@ export default function EmailPage() {
     }
   };
 
-  useEffect(() => { refresh(); fetchHealth(); fetchStyle(); }, []);
+  // Load the muted-conversations map for the management section. Best-effort: a
+  // failure just leaves the section empty rather than blocking the page.
+  const refreshMuted = async () => {
+    try {
+      const res = await fetch('/api/email/muted');
+      const json = await res.json().catch(() => null);
+      setMuted(json && json.muted && typeof json.muted === 'object' ? json.muted : {});
+    } catch {
+      /* best-effort — leave whatever we had */
+    }
+  };
+
+  useEffect(() => { refresh(); fetchHealth(); fetchStyle(); refreshMuted(); }, []);
 
   useLiveUpdates(['email_changed'], () => {
     clearRef(scanHintRef);
     setScanning(false);
     if (!editingId) refresh();
+    // A scan-driven mute/unmute or a 30-day prune can change the muted map; keep
+    // the management section current. Cheap GET; safe to run even while editing.
+    refreshMuted();
   });
 
   // Cleanup on unmount
@@ -272,6 +298,15 @@ export default function EmailPage() {
     const id = setInterval(() => setTick(t => t + 1), SCAN_LABEL_TICK_MS);
     return () => clearInterval(id);
   }, []);
+
+  // Auto-size the draft textarea whenever the row it belongs to opens or its
+  // displayed text changes by a NON-typing path — expanding a row, or Polish
+  // replacing the text. (Typing is sized inline in the textarea's onChange.) The
+  // textarea only exists while a row is expanded, so this no-ops otherwise.
+  useEffect(() => {
+    autoSizeDraft();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandedId, editingId, draftText, items]);
 
   // Manual refresh
   const refreshQueue = async () => {
@@ -501,6 +536,45 @@ export default function EmailPage() {
     await generateDraft(id, { quiet: false });
   };
 
+  // "Polish": take the text CURRENTLY in this row's box, ask the stateless,
+  // MCP-free /api/email/polish seam to improve its fluency while keeping the
+  // user's own voice and language, and drop the result back into the box as an
+  // UNSAVED edit (we set editingId + draftText, never touching the stored draft
+  // or sending anything). It runs on whatever the user is looking at — their own
+  // edits if editing, otherwise the stored draft. Fail-loud: on any failure we
+  // surface the banner and leave the text exactly as it was (never fabricate).
+  const polishDraft = async (id) => {
+    const item = items.find(it => it.id === id);
+    if (!item) return;
+    const { ok, text } = polishSource(id, editingId, draftText, item);
+    if (!ok) {
+      setError('Nothing to polish yet — write or generate a draft first.');
+      return;
+    }
+    setPolishingId(id);
+    setError(null);
+    try {
+      const res = await fetch('/api/email/polish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok || !json || json.available === false) {
+        setError(`Couldn't polish the draft: ${(json && json.reason) || 'unavailable'}`);
+        return;
+      }
+      // Land the polished text as an editable, unsaved edit so the existing diff
+      // vs. the generated baseline + Save + Approve flow handle it unchanged.
+      setEditingId(id);
+      setDraftText(json.draft || '');
+    } catch {
+      setError("Couldn't polish the draft.");
+    } finally {
+      setPolishingId(null);
+    }
+  };
+
   // Dismiss
   const dismiss = async (id) => {
     setBusyId(id);
@@ -583,11 +657,95 @@ export default function EmailPage() {
       if (expandedId === id) { setExpandedId(null); setEditingId(null); }
       setError(null);
       refresh();
+      refreshMuted(); // keep the Muted-conversations section in sync
     } catch {
       setError('Failed to mute the conversation.');
     } finally {
       setBusyId(null);
     }
+  };
+
+  // Unmute one conversation: DELETE /api/email/muted/{key}. Un-muting only stops
+  // future scans from skipping the conversation — it does NOT resurrect any
+  // dismissed item (a genuinely new message earns a fresh skeleton). 409 →
+  // re-read the fresh etag & retry once, mirroring mute (a scan can bump the
+  // shared file's etag between our load and the click).
+  const unmute = async (key) => {
+    setUnmutingKey(key);
+    const del = (withEtag) =>
+      fetch(`/api/email/muted/${encodeURIComponent(key)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ etag: withEtag }),
+      });
+    try {
+      let res = await del(etag);
+      if (res.status === 409) {
+        const fresh = await fetch('/api/email/queue').then(r => r.json()).catch(() => null);
+        if (fresh && fresh.etag) {
+          setEtag(fresh.etag);
+          res = await del(fresh.etag);
+        }
+      }
+      const json = await res.json().catch(() => null);
+      if (json && json.etag) setEtag(json.etag);
+      if (!res.ok) {
+        // 404 → the key was already gone (aged out / unmuted elsewhere); just
+        // resync the list rather than alarm the user.
+        if (res.status !== 404) {
+          setError(`Couldn't unmute that conversation (HTTP ${res.status}).`);
+        }
+      } else {
+        setError(null);
+      }
+      refreshMuted();
+    } catch {
+      setError("Couldn't unmute that conversation — the request did not complete.");
+    } finally {
+      setUnmutingKey(null);
+    }
+  };
+
+  // Dismiss every item in a declared group (sequential soft-DELETE per item,
+  // best-effort). Skips terminal items, adopts the fresh etag after each, and
+  // refreshes once at the end. Each dismiss is a recoverable soft state flip
+  // (Undo from the Dismissed section). NEVER sends.
+  //
+  // Etag handling: each successful write bumps the queue's etag, so we thread a
+  // LOCAL `cur` through the loop and advance it from every response. setEtag()
+  // alone is a next-render update invisible to the running loop, so relying on
+  // it would send a stale etag for items #2..N and the backend
+  // (`expected_etag or current_etag`) would 409 them instead of falling back to
+  // current — silently leaving most of the group undismissed. On a 409 (etag
+  // raced by something outside this loop) we re-read the fresh queue etag and
+  // retry that one item, so EVERY actionable item ends up dismissed.
+  const dismissAll = async (list) => {
+    let cur = etag;
+    for (const item of list) {
+      if (item.status === 'approved' || item.status === 'dismissed') continue;
+      const del = (withEtag) =>
+        fetch(`/api/email/queue/${encodeURIComponent(item.id)}`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ etag: withEtag }),
+        });
+      try {
+        let res = await del(cur);
+        if (res.status === 409) {
+          const fresh = await fetch('/api/email/queue').then(r => r.json()).catch(() => null);
+          if (fresh && fresh.etag) {
+            cur = fresh.etag;
+            res = await del(cur);
+          }
+        }
+        if (res.ok) {
+          const json = await res.json().catch(() => null);
+          if (json && json.etag) cur = json.etag;
+        }
+      } catch { /* best-effort */ }
+    }
+    setEtag(cur ?? null);
+    refresh();
   };
 
   // --- Detail panel ---
@@ -619,6 +777,15 @@ export default function EmailPage() {
     const showDiff = !isReadOnly && generated.trim() !== '' && generated.trim() !== currentText.trim();
     const diffTokens = showDiff ? wordDiff(generated, currentText) : null;
 
+    // Multi-turn thread history: an ordered array of {sender, timestamp, body}
+    // captured by the scan worker. Read defensively (older items predate the
+    // field) so N turns render N cards, 1 → 1, empty/missing → a graceful
+    // placeholder — never crashing, never rendering 'undefined'. All text is
+    // EXTERNAL email content, rendered via React's {…} interpolation (escaped),
+    // never dangerouslySetInnerHTML. The short `threadContext` summary (a 1-2
+    // sentence gist) is complementary and still shown above when present.
+    const hist = threadTurns(item);
+
     return (
       <div style={{ padding: 'var(--space-md)', background: 'var(--surface2)', borderRadius: 'var(--radius)' }}>
         {/* --- Email body (collapsible so it doesn't dominate) --- */}
@@ -641,15 +808,44 @@ export default function EmailPage() {
           )}
         </div>
 
-        {/* --- Thread context summary --- */}
-        {item.threadContext && (
-          <div style={sectionStyle}>
-            <div style={labelStyle}>Thread summary</div>
-            <div style={{ color: 'var(--text)', fontSize: '0.85em', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+        {/* --- Thread history (multi-message timeline) --- */}
+        <div style={sectionStyle}>
+          <div style={labelStyle}>Thread history</div>
+          {item.threadContext && (
+            <div style={{ color: 'var(--muted)', fontSize: '0.82em', fontStyle: 'italic', marginBottom: '0.5em', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
               {item.threadContext}
             </div>
-          </div>
-        )}
+          )}
+          {hist.length === 0 ? (
+            <div style={{ color: 'var(--muted)', fontSize: '0.85em', fontStyle: 'italic' }}>
+              No thread history was captured for this item.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em' }}>
+              {hist.map((turn, i) => (
+                <div
+                  key={i}
+                  className="card"
+                  style={{
+                    padding: '0.6em 0.9em',
+                    borderLeft: '3px solid var(--accent)',
+                    fontSize: '0.85em',
+                  }}
+                >
+                  <div style={{ display: 'flex', gap: '0.6em', alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 600, color: 'var(--text)' }}>{turn.sender || 'unknown'}</span>
+                    {turn.timestamp && (
+                      <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(turn.timestamp)}</span>
+                    )}
+                  </div>
+                  <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
+                    {turn.body || ''}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* --- Draft reply --- */}
         <div style={sectionStyle}>
@@ -729,13 +925,38 @@ export default function EmailPage() {
             )
           ) : (
             <textarea
+              ref={draftRef}
               className="form-textarea"
               value={editing ? draftText : (item.draft || '')}
-              onChange={e => { setEditingId(item.id); setDraftText(e.target.value); }}
+              onChange={e => { setEditingId(item.id); setDraftText(e.target.value); autoSizeDraft(); }}
               placeholder="The drafted reply will appear here. Edit it before approving — your edits teach the style preferences."
               style={{ width: '100%' }}
             />
           )}
+          {/* --- Draft tools — operate on the text in the box above ----------
+              Polish (rewrite for fluency) sits WITH the textarea because it
+              shapes the draft, distinct from the disposition row (Approve /
+              Dismiss / Mute) below. Shown on any editable, drafted row; disabled
+              while polishing/busy or when there's no draft text to polish. */}
+          {!isReadOnly && !undrafted && (() => {
+            const polishText = (editing ? draftText : (item.draft || ''));
+            const noText = polishText.trim() === '';
+            const isPolishing = polishingId === item.id;
+            return (
+              <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.5em' }}>
+                <button
+                  className="btn"
+                  disabled={isBusy || isPolishing || noText}
+                  onClick={() => polishDraft(item.id)}
+                  title={noText
+                    ? 'Write or generate a draft first'
+                    : 'Rewrite the current text to read more fluently while keeping your own wording and language'}
+                >
+                  <FiFeather size={13} /> {isPolishing ? 'Polishing...' : 'Polish'}
+                </button>
+              </div>
+            );
+          })()}
         </div>
 
         {/* --- Word diff vs generated --- */}
@@ -934,6 +1155,19 @@ export default function EmailPage() {
     border: 'none', padding: 0, fontWeight: 600,
   };
 
+  // "Dismiss all (N)" for a group header — soft-dismisses every item in that
+  // declared group (recoverable via Undo), leaving other groups untouched.
+  const dismissAllBtn = (list) => (
+    <button
+      className="btn"
+      style={{ fontSize: '0.78em', padding: '0.2em 0.5em' }}
+      onClick={() => dismissAll(list)}
+      title="Dismiss every item in this group (recoverable from the Dismissed section)"
+    >
+      <FiTrash2 size={11} /> Dismiss all ({list.length})
+    </button>
+  );
+
   // Partition items
   const needsReviewItems = items.filter(isActionable);
   const approvedItems = items.filter(it => it.status === 'approved');
@@ -949,6 +1183,12 @@ export default function EmailPage() {
   const unknownItems = replyItems.filter(it => !it.recipientType || it.recipientType === 'unknown');
   const fyiItems = needsReviewItems.filter(it => reviewGroup(it) === 'fyi');
   const classifyingItems = needsReviewItems.filter(it => reviewGroup(it) === 'classifying');
+
+  // Muted-conversations management: the keys of the muted map, newest-muted
+  // first. An email mute key is the raw conversationId, so a label resolves from
+  // any item on the same conversation (subject, then sender), falling back to the
+  // raw key. Empty map renders nothing.
+  const mutedKeys = sortedMutedKeys(muted);
 
   return (
     <div>
@@ -1040,7 +1280,7 @@ export default function EmailPage() {
       {/* Progress summary */}
       {needsReviewItems.length > 0 && (
         <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginBottom: 'var(--space-md)' }}>
-          {needsReviewItems.length} to review
+          {countActionable(items)} to review
           {replyItems.length > 0 ? ` · ${replyItems.length} reply` : ''}
           {fyiItems.length > 0 ? ` · ${fyiItems.length} fyi` : ''}
           {classifyingItems.length > 0 ? ` · ${classifyingItems.length} classifying...` : ''}
@@ -1073,50 +1313,55 @@ export default function EmailPage() {
         <>
           {toOnlyItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.4em' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   To me only ({toOnlyItems.length})
                 </span>
+                {dismissAllBtn(toOnlyItems)}
               </div>
               <div className="card">{renderTable(toOnlyItems)}</div>
             </div>
           )}
           {toItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.4em' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Me in To ({toItems.length})
                 </span>
+                {dismissAllBtn(toItems)}
               </div>
               <div className="card">{renderTable(toItems)}</div>
             </div>
           )}
           {ccItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.4em' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Me in CC ({ccItems.length})
                 </span>
+                {dismissAllBtn(ccItems)}
               </div>
               <div className="card">{renderTable(ccItems)}</div>
             </div>
           )}
           {dlItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.4em' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Via DL ({dlItems.length})
                 </span>
+                {dismissAllBtn(dlItems)}
               </div>
               <div className="card">{renderTable(dlItems)}</div>
             </div>
           )}
           {unknownItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.4em' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Other ({unknownItems.length})
                 </span>
+                {dismissAllBtn(unknownItems)}
               </div>
               <div className="card">{renderTable(unknownItems)}</div>
             </div>
@@ -1125,10 +1370,13 @@ export default function EmailPage() {
           {/* FYI section (collapsible) */}
           {fyiItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
-              <button type="button" style={collapsibleStyle} onClick={() => setFyiOpen(v => !v)}>
-                {fyiOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
-                FYI — no reply needed ({fyiItems.length})
-              </button>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
+                <button type="button" style={collapsibleStyle} onClick={() => setFyiOpen(v => !v)}>
+                  {fyiOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+                  FYI — no reply needed ({fyiItems.length})
+                </button>
+                {dismissAllBtn(fyiItems)}
+              </div>
               {fyiOpen && (
                 <div className="card" style={{ marginTop: '0.5em' }}>{renderTable(fyiItems)}</div>
               )}
@@ -1172,6 +1420,60 @@ export default function EmailPage() {
           {dismissedOpen && (
             <div className="card" style={{ marginTop: '0.5em' }}>
               {renderTable(dismissedItems)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* --- Muted conversations (collapsible, collapsed by default) --- */}
+      {/* The conversations whose future messages the scan skips. Each row shows a
+          friendly label (resolved from any queue item on the same conversation)
+          and an Unmute button. Empty map renders nothing. */}
+      {mutedKeys.length > 0 && (
+        <div style={{ marginTop: 'var(--space-md)' }}>
+          <button type="button" style={collapsibleStyle} onClick={() => setMutedOpen(v => !v)}>
+            {mutedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+            <FiBellOff size={13} /> Muted conversations ({mutedKeys.length})
+          </button>
+          {mutedOpen && (
+            <div className="card" style={{ marginTop: '0.5em' }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Conversation</th>
+                    <th style={{ textAlign: 'center' }}>Muted</th>
+                    <th style={{ textAlign: 'center' }}>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mutedKeys.map(key => (
+                    <tr key={key}>
+                      <td>
+                        <span>{mutedLabel(key, items)}</span>
+                        <span style={{ color: 'var(--muted)', fontSize: '0.78em', marginLeft: '0.5em' }}>
+                          {key}
+                        </span>
+                      </td>
+                      <td style={{ color: 'var(--muted)', fontSize: '0.85em', textAlign: 'center' }}>
+                        {relativeTime(muted[key] ? muted[key] * 1000 : null)}
+                      </td>
+                      <td style={{ textAlign: 'center' }}>
+                        <button
+                          className="btn"
+                          disabled={unmutingKey === key}
+                          onClick={() => unmute(key)}
+                          title="Unmute — let future messages in this conversation surface again"
+                        >
+                          <FiBellOff size={13} /> {unmutingKey === key ? 'Unmuting...' : 'Unmute'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div style={{ color: 'var(--muted)', fontSize: '0.78em', padding: '0.4em 0.6em 0' }}>
+                Unmuting only lets future messages surface again — it does not restore any dismissed message. Muted conversations also expire automatically after 30 days.
+              </div>
             </div>
           )}
         </div>
