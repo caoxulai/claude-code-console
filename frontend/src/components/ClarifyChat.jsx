@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { FiSend, FiSquare, FiCheckCircle, FiChevronDown, FiChevronRight, FiSave } from 'react-icons/fi';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import { useChat } from '../hooks/useChat';
 import { parseTranscriptToMessages } from '../utils/transcript';
 
@@ -9,6 +12,20 @@ import { parseTranscriptToMessages } from '../utils/transcript';
 // a partial stream fragment. Scanning the prompt echo or mid-stream would
 // "save" the instruction sentence the instant the chat opens. See CLARIFY_PROMPT.
 const MARKER_RE = /---CLARIFICATION---\n([\s\S]*?)\n---END---/;
+
+// DISPLAY-ONLY: strip the two verbatim marker fence lines from the LIVE assistant
+// turn before rendering it as markdown. The fences are an internal machine
+// instruction (so trySaveSummary can extract match[1]) — never content the user
+// needs to see. Crucially, under GFM a line of three-or-more dashes renders as a
+// thematic break <hr>, and a non-empty line immediately followed by `---` becomes
+// a Setext heading, so leaving the fences in would inject stray <hr>/heading
+// artifacts. This NEVER touches MARKER_RE or trySaveSummary (the save path keeps
+// matching the verbatim markers); it only cleans the text passed to ReactMarkdown.
+function stripClarifyMarkers(text) {
+  return (text || '')
+    .replace(/^---CLARIFICATION---$\n?/m, '')
+    .replace(/^---END---$\n?/m, '');
+}
 
 // Build the auto-send clarification prompt. Every interpolated field is guarded
 // so an empty subject/description/project never prints the literal string
@@ -288,7 +305,7 @@ export default function ClarifyChat({ task, onSave }) {
         </div>
       )}
 
-      {/* Scrollable message area (plain text, no markdown) */}
+      {/* Scrollable message area (assistant turns render markdown; user/notes stay plain) */}
       <div
         ref={scrollRef}
         style={{
@@ -397,9 +414,12 @@ export default function ClarifyChat({ task, onSave }) {
   );
 }
 
-// A single message rendered as PLAIN TEXT (no markdown) — a labeled user bubble
-// vs. assistant text. Tool-call / system / error messages from useChat render as
-// a muted note so the mini-chat stays light.
+// A single message. The ASSISTANT turn renders as markdown via the canonical
+// chat stack (chat-msg-content markdown-body + ReactMarkdown/remarkGfm/
+// rehypeHighlight, mirroring MessageBubble) so it matches the main ChatPage; the
+// user bubble and the tool-call / system / error notes stay PLAIN (user-typed
+// text must render literally, and the auto-sent first prompt names the marker
+// fences verbatim — rendering it as markdown would inject <hr>/heading artifacts).
 function ClarifyMessage({ message }) {
   const { role, content } = message;
 
@@ -418,12 +438,14 @@ function ClarifyMessage({ message }) {
   }
 
   if (role === 'assistant') {
+    // Strip the verbatim marker fences for DISPLAY ONLY (the save path still
+    // matches them via MARKER_RE) so the dashes never render as <hr>/headings.
+    const displayContent = stripClarifyMarkers(content);
     return (
-      <div style={{
-        fontSize: 'var(--fs-sm)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-        color: 'var(--text)', lineHeight: 1.5,
-      }}>
-        {content}
+      <div className="chat-msg-content markdown-body" style={{ fontSize: 'var(--fs-sm)', wordBreak: 'break-word' }}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+          {displayContent}
+        </ReactMarkdown>
       </div>
     );
   }

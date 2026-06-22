@@ -237,16 +237,17 @@ function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
           <label style={{ display: 'block', fontSize: 'var(--fs-xs)', color: 'var(--muted)', marginBottom: 'var(--space-xs)', fontWeight: 600 }}>
             Clarification Summary
           </label>
-          <div style={{
+          <div className="markdown-body" style={{
             background: 'var(--surface)',
             border: '1px solid var(--border)',
             borderRadius: 'var(--radius)',
             padding: 'var(--space-sm)',
-            fontSize: 'var(--fs-sm)',
-            whiteSpace: 'pre-wrap',
-            lineHeight: 1.5,
+            fontSize: '0.92em',
+            lineHeight: 1.6,
           }}>
-            {clarSummary}
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+              {clarSummary}
+            </ReactMarkdown>
           </div>
         </div>
       ) : stage === 'clarifying' ? (
@@ -264,7 +265,7 @@ function TaskDetailPanel({ task, onSave, onApprovePlan, saving }) {
           Plan Spec
         </label>
         {hasPlanStored ? (
-          <div style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 'var(--space-sm)', fontSize: 'var(--fs-sm)', maxHeight: '300px', overflow: 'auto' }}>
+          <div className="markdown-body" style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 'var(--space-sm)', fontSize: '0.92em', lineHeight: 1.6, maxHeight: '300px', overflow: 'auto' }}>
             <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
               {task.plan.spec}
             </ReactMarkdown>
