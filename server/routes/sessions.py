@@ -50,6 +50,7 @@ def register(app: web.Application):
     app.router.add_get("/api/sessions/{session_id}/transcript", get_transcript)
     app.router.add_get("/api/sessions/{session_id}/title", get_session_title)
     app.router.add_put("/api/sessions/{session_id}/title", set_session_title)
+    app.router.add_delete("/api/sessions/cleanup", cleanup_sessions)
     app.router.add_delete("/api/sessions/{session_id}", delete_session)
 
     # ── Session-transcript file-watcher (E2) ──────────────────────────────────
@@ -66,6 +67,10 @@ def register(app: web.Application):
     # untouched.
     app.on_startup.append(_start_watcher)
     app.on_cleanup.append(_stop_watcher)
+
+    # ── Print-mode session cleanup worker ─────────────────────────────────────
+    app.on_startup.append(_start_cleanup_worker)
+    app.on_cleanup.append(_stop_cleanup_worker)
 
 
 def _is_interactive_session(path: Path) -> bool:
@@ -381,6 +386,10 @@ def _collect_doc_files(project_path: Path) -> list[dict]:
                 results.append({"name": md.name, "path": str(md)})
 
     results.sort(key=lambda r: _extract_doc_date(Path(r["path"])), reverse=True)
+    # Assign a creation-order number: oldest doc = 1, newest = N.
+    total = len(results)
+    for i, r in enumerate(results):
+        r["number"] = total - i
     return results
 
 
@@ -612,13 +621,16 @@ _projects_cache = _ProjectsCache()
 _projects_cache_lock = asyncio.Lock()
 
 
-def _compute_projects() -> list:
+def _compute_projects(home_bucket: str) -> list:
     """Build the projects LISTING (sync). Returns the slim per-project dicts.
 
     The listing carries a one-line `description` (first prose line of CLAUDE.md,
     else README) instead of the full markdown bodies — the full claudeMd/readme/
     readmeName are fetched on demand via GET /api/projects/{id}/detail. Every
     other field is unchanged. Runs entirely off the event loop via to_thread.
+
+    home_bucket is the slug for the user's home cwd (the bucket where
+    _is_interactive_session applies instead of _is_print_mode_session).
     """
     projects: list = []
 
@@ -663,7 +675,29 @@ def _compute_projects() -> list:
         slug = _project_path_to_claude_slug(project_path)
         session_dir = CLAUDE_PROJECTS_BASE / slug
         jsonl_files = list(session_dir.glob("*.jsonl")) if session_dir.is_dir() else []
-        session_count = len(jsonl_files)
+
+        # Apply the SAME three-tier filter as _compute_sessions (lines 988-1005):
+        # count only files that the Sessions tab would actually show.
+        session_count = 0
+        background_count = 0
+        for f in jsonl_files:
+            try:
+                is_print = _is_print_mode_session(f)
+            except Exception:
+                # Unparseable file: neither interactive nor background.
+                continue
+            if is_print:
+                background_count += 1
+                continue
+            # Home bucket uses _is_interactive_session (stricter); others just
+            # exclude print-mode (already handled above).
+            if slug == home_bucket:
+                if not _is_interactive_session(f):
+                    continue
+            # ALL buckets: skip files without a real user/assistant turn.
+            if not _has_real_turn(f):
+                continue
+            session_count += 1
 
         # d. Check for memory files
         memory_dir = session_dir / "memory" if session_dir.is_dir() else None
@@ -711,6 +745,7 @@ def _compute_projects() -> list:
             "name": project_name,
             "path": project_path,
             "sessionCount": session_count,
+            "backgroundSessionCount": background_count,
             "memoryCount": memory_count,
             "taskCount": tc["total"],
             "openTaskCount": tc["open"],
@@ -750,6 +785,8 @@ async def list_projects(request: web.Request) -> web.Response:
     cached for a few seconds so back-to-back page loads don't re-walk the tree.
     """
     global _projects_cache
+    home_bucket = _cwd_to_project_dir(str(request.app["default_cwd"]))
+
     now = time.monotonic()
     if now - _projects_cache.updated_at < _PROJECTS_CACHE_TTL and _projects_cache.response is not None:
         return web.json_response(_projects_cache.response)
@@ -758,7 +795,7 @@ async def list_projects(request: web.Request) -> web.Response:
         now = time.monotonic()
         if now - _projects_cache.updated_at < _PROJECTS_CACHE_TTL and _projects_cache.response is not None:
             return web.json_response(_projects_cache.response)
-        projects = await asyncio.to_thread(_compute_projects)
+        projects = await asyncio.to_thread(_compute_projects, home_bucket)
         _projects_cache = _ProjectsCache(response=projects, updated_at=time.monotonic())
         return web.json_response(projects)
 
@@ -1311,6 +1348,106 @@ async def _stop_watcher(app) -> None:
     The watcher holds no subprocess, so there is only the task to cancel and await.
     """
     task = app.pop("session_watch_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+# ── Print-mode session cleanup (B/C/D) ────────────────────────────────────────
+
+_CLEANUP_MAX_AGE_S = 30 * 86400  # 30 days
+
+
+def _cleanup_stale_print_sessions() -> int:
+    """Delete print-mode .jsonl files older than 30 days (sync).
+
+    Scans ALL dirs under CLAUDE_PROJECTS_BASE. A file is deleted ONLY when:
+      1. _is_print_mode_session(path) returns True (positively identified), AND
+      2. stat.st_mtime < (time.time() - 30 * 86400) (strictly older than 30 days).
+
+    Files that raise OSError or where _is_print_mode_session returns False or
+    raises are NEVER deleted — an unparseable file is ambiguous and must be
+    preserved. Returns the count of deleted files.
+    """
+    deleted = 0
+    if not CLAUDE_PROJECTS_BASE.is_dir():
+        return deleted
+    cutoff = time.time() - _CLEANUP_MAX_AGE_S
+    for d in CLAUDE_PROJECTS_BASE.iterdir():
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.jsonl"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_mtime >= cutoff:
+                continue
+            # Only delete files POSITIVELY identified as print-mode.
+            try:
+                if not _is_print_mode_session(f):
+                    continue
+            except Exception:
+                continue
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError:
+                continue
+    return deleted
+
+
+async def cleanup_sessions(request: web.Request) -> web.Response:
+    """DELETE /api/sessions/cleanup — run print-mode session cleanup on demand."""
+    n = await asyncio.to_thread(_cleanup_stale_print_sessions)
+    return web.json_response({"deleted": n})
+
+
+# ── Cleanup background worker (mirrors _session_watcher lifecycle exactly) ────
+
+_CLEANUP_INTERVAL_S = 86400  # once per day
+
+
+async def _session_cleanup_worker(app) -> None:
+    """Delete stale print-mode sessions once per day.
+
+    Sleeps FIRST (inert on startup — app.on_startup fires under aiohttp_client(app)
+    in EVERY test, so it must never delete files during the suite). CancelledError
+    propagates so shutdown can cancel+await cleanly, and a per-iteration try/except
+    catches+logs everything else so one bad scan never kills the loop.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_CLEANUP_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+
+        try:
+            n = await asyncio.to_thread(_cleanup_stale_print_sessions)
+            mark_worker_run(app, 'Session Cleanup', result=f'deleted {n} files' if n else 'no stale sessions')
+            if n:
+                logger.info("Session cleanup: deleted %d stale print-mode sessions", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — one bad scan must not kill the loop
+            logger.warning("Session cleanup worker iteration failed: %s", e)
+
+
+async def _start_cleanup_worker(app) -> None:
+    """on_startup: launch the session-cleanup background task (idempotent)."""
+    task = app.get("session_cleanup_task")
+    if task is None or task.done():
+        app["session_cleanup_task"] = asyncio.create_task(_session_cleanup_worker(app))
+        register_worker(app, 'Session Cleanup', 'session_cleanup_task', _CLEANUP_INTERVAL_S, project=None, description='Removes background session files older than 30 days to free disk space')
+
+
+async def _stop_cleanup_worker(app) -> None:
+    """on_cleanup: cancel AND await the cleanup worker so it tears down cleanly."""
+    task = app.pop("session_cleanup_task", None)
     if task is None:
         return
     task.cancel()

@@ -938,6 +938,11 @@ export default function ProjectsPage() {
         >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.sessionCount}</div>
           <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Sessions</div>
+          {project.backgroundSessionCount > 0 && (
+            <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', marginTop: '0.15em' }}>
+              ({project.backgroundSessionCount.toLocaleString()} background)
+            </div>
+          )}
         </div>
         <div
           onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
@@ -1191,9 +1196,17 @@ export default function ProjectsPage() {
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 marginBottom: '2px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.4em',
               }}
             >
-              {f.name}
+              {f.number != null && (
+                <span style={{ color: 'var(--muted)', fontFamily: 'monospace', fontSize: '0.85em', flexShrink: 0 }}>
+                  #{f.number}
+                </span>
+              )}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.name}</span>
             </div>
           ))}
         </div>
@@ -1206,7 +1219,8 @@ export default function ProjectsPage() {
             </div>
           ) : (
             <div>
-              <div style={{ fontWeight: 600, fontSize: 'var(--fs-sm)', marginBottom: 'var(--space-sm)' }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--fs-sm)', marginBottom: 'var(--space-sm)', display: 'flex', alignItems: 'center', gap: '0.5em' }}>
+                {(() => { const f = sopFiles.find(s => s.name === selectedSop); return f?.number != null ? <span style={{ color: 'var(--muted)', fontFamily: 'monospace', fontSize: '0.85em' }}>#{f.number}</span> : null; })()}
                 {selectedSop}
               </div>
               <div className="markdown-body" style={{ fontSize: 'var(--fs-sm)' }}>

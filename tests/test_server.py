@@ -475,8 +475,9 @@ def projects_layout(tmp_path: Path, monkeypatch):
     (alpha / ".claude" / "design" / "design-doc.md").write_text("design doc", encoding="utf-8")
     alpha_sessions = claude_base / slug_for(alpha)
     alpha_sessions.mkdir()
-    _write_jsonl(alpha_sessions / "s1.jsonl", [{"type": "mode"}])
-    _write_jsonl(alpha_sessions / "s2.jsonl", [{"type": "mode"}])
+    _write_jsonl(alpha_sessions / "s1.jsonl", [{"type": "mode"}, {"type": "user", "message": "hi"}, {"type": "assistant", "message": "hello"}])
+    _write_jsonl(alpha_sessions / "s2.jsonl", [{"type": "mode"}, {"type": "user", "message": "hi"}, {"type": "assistant", "message": "hello"}])
+    _write_jsonl(alpha_sessions / "s3_print.jsonl", [{"type": "queue-operation"}])
     alpha_mem = alpha_sessions / "memory"
     alpha_mem.mkdir()
     for name in ("m1.md", "m2.md", "m3.md"):
@@ -489,7 +490,7 @@ def projects_layout(tmp_path: Path, monkeypatch):
     (beta / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
     beta_sessions = claude_base / slug_for(beta)
     beta_sessions.mkdir()
-    _write_jsonl(beta_sessions / "b1.jsonl", [{"type": "mode"}])
+    _write_jsonl(beta_sessions / "b1.jsonl", [{"type": "mode"}, {"type": "user", "message": "hi"}, {"type": "assistant", "message": "hello"}])
 
     # gamma: no claude activity
     (workspace / "gamma").mkdir()
@@ -546,6 +547,7 @@ async def test_projects_lists_all_skips_hidden(client, projects_layout):
 async def test_projects_session_and_memory_counts(client, projects_layout):
     projects = await _get_projects(client)
     assert projects["alpha"]["sessionCount"] == 2
+    assert projects["alpha"]["backgroundSessionCount"] == 1
     assert projects["alpha"]["memoryCount"] == 3
     assert {m["name"] for m in projects["alpha"]["memoryFiles"]} == {"m1.md", "m2.md", "m3.md"}
     assert projects["beta"]["sessionCount"] == 1
@@ -2316,6 +2318,10 @@ async def test_projects_last_activity_reflects_newest_session_mtime(client, proj
     newest = alpha_dir / "s2.jsonl"
     os.utime(alpha_dir / "s1.jsonl", (1_700_000_000, 1_700_000_000))
     os.utime(newest, (1_700_100_000, 1_700_100_000))
+    # Set print-mode session to be older so it doesn't interfere.
+    for f in alpha_dir.glob("*.jsonl"):
+        if f.name not in ("s1.jsonl", "s2.jsonl"):
+            os.utime(f, (1_700_000_000, 1_700_000_000))
 
     projects = await _get_projects(client)
     from datetime import datetime
@@ -9910,5 +9916,117 @@ def test_extract_title_custom_overrides_ai_and_last_wins(tmp_path):
     p2 = tmp_path / "s2.jsonl"
     _write_jsonl(p2, [{"type": "ai-title", "title": "Only AI"}])
     assert sessions_mod._extract_title(p2) == "Only AI"
+
+
+# ── Cleanup endpoint and worker tests ─────────────────────────────────────────
+
+
+async def test_cleanup_endpoint_deletes_stale_print_sessions(client, tmp_path, monkeypatch):
+    """DELETE /api/sessions/cleanup removes print-mode files older than 30 days."""
+    import time
+    claude_base = tmp_path / "dot_claude" / "projects"
+    claude_base.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", claude_base)
+
+    proj = claude_base / "-test-project"
+    proj.mkdir()
+
+    # Freeze time to eliminate wall-clock drift between os.utime and cleanup.
+    fixed_now = time.time()
+
+    # A print-mode session older than 30 days — should be deleted.
+    stale = proj / "stale_print.jsonl"
+    _write_jsonl(stale, [{"type": "queue-operation"}])
+    old_mtime = fixed_now - 31 * 86400
+    os.utime(stale, (old_mtime, old_mtime))
+
+    # A print-mode session exactly 30 days old — should NOT be deleted (boundary).
+    boundary = proj / "boundary_print.jsonl"
+    _write_jsonl(boundary, [{"type": "queue-operation"}])
+    boundary_mtime = fixed_now - 30 * 86400
+    os.utime(boundary, (boundary_mtime, boundary_mtime))
+
+    # A non-print-mode session older than 30 days — should NOT be deleted.
+    interactive_old = proj / "interactive_old.jsonl"
+    _write_jsonl(interactive_old, [{"type": "mode"}, {"type": "user", "message": "hi"}])
+    os.utime(interactive_old, (old_mtime, old_mtime))
+
+    # A recent print-mode session — should NOT be deleted.
+    recent_print = proj / "recent_print.jsonl"
+    _write_jsonl(recent_print, [{"type": "queue-operation"}])
+
+    # Freeze time.time so the cleanup cutoff uses the same "now" as mtime setup.
+    monkeypatch.setattr(time, "time", lambda: fixed_now)
+
+    resp = await client.delete("/api/sessions/cleanup")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["deleted"] == 1
+
+    # Verify correct file was deleted.
+    assert not stale.exists()
+    assert boundary.exists()
+    assert interactive_old.exists()
+    assert recent_print.exists()
+
+
+async def test_cleanup_preserves_unparseable_files(client, tmp_path, monkeypatch):
+    """Cleanup must never delete files that fail to parse."""
+    import time
+    claude_base = tmp_path / "dot_claude" / "projects"
+    claude_base.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", claude_base)
+
+    proj = claude_base / "-test-project"
+    proj.mkdir()
+
+    # An unparseable file older than 30 days — must NOT be deleted.
+    bad = proj / "bad.jsonl"
+    bad.write_text("not valid json\n", encoding="utf-8")
+    old_mtime = time.time() - 31 * 86400
+    os.utime(bad, (old_mtime, old_mtime))
+
+    resp = await client.delete("/api/sessions/cleanup")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["deleted"] == 0
+    assert bad.exists()
+
+
+def test_cleanup_stale_print_sessions_sync(tmp_path, monkeypatch):
+    """Unit test for _cleanup_stale_print_sessions sync helper."""
+    import time
+    claude_base = tmp_path / "projects"
+    claude_base.mkdir()
+    monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", claude_base)
+
+    proj = claude_base / "-my-project"
+    proj.mkdir()
+
+    # Stale print-mode file
+    stale = proj / "old.jsonl"
+    _write_jsonl(stale, [{"type": "queue-operation"}])
+    old_mtime = time.time() - 31 * 86400
+    os.utime(stale, (old_mtime, old_mtime))
+
+    # Fresh print-mode file
+    fresh = proj / "new.jsonl"
+    _write_jsonl(fresh, [{"type": "queue-operation"}])
+
+    deleted = sessions_mod._cleanup_stale_print_sessions()
+    assert deleted == 1
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+async def test_cleanup_endpoint_path_traversal_not_possible(client):
+    """The cleanup endpoint is a fixed path — no user-supplied path component.
+    Verify it responds to DELETE /api/sessions/cleanup correctly and does not
+    match as a session_id."""
+    # Ensure the endpoint exists and does not 404/405
+    resp = await client.delete("/api/sessions/cleanup")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "deleted" in data
 
 
