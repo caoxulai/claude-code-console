@@ -869,6 +869,10 @@ export default function ProjectsPage() {
     border: '1px solid var(--border)',
     transition: 'border-color 0.15s, background 0.15s',
     textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
   };
 
   const renderOverviewTab = (project) => (
@@ -937,12 +941,9 @@ export default function ProjectsPage() {
           onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
         >
           <div style={{ fontSize: '1.6em', fontWeight: 700, color: 'var(--text)' }}>{project.sessionCount}</div>
-          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>Sessions</div>
-          {project.backgroundSessionCount > 0 && (
-            <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', marginTop: '0.15em' }}>
-              ({project.backgroundSessionCount.toLocaleString()} background)
-            </div>
-          )}
+          <div style={{ color: 'var(--muted)', fontSize: 'var(--fs-xs)', fontWeight: 600, textTransform: 'uppercase', marginTop: '0.3em' }}>
+            Sessions{project.backgroundSessionCount > 0 ? ` · ${project.backgroundSessionCount.toLocaleString()} bg` : ''}
+          </div>
         </div>
         <div
           onClick={() => navigate(`/sessions?project=${projectPathToSlug(project.path)}`)}
