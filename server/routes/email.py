@@ -404,6 +404,10 @@ class _PersistentMcpState:
 _mcp_state = _PersistentMcpState()
 _mcp_connect_lock: asyncio.Lock | None = None
 
+# Strong refs to in-flight fire-and-forget mark-read tasks so the event loop
+# does not GC them mid-flight (asyncio only holds weak refs to bare tasks).
+_MARK_READ_TASKS: set = set()
+
 
 def _get_mcp_lock() -> asyncio.Lock:
     """Lazy-init the module-level connect/reconnect lock."""
@@ -682,7 +686,11 @@ def _build_prompt(action: str, payload: dict) -> str:
             f"\n\n{base}\n\n"
             "Return ONLY a STRICT JSON object (no prose, no markdown fences): "
             '{"draft": "<the reply text>", "generatedDraft": "<the same reply text>", '
-            '"threadContext": "<a 1-2 sentence summary of what the email is about>"}. '
+            '"threadContext": "<a 1-2 sentence summary of what the email is about>", '
+            '"threadAsk": "<a short phrase naming what the sender needs FROM ME -- a '
+            "question, decision, or action they are waiting on; if the email asks "
+            "nothing of me (an FYI, newsletter, or automated notice) return an EMPTY "
+            'string; do NOT invent an ask>"}. '
             "generatedDraft must equal draft."
         )
     elif action == "polish":
@@ -748,6 +756,9 @@ def _parse_agent_result(text: str, action: str) -> dict:
             return {"available": False, "reason": "Email classify classifications is not an array."}
         return {"available": True, "classifications": classifications}
     if action in ("draft", "regenerate"):
+        # 'draft' is the ONLY required key; threadContext (summary) and threadAsk
+        # (what the sender needs from me) are OPTIONAL -- a missing ask resolves to
+        # "" and must NEVER make a good draft unavailable nor get fabricated.
         if not isinstance(parsed, dict) or "draft" not in parsed:
             return {"available": False, "reason": f"Email {action} reply missing 'draft'."}
         return {
@@ -755,6 +766,7 @@ def _parse_agent_result(text: str, action: str) -> dict:
             "draft": parsed.get("draft", ""),
             "generatedDraft": parsed.get("generatedDraft", parsed.get("draft", "")),
             "threadContext": parsed.get("threadContext", ""),
+            "threadAsk": parsed.get("threadAsk", ""),
         }
     if action == "polish":
         # Fail loud on a missing 'draft' rather than fabricating a polished text.
@@ -972,8 +984,8 @@ async def _run_email_agent(action: str, payload: dict) -> dict:
 
     Actions:
       'classify'   -> {available:True, classifications:[...]}
-      'draft'      -> {available:True, draft:..., generatedDraft:..., threadContext:...}
-      'regenerate' -> {available:True, draft:..., generatedDraft:..., threadContext:...}
+      'draft'      -> {available:True, draft:..., generatedDraft:..., threadContext:..., threadAsk:...}
+      'regenerate' -> {available:True, draft:..., generatedDraft:..., threadContext:..., threadAsk:...}
       'save_draft' -> {available:True, draftSaved:True/False, draftId:...}
 
     Tests monkeypatch this to exercise the contract without spawning anything.
@@ -1645,6 +1657,12 @@ async def _draft_one(app, sem: asyncio.Semaphore, item_id: str) -> None:
     thread_ctx = result.get("threadContext", "")
     if isinstance(thread_ctx, str) and thread_ctx.strip():
         item["threadContext"] = thread_ctx.strip()
+    # threadAsk (what the sender needs from me) rides the SAME draft call. An
+    # absent/empty ask leaves any prior threadAsk untouched and never fails the
+    # save -- a no-ask FYI keeps an empty ask, never a fabricated one.
+    ask = result.get("threadAsk", "")
+    if isinstance(ask, str) and ask.strip():
+        item["threadAsk"] = ask.strip()
     item["status"] = "needs-review"
 
     try:
@@ -1881,8 +1899,52 @@ async def save_draft(request: web.Request) -> web.Response:
     return web.json_response({"item": item, "etag": new_etag})
 
 
+async def _mark_conversation_read(conv_id: str) -> None:
+    """Best-effort: mark a whole Outlook conversation read via email_read.
+
+    Read-state is set through email_read's ``markAs`` argument (the underlying
+    OWA SetReadState action), so this rides on a tool ALREADY in the read-only
+    allowlist -- no write-enable flag (OUTLOOK_MCP_ENABLE_WRITES) is required.
+    SetReadState acts on the whole CONVERSATION, so a multi-message thread is
+    marked read in full when the user dismisses it (a conscious "I've processed
+    this" decision). NEVER raises: a mark-read failure must not affect the
+    dismiss the caller already persisted.
+    """
+    conv_id = str(conv_id or "").strip()
+    if not conv_id:
+        return
+    try:
+        await call_read_tool("email_read", {"conversationId": conv_id, "markAs": "read"})
+    except Exception as e:  # noqa: BLE001 -- best-effort, never fail the dismiss
+        logger.debug("mark-read failed for %s: %s", conv_id, _scrub(str(e)))
+
+
+def _spawn_mark_read(conv_id: str) -> None:
+    """Fire-and-forget the mark-read so the dismiss response is not delayed.
+
+    Dismiss (and especially 'Dismiss all' of N items) must stay snappy, so the
+    Outlook write runs as a background task. Errors are swallowed inside
+    _mark_conversation_read. Holds a reference so the task is not GC'd mid-flight.
+    """
+    conv_id = str(conv_id or "").strip()
+    if not conv_id:
+        return
+    try:
+        task = asyncio.ensure_future(_mark_conversation_read(conv_id))
+        _MARK_READ_TASKS.add(task)
+        task.add_done_callback(_MARK_READ_TASKS.discard)
+    except RuntimeError:
+        # No running loop (e.g. a sync test context) -- skip the background mark.
+        logger.debug("mark-read skipped for %s: no running loop", _scrub(conv_id))
+
+
 async def dismiss_item(request: web.Request) -> web.Response:
-    """DELETE /api/email/queue/{item_id} -- soft-dismiss (preserve item)."""
+    """DELETE /api/email/queue/{item_id} -- soft-dismiss (preserve item).
+
+    On a SUCCESSFUL dismiss the conversation is marked read in Outlook
+    (best-effort, background) -- the user has consciously processed it. A
+    dismiss that 409s never marks read (we only fire after the durable write).
+    """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request) if request.can_read_body else {}
     expected_etag = body.get("etag")
@@ -1893,6 +1955,7 @@ async def dismiss_item(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
 
     item["status"] = "dismissed"
+    conv_id = str(item.get("conversationId", "") or "").strip()
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -1902,6 +1965,12 @@ async def dismiss_item(request: web.Request) -> web.Response:
             {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
             status=409,
         )
+
+    # Dismiss persisted -> mark the conversation read in Outlook (best-effort,
+    # background). Only after the durable write, so a 409'd dismiss never marks
+    # read. Approve/mute deliberately do NOT mark read -- dismiss is the one
+    # "I've consciously processed this" signal.
+    _spawn_mark_read(conv_id)
 
     ws = request.app["ws_manager"]
     await ws.broadcast("email_changed", {"id": item_id, "dismissed": True})
@@ -1970,6 +2039,16 @@ async def regenerate_item(request: web.Request) -> web.Response:
     new_draft = _scrub(str(result.get("draft", "")))[:_DRAFT_CAP]
     item["draft"] = new_draft
     item["generatedDraft"] = new_draft
+    # Refresh BOTH the summary and the ask from the SAME regenerate call (the
+    # draft worker does the same). Each is set ONLY when the parsed value is a
+    # non-empty string, so a regenerate that returns an empty summary/ask keeps
+    # the pre-regenerate text rather than blanking the Thread Summary.
+    thread_ctx = result.get("threadContext", "")
+    if isinstance(thread_ctx, str) and thread_ctx.strip():
+        item["threadContext"] = thread_ctx.strip()
+    ask = result.get("threadAsk", "")
+    if isinstance(ask, str) and ask.strip():
+        item["threadAsk"] = ask.strip()
     item["status"] = "needs-review"
 
     try:

@@ -10,7 +10,7 @@ import { useLiveUpdates } from '../hooks/useLiveUpdates';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { threadTurns, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight } from './emailDetail';
+import { latestThreadView, threadSummaryParts, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight } from './emailDetail';
 
 // --- Constants ---
 
@@ -777,77 +777,125 @@ export default function EmailPage() {
     const showDiff = !isReadOnly && generated.trim() !== '' && generated.trim() !== currentText.trim();
     const diffTokens = showDiff ? wordDiff(generated, currentText) : null;
 
-    // Multi-turn thread history: an ordered array of {sender, timestamp, body}
-    // captured by the scan worker. Read defensively (older items predate the
-    // field) so N turns render N cards, 1 → 1, empty/missing → a graceful
-    // placeholder — never crashing, never rendering 'undefined'. All text is
+    // Thread Summary: two AI-derived sub-parts (summary = threadContext, ask =
+    // threadAsk). Both optional; a missing field renders a muted placeholder,
+    // never the literal 'undefined' and never a fabricated ask (the decision is
+    // a pure transform unit-tested in emailDetail.test.mjs).
+    const summary = threadSummaryParts(item);
+
+    // Thread Context: an ordered array of {sender, timestamp, body} turns
+    // captured by the scan worker. latestThreadView picks the LATEST turn to
+    // show by default and exposes the REAL turn count for the "Show full email
+    // (N messages)" expander; with no structured history it falls back to the
+    // full concatenated body/snippet. Read defensively (older items predate the
+    // field) so it never crashes and never renders 'undefined'. All text is
     // EXTERNAL email content, rendered via React's {…} interpolation (escaped),
-    // never dangerouslySetInnerHTML. The short `threadContext` summary (a 1-2
-    // sentence gist) is complementary and still shown above when present.
-    const hist = threadTurns(item);
+    // never dangerouslySetInnerHTML.
+    const view = latestThreadView(item);
+
+    // Shared card markup for one thread turn (sender + relative timestamp +
+    // body) — used for the single latest-message card AND each card in the
+    // expanded full timeline so who-said-what is preserved verbatim.
+    const renderTurnCard = (turn, key) => (
+      <div
+        key={key}
+        className="card"
+        style={{
+          padding: '0.6em 0.9em',
+          borderLeft: '3px solid var(--accent)',
+          fontSize: '0.85em',
+        }}
+      >
+        <div style={{ display: 'flex', gap: '0.6em', alignItems: 'baseline', flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 600, color: 'var(--text)' }}>{turn.sender || 'unknown'}</span>
+          {turn.timestamp && (
+            <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(turn.timestamp)}</span>
+          )}
+        </div>
+        <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
+          {turn.body || ''}
+        </div>
+      </div>
+    );
 
     return (
       <div style={{ padding: 'var(--space-md)', background: 'var(--surface2)', borderRadius: 'var(--radius)' }}>
-        {/* --- Email body (collapsible so it doesn't dominate) --- */}
+        {/* --- 1. Thread Summary (AI summary + what they need from you) ----
+            Two AI-derived sub-parts. Both are optional: a missing/empty field
+            (older item, an FYI with no real ask, or a generation that didn't
+            emit one) renders a muted placeholder — NEVER 'undefined', never a
+            fabricated ask. All text via React {…} interpolation, never
+            dangerouslySetInnerHTML. */}
         <div style={sectionStyle}>
-          <button type="button" style={toggleStyle} onClick={() => setEmailBodyOpen(v => !v)}>
-            {emailBodyOpen ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
-            {emailBodyOpen ? 'Hide full email' : 'Show full email'}
-          </button>
-          {emailBodyOpen && (
+          <div style={labelStyle}>Thread summary</div>
+          <div style={{ marginBottom: '0.6em' }}>
+            <div style={{ ...labelStyle, fontSize: '0.66em', marginBottom: '0.2em' }}>Summary</div>
+            {summary.hasSummary ? (
+              <div style={{ color: 'var(--text)', fontSize: '0.88em', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {summary.summary}
+              </div>
+            ) : (
+              <div style={{ color: 'var(--muted)', fontSize: '0.85em', fontStyle: 'italic' }}>
+                No summary available.
+              </div>
+            )}
+          </div>
+          <div>
+            <div style={{ ...labelStyle, fontSize: '0.66em', marginBottom: '0.2em' }}>What they need from you</div>
+            {summary.hasAsk ? (
+              <div style={{ color: 'var(--text)', fontSize: '0.88em', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {summary.ask}
+              </div>
+            ) : (
+              <div style={{ color: 'var(--muted)', fontSize: '0.85em', fontStyle: 'italic' }}>
+                No specific ask detected.
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* --- 2. Thread Context (latest message + expandable full timeline) -
+            The newest turn shows by default; "Show full email (N messages)"
+            expands the full oldest→newest per-turn cards (reusing renderTurnCard
+            so who-said-what is preserved). N is the REAL turn count from
+            latestThreadView. With no structured history we fall back to the full
+            body/snippet. emailBodyOpen drives this section's expand. */}
+        <div style={sectionStyle}>
+          <div style={labelStyle}>Thread context</div>
+          {view.latest ? (
+            renderTurnCard(view.latest, 'latest')
+          ) : (
             <div
               className="card"
               style={{
-                marginTop: '0.4em', padding: '0.7em 0.9em', fontSize: '0.85em',
+                padding: '0.7em 0.9em', fontSize: '0.85em',
                 whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text)',
                 maxHeight: '400px', overflow: 'auto', lineHeight: 1.5,
               }}
             >
-              {item.emailBody || item.snippet || '(no email body available)'}
+              {view.fallbackBody || '(no email body available)'}
             </div>
           )}
-        </div>
-
-        {/* --- Thread history (multi-message timeline) --- */}
-        <div style={sectionStyle}>
-          <div style={labelStyle}>Thread history</div>
-          {item.threadContext && (
-            <div style={{ color: 'var(--muted)', fontSize: '0.82em', fontStyle: 'italic', marginBottom: '0.5em', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-              {item.threadContext}
-            </div>
-          )}
-          {hist.length === 0 ? (
-            <div style={{ color: 'var(--muted)', fontSize: '0.85em', fontStyle: 'italic' }}>
-              No thread history was captured for this item.
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em' }}>
-              {hist.map((turn, i) => (
-                <div
-                  key={i}
-                  className="card"
-                  style={{
-                    padding: '0.6em 0.9em',
-                    borderLeft: '3px solid var(--accent)',
-                    fontSize: '0.85em',
-                  }}
-                >
-                  <div style={{ display: 'flex', gap: '0.6em', alignItems: 'baseline', flexWrap: 'wrap' }}>
-                    <span style={{ fontWeight: 600, color: 'var(--text)' }}>{turn.sender || 'unknown'}</span>
-                    {turn.timestamp && (
-                      <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(turn.timestamp)}</span>
-                    )}
-                  </div>
-                  <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
-                    {turn.body || ''}
-                  </div>
+          {view.count > 1 && (
+            <>
+              <button
+                type="button"
+                style={{ ...toggleStyle, marginTop: '0.5em' }}
+                onClick={() => setEmailBodyOpen(v => !v)}
+              >
+                {emailBodyOpen ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
+                {emailBodyOpen ? 'Hide full email' : `Show full email (${view.count} messages)`}
+              </button>
+              {emailBodyOpen && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em', marginTop: '0.5em' }}>
+                  {view.turns.map((turn, i) => renderTurnCard(turn, i))}
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
         </div>
 
-        {/* --- Draft reply --- */}
+        {/* --- 3. Draft reply --- */}
         <div style={sectionStyle}>
           <div style={labelStyle}>
             {isApproved ? 'Approved draft'

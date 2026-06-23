@@ -90,6 +90,20 @@ def _reset_email_primitives():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _inert_mark_read(monkeypatch):
+    """Neutralize the fire-and-forget mark-read by default.
+
+    dismiss_item spawns a background mark-read that opens a real MCP stdio
+    connection; left live in a test it outlives the request and anyio tears
+    down its cancel scope across tasks ('exit cancel scope in a different
+    task'). Tests that specifically assert mark-read behavior install their own
+    _spawn_mark_read/call_read_tool stub, which overrides this default.
+    """
+    if hasattr(email_mod, "_spawn_mark_read"):
+        monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda cid: None)
+
+
 def _stub_agent(monkeypatch, result):
     """Monkeypatch the delegation seam to return a fixed result dict."""
     async def fake_agent(action, payload):
@@ -193,6 +207,74 @@ async def test_email_dismiss_unknown_is_404(client, email_file):
     _seed(email_file, [])
     resp = await client.delete("/api/email/queue/nope", json={})
     assert resp.status == 404
+
+
+# --- dismiss marks the conversation read in Outlook --------------------------
+
+
+def _capture_mark_read(monkeypatch):
+    """Patch the fire-and-forget mark-read to record conv_ids synchronously.
+
+    The production path spawns a background task; capturing at _spawn_mark_read
+    makes the assertion deterministic (no racing the event loop) while still
+    proving the dismiss handler decided to mark the right conversation read.
+    """
+    calls = []
+    monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda cid: calls.append(cid))
+    return calls
+
+
+async def test_email_dismiss_marks_conversation_read(client, email_file, monkeypatch):
+    """A successful dismiss marks that conversation read in Outlook (best-effort).
+
+    Mirrors the user's rule: scanning leaves mail unread, but dismissing is the
+    conscious "I've processed this" decision, so the whole conversation is marked
+    read. The mark targets the item's conversationId.
+    """
+    calls = _capture_mark_read(monkeypatch)
+    _seed(email_file, [_make_item("i1", conversationId="CONV-9")])
+
+    resp = await client.delete("/api/email/queue/i1", json={})
+    assert resp.status == 200
+    # The dismissed conversation was marked read; exactly one mark, for CONV-9.
+    assert calls == ["CONV-9"]
+
+
+async def test_email_dismiss_conflict_does_not_mark_read(client, email_file, monkeypatch):
+    """A 409'd dismiss must NOT mark read -- we only fire after the durable write.
+
+    Sends a stale etag so the write conflicts; the conversation's read-state in
+    Outlook must be untouched (no mark-read for a dismiss that did not persist).
+    """
+    calls = _capture_mark_read(monkeypatch)
+    _seed(email_file, [_make_item("i1", conversationId="CONV-9")])
+
+    resp = await client.delete(
+        "/api/email/queue/i1", json={"etag": "stale-etag-that-will-conflict"})
+    assert resp.status == 409
+    assert calls == []  # no mark-read on a conflict
+
+
+async def test_email_approve_and_mute_do_not_mark_read(client, email_file, monkeypatch):
+    """Only dismiss marks read -- approve and mute must NOT (the user's choice).
+
+    Approve still saves an Outlook draft + clipboard and mute still soft-dismisses,
+    but neither touches the conversation's read-state.
+    """
+    calls = _capture_mark_read(monkeypatch)
+    _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    _seed(email_file, [
+        _make_item("i1", conversationId="CONV-A"),
+        _make_item("i2", conversationId="CONV-B"),
+    ])
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200
+    resp = await client.post("/api/email/queue/i2/mute", json={})
+    assert resp.status == 200
+
+    # Neither terminal action marked a conversation read.
+    assert calls == []
 
 
 async def test_email_undismiss_restores(client, email_file):
@@ -877,6 +959,39 @@ def test_email_polish_parse_failloud_on_missing_draft():
     assert ok["available"] is True and ok["draft"] == "hi"
 
 
+# --- _mark_conversation_read calls email_read with markAs:read, non-fatal -----
+
+
+async def test_mark_conversation_read_uses_email_read_markas(monkeypatch):
+    """_mark_conversation_read marks the whole conversation read via email_read.
+
+    Read-state is set through email_read's markAs arg (a tool already in the
+    read-only allowlist), so NO write-enable flag is needed. Asserts the exact
+    tool + arguments so a refactor that drops markAs is caught.
+    """
+    calls = []
+
+    async def fake_read_tool(name, arguments):
+        calls.append((name, arguments))
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._mark_conversation_read("CONV-7")
+
+    assert calls == [("email_read", {"conversationId": "CONV-7", "markAs": "read"})]
+
+
+async def test_mark_conversation_read_is_nonfatal(monkeypatch):
+    """A mark-read failure NEVER raises -- it must not break the dismiss."""
+    async def boom(name, arguments):
+        raise email_mod.EmailMcpError("mark-read blew up")
+
+    monkeypatch.setattr(email_mod, "call_read_tool", boom)
+    # Must not raise (and a blank conv_id is a no-op).
+    await email_mod._mark_conversation_read("CONV-7")
+    await email_mod._mark_conversation_read("")
+
+
 # --- (1a) scan attaches threadHistory from a multi-message conversation -------
 
 
@@ -944,3 +1059,162 @@ async def test_scan_history_failure_is_nonfatal(email_file, monkeypatch):
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
     assert len(saved) == 1  # item still created from the snippet
     assert not saved[0].get("threadHistory")  # no fabricated turns
+
+
+# ─── threadAsk contract (D-048 clauses 1-3): summary + ask, ONE call ──────────
+#
+# The draft/regenerate action emits BOTH threadContext (1-2 sentence summary) and
+# a NEW threadAsk (what the sender needs FROM ME) from the SAME LLM call. The ask
+# is OPTIONAL: a missing ask resolves to "" and must NEVER make a good draft
+# return available:False or get fabricated. Both the draft WORKER and the
+# regenerate request path must persist both (regenerate previously dropped even
+# threadContext).
+
+
+def test_build_prompt_draft_instructs_threadask_without_fabrication():
+    """_build_prompt('draft'/'regenerate') asks for threadContext AND threadAsk,
+    and the threadAsk wording forbids inventing an ask for an FYI/newsletter."""
+    for action in ("draft", "regenerate"):
+        out = email_mod._build_prompt(action, {"prompt": "BASE", "item": _make_item()})
+        assert '"threadContext"' in out, f"{action}: summary key missing from contract"
+        assert '"threadAsk"' in out, f"{action}: ask key missing from contract"
+        low = out.lower()
+        # The ask must be empty for a no-ask email and never invented.
+        assert "empty string" in low, f"{action}: should instruct an empty ask when none"
+        assert ("do not invent" in low or "not invent" in low or "never invent" in low), \
+            f"{action}: should forbid fabricating an ask"
+
+
+def test_parse_draft_result_includes_threadask():
+    """A draft/regenerate reply that carries threadAsk surfaces it in the dict."""
+    for action in ("draft", "regenerate"):
+        res = email_mod._parse_agent_result(
+            json.dumps({
+                "draft": "Sure, Friday works.",
+                "generatedDraft": "Sure, Friday works.",
+                "threadContext": "John is asking about the ship date.",
+                "threadAsk": "Confirm whether Friday works to ship.",
+            }),
+            action,
+        )
+        assert res["available"] is True
+        assert res["threadContext"] == "John is asking about the ship date."
+        assert res["threadAsk"] == "Confirm whether Friday works to ship."
+
+
+def test_parse_draft_result_missing_ask_is_empty_not_fatal():
+    """A reply that OMITS threadAsk is still available (ask defaults to ""), so a
+    perfectly good draft is never thrown away because the ask was missing."""
+    for action in ("draft", "regenerate"):
+        res = email_mod._parse_agent_result(
+            json.dumps({"draft": "Thanks for the heads up.",
+                        "generatedDraft": "Thanks for the heads up.",
+                        "threadContext": "FYI: build pipeline migrated."}),
+            action,
+        )
+        assert res["available"] is True, f"{action}: missing ask must not be fatal"
+        assert res["threadAsk"] == "", f"{action}: missing ask must default to empty, not fabricated"
+
+
+def test_parse_draft_result_still_requires_draft():
+    """'draft' remains the ONLY required key — a missing draft is still unavailable
+    even when threadAsk/threadContext are present."""
+    for action in ("draft", "regenerate"):
+        res = email_mod._parse_agent_result(
+            json.dumps({"threadContext": "summary", "threadAsk": "do the thing"}),
+            action,
+        )
+        assert res["available"] is False
+
+
+async def test_draft_worker_persists_threadask_and_context(email_file, monkeypatch):
+    """The draft worker stores BOTH threadContext and threadAsk on the item."""
+    _seed(email_file, [_make_item("i1", status="needs-draft", draft="", generatedDraft="")])
+    _stub_agent(monkeypatch, {
+        "available": True,
+        "draft": "Sure, Friday works.",
+        "generatedDraft": "Sure, Friday works.",
+        "threadContext": "John asks about the ship date.",
+        "threadAsk": "Confirm Friday ship date.",
+    })
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    sem = email_mod.asyncio.Semaphore(1)
+    await email_mod._draft_one({"ws_manager": _WS()}, sem, "i1")
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["threadContext"] == "John asks about the ship date."
+    assert saved["threadAsk"] == "Confirm Friday ship date."
+
+
+async def test_draft_worker_missing_ask_leaves_prior_untouched(email_file, monkeypatch):
+    """An absent ask in the draft result never fails the save and leaves any prior
+    threadAsk untouched (never blanks it, never writes 'undefined')."""
+    _seed(email_file, [_make_item("i1", status="needs-draft", draft="", generatedDraft="",
+                                  threadAsk="prior ask")])
+    _stub_agent(monkeypatch, {
+        "available": True,
+        "draft": "Got it, thanks.",
+        "generatedDraft": "Got it, thanks.",
+        "threadContext": "FYI only.",
+        # no threadAsk
+    })
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    sem = email_mod.asyncio.Semaphore(1)
+    await email_mod._draft_one({"ws_manager": _WS()}, sem, "i1")
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert saved["draft"] == "Got it, thanks."
+    assert saved["threadAsk"] == "prior ask"  # untouched, not blanked
+
+
+async def test_email_regenerate_persists_summary_and_ask(client, email_file, monkeypatch):
+    """Regenerate refreshes BOTH threadContext AND threadAsk (it previously wrote
+    only draft/generatedDraft/status and silently dropped threadContext)."""
+    _seed(email_file, [_make_item("i1", status="edited", draft="old",
+                                  threadContext="stale summary", threadAsk="stale ask")])
+    _stub_agent(monkeypatch, {
+        "available": True,
+        "draft": "fresh draft",
+        "generatedDraft": "fresh draft",
+        "threadContext": "fresh summary",
+        "threadAsk": "fresh ask",
+    })
+    resp = await client.post("/api/email/queue/i1/refresh")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["draft"] == "fresh draft"
+    assert body["item"]["threadContext"] == "fresh summary"
+    assert body["item"]["threadAsk"] == "fresh ask"
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["threadContext"] == "fresh summary"
+    assert saved["threadAsk"] == "fresh ask"
+
+
+async def test_email_regenerate_empty_fields_keep_prior(client, email_file, monkeypatch):
+    """Regenerate with an empty/absent summary+ask keeps the PRE-regenerate text
+    rather than blanking it (set-only-when-non-empty rule)."""
+    _seed(email_file, [_make_item("i1", status="edited", draft="old",
+                                  threadContext="keep this summary",
+                                  threadAsk="keep this ask")])
+    _stub_agent(monkeypatch, {
+        "available": True,
+        "draft": "fresh draft",
+        "generatedDraft": "fresh draft",
+        # no threadContext, no threadAsk
+    })
+    resp = await client.post("/api/email/queue/i1/refresh")
+    assert resp.status == 200
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["draft"] == "fresh draft"
+    assert saved["threadContext"] == "keep this summary"  # not blanked
+    assert saved["threadAsk"] == "keep this ask"          # not blanked

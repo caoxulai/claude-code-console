@@ -13,6 +13,42 @@ export function threadTurns(item) {
   return Array.isArray(item && item.threadHistory) ? item.threadHistory : [];
 }
 
+// Decide what Thread Context shows by default vs. behind "Show full email".
+// Reuses threadTurns(item): when there are structured turns we show the LATEST
+// one by default (the newest turn — the array is oldest→newest, so the last
+// element) and offer to expand the full oldest→newest timeline; `count` is the
+// REAL turn count and drives the "Show full email (N messages)" label (NOT
+// item.messageCount). When there's no structured history we fall back to the
+// full concatenated body (then the snippet); `fallbackBody` is ALWAYS a string
+// so the render never emits the literal 'undefined' and never crashes.
+export function latestThreadView(item) {
+  const turns = threadTurns(item);
+  if (turns.length > 0) {
+    return { latest: turns[turns.length - 1], count: turns.length, turns, fallbackBody: '' };
+  }
+  return {
+    latest: null,
+    count: 0,
+    turns: [],
+    fallbackBody: (item && (item.emailBody || item.snippet)) || '',
+  };
+}
+
+// Decide what the Thread Summary section's two AI-derived sub-parts show. The
+// "Summary" paragraph reuses the existing AI-produced threadContext; the "What
+// they need from you" line reuses a separate AI-produced threadAsk. BOTH are
+// optional: an older item, an FYI with no real ask, or a generation that didn't
+// emit one leaves a field empty. We trim and report has* so the render shows a
+// muted placeholder (never the literal 'undefined', never a fabricated ask).
+// Non-string values are coerced via String() so a stray number can't surface as
+// 'undefined'/'null'. Pure — no DOM, no fetch.
+export function threadSummaryParts(item) {
+  const it = item || {};
+  const summary = it.threadContext == null ? '' : String(it.threadContext).trim();
+  const ask = it.threadAsk == null ? '' : String(it.threadAsk).trim();
+  return { summary, ask, hasSummary: summary !== '', hasAsk: ask !== '' };
+}
+
 // Resolve a mute key to a human-friendly label. The email mute key is the raw
 // conversationId (no _threadTs suffix — see email.py _mute_key_for), so we look
 // up any queue item on the same conversation and borrow its subject (then sender),
