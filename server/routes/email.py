@@ -1168,6 +1168,11 @@ def _extract_email_body(payload) -> str:
                 if isinstance(msg, dict):
                     body = msg.get("body", "")
                     sender = msg.get("sender") or msg.get("from", "")
+                    # Outlook delivers sender as {'name','email'} -- flatten it so
+                    # the header reads "From: Jane Doe", NOT a Python dict repr
+                    # ("From: {'name': ...}"). Mirrors _extract_thread_history.
+                    if isinstance(sender, dict):
+                        sender = sender.get("name") or sender.get("email") or ""
                     subject = msg.get("subject", "")
                     if body:
                         header = f"From: {sender}\nSubject: {subject}\n\n" if sender else ""

@@ -715,6 +715,27 @@ def test_extract_thread_history_handles_garbage_without_fabricating():
     assert turns == []
 
 
+def test_extract_email_body_flattens_sender_dict():
+    """Outlook delivers sender as {'name','email'} -- the body header must read
+    'From: <name>', NEVER a leaked Python dict repr ('From: {\\'name\\': ...}').
+
+    Regression for the Thread Context display showing the raw dict.
+    """
+    payload = {"content": {"emails": [{
+        "sender": {"name": "Tangudu, Punith", "email": "mtaylor@example.com"},
+        "subject": "Travel Reminder",
+        "body": "Hi all, gentle reminder.",
+    }]}}
+    out = email_mod._extract_email_body(payload)
+    assert "From: Tangudu, Punith" in out
+    assert "{'name'" not in out and "'email'" not in out
+    # A plain-string sender still works (no regression).
+    out2 = email_mod._extract_email_body(
+        {"content": {"emails": [{"sender": "Jane", "subject": "Hi", "body": "yo"}]}}
+    )
+    assert "From: Jane" in out2
+
+
 # --- (1b) rich draft prompt (the AC-3 unit-testable seam) --------------------
 
 

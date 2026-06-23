@@ -4,7 +4,11 @@ import {
   FiCheckCircle, FiAlertCircle, FiClock, FiBellOff, FiPause, FiPlay,
   FiClipboard, FiFeather,
 } from 'react-icons/fi';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 // Single source of truth for COUNTING/GROUPING (kept in lockstep with the NavBar
 // bubble and server/routes/email.py — see D-035). The page no longer re-defines
 // these inline so the page sections and the bubble can never drift.
@@ -151,6 +155,21 @@ export default function EmailPage() {
   // Approve confirmation message per item (transient)
   const [approveMsg, setApproveMsg] = useState({});
   const approveMsgRef = useRef({});
+
+  // Transient "Copied" flag for the subject copy button (per item), so the user
+  // can paste the subject into Outlook search. Clears after a short timer.
+  const [subjectCopied, setSubjectCopied] = useState(null);
+  const subjectCopiedRef = useRef(null);
+  const copySubject = async (id, subject) => {
+    try {
+      await navigator.clipboard.writeText(subject || '');
+    } catch {
+      // Clipboard can fail in a non-secure context; nothing else to do.
+    }
+    setSubjectCopied(id);
+    if (subjectCopiedRef.current) clearTimeout(subjectCopiedRef.current);
+    subjectCopiedRef.current = setTimeout(() => setSubjectCopied(null), 1500);
+  };
 
   // Collapsible sections
   const [approvedOpen, setApprovedOpen] = useState(false);
@@ -796,6 +815,21 @@ export default function EmailPage() {
     // Shared card markup for one thread turn (sender + relative timestamp +
     // body) — used for the single latest-message card AND each card in the
     // expanded full timeline so who-said-what is preserved verbatim.
+    // Render an email body as markdown via the canonical app stack (the same
+    // ReactMarkdown + remarkGfm/rehypeHighlight + markdown-body used by chat,
+    // Sessions, Memory) so **bold**, [links](…) and - bullets render as real
+    // formatting instead of literal markdown text. ErrorBoundary keeps a
+    // malformed-markdown throw from blanking the whole detail panel.
+    const renderBody = (text) => (
+      <ErrorBoundary label="Couldn't render this email body.">
+        <div className="markdown-body" style={{ color: 'var(--text)', lineHeight: 1.5, wordBreak: 'break-word' }}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+            {text || ''}
+          </ReactMarkdown>
+        </div>
+      </ErrorBoundary>
+    );
+
     const renderTurnCard = (turn, key) => (
       <div
         key={key}
@@ -812,14 +846,42 @@ export default function EmailPage() {
             <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(turn.timestamp)}</span>
           )}
         </div>
-        <div style={{ marginTop: '0.3em', color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
-          {turn.body || ''}
+        <div style={{ marginTop: '0.3em' }}>
+          {renderBody(turn.body)}
         </div>
       </div>
     );
 
+    const subjectText = (item.subject || '').trim();
+
     return (
       <div style={{ padding: 'var(--space-md)', background: 'var(--surface2)', borderRadius: 'var(--radius)' }}>
+        {/* --- Subject header + copy button (paste into Outlook search) ----
+            The subject is the most reliable key for finding the thread back in
+            Outlook, so we surface it at the top of the panel with a one-click
+            copy. */}
+        <div style={{ ...sectionStyle, display: 'flex', alignItems: 'baseline', gap: '0.5em', flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 600, color: 'var(--text)', wordBreak: 'break-word', flex: 1, minWidth: 0 }}>
+            {subjectText || '(no subject)'}
+          </span>
+          {subjectText && (
+            <button
+              type="button"
+              onClick={() => copySubject(item.id, subjectText)}
+              title="Copy subject to search in Outlook"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: '0.3em',
+                cursor: 'pointer', background: 'none', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius)', color: 'var(--accent)',
+                fontSize: '0.75em', padding: '0.2em 0.5em', whiteSpace: 'nowrap',
+              }}
+            >
+              <FiClipboard size={12} />
+              {subjectCopied === item.id ? 'Copied!' : 'Copy subject'}
+            </button>
+          )}
+        </div>
+
         {/* --- 1. Thread Summary (AI summary + what they need from you) ----
             Two AI-derived sub-parts. Both are optional: a missing/empty field
             (older item, an FYI with no real ask, or a generation that didn't
@@ -869,11 +931,12 @@ export default function EmailPage() {
               className="card"
               style={{
                 padding: '0.7em 0.9em', fontSize: '0.85em',
-                whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text)',
-                maxHeight: '400px', overflow: 'auto', lineHeight: 1.5,
+                color: 'var(--text)', maxHeight: '400px', overflow: 'auto',
               }}
             >
-              {view.fallbackBody || '(no email body available)'}
+              {view.fallbackBody
+                ? renderBody(view.fallbackBody)
+                : <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>(no email body available)</span>}
             </div>
           )}
           {view.count > 1 && (
@@ -1132,7 +1195,27 @@ export default function EmailPage() {
                     <span>{item.sender || 'unknown'}</span>
                   </span>
                 </td>
-                <td style={{ fontWeight: 500 }}>{truncate(item.subject, 60)}</td>
+                <td style={{ fontWeight: 500 }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em' }}>
+                    <span>{truncate(item.subject, 60)}</span>
+                    {(item.subject || '').trim() && (
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); copySubject(item.id, (item.subject || '').trim()); }}
+                        title="Copy subject to search in Outlook"
+                        style={{
+                          display: 'inline-flex', alignItems: 'center', gap: '0.25em',
+                          cursor: 'pointer', background: 'none', border: 'none',
+                          color: subjectCopied === item.id ? 'var(--success, var(--accent))' : 'var(--muted)',
+                          fontSize: '0.78em', padding: '0.1em 0.2em', whiteSpace: 'nowrap', flexShrink: 0,
+                        }}
+                      >
+                        <FiClipboard size={12} />
+                        {subjectCopied === item.id && <span>Copied!</span>}
+                      </button>
+                    )}
+                  </span>
+                </td>
                 <td title={item.snippet}>{truncate(item.snippet, 70)}</td>
                 <td style={{ color: 'var(--muted)', fontSize: '0.85em', textAlign: 'center' }}>{relativeTime(item.ts)}</td>
                 <td style={{ textAlign: 'center' }}>
