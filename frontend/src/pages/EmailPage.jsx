@@ -238,9 +238,15 @@ export default function EmailPage() {
       const res = await fetch('/api/email/health');
       if (!res.ok) { setHealth({ ready: false, detail: 'Health check unavailable.' }); return; }
       const json = await res.json();
+      // Graph (manager-outlook-mcp) read path needs Node 24. The backend reports
+      // it separately as graphNodeReady/graphNodeReason; fold graphNodeReady into
+      // overall readiness so a missing Node 24 shows the actionable "not wired"
+      // banner (with the install reason) instead of a green badge over an empty
+      // queue that looks like "inbox is empty".
+      const ready = json.ready === true && json.graphNodeReady !== false;
       setHealth({
-        ready: json.ready === true,
-        detail: typeof json.detail === 'string' ? json.detail : '',
+        ready,
+        detail: typeof json.graphNodeReason === 'string' ? json.graphNodeReason : '',
       });
     } catch {
       setHealth({ ready: false, detail: 'Health check unavailable.' });
