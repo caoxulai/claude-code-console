@@ -24,10 +24,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+import glob
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import tempfile
@@ -141,14 +143,41 @@ _EMAIL_MCP_FALLBACK = {
     "env": {},
 }
 
+# Fallback manager-outlook-mcp (Graph via GRASP) launch spec. The wrapper at
+# ~/.aim/mcp-servers/manager-outlook-mcp runs `aim mcp start-server
+# manager-outlook-mcp`; prefer the bare command (it's on PATH after `aim mcp
+# install`), else fall back to the explicit aim invocation.
+_GRAPH_MCP_FALLBACK = {
+    "command": "manager-outlook-mcp",
+    "args": [],
+    "env": {},
+}
+
+# Node-24 resolution: manager-outlook-mcp HARD-ABORTS on Node < 24 (logs
+# "Node version 22 detected, but version 24 or higher is required" and the MCP
+# handshake dies with "Connection closed"). The aws-outlook-mcp launch runs fine
+# on the default Node 22, so we PREPEND a Node-24 bin dir onto PATH for the GRAPH
+# subprocess ONLY — never the global toolchain. The bin dir is discovered by
+# globbing the mise install dir; an env override (CLAUDE_WEB_NODE24_BIN) wins.
+_NODE24_ENV_OVERRIDE = "CLAUDE_WEB_NODE24_BIN"
+_NODE24_GLOB = str(Path.home() / ".local" / "share" / "mise" / "installs" / "node" / "24*" / "bin")
+
 
 # ── Send-safety boundary ───────────────────────────────────────────────────
 
 # THE SEND-SAFETY BOUNDARY: the email module may ONLY call read tools via MCP.
-# Write tools (reply, send, draft, forward, move, update) are NEVER in this set.
-# call_read_tool REFUSES by name any tool NOT in this frozenset BEFORE the SDK
-# ever touches the server.
+# Write tools (reply, send, draft, forward, move, update, mark_email_read) are
+# NEVER in this set. call_read_tool REFUSES by name any tool NOT in this frozenset
+# BEFORE the SDK ever touches the server.
+#
+# The Graph read tools (get_emails, get_email) from manager-outlook-mcp join the
+# legacy aws-outlook-mcp read tools here -- the frozenset gates by tool NAME, so
+# call_read_tool accepts both and routes by name (see call_read_tool). The Graph
+# WRITE tool mark_email_read is DELIBERATELY ABSENT: it goes through a SEPARATE
+# explicitly-gated path (_call_graph_write_tool) so the read client can never
+# invoke send/reply/forward/delete/move/mark-read.
 _EMAIL_READ_ONLY_TOOLS = frozenset({
+    # aws-outlook-mcp (OWA/EWS) legacy reads -- retained for back-compat.
     "email_inbox",
     "email_read",
     "email_search",
@@ -157,7 +186,14 @@ _EMAIL_READ_ONLY_TOOLS = frozenset({
     "email_contacts",
     "email_attachments",
     "email_categories",
+    # manager-outlook-mcp (Microsoft Graph via GRASP) reads -- the migrated path.
+    "get_emails",
+    "get_email",
 })
+
+# Tools that route to the GRAPH (manager-outlook-mcp) persistent session rather
+# than the legacy aws-outlook-mcp session. call_read_tool dispatches by this set.
+_GRAPH_READ_TOOLS = frozenset({"get_emails", "get_email"})
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -388,6 +424,114 @@ def _email_mcp_params() -> StdioServerParameters:
     return StdioServerParameters(command=str(command), args=args, env=env)
 
 
+# ── manager-outlook-mcp (Graph) config + Node-24 resolution ─────────────────
+
+class GraphMcpNodeError(Exception):
+    """Node 24+ could not be located for the manager-outlook-mcp subprocess.
+
+    manager-outlook-mcp hard-aborts on Node < 24 (the handshake dies with the
+    opaque 'Connection closed'). We raise this BEFORE spawning so the failure is
+    actionable instead of presenting as an empty queue ('inbox is empty').
+    """
+
+
+def _find_graph_mcp_entry() -> dict | None:
+    """Best-effort: read the manager-outlook-mcp server entry from a claude config.
+
+    Mirrors _find_email_mcp_entry but matches a server name containing
+    'manager-outlook' or 'graph' (NOT 'aws-outlook' -- a SIBLING finder so the
+    aws-outlook draft path is untouched). Returns the raw entry dict or None.
+    NEVER spawns anything.
+    """
+    def _scan(servers) -> dict | None:
+        if not isinstance(servers, dict):
+            return None
+        for name, entry in servers.items():
+            low = str(name).lower()
+            if ("manager-outlook" in low or "graph" in low) and isinstance(entry, dict):
+                return entry
+        return None
+
+    for path in _mcp_config_paths():
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        found = _scan(doc.get("mcpServers"))
+        if found is not None:
+            return found
+        projects = doc.get("projects")
+        if isinstance(projects, dict):
+            for proj in projects.values():
+                if isinstance(proj, dict):
+                    found = _scan(proj.get("mcpServers"))
+                    if found is not None:
+                        return found
+    return None
+
+
+def _resolve_node24_bin() -> str:
+    """Resolve a Node 24+ bin dir for the manager-outlook-mcp subprocess.
+
+    Precedence: the CLAUDE_WEB_NODE24_BIN env override, else the newest match of
+    the mise glob (~/.local/share/mise/installs/node/24*/bin). FAILS LOUD with a
+    GraphMcpNodeError naming the expected location + install command when none is
+    found -- NEVER silently falls back to the default Node 22 (which produces the
+    opaque 'Connection closed').
+    """
+    override = os.environ.get(_NODE24_ENV_OVERRIDE)
+    if override and Path(override).is_dir():
+        return override
+    matches = sorted(p for p in glob.glob(_NODE24_GLOB) if Path(p).is_dir())
+    if matches:
+        # Prefer the newest patch (lexical sort is fine across 24.x dirs).
+        return matches[-1]
+    raise GraphMcpNodeError(
+        "manager-outlook-mcp requires Node 24+, but no Node-24 bin dir was found "
+        f"(searched {_NODE24_GLOB} and ${_NODE24_ENV_OVERRIDE}). Install it via "
+        "`mise install node@24` (or set "
+        f"{_NODE24_ENV_OVERRIDE} to a Node-24 bin dir). Without it the MCP "
+        "handshake dies with an opaque 'Connection closed'."
+    )
+
+
+def _graph_mcp_params() -> StdioServerParameters:
+    """Build StdioServerParameters for manager-outlook-mcp (Graph) with Node 24.
+
+    Discovers the entry from the same configs _find_email_mcp_entry scans (matching
+    'manager-outlook'/'graph'); falls back to the bare `manager-outlook-mcp`
+    command. PREPENDS the resolved Node-24 bin dir onto a COPY of PATH in the
+    subprocess env (never mutates os.environ, never touches the aws-outlook launch).
+    Raises GraphMcpNodeError if Node 24 is absent (fail loud).
+    """
+    entry = _find_graph_mcp_entry()
+    if entry is None:
+        entry = dict(_GRAPH_MCP_FALLBACK)
+
+    command = entry.get("command") or _GRAPH_MCP_FALLBACK["command"]
+    raw_args = entry.get("args")
+    args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+
+    # Build the subprocess env from a scrubbed copy of the entry's env, then
+    # PREPEND the Node-24 bin dir to PATH for THIS subprocess only.
+    env: dict[str, str] = {}
+    raw_env = entry.get("env")
+    if isinstance(raw_env, dict):
+        env = {
+            str(k): str(v)
+            for k, v in raw_env.items()
+            if not (_looks_secret(str(k)) or _looks_secret(str(v)))
+        }
+
+    node24_bin = _resolve_node24_bin()  # fail-loud if absent
+    base_path = env.get("PATH") or os.environ.get("PATH", "")
+    env["PATH"] = node24_bin + (os.pathsep + base_path if base_path else "")
+
+    return StdioServerParameters(command=str(command), args=args, env=env)
+
+
 # ── Persistent MCP session state ──────────────────────────────────────────
 
 @dataclass
@@ -404,6 +548,12 @@ class _PersistentMcpState:
 _mcp_state = _PersistentMcpState()
 _mcp_connect_lock: asyncio.Lock | None = None
 
+# Second persistent session: manager-outlook-mcp (Microsoft Graph via GRASP). It
+# is the migrated READ path (get_emails/get_email) AND the gated mark-read write
+# path. It has its OWN state + connect-lock, mirroring the aws-outlook session.
+_graph_mcp_state = _PersistentMcpState()
+_graph_mcp_connect_lock: asyncio.Lock | None = None
+
 # Strong refs to in-flight fire-and-forget mark-read tasks so the event loop
 # does not GC them mid-flight (asyncio only holds weak refs to bare tasks).
 _MARK_READ_TASKS: set = set()
@@ -415,6 +565,14 @@ def _get_mcp_lock() -> asyncio.Lock:
     if _mcp_connect_lock is None:
         _mcp_connect_lock = asyncio.Lock()
     return _mcp_connect_lock
+
+
+def _get_graph_mcp_lock() -> asyncio.Lock:
+    """Lazy-init the graph (manager-outlook-mcp) connect/reconnect lock."""
+    global _graph_mcp_connect_lock
+    if _graph_mcp_connect_lock is None:
+        _graph_mcp_connect_lock = asyncio.Lock()
+    return _graph_mcp_connect_lock
 
 
 async def _connect_mcp() -> None:
@@ -493,6 +651,78 @@ async def _disconnect_mcp() -> None:
         logger.info("Email persistent MCP session disconnected.")
 
 
+async def _connect_graph_mcp() -> None:
+    """Lazily connect the persistent manager-outlook-mcp (Graph) session.
+
+    Mirrors _connect_mcp exactly but spawns manager-outlook-mcp with Node 24 on
+    PATH (via _graph_mcp_params). Idempotent under its OWN connect lock. A missing
+    Node 24 raises GraphMcpNodeError (fail loud) before any spawn.
+    """
+    lock = _get_graph_mcp_lock()
+    async with lock:
+        if _graph_mcp_state.session is not None:
+            return  # Already connected.
+
+        params = _graph_mcp_params()  # may raise GraphMcpNodeError (fail loud)
+        stdio_cm = None
+        session_cm = None
+        try:
+            stdio_cm = stdio_client(params)
+            read_stream, write_stream = await stdio_cm.__aenter__()
+
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+
+            await session.initialize()
+
+            _graph_mcp_state.session = session
+            _graph_mcp_state.stdio_cm = stdio_cm
+            _graph_mcp_state.session_cm = session_cm
+            _graph_mcp_state.read_stream = read_stream
+            _graph_mcp_state.write_stream = write_stream
+            _graph_mcp_state.connected_at = time.time()
+            logger.info("Email Graph (manager-outlook-mcp) MCP session connected.")
+        except BaseException:
+            if session_cm is not None:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            if stdio_cm is not None:
+                try:
+                    await stdio_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            raise
+
+
+async def _disconnect_graph_mcp() -> None:
+    """Tear down the persistent manager-outlook-mcp (Graph) session (idempotent)."""
+    lock = _get_graph_mcp_lock()
+    async with lock:
+        if _graph_mcp_state.session is None:
+            return
+
+        if _graph_mcp_state.session_cm is not None:
+            try:
+                await _graph_mcp_state.session_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Graph MCP session_cm teardown: %s", _scrub(str(e)))
+        if _graph_mcp_state.stdio_cm is not None:
+            try:
+                await _graph_mcp_state.stdio_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Graph MCP stdio_cm teardown: %s", _scrub(str(e)))
+
+        _graph_mcp_state.session = None
+        _graph_mcp_state.stdio_cm = None
+        _graph_mcp_state.session_cm = None
+        _graph_mcp_state.read_stream = None
+        _graph_mcp_state.write_stream = None
+        _graph_mcp_state.connected_at = None
+        logger.info("Email Graph (manager-outlook-mcp) MCP session disconnected.")
+
+
 class EmailMcpError(Exception):
     """A direct-MCP read failed (connect/handshake/call/parse/tool error)."""
 
@@ -533,29 +763,25 @@ def _is_transient_mcp_error(exc: BaseException) -> bool:
 
 # ── MCP tool guard ──────────────────────────────────────────────────────────
 
-async def call_read_tool(name: str, arguments: dict) -> object:
-    """Call ONE email MCP READ tool via a PERSISTENT session; FAIL LOUD on error.
+async def _call_session_tool(*, name: str, arguments: dict, state: _PersistentMcpState,
+                             connect, disconnect, label: str) -> object:
+    """Shared persistent-session call: connect -> call_tool -> normalize, with a
+    reconnect-once retry on a transient stream break. FAIL LOUD on a tool error.
 
-    THE SEND-SAFETY BOUNDARY: rejects by name BEFORE any connection or SDK
-    interaction. Uses a persistent session with reconnect-once on transient error.
+    Used by BOTH the read path (aws-outlook / graph reads) and the separate gated
+    graph write path; the boundary refusal lives in the callers, NOT here.
     """
-    if name not in _EMAIL_READ_ONLY_TOOLS:
-        raise EmailMcpError(
-            f"Refusing to call email tool {name!r}: not in the read-only allowlist."
-        )
-
-    # Retry strategy: 1 call on existing session + 1 retry after reconnect.
     for attempt in range(2):
         try:
-            await _connect_mcp()
-            if _mcp_state.session is None:
-                raise EmailMcpError("Email MCP session failed to connect.")
+            await connect()
+            if state.session is None:
+                raise EmailMcpError(f"{label} MCP session failed to connect.")
 
-            result = await _mcp_state.session.call_tool(name, arguments)
+            result = await state.session.call_tool(name, arguments)
 
             if getattr(result, "isError", False):
                 raise EmailMcpError(
-                    _scrub(f"Email MCP tool {name!r} returned an error: "
+                    _scrub(f"{label} MCP tool {name!r} returned an error: "
                            + _one_line(str(getattr(result, "content", "")), 200))
                 )
 
@@ -567,13 +793,63 @@ async def call_read_tool(name: str, arguments: dict) -> object:
             raise
         except BaseException as e:
             if _is_transient_mcp_error(e) and attempt == 0:
-                logger.debug("Email MCP transient error, reconnecting: %s", _scrub(str(e)))
-                await _disconnect_mcp()
+                logger.debug("%s MCP transient error, reconnecting: %s", label, _scrub(str(e)))
+                await disconnect()
                 await asyncio.sleep(1.0)
                 continue
-            raise EmailMcpError(_scrub(f"Email MCP call failed: {e}")) from e
+            raise EmailMcpError(_scrub(f"{label} MCP call failed: {e}")) from e
 
-    raise EmailMcpError("Email MCP call failed after retry.")
+    raise EmailMcpError(f"{label} MCP call failed after retry.")
+
+
+async def call_read_tool(name: str, arguments: dict) -> object:
+    """Call ONE email MCP READ tool via a PERSISTENT session; FAIL LOUD on error.
+
+    THE SEND-SAFETY BOUNDARY: rejects by name BEFORE any connection or SDK
+    interaction (the by-name refusal is FIRST, before any connect). Routes by tool
+    name -- Graph reads (get_emails/get_email) to the manager-outlook-mcp session,
+    everything else to the legacy aws-outlook-mcp session.
+    """
+    if name not in _EMAIL_READ_ONLY_TOOLS:
+        raise EmailMcpError(
+            f"Refusing to call email tool {name!r}: not in the read-only allowlist."
+        )
+
+    if name in _GRAPH_READ_TOOLS:
+        return await _call_session_tool(
+            name=name, arguments=arguments, state=_graph_mcp_state,
+            connect=_connect_graph_mcp, disconnect=_disconnect_graph_mcp,
+            label="Email Graph",
+        )
+    return await _call_session_tool(
+        name=name, arguments=arguments, state=_mcp_state,
+        connect=_connect_mcp, disconnect=_disconnect_mcp, label="Email",
+    )
+
+
+# Graph WRITE tools reachable ONLY through the separate gated path below. This is
+# DELIBERATELY tiny: mark_email_read is the only write this change authorizes. It
+# is NOT in _EMAIL_READ_ONLY_TOOLS and NEVER routes through call_read_tool, so the
+# read client can never reach send/reply/forward/delete/move.
+_GRAPH_GATED_WRITE_TOOLS = frozenset({"mark_email_read"})
+
+
+async def _call_graph_write_tool(name: str, arguments: dict) -> object:
+    """SEPARATE explicitly-gated path for the one authorized Graph WRITE tool.
+
+    Distinct from call_read_tool by design: it accepts ONLY the gated write tools
+    (mark_email_read), routes to the manager-outlook-mcp session, and FAILS LOUD on
+    anything else -- the structural guarantee that the read client never sends.
+    """
+    if name not in _GRAPH_GATED_WRITE_TOOLS:
+        raise EmailMcpError(
+            f"Refusing graph write tool {name!r}: not in the gated write allowlist."
+        )
+    return await _call_session_tool(
+        name=name, arguments=arguments, state=_graph_mcp_state,
+        connect=_connect_graph_mcp, disconnect=_disconnect_graph_mcp,
+        label="Email Graph write",
+    )
 
 
 def _normalize_tool_result(result) -> object:
@@ -1019,24 +1295,52 @@ def _get_scan_event() -> asyncio.Event:
     return _scan_wake_event
 
 
+def _graph_node_status() -> dict:
+    """Resolve the Node-24 readiness for manager-outlook-mcp WITHOUT spawning.
+
+    Returns {graphNodeReady: bool, graphNodeReason: <actionable msg or ''>}. A
+    missing Node 24 is the SILENT-NODE-22-FALLBACK trap (an empty queue that reads
+    as 'inbox is empty'), so we surface the actionable reason instead of guessing.
+    """
+    try:
+        _resolve_node24_bin()
+        return {"graphNodeReady": True, "graphNodeReason": ""}
+    except GraphMcpNodeError as e:
+        return {"graphNodeReady": False, "graphNodeReason": _scrub(str(e))}
+
+
 def _probe_readiness() -> dict:
     """Report seam readiness WITHOUT any I/O.
 
-    Returns whether claude is on PATH and email MCP is configured.
+    Returns whether claude is on PATH, email MCP is configured, and whether the
+    Graph (manager-outlook-mcp) read path can launch (Node 24 present). The scan
+    READ path now needs Node 24; a missing Node 24 surfaces as an actionable
+    reason rather than an empty queue.
     """
     claude_on_path = shutil.which("claude") is not None
     mcp_entry = _find_email_mcp_entry()
     mcp_configured = mcp_entry is not None
-    ready = claude_on_path  # Email MCP not strictly required for MCP-FREE actions
+    node = _graph_node_status()
+    ready = claude_on_path  # MCP-FREE actions (classify/draft) don't need MCP
     return {
         "claudeOnPath": claude_on_path,
         "mcpConfigured": mcp_configured,
+        "graphNodeReady": node["graphNodeReady"],
+        "graphNodeReason": node["graphNodeReason"],
         "ready": ready,
     }
 
 
 def _mute_key_for(item: dict) -> str:
-    """Derive a mute key from an item (conversationId-scoped)."""
+    """Derive a stable Graph-native mute key from an item.
+
+    Keys on the Graph messageId (the conversationId is an alias of it, see D-051),
+    so a mute survives the conversationId->messageId re-key. Falls back to
+    conversationId then the queue id so an older item never produces an empty key.
+    """
+    msg_id = str(item.get("messageId", "") or "").strip()
+    if msg_id:
+        return msg_id
     conv_id = str(item.get("conversationId", "") or "").strip()
     return conv_id or str(item.get("id", ""))
 
@@ -1115,92 +1419,158 @@ def _recipient_type(raw: dict) -> str:
     return "dl"
 
 
-def _skeleton_for(raw: dict) -> dict:
-    """Build a needs-classify skeleton from a raw inbox item.
+def _flatten_from(raw: dict) -> tuple[str, str]:
+    """Flatten a Graph ``from`` field into (display_name, email).
 
-    The Outlook MCP uses: topic (not subject), senders (array, not sender),
-    preview (not snippet), recipients (array).
+    Graph delivers from as {name, email}. The display name falls back to the email
+    when name is blank (never a leaked dict repr, never an empty sender). Tolerates
+    a legacy senders[]/sender/from-string shape so older callers keep working.
     """
-    import secrets as _secrets
-    conv_id = str(raw.get("conversationId", "") or raw.get("id", ""))
-    # Sender: Outlook uses senders[] array
+    frm = raw.get("from")
+    if isinstance(frm, dict):
+        name = str(frm.get("name", "") or "").strip()
+        email = str(frm.get("email", "") or "").strip()
+        return (name or email, email)
+    # Legacy aws-outlook shapes: senders[] array or a plain string.
     senders = raw.get("senders") or []
-    sender = senders[0] if isinstance(senders, list) and senders else str(raw.get("sender", "") or raw.get("from", ""))
-    # Subject: Outlook uses "topic"
-    subject = str(raw.get("topic", "") or raw.get("subject", ""))
-    # Snippet: Outlook uses "preview"
+    if isinstance(senders, list) and senders:
+        return (str(senders[0]), "")
+    name = str(raw.get("sender", "") or (frm if isinstance(frm, str) else "") or "")
+    return (name, str(raw.get("senderEmail", "") or ""))
+
+
+def _graph_ts_ms(raw: dict) -> int:
+    """Parse the Graph ``received`` (ISO8601) into epoch ms; fall back to now().
+
+    A missing/unparseable timestamp falls back to the scan time so the row never
+    shows a garbage 'When'. Tolerates legacy receivedDateTime too.
+    """
+    received = raw.get("received") or raw.get("receivedDateTime") or ""
+    dt = _parse_ts(str(received))
+    if dt is not None:
+        try:
+            return int(dt.timestamp() * 1000)
+        except (OverflowError, OSError, ValueError):
+            pass
+    return int(time.time() * 1000)
+
+
+def _skeleton_for(raw: dict) -> dict:
+    """Build a needs-classify skeleton from a Microsoft Graph inbox message.
+
+    Graph (manager-outlook-mcp get_emails) shape: id (the Graph message_id),
+    subject, from{name,email}, received (ISO8601), is_read, has_attachments,
+    preview. The item keys NATIVELY on the Graph message_id (``messageId``) and
+    aliases ``conversationId`` to it (Graph exposes no conversation id, D-051) so
+    the existing frontend/mute logic keeps working. ``senderEmail`` is NOW
+    populated from from.email (the old aws-outlook path left it blank, AC-3).
+    """
+    message_id = str(raw.get("id", "") or raw.get("messageId", "")
+                     or raw.get("conversationId", ""))
+    sender, sender_email = _flatten_from(raw)
+    subject = str(raw.get("subject", "") or raw.get("topic", ""))
     snippet = str(raw.get("preview", "") or raw.get("snippet", "") or raw.get("bodyPreview", ""))
-    # Recipients
     recipients = raw.get("recipients") or []
     return {
-        "id": _secrets.token_hex(4),
-        "conversationId": conv_id,
+        "id": secrets.token_hex(4),
+        "messageId": message_id,
+        # Alias: Graph exposes no conversation id, so conversationId == messageId
+        # keeps the frontend mute-label + the mute-key derivation correct (D-051).
+        "conversationId": message_id,
         "sender": _scrub(_one_line(sender, 200)),
-        "senderEmail": "",
+        "senderEmail": _scrub(_one_line(sender_email, 200)),
         "subject": _scrub(_one_line(subject, 300)),
         "snippet": _scrub(snippet[:_SNIPPET_CAP]),
         "recipients": recipients if isinstance(recipients, list) else [],
         "recipientType": _recipient_type(raw),
-        "hasAttachments": bool(raw.get("hasAttachments")),
+        "hasAttachments": bool(raw.get("has_attachments") or raw.get("hasAttachments")),
         "messageCount": raw.get("messageCount") or raw.get("unreadCount") or 1,
         "status": "needs-classify",
-        "ts": int(time.time() * 1000),
+        "ts": _graph_ts_ms(raw),
     }
 
 
-def _extract_email_body(payload) -> str:
-    """Extract the email body text from an email_read MCP response.
+def _msg_sender_name(msg: dict) -> str:
+    """Flatten a message's sender/from into a display name (never a dict repr)."""
+    sender = msg.get("from")
+    if sender is None:
+        sender = msg.get("sender") or ""
+    if isinstance(sender, dict):
+        return str(sender.get("name") or sender.get("email") or "")
+    return str(sender or "")
 
-    Outlook MCP returns: {success, content: {emails: [{body: "..."}]}}
-    We concatenate all message bodies (newest first) into a single string.
+
+def _email_messages_from_payload(payload) -> list[dict]:
+    """Normalize an MCP body response into a list of message dicts.
+
+    Supports BOTH the migrated Graph shape (get_email -> {email:{...}} with an
+    optional messages[] thread array, else the single email IS the message) AND
+    the legacy aws-outlook shape ({content:{emails:[...]}}). Returns [] when no
+    message dict is present so callers never fabricate content.
+    """
+    if not isinstance(payload, dict):
+        return []
+    # Graph: {email: {... , messages?: [...]}}
+    email = payload.get("email")
+    if isinstance(email, dict):
+        msgs = email.get("messages") or email.get("emails")
+        if isinstance(msgs, list) and msgs:
+            return [m for m in msgs if isinstance(m, dict)]
+        return [email]
+    # Legacy aws-outlook: {content: {emails|messages: [...]}}
+    content = payload.get("content")
+    if isinstance(content, dict):
+        emails = content.get("emails") or content.get("messages")
+        if isinstance(emails, list) and emails:
+            return [m for m in emails if isinstance(m, dict)]
+    return []
+
+
+def _extract_email_body(payload) -> str:
+    """Extract the email body text from a body MCP response.
+
+    Handles the Graph {email:{...}} shape AND the legacy {content:{emails:[...]}}
+    shape (via _email_messages_from_payload). We concatenate all message bodies
+    into a single string, flattening from{name,email} so the header reads
+    "From: Jane Doe", NEVER a leaked Python dict repr.
     """
     if isinstance(payload, str):
         return payload
     if not isinstance(payload, dict):
         return ""
-    # Try content.emails[].body (the actual Outlook MCP shape)
-    content = payload.get("content")
-    if isinstance(content, dict):
-        emails = content.get("emails") or content.get("messages") or []
-        if isinstance(emails, list) and emails:
-            parts = []
-            for msg in emails:
-                if isinstance(msg, dict):
-                    body = msg.get("body", "")
-                    sender = msg.get("sender") or msg.get("from", "")
-                    # Outlook delivers sender as {'name','email'} -- flatten it so
-                    # the header reads "From: Jane Doe", NOT a Python dict repr
-                    # ("From: {'name': ...}"). Mirrors _extract_thread_history.
-                    if isinstance(sender, dict):
-                        sender = sender.get("name") or sender.get("email") or ""
-                    subject = msg.get("subject", "")
-                    if body:
-                        header = f"From: {sender}\nSubject: {subject}\n\n" if sender else ""
-                        parts.append(header + body)
-            return "\n---\n".join(parts) if parts else ""
+    msgs = _email_messages_from_payload(payload)
+    if msgs:
+        parts = []
+        for msg in msgs:
+            body = msg.get("body", "")
+            sender = _msg_sender_name(msg)
+            subject = msg.get("subject", "")
+            if body:
+                header = f"From: {sender}\nSubject: {subject}\n\n" if sender else ""
+                parts.append(header + str(body))
+        if parts:
+            return "\n---\n".join(parts)
     # Fallback: top-level body or content as string
     body = payload.get("body", "") or payload.get("content", "")
     return str(body) if body else ""
 
 
 def _extract_thread_history(payload) -> list[dict]:
-    """Build a structured threadHistory array from an email_read MCP response.
+    """Build a structured threadHistory array from a body MCP response.
 
-    Same response shape _extract_email_body parses ({content:{emails:[...]}}); the
-    Outlook MCP returns the conversation's messages newest-first, so we reverse to
-    oldest->newest. Each turn is ``{sender, timestamp, body}`` with the body
-    scrubbed and capped at _THREAD_TURN_BODY_CAP, and the array bounded to the
-    _THREAD_HISTORY_MAX_TURNS newest turns. An email with no body is NOT emitted
-    (we never fabricate a turn). Returns [] for any unexpected/empty payload so the
-    caller can fall back to the snippet/body alone.
+    Handles the Graph {email:{...}} shape AND the legacy {content:{emails:[...]}}
+    shape (via _email_messages_from_payload). The MCP returns the conversation's
+    messages newest-first, so we reverse to oldest->newest (or sort by a parseable
+    timestamp when every turn carries one). Each turn is ``{sender, timestamp,
+    body}`` with the body scrubbed and capped at _THREAD_TURN_BODY_CAP, and the
+    array bounded to the _THREAD_HISTORY_MAX_TURNS newest turns. An email with no
+    body is NOT emitted (we never fabricate a turn). Returns [] for any
+    unexpected/empty payload so the caller can fall back to the snippet/body alone.
     """
     if not isinstance(payload, dict):
         return []
-    content = payload.get("content")
-    emails = None
-    if isinstance(content, dict):
-        emails = content.get("emails") or content.get("messages")
-    if not isinstance(emails, list) or not emails:
+    emails = _email_messages_from_payload(payload)
+    if not emails:
         return []
 
     turns: list[dict] = []
@@ -1211,11 +1581,9 @@ def _extract_thread_history(payload) -> list[dict]:
         body = _scrub(body)[:_THREAD_TURN_BODY_CAP].strip()
         if not body:
             continue  # never fabricate a turn for a body-less message
-        sender = msg.get("sender") or msg.get("from") or ""
-        if isinstance(sender, dict):
-            sender = sender.get("name") or sender.get("email") or ""
+        sender = _msg_sender_name(msg)
         timestamp = (
-            msg.get("receivedDateTime") or msg.get("timestamp")
+            msg.get("received") or msg.get("receivedDateTime") or msg.get("timestamp")
             or msg.get("sentDateTime") or msg.get("date") or ""
         )
         ts_str = _one_line(str(timestamp), 100)
@@ -1357,18 +1725,19 @@ def _build_email_draft_prompt(item: dict) -> str:
 async def _scan_once(app) -> None:
     """Run ONE deterministic email scan: fetch inbox -> dedupe -> fetch bodies -> write.
 
-    Calls email_inbox via the read-only direct-MCP client, filters by new
-    conversationId, fetches full body for each, writes needs-classify skeletons.
-    On MCP read failure it FAILS LOUD (raises EmailMcpError).
+    Reads via Microsoft Graph (manager-outlook-mcp): get_emails for the unread
+    inbox, get_email per message for the full body + thread history. Filters by new
+    Graph message_id, writes needs-classify skeletons. On MCP read failure it FAILS
+    LOUD (raises EmailMcpError) -- never fabricates email data.
     """
     global _LAST_SCAN_TS_MS
     now_ms = int(time.time() * 1000)
 
-    # Fetch unread inbox
-    inbox_payload = await call_read_tool("email_inbox", {
-        "unreadOnly": True, "limit": 25, "enrichRecipients": True,
+    # Fetch the unread inbox via Graph (get_emails -> {emails:[...], count, folder}).
+    inbox_payload = await call_read_tool("get_emails", {
+        "folder": "inbox", "limit": 25, "unread_only": True,
     })
-    raw_items = _unwrap_list(inbox_payload, "messages", "items", "emails", "value")
+    raw_items = _unwrap_list(inbox_payload, "emails", "messages", "items", "value")
 
     data, current_etag = _load()
 
@@ -1377,49 +1746,51 @@ async def _scan_once(app) -> None:
     muted = _prune_muted(data.get("mutedThreads") or {}, now_s)
     data["mutedThreads"] = muted
 
-    # Existing conversationIds in active statuses
-    existing_conv_ids = {
-        str(it.get("conversationId", ""))
+    # Existing Graph message_ids in active statuses (keyed natively on messageId;
+    # conversationId is its alias so older items resolve too).
+    def _item_msg_id(it: dict) -> str:
+        return str(it.get("messageId", "") or it.get("conversationId", ""))
+
+    existing_msg_ids = {
+        _item_msg_id(it)
         for it in data["items"]
         if it.get("status") in {"needs-classify", "needs-draft", "needs-review", "edited"}
     }
 
-    # Filter new items (not already in queue, not muted)
+    # Filter new items (not already in queue, not muted) -- key on the Graph
+    # message_id so the conversationId->messageId re-key drops nothing.
     new_items = []
     for raw in raw_items:
         if not isinstance(raw, dict):
             continue
-        conv_id = str(raw.get("conversationId", "") or raw.get("id", ""))
-        if not conv_id:
+        msg_id = str(raw.get("id", "") or raw.get("messageId", ""))
+        if not msg_id:
             continue
-        if conv_id in existing_conv_ids:
+        if msg_id in existing_msg_ids:
             continue
-        mute_key = conv_id
-        if muted and mute_key in muted:
+        if muted and msg_id in muted:
             continue
         new_items.append(raw)
 
-    # For each new email, pre-fetch body + thread history via email_read. The
-    # SAME response (content.emails[]) yields BOTH the concatenated body
+    # For each new email, pre-fetch body + thread history via Graph get_email. The
+    # SAME response ({email:{...}}) yields BOTH the concatenated body
     # (_extract_email_body) and the structured multi-turn threadHistory
     # (_extract_thread_history), so the draft worker needs no further MCP call.
     for raw in new_items:
-        conv_id = str(raw.get("conversationId", "") or raw.get("id", ""))
-        if conv_id:
+        msg_id = str(raw.get("id", "") or raw.get("messageId", ""))
+        if msg_id:
             try:
-                body_payload = await call_read_tool(
-                    "email_read", {"conversationId": conv_id, "format": "markdown"}
-                )
+                body_payload = await call_read_tool("get_email", {"message_id": msg_id})
                 body_text = _extract_email_body(body_payload)
                 if body_text:
                     raw["emailBody"] = body_text[:_EMAIL_BODY_CAP]
                 history = _extract_thread_history(body_payload)
                 if history:
                     raw["threadHistory"] = history
-            except (EmailMcpError, Exception) as e:
+            except Exception as e:  # noqa: BLE001 -- body fetch is best-effort
                 # Non-fatal: we can still classify/draft from the snippet alone, and
                 # we NEVER fabricate turns — threadHistory simply stays absent.
-                logger.debug("Email body fetch failed for %s: %s", conv_id, _scrub(str(e)))
+                logger.debug("Email body fetch failed for %s: %s", msg_id, _scrub(str(e)))
 
     # Write needs-classify skeletons
     for raw in new_items:
@@ -1789,17 +2160,30 @@ async def _stop_draft_worker(app) -> None:
 
 
 async def _cleanup_persistent_mcp(app) -> None:
-    """on_cleanup: tear down the persistent email MCP session (reap subprocess)."""
+    """on_cleanup: tear down BOTH persistent email MCP sessions (reap subprocesses).
+
+    Disconnects the legacy aws-outlook-mcp session AND the manager-outlook-mcp
+    (Graph) session so neither child subprocess is left orphaned on shutdown.
+    """
     await _disconnect_mcp()
+    await _disconnect_graph_mcp()
 
 
 # ── Route handlers ──────────────────────────────────────────────────────────
 
 async def get_health(request: web.Request) -> web.Response:
-    """GET /api/email/health -- readiness probe."""
+    """GET /api/email/health -- readiness probe.
+
+    Surfaces the Graph (manager-outlook-mcp) Node-24 readiness so a missing Node
+    24 reads as an ACTIONABLE state (graphNodeReady:false + a reason) rather than a
+    silent empty queue that looks like 'inbox is empty'.
+    """
     claude_on_path = shutil.which("claude") is not None
+    node = _graph_node_status()
     return web.json_response({
         "claudeOnPath": claude_on_path,
+        "graphNodeReady": node["graphNodeReady"],
+        "graphNodeReason": node["graphNodeReason"],
         "ready": claude_on_path,
     })
 
@@ -1904,51 +2288,107 @@ async def save_draft(request: web.Request) -> web.Response:
     return web.json_response({"item": item, "etag": new_etag})
 
 
-async def _mark_conversation_read(conv_id: str) -> None:
-    """Best-effort: mark a whole Outlook conversation read via email_read.
+# Graph mark_email_read accepts at most 10 message_ids per call (verified live).
+_MARK_READ_BATCH = 10
 
-    Read-state is set through email_read's ``markAs`` argument (the underlying
-    OWA SetReadState action), so this rides on a tool ALREADY in the read-only
-    allowlist -- no write-enable flag (OUTLOOK_MCP_ENABLE_WRITES) is required.
-    SetReadState acts on the whole CONVERSATION, so a multi-message thread is
-    marked read in full when the user dismisses it (a conscious "I've processed
-    this" decision). NEVER raises: a mark-read failure must not affect the
-    dismiss the caller already persisted.
+
+async def _mark_messages_read(messages: dict) -> None:
+    """Mark one or more messages read in Outlook via Graph mark_email_read.
+
+    ``messages`` is a {message_id: subject-or-None} map. The call goes through the
+    SEPARATE explicitly-gated graph write path (_call_graph_write_tool), NOT
+    call_read_tool and NOT the read-only frozenset -- the structural guarantee that
+    the read client never sends. Batched ≤10 ids/call (Graph's limit).
+
+    VERIFY EFFECT, NOT CALLER: we INSPECT results[]/summary and treat any
+    success:false (or an empty/malformed response) as a failure -- never claim a
+    read that did not happen. A failure is logged at WARNING (not invisible debug)
+    and is NON-FATAL: it must never break the dismiss the caller already persisted.
     """
-    conv_id = str(conv_id or "").strip()
-    if not conv_id:
+    clean = {
+        str(mid): (subj if subj is None else str(subj))
+        for mid, subj in (messages or {}).items()
+        if str(mid or "").strip()
+    }
+    if not clean:
         return
-    try:
-        await call_read_tool("email_read", {"conversationId": conv_id, "markAs": "read"})
-    except Exception as e:  # noqa: BLE001 -- best-effort, never fail the dismiss
-        logger.debug("mark-read failed for %s: %s", conv_id, _scrub(str(e)))
+
+    ids = list(clean.keys())
+    for start in range(0, len(ids), _MARK_READ_BATCH):
+        chunk = ids[start:start + _MARK_READ_BATCH]
+        batch = {mid: clean[mid] for mid in chunk}
+        try:
+            result = await _call_graph_write_tool(
+                "mark_email_read", {"emails": batch, "is_read": True}
+            )
+        except Exception as e:  # noqa: BLE001 -- never fail the dismiss
+            logger.warning(
+                "mark-read failed for %d message(s): %s",
+                len(chunk), _scrub(str(e)),
+            )
+            continue
+
+        # Inspect the per-id results -- a {success:false} or a missing/empty
+        # results array means the read did NOT flip. Surface it at WARNING.
+        results = result.get("results") if isinstance(result, dict) else None
+        if not isinstance(results, list) or not results:
+            logger.warning(
+                "mark-read returned no results for %d message(s) (response: %s)",
+                len(chunk), _scrub(_one_line(str(result), 200)),
+            )
+            continue
+        failed = [
+            str(r.get("message_id", ""))
+            for r in results
+            if isinstance(r, dict) and not r.get("success")
+        ]
+        if failed:
+            logger.warning(
+                "mark-read did NOT flip is_read for %d message(s): %s",
+                len(failed), _scrub(_one_line(", ".join(failed), 200)),
+            )
 
 
-def _spawn_mark_read(conv_id: str) -> None:
+def _spawn_mark_read(messages: dict) -> None:
     """Fire-and-forget the mark-read so the dismiss response is not delayed.
 
     Dismiss (and especially 'Dismiss all' of N items) must stay snappy, so the
-    Outlook write runs as a background task. Errors are swallowed inside
-    _mark_conversation_read. Holds a reference so the task is not GC'd mid-flight.
+    Graph write runs as a background task AFTER the durable write. Errors are
+    inspected + logged inside _mark_messages_read (never re-raised). Holds a strong
+    ref so the task is not GC'd mid-flight. ``messages`` is a {message_id: subject}
+    map (a single-item dict for one dismiss; coalesced/chunked ≤10 by the callee).
     """
-    conv_id = str(conv_id or "").strip()
-    if not conv_id:
+    if not messages:
         return
     try:
-        task = asyncio.ensure_future(_mark_conversation_read(conv_id))
+        task = asyncio.ensure_future(_mark_messages_read(dict(messages)))
         _MARK_READ_TASKS.add(task)
         task.add_done_callback(_MARK_READ_TASKS.discard)
     except RuntimeError:
         # No running loop (e.g. a sync test context) -- skip the background mark.
-        logger.debug("mark-read skipped for %s: no running loop", _scrub(conv_id))
+        logger.debug("mark-read skipped: no running loop")
+
+
+def _mark_read_map_for(item: dict) -> dict:
+    """Build the {message_id: subject} mark-read map for one dismissed item.
+
+    Uses the item's Graph messageId (conversationId is its alias) keyed to the
+    subject; returns {} when no message id is resolvable (so we never fire a bogus
+    mark-read with an empty id).
+    """
+    msg_id = str(item.get("messageId", "") or item.get("conversationId", "") or "").strip()
+    if not msg_id:
+        return {}
+    subject = item.get("subject")
+    return {msg_id: (str(subject) if subject else None)}
 
 
 async def dismiss_item(request: web.Request) -> web.Response:
     """DELETE /api/email/queue/{item_id} -- soft-dismiss (preserve item).
 
-    On a SUCCESSFUL dismiss the conversation is marked read in Outlook
-    (best-effort, background) -- the user has consciously processed it. A
-    dismiss that 409s never marks read (we only fire after the durable write).
+    On a SUCCESSFUL dismiss the message is marked read in Outlook via Graph
+    mark_email_read (best-effort, background) -- the user has consciously processed
+    it. A dismiss that 409s never marks read (we only fire AFTER the durable write).
     """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request) if request.can_read_body else {}
@@ -1960,7 +2400,7 @@ async def dismiss_item(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
 
     item["status"] = "dismissed"
-    conv_id = str(item.get("conversationId", "") or "").strip()
+    mark_read_map = _mark_read_map_for(item)
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -1971,11 +2411,11 @@ async def dismiss_item(request: web.Request) -> web.Response:
             status=409,
         )
 
-    # Dismiss persisted -> mark the conversation read in Outlook (best-effort,
+    # Dismiss persisted -> mark the message read in Outlook (best-effort,
     # background). Only after the durable write, so a 409'd dismiss never marks
     # read. Approve/mute deliberately do NOT mark read -- dismiss is the one
     # "I've consciously processed this" signal.
-    _spawn_mark_read(conv_id)
+    _spawn_mark_read(mark_read_map)
 
     ws = request.app["ws_manager"]
     await ws.broadcast("email_changed", {"id": item_id, "dismissed": True})
@@ -2148,11 +2588,12 @@ async def mute_item(request: web.Request) -> web.Response:
     if not item:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
 
-    # Derive mute key from conversationId
-    conv_id = str(item.get("conversationId", "") or "").strip()
-    mute_key = conv_id or item_id
+    # Derive the mute key from the Graph messageId (conversationId is its alias,
+    # so the key matches what _scan_once checks when suppressing a muted message).
+    mute_key = _mute_key_for(item) or item_id
 
-    # Record the mute and soft-dismiss
+    # Record the mute and soft-dismiss. Mute deliberately does NOT mark read --
+    # dismiss is the one "I've consciously processed this" signal.
     data.setdefault("mutedThreads", {})[mute_key] = int(time.time())
     item["status"] = "dismissed"
 

@@ -213,41 +213,45 @@ async def test_email_dismiss_unknown_is_404(client, email_file):
 
 
 def _capture_mark_read(monkeypatch):
-    """Patch the fire-and-forget mark-read to record conv_ids synchronously.
+    """Patch the fire-and-forget mark-read to record its message map synchronously.
 
-    The production path spawns a background task; capturing at _spawn_mark_read
-    makes the assertion deterministic (no racing the event loop) while still
-    proving the dismiss handler decided to mark the right conversation read.
+    The production path spawns a background task that marks the item's Graph
+    message_id read via manager-outlook-mcp's mark_email_read (a batch
+    {message_id: subject} map). Capturing at _spawn_mark_read makes the assertion
+    deterministic (no racing the event loop) while still proving the dismiss
+    handler decided to mark the right message read.
     """
     calls = []
-    monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda cid: calls.append(cid))
+    monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda messages: calls.append(messages))
     return calls
 
 
-async def test_email_dismiss_marks_conversation_read(client, email_file, monkeypatch):
-    """A successful dismiss marks that conversation read in Outlook (best-effort).
+async def test_email_dismiss_marks_message_read(client, email_file, monkeypatch):
+    """A successful dismiss marks that message read in Outlook (best-effort).
 
     Mirrors the user's rule: scanning leaves mail unread, but dismissing is the
-    conscious "I've processed this" decision, so the whole conversation is marked
-    read. The mark targets the item's conversationId.
+    conscious "I've processed this" decision. The read path is now Microsoft Graph
+    (manager-outlook-mcp), so the mark targets the item's Graph message_id via
+    mark_email_read ({message_id: subject}).
     """
     calls = _capture_mark_read(monkeypatch)
-    _seed(email_file, [_make_item("i1", conversationId="CONV-9")])
+    _seed(email_file, [_make_item("i1", messageId="AAMkMSG-9",
+                                  conversationId="AAMkMSG-9", subject="Re: Hi")])
 
     resp = await client.delete("/api/email/queue/i1", json={})
     assert resp.status == 200
-    # The dismissed conversation was marked read; exactly one mark, for CONV-9.
-    assert calls == ["CONV-9"]
+    # Exactly one mark, carrying the Graph message_id keyed to its subject.
+    assert calls == [{"AAMkMSG-9": "Re: Hi"}]
 
 
 async def test_email_dismiss_conflict_does_not_mark_read(client, email_file, monkeypatch):
     """A 409'd dismiss must NOT mark read -- we only fire after the durable write.
 
-    Sends a stale etag so the write conflicts; the conversation's read-state in
+    Sends a stale etag so the write conflicts; the message's read-state in
     Outlook must be untouched (no mark-read for a dismiss that did not persist).
     """
     calls = _capture_mark_read(monkeypatch)
-    _seed(email_file, [_make_item("i1", conversationId="CONV-9")])
+    _seed(email_file, [_make_item("i1", messageId="AAMkMSG-9", conversationId="AAMkMSG-9")])
 
     resp = await client.delete(
         "/api/email/queue/i1", json={"etag": "stale-etag-that-will-conflict"})
@@ -264,8 +268,8 @@ async def test_email_approve_and_mute_do_not_mark_read(client, email_file, monke
     calls = _capture_mark_read(monkeypatch)
     _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
     _seed(email_file, [
-        _make_item("i1", conversationId="CONV-A"),
-        _make_item("i2", conversationId="CONV-B"),
+        _make_item("i1", messageId="AAMkA", conversationId="AAMkA"),
+        _make_item("i2", messageId="AAMkB", conversationId="AAMkB"),
     ])
 
     resp = await client.post("/api/email/queue/i1/approve", json={})
@@ -980,65 +984,169 @@ def test_email_polish_parse_failloud_on_missing_draft():
     assert ok["available"] is True and ok["draft"] == "hi"
 
 
-# --- _mark_conversation_read calls email_read with markAs:read, non-fatal -----
+# --- _mark_messages_read calls manager-outlook-mcp mark_email_read (Graph) ----
+#
+# The read path migrated to Microsoft Graph (manager-outlook-mcp). Dismiss-marks-
+# read now uses the verified Graph schema:
+#   mark_email_read {emails: {<message_id>: <subject|null>}, is_read: bool}
+# It is a WRITE tool, so it MUST go through a SEPARATE explicitly-gated path
+# (_call_graph_write_tool / _mark_messages_read), NEVER through call_read_tool and
+# NEVER added to _EMAIL_READ_ONLY_TOOLS.
 
 
-async def test_mark_conversation_read_uses_email_read_markas(monkeypatch):
-    """_mark_conversation_read marks the whole conversation read via email_read.
-
-    Read-state is set through email_read's markAs arg (a tool already in the
-    read-only allowlist), so NO write-enable flag is needed. Asserts the exact
-    tool + arguments so a refactor that drops markAs is caught.
-    """
+def _capture_graph_write(monkeypatch, return_value=None):
+    """Patch the separate gated graph write path to record (name, args) calls."""
     calls = []
 
-    async def fake_read_tool(name, arguments):
+    async def fake_write(name, arguments):
         calls.append((name, arguments))
-        return {}
+        if return_value is not None:
+            return return_value
+        # Default: a success result for every id in the batch.
+        ids = list((arguments.get("emails") or {}).keys())
+        return {
+            "results": [{"message_id": i, "success": True} for i in ids],
+            "summary": {"total": len(ids), "success": len(ids), "failed": 0},
+        }
 
-    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
-    await email_mod._mark_conversation_read("CONV-7")
-
-    assert calls == [("email_read", {"conversationId": "CONV-7", "markAs": "read"})]
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool", fake_write)
+    return calls
 
 
-async def test_mark_conversation_read_is_nonfatal(monkeypatch):
-    """A mark-read failure NEVER raises -- it must not break the dismiss."""
+async def test_mark_messages_read_uses_mark_email_read(monkeypatch):
+    """_mark_messages_read marks messages read via the Graph mark_email_read tool.
+
+    Asserts the exact tool + Graph argument shape ({emails:{id:subj}, is_read:true})
+    so a refactor that drops the batch map or the is_read flag is caught.
+    """
+    calls = _capture_graph_write(monkeypatch)
+    await email_mod._mark_messages_read({"AAMk1": "Re: A", "AAMk2": "Re: B"})
+
+    assert len(calls) == 1
+    name, args = calls[0]
+    assert name == "mark_email_read"
+    assert args["is_read"] is True
+    assert args["emails"] == {"AAMk1": "Re: A", "AAMk2": "Re: B"}
+
+
+async def test_mark_messages_read_batches_at_ten(monkeypatch):
+    """Graph mark_email_read accepts at most 10 ids/call — coalesce into chunks."""
+    calls = _capture_graph_write(monkeypatch)
+    messages = {f"AAMk{i}": f"S{i}" for i in range(23)}
+    await email_mod._mark_messages_read(messages)
+
+    # 23 ids -> 3 batches (10 + 10 + 3), each <= 10.
+    assert len(calls) == 3
+    sizes = [len(args["emails"]) for _, args in calls]
+    assert sizes == [10, 10, 3]
+    assert all(sz <= 10 for sz in sizes)
+    # Every id was marked exactly once across the batches.
+    seen = set()
+    for _, args in calls:
+        seen |= set(args["emails"].keys())
+    assert seen == set(messages.keys())
+
+
+async def test_mark_messages_read_failure_logs_warning_nonfatal(monkeypatch, caplog):
+    """A Graph {success:false} (or a raised error) must NOT raise, and must log at
+    WARNING (not invisible debug) — never claim success it did not achieve."""
+    import logging
+
+    async def fake_write(name, arguments):
+        ids = list((arguments.get("emails") or {}).keys())
+        # Graph reports the write FAILED for every id.
+        return {
+            "results": [{"message_id": i, "success": False} for i in ids],
+            "summary": {"total": len(ids), "success": 0, "failed": len(ids)},
+        }
+
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool", fake_write)
+    with caplog.at_level(logging.WARNING, logger=email_mod.logger.name):
+        # Must not raise.
+        await email_mod._mark_messages_read({"AAMkX": "Re: X"})
+    assert any(rec.levelno >= logging.WARNING for rec in caplog.records), \
+        "a mark-read failure must surface at WARNING"
+
+
+async def test_mark_messages_read_raise_is_nonfatal(monkeypatch, caplog):
+    """A raised exception in the gated write path NEVER breaks the dismiss."""
+    import logging
+
     async def boom(name, arguments):
         raise email_mod.EmailMcpError("mark-read blew up")
 
-    monkeypatch.setattr(email_mod, "call_read_tool", boom)
-    # Must not raise (and a blank conv_id is a no-op).
-    await email_mod._mark_conversation_read("CONV-7")
-    await email_mod._mark_conversation_read("")
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool", boom)
+    with caplog.at_level(logging.WARNING, logger=email_mod.logger.name):
+        await email_mod._mark_messages_read({"AAMkX": "Re: X"})
+        await email_mod._mark_messages_read({})  # empty map is a no-op
+    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
+
+
+def test_mark_email_read_not_in_read_only_frozenset():
+    """BOUNDARY: mark_email_read (a Graph WRITE tool) must NEVER be reachable via
+    the read client — it stays out of _EMAIL_READ_ONLY_TOOLS so the read session
+    can never invoke send/reply/delete/move/mark-read."""
+    ro = email_mod._EMAIL_READ_ONLY_TOOLS
+    for write_tool in ("mark_email_read", "send_email", "reply_to_email",
+                       "delete_email", "move_email"):
+        assert write_tool not in ro, f"{write_tool} must not be in the read-only set"
+    # The two Graph READ tools DO belong on the read-only side.
+    assert "get_emails" in ro and "get_email" in ro
+
+
+async def test_call_read_tool_refuses_mark_email_read(monkeypatch):
+    """call_read_tool must refuse mark_email_read by name BEFORE any connect."""
+    with pytest.raises(email_mod.EmailMcpError):
+        await email_mod.call_read_tool("mark_email_read", {})
+
+
+async def test_graph_write_path_refuses_send_and_delete():
+    """The SEPARATE gated write path accepts ONLY mark_email_read — never the other
+    Graph write tools (send/reply/delete/move), so the gate can't be widened into a
+    general send path."""
+    for forbidden in ("send_email", "reply_to_email", "delete_email", "move_email",
+                      "get_emails", "get_email"):
+        with pytest.raises(email_mod.EmailMcpError):
+            await email_mod._call_graph_write_tool(forbidden, {})
 
 
 # --- (1a) scan attaches threadHistory from a multi-message conversation -------
 
 
 async def test_scan_attaches_thread_history(email_file, monkeypatch):
-    """_scan_once attaches a structured threadHistory from email_read.
+    """_scan_once attaches a structured threadHistory from the Graph get_email body.
 
-    Mocks the read-only MCP client to return one new inbox conversation and a
-    multi-message email_read body so the scan stores threadHistory turns on the
-    skeleton without the draft worker needing any further MCP call.
+    Mocks the read-only Graph MCP client to return one new unread inbox message
+    (get_emails) and a full body (get_email) so the scan stores threadHistory turns
+    on the skeleton without the draft worker needing any further MCP call.
     """
     _seed(email_file, [])
 
     async def fake_read_tool(name, arguments):
-        if name == "email_inbox":
-            return {"messages": [{
-                "conversationId": "CONV-multi",
-                "topic": "Re: Roadmap",
-                "senders": ["John"],
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkRoadmap",
+                "subject": "Re: Roadmap",
+                "from": {"name": "John", "email": "john@example.com"},
+                "received": "2026-06-03T10:00:00Z",
+                "is_read": False,
                 "preview": "latest snippet",
-            }]}
-        if name == "email_read":
-            return {"content": {"emails": [
-                {"sender": "John", "receivedDateTime": "t3", "body": "newest turn"},
-                {"sender": "Me", "receivedDateTime": "t2", "body": "middle turn"},
-                {"sender": "John", "receivedDateTime": "t1", "body": "oldest turn"},
-            ]}}
+            }], "count": 1, "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {
+                "id": "AAMkRoadmap",
+                "subject": "Re: Roadmap",
+                "from": {"name": "John", "email": "john@example.com"},
+                "body": (
+                    "From: John\n\nnewest turn\n---\n"
+                    "From: Me\n\nmiddle turn\n---\nFrom: John\n\noldest turn"
+                ),
+                "messages": [
+                    {"from": {"name": "John"}, "received": "2026-06-03T10:00:00Z", "body": "newest turn"},
+                    {"from": {"name": "Me"}, "received": "2026-06-02T10:00:00Z", "body": "middle turn"},
+                    {"from": {"name": "John"}, "received": "2026-06-01T10:00:00Z", "body": "oldest turn"},
+                ],
+            }}
         return {}
 
     monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
@@ -1057,16 +1165,20 @@ async def test_scan_attaches_thread_history(email_file, monkeypatch):
 
 
 async def test_scan_history_failure_is_nonfatal(email_file, monkeypatch):
-    """A failing email_read does NOT fail the scan and never fabricates turns."""
+    """A failing get_email does NOT fail the scan and never fabricates turns."""
     _seed(email_file, [])
 
     async def fake_read_tool(name, arguments):
-        if name == "email_inbox":
-            return {"messages": [{
-                "conversationId": "CONV-x", "topic": "Hi", "senders": ["A"],
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkX",
+                "subject": "Hi",
+                "from": {"name": "A", "email": "a@example.com"},
+                "received": "2026-06-01T10:00:00Z",
+                "is_read": False,
                 "preview": "snip",
             }]}
-        if name == "email_read":
+        if name == "get_email":
             raise email_mod.EmailMcpError("read blew up")
         return {}
 
@@ -1080,6 +1192,178 @@ async def test_scan_history_failure_is_nonfatal(email_file, monkeypatch):
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
     assert len(saved) == 1  # item still created from the snippet
     assert not saved[0].get("threadHistory")  # no fabricated turns
+
+
+# --- Graph read path: get_emails/get_email + _skeleton_for shape mapping -------
+
+
+def test_skeleton_maps_graph_shape_with_sender_email():
+    """REGRESSION (AC-3 / shape-mapping-gap): _skeleton_for maps the GRAPH email
+    shape (id/subject/from{name,email}/received/is_read/has_attachments/preview)
+    into the item contract — and senderEmail is now POPULATED (it was blank on the
+    old aws-outlook path). A green pytest that only checks status flips would miss
+    a blank senderEmail / empty snippet / unparsed ts; assert them explicitly."""
+    raw = {
+        "id": "AAMkADExample==",
+        "subject": "Re: Q3 planning",
+        "from": {"name": "Jane Roe", "email": "jane.roe@example.com"},
+        "received": "2026-06-20T14:30:00Z",
+        "is_read": False,
+        "has_attachments": True,
+        "preview": "Following up on the numbers we discussed",
+    }
+    sk = email_mod._skeleton_for(raw)
+    # Graph message_id keys the item natively; conversationId aliases it (D-051).
+    assert sk["messageId"] == "AAMkADExample=="
+    assert sk["conversationId"] == "AAMkADExample=="
+    assert sk["sender"] == "Jane Roe"
+    assert sk["senderEmail"] == "jane.roe@example.com"   # NOW populated (was blank)
+    assert sk["subject"] == "Re: Q3 planning"
+    assert sk["snippet"] == "Following up on the numbers we discussed"
+    assert sk["hasAttachments"] is True
+    assert sk["status"] == "needs-classify"
+    # ts is parsed from the ISO8601 'received' into epoch ms (not left as now()).
+    assert isinstance(sk["ts"], int)
+    from datetime import datetime, timezone
+    expected_ms = int(datetime(2026, 6, 20, 14, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert sk["ts"] == expected_ms
+    # A random-hex queue id distinct from the Graph message id.
+    assert sk["id"] and sk["id"] != sk["messageId"]
+
+
+def test_skeleton_sender_falls_back_to_email_when_name_blank():
+    """When Graph from.name is empty, sender falls back to from.email (never blank)."""
+    sk = email_mod._skeleton_for({
+        "id": "AAMk1", "subject": "Hi",
+        "from": {"name": "", "email": "noreply@example.com"},
+        "received": "2026-06-20T14:30:00Z",
+    })
+    assert sk["sender"] == "noreply@example.com"
+    assert sk["senderEmail"] == "noreply@example.com"
+
+
+def test_extract_email_body_handles_graph_shape():
+    """_extract_email_body reads the Graph {email:{...}} shape, flattening from{}."""
+    payload = {"email": {
+        "id": "AAMk1",
+        "subject": "Travel Reminder",
+        "from": {"name": "Tangudu, Punith", "email": "mtaylor@example.com"},
+        "body": "Hi all, gentle reminder.",
+    }}
+    out = email_mod._extract_email_body(payload)
+    assert "Hi all, gentle reminder." in out
+    assert "From: Tangudu, Punith" in out
+    assert "{'name'" not in out and "'email'" not in out
+
+
+async def test_scan_dedupes_on_message_id(email_file, monkeypatch):
+    """MIGRATION DATA-LOSS guard: an item already in the queue (active status) under
+    its Graph message_id is NOT re-surfaced, and a genuinely new message_id IS.
+    Re-keying conversationId->messageId must not drop or double-surface emails."""
+    # Seed an existing active item keyed on a Graph message_id.
+    _seed(email_file, [_make_item("existing", messageId="AAMkOLD",
+                                  conversationId="AAMkOLD", status="needs-review")])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [
+                {"id": "AAMkOLD", "subject": "Old", "from": {"name": "A", "email": "a@x.com"},
+                 "received": "2026-06-01T10:00:00Z", "is_read": False, "preview": "old"},
+                {"id": "AAMkNEW", "subject": "New", "from": {"name": "B", "email": "b@x.com"},
+                 "received": "2026-06-02T10:00:00Z", "is_read": False, "preview": "new"},
+            ]}
+        if name == "get_email":
+            mid = arguments.get("message_id")
+            return {"email": {"id": mid, "subject": "S", "from": {"name": "x"}, "body": "body"}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    by_msg = {it.get("messageId"): it for it in saved}
+    # The old message_id stayed a single item (not double-surfaced); the new one
+    # earned a fresh skeleton.
+    assert sum(1 for it in saved if it.get("messageId") == "AAMkOLD") == 1
+    assert "AAMkNEW" in by_msg
+    assert by_msg["AAMkNEW"]["status"] == "needs-classify"
+
+
+async def test_scan_skips_muted_message(email_file, monkeypatch):
+    """MIGRATION guard: a muted message (keyed on its messageId) must NOT re-appear
+    after the conversationId->messageId re-key. Mute still matches."""
+    _seed(email_file, [], mutedThreads={"AAMkMUTED": __import__("time").time()})
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [
+                {"id": "AAMkMUTED", "subject": "Muted thread",
+                 "from": {"name": "A", "email": "a@x.com"},
+                 "received": "2026-06-01T10:00:00Z", "is_read": False, "preview": "x"},
+            ]}
+        if name == "get_email":
+            return {"email": {"id": "AAMkMUTED", "subject": "S", "from": {"name": "x"}, "body": "b"}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert saved == [], "a muted message must not re-surface"
+
+
+def test_node24_bin_resolution_fails_loud_when_absent(monkeypatch, tmp_path):
+    """SILENT-NODE-22-FALLBACK guard: when no Node 24 bin dir is found, resolution
+    RAISES an actionable error (never silently falls back to the default Node,
+    which produces the opaque 'Connection closed')."""
+    # Point the search at an empty dir and clear any override so nothing resolves.
+    monkeypatch.setattr(email_mod, "_NODE24_GLOB", str(tmp_path / "nonexistent" / "node" / "24*" / "bin"))
+    monkeypatch.delenv("CLAUDE_WEB_NODE24_BIN", raising=False)
+    with pytest.raises(email_mod.GraphMcpNodeError) as exc:
+        email_mod._resolve_node24_bin()
+    msg = str(exc.value)
+    # The error must name the expected location and the install command.
+    assert "24" in msg
+    assert ("mise" in msg.lower() or "install" in msg.lower())
+
+
+def test_graph_mcp_params_injects_node24_path(monkeypatch, tmp_path):
+    """_graph_mcp_params PREPENDS the Node-24 bin dir onto PATH for THAT subprocess
+    only — never mutates os.environ or the aws-outlook launch."""
+    node24 = tmp_path / "node24bin"
+    node24.mkdir()
+    monkeypatch.setenv("CLAUDE_WEB_NODE24_BIN", str(node24))
+    before_os_path = __import__("os").environ.get("PATH", "")
+
+    params = email_mod._graph_mcp_params()
+    env = params.env or {}
+    assert "PATH" in env, "the subprocess env must carry a PATH with Node 24 prepended"
+    assert env["PATH"].split(":")[0] == str(node24), \
+        "Node 24 bin dir must be PREPENDED (first on PATH)"
+    # os.environ is untouched (no global toolchain mutation).
+    assert __import__("os").environ.get("PATH", "") == before_os_path
+
+
+def test_find_graph_mcp_entry_does_not_match_aws_outlook(monkeypatch, tmp_path):
+    """The graph finder matches 'manager-outlook'/'graph' names, NOT 'aws-outlook'
+    — so the existing aws-outlook draft path is untouched."""
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "aws-outlook-mcp": {"command": "aws-outlook-mcp"},
+        "manager-outlook-mcp": {"command": "manager-outlook-mcp", "args": []},
+    }}), encoding="utf-8")
+    monkeypatch.setattr(email_mod, "_mcp_config_paths", lambda: [cfg])
+    entry = email_mod._find_graph_mcp_entry()
+    assert entry is not None
+    assert entry.get("command") == "manager-outlook-mcp"
 
 
 # ─── threadAsk contract (D-048 clauses 1-3): summary + ask, ONE call ──────────
