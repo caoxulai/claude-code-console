@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight } from './emailDetail';
 
 // --- Constants ---
 
@@ -886,6 +886,16 @@ export default function EmailPage() {
             <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(turn.timestamp)}</span>
           )}
         </div>
+        {/* Optional "To:" line — who this turn was sent to. Rendered ONLY when
+            the turn carries a non-empty recipients STRING (the backend joins
+            display names into a human-readable string — see email.py); skipped
+            entirely otherwise so we never show an empty "To:" or a placeholder.
+            All text via React {…} interpolation, never dangerouslySetInnerHTML. */}
+        {typeof turn.recipients === 'string' && turn.recipients.trim() && (
+          <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginTop: '0.15em' }}>
+            To: {turn.recipients}
+          </div>
+        )}
         <div style={{ marginTop: '0.3em' }}>
           {renderBody(turn.body)}
         </div>
@@ -1228,7 +1238,7 @@ export default function EmailPage() {
                     <span style={{ color: 'var(--muted)' }}>
                       {open ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
                     </span>
-                    <span>{item.sender || 'unknown'}</span>
+                    <span>{fromColumnLabel(item)}</span>
                   </span>
                 </td>
                 <td style={{ fontWeight: 500 }}>

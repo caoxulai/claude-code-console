@@ -49,6 +49,25 @@ export function threadSummaryParts(item) {
   return { summary, ask, hasSummary: summary !== '', hasAsk: ask !== '' };
 }
 
+// Build the email-list "From" cell text. The base name is the latest reply's
+// sender (the scan worker backfills item.sender to the newest turn's sender —
+// see email.py _extract_thread_history), preserving the existing
+// `sender || 'unknown'` fallback. When the item carries a senderList (an
+// ordered, deduped list of unique participants) with more than one name, append
+// ` +N` where N is the number of ADDITIONAL unique senders (length - 1): a
+// 2-sender thread reads "+1", a 3-sender "+2". A single-sender, missing, empty,
+// or non-array senderList (older items predate the field) gets NO suffix —
+// never "+0", never a bare "+". Pure — no DOM, no fetch.
+export function fromColumnLabel(item) {
+  const it = item || {};
+  const base = it.sender || 'unknown';
+  const list = it.senderList;
+  if (Array.isArray(list) && list.length > 1) {
+    return `${base} +${list.length - 1}`;
+  }
+  return base;
+}
+
 // Resolve a mute key to a human-friendly label. The email mute key is the raw
 // conversationId (no _threadTs suffix — see email.py _mute_key_for), so we look
 // up any queue item on the same conversation and borrow its subject (then sender),

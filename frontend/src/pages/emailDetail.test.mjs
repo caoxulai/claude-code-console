@@ -12,6 +12,7 @@ import {
   threadTurns,
   latestThreadView,
   threadSummaryParts,
+  fromColumnLabel,
   mutedLabel,
   sortedMutedKeys,
   polishSource,
@@ -195,6 +196,56 @@ test('threadSummaryParts: non-string fields are coerced safely, never "undefined
   assert.equal(p.hasSummary, true);
   assert.equal(p.ask, '');
   assert.equal(p.hasAsk, false);
+});
+
+// --- fromColumnLabel: the email-list "From" cell text ---------------------
+// The list From cell shows the LATEST reply's sender (backfilled server-side
+// onto item.sender) plus a "+N" participant count where N = the number of
+// ADDITIONAL unique senders. So a 2-sender thread reads "+1", a 3-sender "+2".
+// A single-sender OR a missing/empty senderList (older items predate the field)
+// renders the base sender with NO suffix — never "+0", never a bare "+". The
+// existing `sender || 'unknown'` fallback is preserved. Pure — no DOM.
+
+test('fromColumnLabel: single-sender senderList -> base name only, no "+N"', () => {
+  assert.equal(fromColumnLabel({ sender: 'Yibo', senderList: ['Yibo'] }), 'Yibo');
+});
+
+test('fromColumnLabel: 2 unique senders -> "+1" (additional uniques, not total)', () => {
+  assert.equal(
+    fromColumnLabel({ sender: 'Bingfeng', senderList: ['Yibo', 'Bingfeng'] }),
+    'Bingfeng +1',
+  );
+});
+
+test('fromColumnLabel: 3 unique senders -> "+2"', () => {
+  assert.equal(
+    fromColumnLabel({ sender: 'Bingfeng', senderList: ['Han', 'Yibo', 'Bingfeng'] }),
+    'Bingfeng +2',
+  );
+});
+
+test('fromColumnLabel: missing senderList (old item) -> base sender, no suffix', () => {
+  assert.equal(fromColumnLabel({ sender: 'Yibo' }), 'Yibo');
+});
+
+test('fromColumnLabel: empty senderList -> base sender, no suffix (never "+0"/"+")', () => {
+  const out = fromColumnLabel({ sender: 'Yibo', senderList: [] });
+  assert.equal(out, 'Yibo');
+  assert.equal(out.includes('+'), false);
+});
+
+test('fromColumnLabel: non-array senderList is ignored -> base sender only', () => {
+  assert.equal(fromColumnLabel({ sender: 'Yibo', senderList: 'not an array' }), 'Yibo');
+});
+
+test('fromColumnLabel: empty sender -> "unknown" fallback preserved', () => {
+  assert.equal(fromColumnLabel({}), 'unknown');
+  assert.equal(fromColumnLabel({ sender: '' }), 'unknown');
+  assert.equal(fromColumnLabel(undefined), 'unknown');
+});
+
+test('fromColumnLabel: empty sender but multi senderList -> "unknown +N" still counts', () => {
+  assert.equal(fromColumnLabel({ sender: '', senderList: ['A', 'B'] }), 'unknown +1');
 });
 
 // --- mutedLabel: resolve a friendly label from a mute key -----------------
