@@ -476,13 +476,6 @@ _SCAN_LIST_DMS_LIMIT = 30
 # forever (the user can re-mute if it's still noise).
 _MUTE_TTL_S = 30 * 24 * 60 * 60  # 30 days
 
-# Watched channels: small private channels where get_unreads unreliably surfaces
-# @here/@channel broadcast mentions. Checked every scan cycle for unread messages
-# from others (bypasses get_unreads entirely for these channels).
-_WATCHED_CHANNELS = [
-    "C02UD3DUERL",  # glenn-sdms (4 members)
-]
-
 # Bot senders that never need a human reply — skip during scan.
 _BOT_SENDERS = frozenset({
     "slackbot",
@@ -894,24 +887,33 @@ def _build_agent_prompt(action: str, payload: dict) -> str:
             "of the conversation topic and what they're asking/discussing — NOT the raw messages."
         )
     elif action == "polish":
-        # MCP-FREE (D-029): polish the user's CURRENT draft text for fluency while
-        # preserving THEIR voice and language. It reasons ONLY over the text already
-        # in the prompt — no tool calls, no fetch, no send — so the subprocess gets
-        # NO --allowedTools and an EMPTY --mcp-config under --strict-mcp-config. The
-        # instruction is deliberately conservative: improve flow/grammar/clarity but
-        # do NOT change meaning, do NOT translate, do NOT formalize the user's style.
+        # MCP-FREE (D-029): rewrite the user's draft into a polished professional
+        # Slack reply. Has access to thread context and snippet so it can add
+        # relevant clarifying questions and structure the reply well. No tool calls,
+        # no fetch, no send — empty MCP config under --strict-mcp-config.
         text = str(payload.get("text", ""))
+        thread_context = str(payload.get("threadContext", "")).strip()
+        snippet = str(payload.get("snippet", "")).strip()
+        context_block = ""
+        if snippet:
+            context_block += f"Message I'm replying to:\n{snippet}\n\n"
+        if thread_context:
+            context_block += f"Thread context:\n{thread_context}\n\n"
         prompt = (
-            "Improve the FLUENCY of the Slack reply below — do NOT call any tools, "
-            "do NOT fetch anything, do NOT send anything. Fix grammar, awkward "
-            "phrasing, and clarity so it reads smoothly, but you MUST preserve MY "
-            "own voice and writing style and the SAME language the text is written "
-            "in (do NOT translate). Do NOT change the meaning, do NOT add or remove "
-            "information, do NOT make it more formal or more casual than I wrote it, "
-            "and keep it roughly the same length. If the text is already fluent, "
-            "return it essentially unchanged.\n\n"
-            "My draft:\n"
-            f"{text}\n\n"
+            "You are helping me polish a Slack reply. Use good judgment on how much "
+            "to change based on what the message actually needs:\n\n"
+            "- If my draft is already clear and complete: just fix grammar, "
+            "awkward phrasing, or clarity. Keep it roughly the same length.\n"
+            "- If my draft is rough notes or covers a technical/complex situation: "
+            "expand into a well-structured reply. Acknowledge the situation, state "
+            "what I will do, and add 1-3 specific clarifying questions ONLY if they "
+            "would genuinely help move things forward (base them on the thread — "
+            "do NOT add generic questions).\n\n"
+            "Always: be concise and direct, no filler phrases, preserve my intent, "
+            "use the SAME language (do NOT translate), professional but not stiff.\n\n"
+            "Do NOT call any tools, do NOT fetch anything, do NOT send anything.\n\n"
+            + (context_block)
+            + f"My draft:\n{text}\n\n"
             'Return ONLY a STRICT JSON object (no prose, no markdown fences): '
             '{"draft": "<the polished reply text>"}.'
         )
@@ -2684,16 +2686,11 @@ def _dm_candidates(dms_payload, now_ms: int) -> list[dict]:
     """Build DM / group-DM scan candidates from a parsed list_dms payload.
 
     Each candidate is a normalized dict {channelId, userId, channelType, sender,
-    channel, snippet, ts}. channelId/userId are captured VERBATIM (routing ids,
-    not secrets); sender/channel/snippet are datamark-normalized + scrubbed.
-
-    Uses a generous 24h cutoff (not the tight scan-window) because list_dms's
-    lastActivity can be stale — e.g. channel creation time rather than latest
-    message time for newly-created group DMs. The 24h window ensures a
-    minutes-stale lastActivity still passes while preventing peeks on channels
-    inactive for days.
+    channel, snippet, ts}. A DM/group-DM qualifies when its lastActivity is newer
+    than the scan window cutoff. channelId/userId are captured VERBATIM (routing
+    ids, not secrets); sender/channel/snippet are datamark-normalized + scrubbed.
     """
-    cutoff = now_ms - _SCAN_WINDOW_MS  # 24h fixed window
+    cutoff = _scan_window_start_ms(now_ms)
     out: list[dict] = []
     for raw in _unwrap_list(dms_payload, "dms", "conversations", "ims", "items"):
         if not isinstance(raw, dict):
@@ -2975,9 +2972,8 @@ _SLACK_XML_RE = re.compile(
     re.DOTALL,
 )
 
-# Matches a Slack @mention of the current user (W0187CHBRU0 or U06PZ036D98)
-# OR a broadcast mention (@here, @channel) that reaches all channel members.
-_SELF_MENTION_RE = re.compile(r'<@(?:W0187CHBRU0|U06PZ036D98)>|<!(?:here|channel)>')
+# Matches a Slack @mention of the current user (W0187CHBRU0 or U06PZ036D98).
+_SELF_MENTION_RE = re.compile(r'<@(?:W0187CHBRU0|U06PZ036D98)>')
 
 
 _USER_MENTION_RE = re.compile(r'<@([WU][A-Z0-9]+)>')
@@ -3126,44 +3122,6 @@ async def _scan_once(app) -> None:
             continue
         candidates.append(dc)
         seen_ids.add(cid)
-
-    # Watched channels: small private channels where get_unreads unreliably
-    # surfaces @here/@channel broadcasts. Peek at the latest message in each; if
-    # it's from someone else and not already covered, add as a mention candidate.
-    for wch in _WATCHED_CHANNELS:
-        if wch in seen_ids:
-            continue
-        try:
-            peek = await _scan_read("get_messages", {"channel": wch, "limit": 1})
-            msgs = (peek.get("messages") if isinstance(peek, dict) else peek) or []
-            if not msgs:
-                continue
-            last_msg = msgs[0] if isinstance(msgs, list) else {}
-            raw_user = last_msg.get("user") or last_msg.get("sender") or ""
-            if isinstance(raw_user, dict):
-                last_author = raw_user.get("name") or raw_user.get("id") or ""
-            else:
-                last_author = str(raw_user)
-            if last_author.lower() == "xulaicao":
-                continue
-            text = str(last_msg.get("text", ""))
-            if not (_SELF_MENTION_RE.search(text)):
-                continue
-            ch_name = ""
-            if isinstance(peek, dict) and isinstance(peek.get("channel"), dict):
-                ch_name = peek["channel"].get("name", "")
-            candidates.append({
-                "channelId": wch,
-                "userId": "",
-                "channelType": "mention",
-                "sender": _scrub(last_author)[:_SNIPPET_CAP],
-                "channel": _scrub(ch_name or wch)[:_SNIPPET_CAP],
-                "snippet": _scrub(_resolve_mentions(_strip_slack_xml(text)))[:_SNIPPET_CAP],
-                "ts": _as_int_ms(last_msg.get("ts")),
-            })
-            seen_ids.add(wch)
-        except Exception:  # noqa: BLE001
-            continue
 
     # Filter out bot senders that never need replies.
     candidates = [c for c in candidates if not _is_bot_sender(c.get("sender", ""))]
@@ -3691,7 +3649,11 @@ async def polish_text(request: web.Request) -> web.Response:
     if not isinstance(text, str) or not text.strip():
         raise web.HTTPBadRequest(reason="polish requires a non-empty 'text'")
 
-    result = await _run_slack_agent("polish", {"text": text[:_DRAFT_CAP]})
+    result = await _run_slack_agent("polish", {
+        "text": text[:_DRAFT_CAP],
+        "threadContext": str(body.get("threadContext") or "")[:1000],
+        "snippet": str(body.get("snippet") or "")[:500],
+    })
     if not result.get("available"):
         # Honest failure — never fabricate a polished draft.
         return web.json_response(

@@ -212,11 +212,6 @@ function statusBadge(item) {
   return { label: 'needs review', className: 'badge', style: NEEDS_REVIEW_BADGE_STYLE };
 }
 
-// Survives component unmount so pending sends remain trackable across tab switches.
-// When a send is confirmed, the entry is written here; fireSend deletes it on completion.
-// Structure: { [itemId]: { confirmedAt, capturedText, capturedBaseline, undoWindowS, timerHandle } }
-const _pendingSendStore = {};
-
 export default function SlackPage() {
   const [items, setItems] = useState([]);
   const [etag, setEtag] = useState(null);
@@ -390,38 +385,7 @@ export default function SlackPage() {
 
   useEffect(() => { refresh(); fetchHealth(); refreshMuted(); }, []);
 
-  // Rehydrate pending-send state from the module-level store on mount. When the
-  // user switches tabs and returns, the component remounts fresh — this seeds
-  // pendingSends from _pendingSendStore so the countdown resumes (or shows
-  // "Sending..." if the timer already fired while away).
-  useEffect(() => {
-    const now = Date.now();
-    const rehydrated = {};
-    for (const [id, entry] of Object.entries(_pendingSendStore)) {
-      const elapsed = (now - entry.confirmedAt) / 1000;
-      const remaining = Math.max(0, Math.ceil(entry.undoWindowS - elapsed));
-      rehydrated[id] = { secondsLeft: remaining, capturedText: entry.capturedText, capturedBaseline: entry.capturedBaseline };
-      if (remaining > 0) {
-        // Restart the visual countdown interval (the fire timer is already running).
-        const interval = setInterval(() => {
-          setPendingSends(prev => {
-            const cur = prev[id];
-            if (!cur) return prev;
-            return { ...prev, [id]: { ...cur, secondsLeft: Math.max(0, cur.secondsLeft - 1) } };
-          });
-        }, 1000);
-        timersRef.current[id] = { timer: entry.timerHandle, interval };
-      } else {
-        // Timer already fired (or is about to) — show "Sending..." until the
-        // next queue refresh removes the store entry (fireSend deletes it on
-        // completion; refresh() updates items to 'sent' status).
-        timersRef.current[id] = { timer: entry.timerHandle, interval: null };
-      }
-    }
-    if (Object.keys(rehydrated).length > 0) {
-      setPendingSends(rehydrated);
-    }
-  }, []);
+
 
   // Live refresh, but never while a draft is open in the editor — that would
   // discard the in-progress edit.
@@ -455,10 +419,6 @@ export default function SlackPage() {
   // removes ONLY that id from the map. Per-row Undo calls this. Safe to call
   // when nothing is pending for the id.
   const cancelPendingSend = (id) => {
-    // Clear the fire timeout from the module-level store (reachable after remount).
-    const storeEntry = _pendingSendStore[id];
-    if (storeEntry && storeEntry.timerHandle) clearTimeout(storeEntry.timerHandle);
-    delete _pendingSendStore[id];
     clearTimersFor(id);
     setPendingSends(prev => {
       if (!(id in prev)) return prev;
@@ -468,13 +428,15 @@ export default function SlackPage() {
     });
   };
 
-  // On unmount (tab switch), clear only the visual countdown intervals — let
-  // confirmed send timers fire in the background so a tab switch after Approve
-  // doesn't silently cancel an already-confirmed send.
+  // Clear EVERY outstanding send-timer on unmount so no confirmed-but-undone (or
+  // simply navigated-away-from) send fires after the component is gone. Iterates
+  // the whole per-id timer map.
   useEffect(() => () => {
-    Object.values(timersRef.current).forEach(({ interval }) => {
+    Object.values(timersRef.current).forEach(({ timer, interval }) => {
+      if (timer) clearTimeout(timer);
       if (interval) clearInterval(interval);
     });
+    timersRef.current = {};
     clearRef(scanHintRef);
     clearRef(scanNoticeRef);
   }, []);
@@ -747,15 +709,12 @@ export default function SlackPage() {
   // conflict banner if the item itself actually changed (or the retry still 409s).
   const fireSend = async (id, text, baseline) => {
     clearTimersFor(id);
-    // Mark as "firing" in the module store (timer gone, but entry persists until
-    // the send confirms). If the component is unmounted during the POST, the
-    // rehydration shows "Sending..." on return. Only delete on success.
-    if (_pendingSendStore[id]) {
-      _pendingSendStore[id].timerHandle = null;
-    }
+    delete _pendingSendStore[id];
     setPendingSends(prev => {
       if (!(id in prev)) return prev;
-      return { ...prev, [id]: { ...prev[id], secondsLeft: 0 } };
+      const next = { ...prev };
+      delete next[id];
+      return next;
     });
     setBusyId(id);
     setError(null);
@@ -788,7 +747,6 @@ export default function SlackPage() {
         }
         if (fresh && fresh.status === 'sent') {
           // Already sent (double-send guard / a prior fire landed). Not an error.
-          delete _pendingSendStore[id];
           setEditingId(null);
           refresh();
           return;
@@ -804,31 +762,26 @@ export default function SlackPage() {
         } else {
           // The item ACTUALLY changed underneath us (an edit / re-draft /
           // someone sent it) — do not silently resend stale text; surface it.
-          delete _pendingSendStore[id];
           setError('Conflict: this item changed before the send. Re-review and approve again.');
           return;
         }
       }
       if (status === 409) {
         // Still conflicting after the single retry — surface it.
-        delete _pendingSendStore[id];
         setError('Conflict: the queue was modified elsewhere before the send. Re-review and approve again.');
         refresh();
         return;
       }
       if (status < 200 || status >= 300) {
         const reason = (json && json.reason) || 'Send failed';
-        delete _pendingSendStore[id];
         setSendFailedIds(prev => new Map(prev).set(id, reason));
         setError('Failed to send the reply.');
         return;
       }
-      delete _pendingSendStore[id];
       if (json && json.etag) setEtag(json.etag);
       setEditingId(null);
       refresh();
     } catch {
-      delete _pendingSendStore[id];
       setSendFailedIds(prev => new Map(prev).set(id, 'Network error — check connection'));
       setError('Failed to send the reply.');
     } finally {
@@ -865,8 +818,7 @@ export default function SlackPage() {
     }, 1000);
     const timer = setTimeout(() => fireSend(id, text, baseline), UNDO_WINDOW_S * 1000);
     timersRef.current[id] = { timer, interval };
-    // Persist to module-level store so the send survives unmount (tab switch).
-    _pendingSendStore[id] = { confirmedAt: Date.now(), capturedText: text, capturedBaseline: baseline, undoWindowS: UNDO_WINDOW_S, timerHandle: timer };
+
   };
 
   // Generate a single item's draft via the per-item seam call
@@ -940,7 +892,11 @@ export default function SlackPage() {
       const res = await fetch('/api/slack/polish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: source }),
+        body: JSON.stringify({
+          text: source,
+          threadContext: item.threadContext || '',
+          snippet: item.snippet || '',
+        }),
       });
       const json = await res.json().catch(() => null);
       if (!res.ok || !json || json.available === false) {
@@ -1420,14 +1376,11 @@ export default function SlackPage() {
               style={{ width: '100%' }}
             />
           )}
-          {/* Polish (rewrite for fluency) and Save edit sit WITH the textarea
-              because they shape the draft, distinct from the disposition row
-              (Send / Dismiss / Mute) below. Shown ONLY once the draft has been
-              edited (dirty): an untouched machine draft needs no polishing or
-              saving, so this whole row stays hidden until you change the text.
-              (Polishing also sets the text, which keeps `dirty` true — so Polish
-              stays available for repeated passes.) */}
-          {!isReadOnly && !undrafted && !pending && dirty && (
+          {/* --- Draft tools — operate on the text in the box above ---------- */}
+          {/* Polish is available whenever the text box is open (editing), so you
+              can polish the machine draft without first manually changing it.
+              Save only appears when the text has actually been changed (dirty). */}
+          {!isReadOnly && !undrafted && !pending && editing && (
             <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.5em' }}>
               <button
                 className="btn"
@@ -1437,12 +1390,14 @@ export default function SlackPage() {
               >
                 <FiFeather size={13} /> {isPolishing ? 'Polishing…' : 'Polish'}
               </button>
-              <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
-                <FiSave size={13} /> Save edit
-              </button>
-              <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
-                Unsaved edits — Send will use the edited text.
-              </span>
+              {dirty && <>
+                <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
+                  <FiSave size={13} /> Save edit
+                </button>
+                <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
+                  Unsaved edits — Send will use the edited text.
+                </span>
+              </>}
             </div>
           )}
         </div>
@@ -1735,22 +1690,20 @@ export default function SlackPage() {
 
   // Dismiss all items in a list (sequential, best-effort per item).
   const dismissAll = async (list) => {
-    let currentEtag = etag;
     for (const item of list) {
       if (item.status === 'sent') continue;
       try {
         const res = await fetch(`/api/slack/queue/${encodeURIComponent(item.id)}`, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ etag: currentEtag }),
+          body: JSON.stringify({ etag }),
         });
         if (res.ok) {
           const json = await res.json();
-          currentEtag = json.etag ?? currentEtag;
+          setEtag(json.etag ?? null);
         }
       } catch { /* best-effort */ }
     }
-    setEtag(currentEtag);
     refresh();
   };
 
