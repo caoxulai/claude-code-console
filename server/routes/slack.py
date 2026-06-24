@@ -476,6 +476,13 @@ _SCAN_LIST_DMS_LIMIT = 30
 # forever (the user can re-mute if it's still noise).
 _MUTE_TTL_S = 30 * 24 * 60 * 60  # 30 days
 
+# Watched channels: small private channels where get_unreads unreliably surfaces
+# @here/@channel broadcast mentions. Checked every scan cycle for unread messages
+# from others (bypasses get_unreads entirely for these channels).
+_WATCHED_CHANNELS = [
+    "C02UD3DUERL",  # glenn-sdms (4 members)
+]
+
 # Bot senders that never need a human reply — skip during scan.
 _BOT_SENDERS = frozenset({
     "slackbot",
@@ -2677,11 +2684,16 @@ def _dm_candidates(dms_payload, now_ms: int) -> list[dict]:
     """Build DM / group-DM scan candidates from a parsed list_dms payload.
 
     Each candidate is a normalized dict {channelId, userId, channelType, sender,
-    channel, snippet, ts}. A DM/group-DM qualifies when its lastActivity is newer
-    than the scan window cutoff. channelId/userId are captured VERBATIM (routing
-    ids, not secrets); sender/channel/snippet are datamark-normalized + scrubbed.
+    channel, snippet, ts}. channelId/userId are captured VERBATIM (routing ids,
+    not secrets); sender/channel/snippet are datamark-normalized + scrubbed.
+
+    Uses a generous 24h cutoff (not the tight scan-window) because list_dms's
+    lastActivity can be stale — e.g. channel creation time rather than latest
+    message time for newly-created group DMs. The 24h window ensures a
+    minutes-stale lastActivity still passes while preventing peeks on channels
+    inactive for days.
     """
-    cutoff = _scan_window_start_ms(now_ms)
+    cutoff = now_ms - _SCAN_WINDOW_MS  # 24h fixed window
     out: list[dict] = []
     for raw in _unwrap_list(dms_payload, "dms", "conversations", "ims", "items"):
         if not isinstance(raw, dict):
@@ -2963,8 +2975,9 @@ _SLACK_XML_RE = re.compile(
     re.DOTALL,
 )
 
-# Matches a Slack @mention of the current user (W0187CHBRU0 or U06PZ036D98).
-_SELF_MENTION_RE = re.compile(r'<@(?:W0187CHBRU0|U06PZ036D98)>')
+# Matches a Slack @mention of the current user (W0187CHBRU0 or U06PZ036D98)
+# OR a broadcast mention (@here, @channel) that reaches all channel members.
+_SELF_MENTION_RE = re.compile(r'<@(?:W0187CHBRU0|U06PZ036D98)>|<!(?:here|channel)>')
 
 
 _USER_MENTION_RE = re.compile(r'<@([WU][A-Z0-9]+)>')
@@ -3113,6 +3126,44 @@ async def _scan_once(app) -> None:
             continue
         candidates.append(dc)
         seen_ids.add(cid)
+
+    # Watched channels: small private channels where get_unreads unreliably
+    # surfaces @here/@channel broadcasts. Peek at the latest message in each; if
+    # it's from someone else and not already covered, add as a mention candidate.
+    for wch in _WATCHED_CHANNELS:
+        if wch in seen_ids:
+            continue
+        try:
+            peek = await _scan_read("get_messages", {"channel": wch, "limit": 1})
+            msgs = (peek.get("messages") if isinstance(peek, dict) else peek) or []
+            if not msgs:
+                continue
+            last_msg = msgs[0] if isinstance(msgs, list) else {}
+            raw_user = last_msg.get("user") or last_msg.get("sender") or ""
+            if isinstance(raw_user, dict):
+                last_author = raw_user.get("name") or raw_user.get("id") or ""
+            else:
+                last_author = str(raw_user)
+            if last_author.lower() == "xulaicao":
+                continue
+            text = str(last_msg.get("text", ""))
+            if not (_SELF_MENTION_RE.search(text)):
+                continue
+            ch_name = ""
+            if isinstance(peek, dict) and isinstance(peek.get("channel"), dict):
+                ch_name = peek["channel"].get("name", "")
+            candidates.append({
+                "channelId": wch,
+                "userId": "",
+                "channelType": "mention",
+                "sender": _scrub(last_author)[:_SNIPPET_CAP],
+                "channel": _scrub(ch_name or wch)[:_SNIPPET_CAP],
+                "snippet": _scrub(_resolve_mentions(_strip_slack_xml(text)))[:_SNIPPET_CAP],
+                "ts": _as_int_ms(last_msg.get("ts")),
+            })
+            seen_ids.add(wch)
+        except Exception:  # noqa: BLE001
+            continue
 
     # Filter out bot senders that never need replies.
     candidates = [c for c in candidates if not _is_bot_sender(c.get("sender", ""))]
@@ -3328,16 +3379,10 @@ async def save_draft(request: web.Request) -> web.Response:
     """Save an edited draft. Editing (text differs from the generated draft)
     flips status to 'edited' — that edit is the preference-learning signal,
     consumed on approve. NEVER sends.
-
-    Uses the freshly-loaded current_etag (not the client-provided one) because
-    background workers (scanner, classify, draft) advance the file etag while the
-    user is editing a DIFFERENT item — the frontend suppresses refreshes during
-    editing so its etag goes stale. This is safe: save_draft only mutates one
-    item's draft/status fields, so a concurrent worker write to other items is
-    non-conflicting.
     """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request)
+    expected_etag = body.get("etag")
     if "draft" not in body:
         raise web.HTTPBadRequest(reason="draft field required")
     new_draft = _scrub(str(body["draft"]))[:_DRAFT_CAP]
@@ -3354,7 +3399,7 @@ async def save_draft(request: web.Request) -> web.Response:
         item["status"] = "edited"
 
     try:
-        new_etag = filestore.write_json(SLACK_PATH, data, current_etag)
+        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
     except filestore.ConflictError as e:
         current, current_etag = filestore.read_json(SLACK_PATH)
         return web.json_response(

@@ -5576,10 +5576,7 @@ async def test_slack_save_draft_marks_edited_and_round_trips(client, slack_file,
     assert saved["draft"] == "my own words"
 
 
-async def test_slack_save_draft_ignores_stale_client_etag(client, slack_file):
-    """save_draft uses the freshly-loaded current_etag (not the client's stale
-    one) because background workers advance the file etag while the user edits
-    a different item. The save should succeed regardless of client etag."""
+async def test_slack_save_draft_conflict_returns_409(client, slack_file):
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
@@ -5587,9 +5584,9 @@ async def test_slack_save_draft_ignores_stale_client_etag(client, slack_file):
         "generatedDraft": "d", "status": "needs-review", "ts": 1,
     }]}), encoding="utf-8")
     resp = await client.put("/api/slack/queue/i1", json={"draft": "x", "etag": "stale-etag"})
-    assert resp.status == 200
+    assert resp.status == 409
     body = await resp.json()
-    assert body["item"]["draft"] == "x"
+    assert body["error"] == "conflict"
 
 
 async def test_slack_dismiss_sets_status_not_delete(client, slack_file):
@@ -7535,16 +7532,17 @@ async def test_slack_scan_read_tool_non_transient_isError_no_retry(monkeypatch, 
 
 
 def test_slack_dm_candidates_distinguish_group_and_dm(reset_scan_ts):
-    """_dm_candidates builds DM/group-DM candidates from a list_dms payload by the
-    activity window, and a group DM 'C…' is channelType 'group_dm' while a 1:1 DM
-    'D…' is 'dm' — even when they share a participant. channelId is verbatim."""
+    """_dm_candidates builds DM/group-DM candidates from a list_dms payload using
+    a generous 24h cutoff (not the tight scan-window), and a group DM 'C…' is
+    channelType 'group_dm' while a 1:1 DM 'D…' is 'dm' — even when they share
+    a participant. channelId is verbatim."""
     now = 2_000_000_000_000
     payload = {"dms": [
         {"channelId": "D_one_on_one", "user": "U_alice", "name": "alice",
          "lastActivity": now - 1000},
         {"channelId": "C_group", "isGroup": True, "name": "mpdm-alice--bob-1",
          "lastActivity": now - 1000},
-        # Too old -> excluded by the activity window (fallback window from now).
+        # Too old (10 days) -> excluded by the 24h activity window.
         {"channelId": "D_stale", "user": "U_old", "name": "old",
          "lastActivity": now - 10 * slack_mod._SCAN_WINDOW_MS},
     ]}
