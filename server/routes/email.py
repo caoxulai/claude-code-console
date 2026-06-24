@@ -1638,6 +1638,10 @@ def _html_to_text(html: str) -> str:
     # Decode common HTML entities
     text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     text = text.replace("&nbsp;", " ").replace("&quot;", '"')
+    # Strip angle brackets around email addresses (e.g. <user@amazon.com> → user@amazon.com)
+    # so ReactMarkdown doesn't treat them as HTML tags and silently drop following content.
+    text = re.sub(r"<([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})>",
+                  r"\1", text)
     # Collapse whitespace (preserve newlines and sentinels)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
