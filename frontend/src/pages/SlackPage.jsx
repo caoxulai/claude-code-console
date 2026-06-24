@@ -68,8 +68,20 @@ function clearRef(ref) {
 
 function stripSlackXml(text) {
   if (!text) return '';
-  return text.replace(/<slack-user-content[^>]*>([\s\S]*?)<\/slack-user-content>/g, '$1')
+  const stripped = text.replace(/<slack-user-content[^>]*>([\s\S]*?)<\/slack-user-content>/g, '$1')
     .replace(//g, '').trim();
+  // Split on Slack link syntax <url|label> or <url> and render as clickable links.
+  const parts = stripped.split(/(<https?:\/\/[^>]+>)/g);
+  if (parts.length === 1) return stripped;
+  return parts.map((part, i) => {
+    const m = part.match(/^<(https?:\/\/[^|>]+)(?:\|([^>]+))?>$/);
+    if (m) {
+      const url = m[1];
+      const label = m[2] || url.replace(/^https?:\/\//, '').slice(0, 60);
+      return <a key={i} href={url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--link, #58a6ff)' }}>{label}</a>;
+    }
+    return part;
+  });
 }
 
 // A compact word-level diff between the originally-generated draft and the
@@ -892,11 +904,7 @@ export default function SlackPage() {
       const res = await fetch('/api/slack/polish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: source,
-          threadContext: item.threadContext || '',
-          snippet: item.snippet || '',
-        }),
+        body: JSON.stringify({ text: source }),
       });
       const json = await res.json().catch(() => null);
       if (!res.ok || !json || json.available === false) {
@@ -1376,11 +1384,14 @@ export default function SlackPage() {
               style={{ width: '100%' }}
             />
           )}
-          {/* --- Draft tools — operate on the text in the box above ---------- */}
-          {/* Polish is available whenever the text box is open (editing), so you
-              can polish the machine draft without first manually changing it.
-              Save only appears when the text has actually been changed (dirty). */}
-          {!isReadOnly && !undrafted && !pending && editing && (
+          {/* Polish (rewrite for fluency) and Save edit sit WITH the textarea
+              because they shape the draft, distinct from the disposition row
+              (Send / Dismiss / Mute) below. Shown ONLY once the draft has been
+              edited (dirty): an untouched machine draft needs no polishing or
+              saving, so this whole row stays hidden until you change the text.
+              (Polishing also sets the text, which keeps `dirty` true — so Polish
+              stays available for repeated passes.) */}
+          {!isReadOnly && !undrafted && !pending && dirty && (
             <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.5em' }}>
               <button
                 className="btn"
@@ -1390,14 +1401,12 @@ export default function SlackPage() {
               >
                 <FiFeather size={13} /> {isPolishing ? 'Polishing…' : 'Polish'}
               </button>
-              {dirty && <>
-                <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
-                  <FiSave size={13} /> Save edit
-                </button>
-                <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
-                  Unsaved edits — Send will use the edited text.
-                </span>
-              </>}
+              <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
+                <FiSave size={13} /> Save edit
+              </button>
+              <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
+                Unsaved edits — Send will use the edited text.
+              </span>
             </div>
           )}
         </div>
