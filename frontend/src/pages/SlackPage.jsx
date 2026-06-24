@@ -224,6 +224,11 @@ function statusBadge(item) {
   return { label: 'needs review', className: 'badge', style: NEEDS_REVIEW_BADGE_STYLE };
 }
 
+// Survives component unmount so pending sends remain trackable across tab switches.
+// When a send is confirmed, the entry is written here; fireSend deletes it on completion.
+// Structure: { [itemId]: { confirmedAt, capturedText, capturedBaseline, undoWindowS, timerHandle } }
+const _pendingSendStore = {};
+
 export default function SlackPage() {
   const [items, setItems] = useState([]);
   const [etag, setEtag] = useState(null);
@@ -397,7 +402,38 @@ export default function SlackPage() {
 
   useEffect(() => { refresh(); fetchHealth(); refreshMuted(); }, []);
 
-
+  // Rehydrate pending-send state from the module-level store on mount. When the
+  // user switches tabs and returns, the component remounts fresh — this seeds
+  // pendingSends from _pendingSendStore so the countdown resumes (or shows
+  // "Sending..." if the timer already fired while away).
+  useEffect(() => {
+    const now = Date.now();
+    const rehydrated = {};
+    for (const [id, entry] of Object.entries(_pendingSendStore)) {
+      const elapsed = (now - entry.confirmedAt) / 1000;
+      const remaining = Math.max(0, Math.ceil(entry.undoWindowS - elapsed));
+      rehydrated[id] = { secondsLeft: remaining, capturedText: entry.capturedText, capturedBaseline: entry.capturedBaseline };
+      if (remaining > 0) {
+        // Restart the visual countdown interval (the fire timer is already running).
+        const interval = setInterval(() => {
+          setPendingSends(prev => {
+            const cur = prev[id];
+            if (!cur) return prev;
+            return { ...prev, [id]: { ...cur, secondsLeft: Math.max(0, cur.secondsLeft - 1) } };
+          });
+        }, 1000);
+        timersRef.current[id] = { timer: entry.timerHandle, interval };
+      } else {
+        // Timer already fired (or is about to) — show "Sending..." until the
+        // next queue refresh removes the store entry (fireSend deletes it on
+        // completion; refresh() updates items to 'sent' status).
+        timersRef.current[id] = { timer: entry.timerHandle, interval: null };
+      }
+    }
+    if (Object.keys(rehydrated).length > 0) {
+      setPendingSends(rehydrated);
+    }
+  }, []);
 
   // Live refresh, but never while a draft is open in the editor — that would
   // discard the in-progress edit.
@@ -431,6 +467,10 @@ export default function SlackPage() {
   // removes ONLY that id from the map. Per-row Undo calls this. Safe to call
   // when nothing is pending for the id.
   const cancelPendingSend = (id) => {
+    // Clear the fire timeout from the module-level store (reachable after remount).
+    const storeEntry = _pendingSendStore[id];
+    if (storeEntry && storeEntry.timerHandle) clearTimeout(storeEntry.timerHandle);
+    delete _pendingSendStore[id];
     clearTimersFor(id);
     setPendingSends(prev => {
       if (!(id in prev)) return prev;
@@ -440,15 +480,13 @@ export default function SlackPage() {
     });
   };
 
-  // Clear EVERY outstanding send-timer on unmount so no confirmed-but-undone (or
-  // simply navigated-away-from) send fires after the component is gone. Iterates
-  // the whole per-id timer map.
+  // On unmount (tab switch), clear only the visual countdown intervals — let
+  // confirmed send timers fire in the background so a tab switch after Approve
+  // doesn't silently cancel an already-confirmed send.
   useEffect(() => () => {
-    Object.values(timersRef.current).forEach(({ timer, interval }) => {
-      if (timer) clearTimeout(timer);
+    Object.values(timersRef.current).forEach(({ interval }) => {
       if (interval) clearInterval(interval);
     });
-    timersRef.current = {};
     clearRef(scanHintRef);
     clearRef(scanNoticeRef);
   }, []);
@@ -721,12 +759,15 @@ export default function SlackPage() {
   // conflict banner if the item itself actually changed (or the retry still 409s).
   const fireSend = async (id, text, baseline) => {
     clearTimersFor(id);
-    delete _pendingSendStore[id];
+    // Mark as "firing" in the module store (timer gone, but entry persists until
+    // the send confirms). If the component is unmounted during the POST, the
+    // rehydration shows "Sending..." on return. Only delete on success.
+    if (_pendingSendStore[id]) {
+      _pendingSendStore[id].timerHandle = null;
+    }
     setPendingSends(prev => {
       if (!(id in prev)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
+      return { ...prev, [id]: { ...prev[id], secondsLeft: 0 } };
     });
     setBusyId(id);
     setError(null);
@@ -759,6 +800,7 @@ export default function SlackPage() {
         }
         if (fresh && fresh.status === 'sent') {
           // Already sent (double-send guard / a prior fire landed). Not an error.
+          delete _pendingSendStore[id];
           setEditingId(null);
           refresh();
           return;
@@ -774,26 +816,31 @@ export default function SlackPage() {
         } else {
           // The item ACTUALLY changed underneath us (an edit / re-draft /
           // someone sent it) — do not silently resend stale text; surface it.
+          delete _pendingSendStore[id];
           setError('Conflict: this item changed before the send. Re-review and approve again.');
           return;
         }
       }
       if (status === 409) {
         // Still conflicting after the single retry — surface it.
+        delete _pendingSendStore[id];
         setError('Conflict: the queue was modified elsewhere before the send. Re-review and approve again.');
         refresh();
         return;
       }
       if (status < 200 || status >= 300) {
         const reason = (json && json.reason) || 'Send failed';
+        delete _pendingSendStore[id];
         setSendFailedIds(prev => new Map(prev).set(id, reason));
         setError('Failed to send the reply.');
         return;
       }
+      delete _pendingSendStore[id];
       if (json && json.etag) setEtag(json.etag);
       setEditingId(null);
       refresh();
     } catch {
+      delete _pendingSendStore[id];
       setSendFailedIds(prev => new Map(prev).set(id, 'Network error — check connection'));
       setError('Failed to send the reply.');
     } finally {
@@ -830,7 +877,7 @@ export default function SlackPage() {
     }, 1000);
     const timer = setTimeout(() => fireSend(id, text, baseline), UNDO_WINDOW_S * 1000);
     timersRef.current[id] = { timer, interval };
-
+    _pendingSendStore[id] = { confirmedAt: Date.now(), capturedText: text, capturedBaseline: baseline, undoWindowS: UNDO_WINDOW_S, timerHandle: timer };
   };
 
   // Generate a single item's draft via the per-item seam call
