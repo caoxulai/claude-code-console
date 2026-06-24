@@ -1534,3 +1534,268 @@ async def test_email_regenerate_empty_fields_keep_prior(client, email_file, monk
     assert saved["draft"] == "fresh draft"
     assert saved["threadContext"] == "keep this summary"  # not blanked
     assert saved["threadAsk"] == "keep this ask"          # not blanked
+
+
+# ─── D-052: latest-sender + senderList + per-turn recipients + GFM fixes ──────
+#
+# AC-1/AC-2: the From column must show the LATEST reply's sender (threadHistory
+# is oldest->newest, so the newest is [-1]) plus a senderList of unique display
+# names (oldest->newest, first-seen-wins, bounded) driving the "+N" participant
+# count. AC-3/AC-4: _html_to_text must emit GFM-valid tables (leading/trailing
+# pipes + a separator row) and line-anchored "- " bullets, while leaving plain
+# text untouched. AC-5: each thread turn carries a human-readable recipients
+# string for the To: line.
+
+
+# --- (D-052 §1/§2) _sender_list_from_history helper ---------------------------
+
+
+def test_sender_list_from_history_dedupes_first_seen_wins():
+    """Ordered oldest->newest, deduped by case-insensitive name, FIRST-seen display
+    string kept. Yibo->Bingfeng->Yibo collapses to ['Yibo','Bingfeng'] (no distinct
+    participant silently dropped, order preserved)."""
+    history = [
+        {"sender": "Yibo", "timestamp": "t1", "body": "a"},
+        {"sender": "Bingfeng", "timestamp": "t2", "body": "b"},
+        {"sender": "Yibo", "timestamp": "t3", "body": "c"},
+    ]
+    assert email_mod._sender_list_from_history(history) == ["Yibo", "Bingfeng"]
+
+
+def test_sender_list_from_history_dedupe_is_case_and_space_insensitive():
+    """Dedup key is lowercased+stripped, but the STORED string is the first-seen
+    display form (so 'Han ' and 'han' are one participant shown as 'Han ')."""
+    history = [
+        {"sender": "Han", "timestamp": "t1", "body": "a"},
+        {"sender": "  han  ", "timestamp": "t2", "body": "b"},
+        {"sender": "HAN", "timestamp": "t3", "body": "c"},
+    ]
+    assert email_mod._sender_list_from_history(history) == ["Han"]
+
+
+def test_sender_list_from_history_drops_empties_and_bounds():
+    """Empty/blank senders are dropped and the list is bounded to a reasonable cap."""
+    history = [{"sender": "", "timestamp": "t", "body": "x"},
+               {"sender": "   ", "timestamp": "t", "body": "x"}]
+    assert email_mod._sender_list_from_history(history) == []
+    # Many distinct senders are capped (suggest 12) — never unbounded.
+    big = [{"sender": f"P{i}", "timestamp": "t", "body": "x"} for i in range(40)]
+    out = email_mod._sender_list_from_history(big)
+    assert 0 < len(out) <= 12
+
+
+def test_sender_list_from_history_handles_garbage():
+    """A non-list / non-dict-entry input yields [] (never raises)."""
+    assert email_mod._sender_list_from_history(None) == []
+    assert email_mod._sender_list_from_history("nope") == []
+    assert email_mod._sender_list_from_history([None, 1, "x"]) == []
+
+
+# --- (D-052 §5) per-turn recipients string on threadHistory -------------------
+
+
+def test_extract_thread_history_attaches_recipients_string():
+    """Each turn carries a 'recipients' STRING flattened from to/recipients (name
+    else email, joined with ', ') — NEVER a dict repr / [object Object]."""
+    payload = {"content": {"emails": [
+        {"sender": "John", "receivedDateTime": "2026-06-01T10:00:00Z",
+         "body": "oldest",
+         "toRecipients": [{"name": "Me", "email": "me@x.com"},
+                          {"name": "", "email": "cc@x.com"}]},
+        {"sender": "Me", "receivedDateTime": "2026-06-02T10:00:00Z",
+         "body": "newest", "recipients": [{"name": "John Doe", "email": "j@x.com"}]},
+    ]}}
+    turns = email_mod._extract_thread_history(payload)
+    assert all("recipients" in t for t in turns)
+    # name-else-email flattening, joined with ", " — no dict noise.
+    assert turns[0]["recipients"] == "Me, cc@x.com"
+    assert turns[1]["recipients"] == "John Doe"
+    for t in turns:
+        assert "{" not in t["recipients"] and "object Object" not in t["recipients"]
+
+
+def test_extract_thread_history_recipients_empty_when_absent():
+    """A turn with no recipient info gets recipients '' (never fabricated)."""
+    turns = email_mod._extract_thread_history(
+        {"content": {"emails": [{"sender": "A", "receivedDateTime": "t", "body": "hi"}]}}
+    )
+    assert turns and turns[0]["recipients"] == ""
+
+
+# --- (D-052 §1) latest sender + senderList on the PERSISTED item, both paths ---
+
+
+async def test_scan_sets_latest_sender_and_sender_list(email_file, monkeypatch):
+    """AC-1/AC-2: after the body fetch attaches threadHistory, the PERSISTED skeleton
+    'sender' is the LATEST (newest) turn's sender and 'senderList' is the ordered,
+    deduped participant list — NOT the original/inbox sender."""
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkMAWS", "subject": "Re: MAWS CN deprecation",
+                "from": {"name": "Yibo", "email": "yibo@example.com"},
+                "received": "2026-06-03T10:00:00Z", "is_read": False, "preview": "x",
+            }]}
+        if name == "get_email":
+            return {"email": {"id": "AAMkMAWS", "subject": "Re: MAWS CN deprecation",
+                              "messages": [
+                {"from": {"name": "Yibo"}, "received": "2026-06-01T10:00:00Z", "body": "first"},
+                {"from": {"name": "Bingfeng"}, "received": "2026-06-02T10:00:00Z", "body": "reply"},
+            ]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    # The newest turn is Bingfeng — the From column must show the LATEST sender,
+    # NOT the original (Yibo) nor the inbox 'from'.
+    assert saved["sender"] == "Bingfeng"
+    assert saved["senderList"] == ["Yibo", "Bingfeng"]
+
+
+async def test_scan_no_history_keeps_seeded_sender(email_file, monkeypatch):
+    """When the body fetch yields no thread history, the seeded (inbox) sender is
+    left untouched — no overwrite, no blank, and no senderList fabricated."""
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkNohist", "subject": "Hi",
+                "from": {"name": "Original Sender", "email": "orig@example.com"},
+                "received": "2026-06-03T10:00:00Z", "is_read": False, "preview": "x",
+            }]}
+        if name == "get_email":
+            # No body -> _extract_thread_history returns [] (no turns).
+            return {"email": {"id": "AAMkNohist", "subject": "Hi",
+                              "from": {"name": "Original Sender"}, "body": ""}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["sender"] == "Original Sender"  # seeded value untouched
+    assert not saved.get("senderList")           # none fabricated
+
+
+async def test_scan_backfill_updates_sender_and_list(email_file, monkeypatch):
+    """The backfill-retry loop (existing item with empty emailBody) ALSO overwrites
+    sender/senderList on the persisted item after _extract_thread_history."""
+    # Existing active item with NO body and the stale original sender.
+    _seed(email_file, [_make_item(
+        "i1", messageId="AAMkBackfill", conversationId="AAMkBackfill",
+        status="needs-review", sender="Stale Original", emailBody="",
+    )])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": []}  # no new inbox items
+        if name == "get_email":
+            return {"email": {"id": "AAMkBackfill", "subject": "S", "messages": [
+                {"from": {"name": "Han"}, "received": "2026-06-01T10:00:00Z", "body": "one"},
+                {"from": {"name": "Bingfeng"}, "received": "2026-06-02T10:00:00Z", "body": "two"},
+            ]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["sender"] == "Bingfeng"             # latest turn, not the stale original
+    assert saved["senderList"] == ["Han", "Bingfeng"]
+
+
+def test_skeleton_for_keeps_original_sender():
+    """_skeleton_for runs BEFORE the body fetch and must NOT derive a latest sender:
+    it seeds 'sender' from the inbox 'from' and writes NO senderList."""
+    sk = email_mod._skeleton_for({
+        "id": "AAMk1", "subject": "Hi",
+        "from": {"name": "Inbox Sender", "email": "inbox@example.com"},
+        "received": "2026-06-20T14:30:00Z",
+    })
+    assert sk["sender"] == "Inbox Sender"
+    assert "senderList" not in sk  # the body-fetch path adds it, not the skeleton
+
+
+# --- (D-052 §6) _html_to_text GFM table + bullet fixes ------------------------
+
+
+def test_html_to_text_emits_gfm_table_with_separator_row():
+    """A <table> becomes a GFM table: leading/trailing pipes on every row AND a
+    '| --- | --- | --- |' separator row right after the header (the load-bearing
+    part — pipes without it render as literal text in remarkGfm)."""
+    html = (
+        "<table><tr><th>Status</th><th>Owner</th><th>ETA</th></tr>"
+        "<tr><td>Green</td><td>Han</td><td>Fri</td></tr>"
+        "<tr><td>Red</td><td>Bingfeng</td><td>Mon</td></tr></table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # Header row wrapped in pipes.
+    assert lines[0] == "| Status | Owner | ETA |"
+    # Separator row immediately after the header, matching the 3-column count.
+    assert lines[1] == "| --- | --- | --- |"
+    # Body rows also wrapped.
+    assert lines[2] == "| Green | Han | Fri |"
+    assert lines[3] == "| Red | Bingfeng | Mon |"
+
+
+def test_html_to_text_bullets_are_line_anchored_dashes():
+    """<li> becomes a line-anchored '- ' GFM marker (NO leading spaces, NOT the
+    Unicode '•') so ReactMarkdown renders a real <ul><li>."""
+    html = "<ul><li>First point</li><li>Second point</li></ul>"
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines == ["- First point", "- Second point"]
+    assert "•" not in out
+    # Each marker sits at column 0 of its line (no leading whitespace).
+    for ln in lines:
+        assert ln.startswith("- ") and not ln.startswith(" ")
+
+
+def test_html_to_text_plain_text_unchanged():
+    """Backward-compat: plain text (no '<') passes through verbatim — no injected
+    pipes, no separator row, no stray '- '."""
+    plain = "Hi team,\n\nThis is a normal note. Budget | forecast is fine.\nThanks"
+    assert email_mod._html_to_text(plain) == plain
+
+
+def test_html_to_text_prose_html_not_turned_into_table_or_list():
+    """HTML with no <table>/<li> must NOT gain a separator row, leading/trailing
+    pipes, or '- ' markers — a literal '|' typed in prose is left intact."""
+    html = "<p>Compare A | B below.</p><p>- not a real bullet</p>"
+    out = email_mod._html_to_text(html)
+    assert "| --- |" not in out          # no phantom separator
+    assert "A | B" in out                # the literal pipe is preserved as-is
+    # The paragraph text is not re-pipe-wrapped into a table row.
+    assert "| Compare A | B below. |" not in out
+
+
+def test_html_to_text_prose_before_table_stays_prose():
+    """Intro prose immediately preceding a <table> stays on its own line — it is NOT
+    folded into the table's first cell (a common real-email layout)."""
+    html = ("<p>Status summary below:</p>"
+            "<table><tr><th>Service</th><th>State</th></tr>"
+            "<tr><td>MAWS</td><td>Deprecating</td></tr></table>")
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "Status summary below:"     # prose, not a pipe-wrapped cell
+    assert lines[1] == "| Service | State |"
+    assert lines[2] == "| --- | --- |"             # separator after the header
+    assert lines[3] == "| MAWS | Deprecating |"

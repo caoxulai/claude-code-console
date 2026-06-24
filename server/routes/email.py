@@ -98,6 +98,10 @@ _DRAFT_CAP = 8000
 _THREAD_TURN_BODY_CAP = 4096
 _THREAD_HISTORY_MAX_TURNS = 20
 
+# senderList cap: the From column shows the latest sender + a "+N" participant
+# count derived from this list, so a runaway thread can't bloat the item.
+_SENDER_LIST_MAX = 12
+
 # Lines that may carry credentials -- never persisted or surfaced.
 _SECRET_MARKERS = ("~/.midway", ".midway", "cookie", "mwinit", "aws_secret", "authorization:")
 
@@ -1628,8 +1632,11 @@ def _html_to_text(html: str) -> str:
     text = re.sub(r"</tr>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<t[hd][^>]*>", _CELL_SEP, text, flags=re.IGNORECASE)
     text = re.sub(r"</t[hd]>", "", text, flags=re.IGNORECASE)
-    # List items get a bullet
-    text = re.sub(r"<li[^>]*>", "  • ", text, flags=re.IGNORECASE)
+    # List items get a GFM unordered-list marker. It MUST be line-anchored ("\n- "
+    # → "- " at column 0 after the whitespace collapse below) so ReactMarkdown+
+    # remarkGfm renders a real <ul><li>. A leading-space "  • " bullet (the old
+    # form) is NOT a list to remarkGfm — it renders as indented plain text.
+    text = re.sub(r"<li[^>]*>", "\n- ", text, flags=re.IGNORECASE)
     # Block-level breaks
     text = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</h[1-6]>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<h[1-6][^>]*>", "\n", text, flags=re.IGNORECASE)
@@ -1645,18 +1652,43 @@ def _html_to_text(html: str) -> str:
     # Collapse whitespace (preserve newlines and sentinels)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
-    # Convert table sentinels to readable pipe-separated format.
-    # Each ROW_SEP starts a new line; each CELL_SEP within a row becomes " | ".
-    # Clean up: strip inner newlines within cells (HTML content between <td> tags
-    # often has <p> or <br> that became \n — flatten to space within a cell).
+    # Convert table sentinels to GFM markdown tables. Each ROW_SEP starts a new
+    # row; each CELL_SEP within a row is a column boundary. remarkGfm needs the
+    # FULL GFM form to render an HTML <table>: every row wrapped in leading/
+    # trailing '|', AND a '| --- | --- | ... |' separator row immediately after the
+    # FIRST row of each contiguous table block. The separator is load-bearing —
+    # pipe-wrapped rows WITHOUT it render as literal '|' text.
+    #
+    # BACKWARD-COMPAT: this fires ONLY for rows that actually contain a cell
+    # sentinel (a real <td>/<th>). A non-table row (ordinary prose, or a literal
+    # '|' typed in text) carries no sentinel, so it passes through untouched — no
+    # injected pipes, no separator row.
     lines = text.split(_ROW_SEP)
     out_lines = []
+    in_table = False  # tracks a contiguous run of cell-bearing rows
     for line in lines:
         if _CELL_SEP in line:
-            cells = [c.replace("\n", " ").strip() for c in line.split(_CELL_SEP)]
+            # Any text BEFORE the first cell sentinel is prose (a real cell always
+            # opens with _CELL_SEP), so emit it on its own line first and break any
+            # open table block — it must not be folded into the row's first cell.
+            prefix, _, rest = line.partition(_CELL_SEP)
+            prefix = prefix.strip()
+            if prefix:
+                in_table = False
+                out_lines.append(prefix)
+            cells = [c.replace("\n", " ").strip() for c in rest.split(_CELL_SEP)]
             cells = [c for c in cells if c]
-            out_lines.append(" | ".join(cells))
+            if not cells:
+                in_table = False
+                continue
+            out_lines.append("| " + " | ".join(cells) + " |")
+            if not in_table:
+                # First row of this table block -> emit the GFM separator matching
+                # the column count so remarkGfm parses a real table.
+                out_lines.append("| " + " | ".join(["---"] * len(cells)) + " |")
+                in_table = True
         else:
+            in_table = False
             out_lines.append(line)
     text = "\n".join(out_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -1671,6 +1703,41 @@ def _msg_sender_name(msg: dict) -> str:
     if isinstance(sender, dict):
         return str(sender.get("name") or sender.get("email") or "")
     return str(sender or "")
+
+
+def _flatten_recipient(entry) -> str:
+    """Flatten ONE recipient entry into a display string (name else email).
+
+    Mirrors _msg_sender_name/_flatten_from: a {name,email} dict yields the name
+    (falling back to the email), a plain string passes through, anything else
+    yields "" — NEVER a leaked dict repr / '[object Object]'.
+    """
+    if isinstance(entry, dict):
+        return str(entry.get("name") or entry.get("email") or "").strip()
+    return str(entry or "").strip()
+
+
+def _msg_recipients_str(msg: dict) -> str:
+    """Build a human-readable 'To:' string for one message turn.
+
+    Reads the message's toRecipients/recipients/to field, flattens each entry via
+    _flatten_recipient (name else email, never a dict repr), drops empties, and
+    joins with ', '. Returns "" when the message carries no recipient info so the
+    turn never fabricates a recipients line.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    raw = msg.get("toRecipients")
+    if not isinstance(raw, list) or not raw:
+        raw = msg.get("recipients")
+    if not isinstance(raw, list) or not raw:
+        raw = msg.get("to")
+    if isinstance(raw, str):
+        return _one_line(raw, 200)
+    if not isinstance(raw, list):
+        return ""
+    names = [n for n in (_flatten_recipient(e) for e in raw) if n]
+    return _one_line(", ".join(names), 200)
 
 
 def _email_messages_from_payload(payload) -> list[dict]:
@@ -1766,6 +1833,7 @@ def _extract_thread_history(payload) -> list[dict]:
             "sender": _scrub(_one_line(str(sender), 200)),
             "timestamp": ts_str,
             "body": body,
+            "recipients": _scrub(_msg_recipients_str(msg)),
         })
 
     # Order oldest -> newest. When EVERY turn has a parseable timestamp, sort by it
@@ -1776,9 +1844,67 @@ def _extract_thread_history(payload) -> list[dict]:
         turns.sort(key=lambda t: (t["_sort"], t["_idx"]))
     else:
         turns.reverse()
-    ordered = [{"sender": t["sender"], "timestamp": t["timestamp"], "body": t["body"]}
-               for t in turns]
+    ordered = [
+        {"sender": t["sender"], "timestamp": t["timestamp"], "body": t["body"],
+         "recipients": t["recipients"]}
+        for t in turns
+    ]
     return ordered[-_THREAD_HISTORY_MAX_TURNS:]
+
+
+def _sender_list_from_history(history) -> list[str]:
+    """Ordered, deduped list of participant display names across a threadHistory.
+
+    Walks turns oldest->newest and appends each turn's ``sender`` the FIRST time it
+    is seen (dedup key = lowercased+stripped; the STORED string is the first-seen
+    display form). Empties are dropped and the result is bounded to _SENDER_LIST_MAX.
+
+    FIRST-SEEN-WINS so no distinct participant is silently dropped and the order is
+    preserved (Yibo -> Bingfeng -> Yibo => ['Yibo', 'Bingfeng']). This drives the
+    From column's "+N" participant count, so a list that collapsed to only the
+    newest name (or deduped by overwriting earlier entries) would undercount. A
+    non-list / malformed input yields [] (never raises).
+    """
+    if not isinstance(history, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for turn in history:
+        if not isinstance(turn, dict):
+            continue
+        name = str(turn.get("sender", "") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+        if len(out) >= _SENDER_LIST_MAX:
+            break
+    return out
+
+
+def _apply_latest_sender(item: dict, history) -> None:
+    """Overwrite item['sender']/['senderList'] from a non-empty threadHistory.
+
+    Sets ``sender`` to the LATEST turn's sender (history[-1] — threadHistory is
+    oldest->newest) and ``senderList`` to the ordered/deduped participant list.
+    Shared by BOTH _scan_once write sites (new-item + backfill) so they can't
+    drift. A no-op for an empty/malformed history so the seeded inbox sender stays
+    untouched (never blanked).
+    """
+    if not isinstance(history, list) or not history:
+        return
+    last = history[-1]
+    latest = ""
+    if isinstance(last, dict):
+        latest = str(last.get("sender", "") or "").strip()
+    if latest:
+        item["sender"] = _scrub(_one_line(latest, 200))
+    sender_list = _sender_list_from_history(history)
+    if sender_list:
+        item["senderList"] = sender_list
 
 
 def _parse_ts(value: str):
@@ -1983,6 +2109,11 @@ async def _scan_once(app) -> None:
             history = _extract_thread_history(body_payload)
             if history:
                 it["threadHistory"] = history
+                # Same overwrite as the new-item path: land the latest sender +
+                # participant list on the EXISTING persisted item `it` so a thread
+                # last replied to by someone other than the original sender shows
+                # the latest sender in the From column.
+                _apply_latest_sender(it, history)
         except Exception as e:  # noqa: BLE001
             logger.warning("Email body backfill failed for %s: %s", msg_id, _scrub(str(e)))
 
@@ -1991,8 +2122,17 @@ async def _scan_once(app) -> None:
         skeleton = _skeleton_for(raw)
         if raw.get("emailBody"):
             skeleton["emailBody"] = raw["emailBody"]
-        if raw.get("threadHistory"):
-            skeleton["threadHistory"] = raw["threadHistory"]
+        history = raw.get("threadHistory")
+        if history:
+            skeleton["threadHistory"] = history
+            # Overwrite the seeded (inbox 'from') sender with the LATEST turn's
+            # sender so the From column shows who most recently messaged me, and
+            # attach the ordered/deduped participant list driving the "+N" count.
+            # threadHistory is oldest->newest, so the newest turn is history[-1].
+            # MUST land on the persisted `skeleton`, NOT the throwaway `raw` (which
+            # _skeleton_for re-derives sender from). An empty history leaves the
+            # seeded sender untouched (no overwrite, no blank).
+            _apply_latest_sender(skeleton, history)
         data["items"].append(skeleton)
 
     # Update lastScanAt
