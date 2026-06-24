@@ -976,6 +976,14 @@ def _parse_agent_result(text: str, action: str) -> dict:
     text = (text or "").strip()
     if not text:
         return {"available": False, "reason": "Slack agent returned an empty reply."}
+    # Models sometimes wrap JSON in markdown fences despite the prompt forbidding it.
+    if text.startswith("```"):
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
@@ -3320,10 +3328,16 @@ async def save_draft(request: web.Request) -> web.Response:
     """Save an edited draft. Editing (text differs from the generated draft)
     flips status to 'edited' — that edit is the preference-learning signal,
     consumed on approve. NEVER sends.
+
+    Uses the freshly-loaded current_etag (not the client-provided one) because
+    background workers (scanner, classify, draft) advance the file etag while the
+    user is editing a DIFFERENT item — the frontend suppresses refreshes during
+    editing so its etag goes stale. This is safe: save_draft only mutates one
+    item's draft/status fields, so a concurrent worker write to other items is
+    non-conflicting.
     """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request)
-    expected_etag = body.get("etag")
     if "draft" not in body:
         raise web.HTTPBadRequest(reason="draft field required")
     new_draft = _scrub(str(body["draft"]))[:_DRAFT_CAP]
@@ -3340,7 +3354,7 @@ async def save_draft(request: web.Request) -> web.Response:
         item["status"] = "edited"
 
     try:
-        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
+        new_etag = filestore.write_json(SLACK_PATH, data, current_etag)
     except filestore.ConflictError as e:
         current, current_etag = filestore.read_json(SLACK_PATH)
         return web.json_response(

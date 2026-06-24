@@ -212,6 +212,11 @@ function statusBadge(item) {
   return { label: 'needs review', className: 'badge', style: NEEDS_REVIEW_BADGE_STYLE };
 }
 
+// Survives component unmount so pending sends remain trackable across tab switches.
+// When a send is confirmed, the entry is written here; fireSend deletes it on completion.
+// Structure: { [itemId]: { confirmedAt, capturedText, capturedBaseline, undoWindowS, timerHandle } }
+const _pendingSendStore = {};
+
 export default function SlackPage() {
   const [items, setItems] = useState([]);
   const [etag, setEtag] = useState(null);
@@ -256,9 +261,10 @@ export default function SlackPage() {
   const scanNoticeRef = useRef(null);
 
   const [expandedId, setExpandedId] = useState(null);
-  // Whether the per-row "Recent history (3d)" block is expanded. Collapsed by
-  // default so the long history never bloats the opened row; reset on every
-  // collapse/row-switch in toggleExpand so a freshly-opened row starts folded.
+  // Whether the per-row "Recent history (3d)" section shows ALL messages.
+  // false = show only the last 5 (most recent); true = show all. Reset on
+  // every collapse/row-switch in toggleExpand so a freshly-opened row always
+  // starts with the last-5 preview.
   const [historyOpen, setHistoryOpen] = useState(false);
   // The Sent and Dismissed sections are collapsible and COLLAPSED BY DEFAULT so
   // they never crowd the actionable Needs-review list. Same chevron toggle the
@@ -384,6 +390,39 @@ export default function SlackPage() {
 
   useEffect(() => { refresh(); fetchHealth(); refreshMuted(); }, []);
 
+  // Rehydrate pending-send state from the module-level store on mount. When the
+  // user switches tabs and returns, the component remounts fresh — this seeds
+  // pendingSends from _pendingSendStore so the countdown resumes (or shows
+  // "Sending..." if the timer already fired while away).
+  useEffect(() => {
+    const now = Date.now();
+    const rehydrated = {};
+    for (const [id, entry] of Object.entries(_pendingSendStore)) {
+      const elapsed = (now - entry.confirmedAt) / 1000;
+      const remaining = Math.max(0, Math.ceil(entry.undoWindowS - elapsed));
+      rehydrated[id] = { secondsLeft: remaining, capturedText: entry.capturedText, capturedBaseline: entry.capturedBaseline };
+      if (remaining > 0) {
+        // Restart the visual countdown interval (the fire timer is already running).
+        const interval = setInterval(() => {
+          setPendingSends(prev => {
+            const cur = prev[id];
+            if (!cur) return prev;
+            return { ...prev, [id]: { ...cur, secondsLeft: Math.max(0, cur.secondsLeft - 1) } };
+          });
+        }, 1000);
+        timersRef.current[id] = { timer: entry.timerHandle, interval };
+      } else {
+        // Timer already fired (or is about to) — show "Sending..." until the
+        // next queue refresh removes the store entry (fireSend deletes it on
+        // completion; refresh() updates items to 'sent' status).
+        timersRef.current[id] = { timer: entry.timerHandle, interval: null };
+      }
+    }
+    if (Object.keys(rehydrated).length > 0) {
+      setPendingSends(rehydrated);
+    }
+  }, []);
+
   // Live refresh, but never while a draft is open in the editor — that would
   // discard the in-progress edit.
   useLiveUpdates(['slack_changed', 'slack_deleted'], () => {
@@ -416,6 +455,10 @@ export default function SlackPage() {
   // removes ONLY that id from the map. Per-row Undo calls this. Safe to call
   // when nothing is pending for the id.
   const cancelPendingSend = (id) => {
+    // Clear the fire timeout from the module-level store (reachable after remount).
+    const storeEntry = _pendingSendStore[id];
+    if (storeEntry && storeEntry.timerHandle) clearTimeout(storeEntry.timerHandle);
+    delete _pendingSendStore[id];
     clearTimersFor(id);
     setPendingSends(prev => {
       if (!(id in prev)) return prev;
@@ -425,15 +468,13 @@ export default function SlackPage() {
     });
   };
 
-  // Clear EVERY outstanding send-timer on unmount so no confirmed-but-undone (or
-  // simply navigated-away-from) send fires after the component is gone. Iterates
-  // the whole per-id timer map.
+  // On unmount (tab switch), clear only the visual countdown intervals — let
+  // confirmed send timers fire in the background so a tab switch after Approve
+  // doesn't silently cancel an already-confirmed send.
   useEffect(() => () => {
-    Object.values(timersRef.current).forEach(({ timer, interval }) => {
-      if (timer) clearTimeout(timer);
+    Object.values(timersRef.current).forEach(({ interval }) => {
       if (interval) clearInterval(interval);
     });
-    timersRef.current = {};
     clearRef(scanHintRef);
     clearRef(scanNoticeRef);
   }, []);
@@ -706,11 +747,15 @@ export default function SlackPage() {
   // conflict banner if the item itself actually changed (or the retry still 409s).
   const fireSend = async (id, text, baseline) => {
     clearTimersFor(id);
+    // Mark as "firing" in the module store (timer gone, but entry persists until
+    // the send confirms). If the component is unmounted during the POST, the
+    // rehydration shows "Sending..." on return. Only delete on success.
+    if (_pendingSendStore[id]) {
+      _pendingSendStore[id].timerHandle = null;
+    }
     setPendingSends(prev => {
       if (!(id in prev)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
+      return { ...prev, [id]: { ...prev[id], secondsLeft: 0 } };
     });
     setBusyId(id);
     setError(null);
@@ -743,6 +788,7 @@ export default function SlackPage() {
         }
         if (fresh && fresh.status === 'sent') {
           // Already sent (double-send guard / a prior fire landed). Not an error.
+          delete _pendingSendStore[id];
           setEditingId(null);
           refresh();
           return;
@@ -758,26 +804,31 @@ export default function SlackPage() {
         } else {
           // The item ACTUALLY changed underneath us (an edit / re-draft /
           // someone sent it) — do not silently resend stale text; surface it.
+          delete _pendingSendStore[id];
           setError('Conflict: this item changed before the send. Re-review and approve again.');
           return;
         }
       }
       if (status === 409) {
         // Still conflicting after the single retry — surface it.
+        delete _pendingSendStore[id];
         setError('Conflict: the queue was modified elsewhere before the send. Re-review and approve again.');
         refresh();
         return;
       }
       if (status < 200 || status >= 300) {
         const reason = (json && json.reason) || 'Send failed';
+        delete _pendingSendStore[id];
         setSendFailedIds(prev => new Map(prev).set(id, reason));
         setError('Failed to send the reply.');
         return;
       }
+      delete _pendingSendStore[id];
       if (json && json.etag) setEtag(json.etag);
       setEditingId(null);
       refresh();
     } catch {
+      delete _pendingSendStore[id];
       setSendFailedIds(prev => new Map(prev).set(id, 'Network error — check connection'));
       setError('Failed to send the reply.');
     } finally {
@@ -814,6 +865,8 @@ export default function SlackPage() {
     }, 1000);
     const timer = setTimeout(() => fireSend(id, text, baseline), UNDO_WINDOW_S * 1000);
     timersRef.current[id] = { timer, interval };
+    // Persist to module-level store so the send survives unmount (tab switch).
+    _pendingSendStore[id] = { confirmedAt: Date.now(), capturedText: text, capturedBaseline: baseline, undoWindowS: UNDO_WINDOW_S, timerHandle: timer };
   };
 
   // Generate a single item's draft via the per-item seam call
@@ -1214,28 +1267,23 @@ export default function SlackPage() {
         </div>
 
         {/* --- Recent history (3d) ------------------------------------------- */}
-        {/* The full last-3-days conversation, distinct from the short summary
-            above. Collapsed by default (opt-in expand) so it never bloats the
-            row. Rendered only when there is history to show; older items
-            without the field simply omit this block. */}
-        {history.length > 0 && (
-          <div style={sectionStyle}>
-            <button
-              type="button"
-              style={toggleStyle}
-              onClick={() => setHistoryOpen(v => !v)}
-            >
-              {historyOpen ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
-              {historyOpen ? 'Hide recent history (3d)' : 'Show recent history (3d)'}
-            </button>
-            {historyOpen && (
-              <div className="card" style={{ padding: 0, overflow: 'hidden', marginTop: '0.4em' }}>
-                {history.map((msg, i) => (
+        {/* Always-visible last-5 preview (most recent messages). If the full
+            list has more than 5 entries, a "Show all" / "Show less" toggle
+            reveals or collapses the remainder. historyOpen = show all. */}
+        {history.length > 0 && (() => {
+          const visibleMessages = (historyOpen || history.length <= 5)
+            ? history
+            : history.slice(-5);
+          return (
+            <div style={sectionStyle}>
+              <div style={labelStyle}>Recent history (3d)</div>
+              <div className="card" style={{ padding: 0, overflow: 'hidden', marginTop: '0.3em' }}>
+                {visibleMessages.map((msg, i) => (
                   <div
                     key={i}
                     style={{
                       padding: '0.6em 0.9em',
-                      borderBottom: i < history.length - 1 ? '1px solid var(--border)' : 'none',
+                      borderBottom: i < visibleMessages.length - 1 ? '1px solid var(--border)' : 'none',
                       fontSize: '0.85em',
                     }}
                   >
@@ -1249,9 +1297,19 @@ export default function SlackPage() {
                   </div>
                 ))}
               </div>
-            )}
-          </div>
-        )}
+              {history.length > 5 && (
+                <button
+                  type="button"
+                  style={{ ...toggleStyle, marginTop: '0.4em' }}
+                  onClick={() => setHistoryOpen(v => !v)}
+                >
+                  {historyOpen ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
+                  {historyOpen ? 'Show less' : `Show all (${history.length - 5})`}
+                </button>
+              )}
+            </div>
+          );
+        })()}
 
         {/* --- Draft reply --------------------------------------------------- */}
         <div style={sectionStyle}>
@@ -1362,7 +1420,6 @@ export default function SlackPage() {
               style={{ width: '100%' }}
             />
           )}
-          {/* --- Draft tools — operate on the text in the box above ---------- */}
           {/* Polish (rewrite for fluency) and Save edit sit WITH the textarea
               because they shape the draft, distinct from the disposition row
               (Send / Dismiss / Mute) below. Shown ONLY once the draft has been
@@ -1451,16 +1508,20 @@ export default function SlackPage() {
             // Pending undo window — the send is queued but has NOT left yet.
             // Undo cancels ONLY this row's send (no approve POST). This is the
             // only way to cancel a confirmed-but-not-yet-fired send.
+            // When secondsLeft hits 0 the fire timer has already been called —
+            // show "Sending..." with no Undo (too late to cancel).
             <div style={{ display: 'flex', gap: '0.6em', flexWrap: 'wrap', alignItems: 'center' }}>
               <span
                 className="badge"
                 style={{ ...NEEDS_REVIEW_BADGE_STYLE, display: 'inline-flex', alignItems: 'center', gap: '0.35em' }}
               >
-                <FiClock size={12} /> Sending in {pending.secondsLeft}s…
+                <FiClock size={12} /> {pending.secondsLeft > 0 ? `Sending in ${pending.secondsLeft}s…` : 'Sending…'}
               </span>
-              <button className="btn" onClick={() => cancelPendingSend(item.id)} title="Cancel — do not send this reply">
-                <FiXCircle size={13} /> Undo ({pending.secondsLeft}s)
-              </button>
+              {pending.secondsLeft > 0 && (
+                <button className="btn" onClick={() => cancelPendingSend(item.id)} title="Cancel — do not send this reply">
+                  <FiXCircle size={13} /> Undo ({pending.secondsLeft}s)
+                </button>
+              )}
             </div>
           ) : (
             // Disposition row — what HAPPENS to this conversation. Send (the
@@ -1557,8 +1618,8 @@ export default function SlackPage() {
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', flexWrap: 'wrap', justifyContent: 'center' }}>
                     <span className={badge.className} style={badge.style}>{badge.label}</span>
                     {pendingSends[item.id] && (
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3em', color: 'var(--muted)', fontSize: '0.78em' }} title="A send is queued — open the row to undo.">
-                        <FiClock size={11} /> sending in {pendingSends[item.id].secondsLeft}s…
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3em', color: 'var(--muted)', fontSize: '0.78em' }} title={pendingSends[item.id].secondsLeft > 0 ? 'A send is queued — open the row to undo.' : 'Sending now…'}>
+                        <FiClock size={11} /> {pendingSends[item.id].secondsLeft > 0 ? `sending in ${pendingSends[item.id].secondsLeft}s…` : 'sending…'}
                       </span>
                     )}
                     {draftingIds.has(item.id) && (
@@ -1674,20 +1735,22 @@ export default function SlackPage() {
 
   // Dismiss all items in a list (sequential, best-effort per item).
   const dismissAll = async (list) => {
+    let currentEtag = etag;
     for (const item of list) {
       if (item.status === 'sent') continue;
       try {
         const res = await fetch(`/api/slack/queue/${encodeURIComponent(item.id)}`, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ etag }),
+          body: JSON.stringify({ etag: currentEtag }),
         });
         if (res.ok) {
           const json = await res.json();
-          setEtag(json.etag ?? null);
+          currentEtag = json.etag ?? currentEtag;
         }
       } catch { /* best-effort */ }
     }
+    setEtag(currentEtag);
     refresh();
   };
 

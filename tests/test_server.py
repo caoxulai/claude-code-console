@@ -5576,7 +5576,10 @@ async def test_slack_save_draft_marks_edited_and_round_trips(client, slack_file,
     assert saved["draft"] == "my own words"
 
 
-async def test_slack_save_draft_conflict_returns_409(client, slack_file):
+async def test_slack_save_draft_ignores_stale_client_etag(client, slack_file):
+    """save_draft uses the freshly-loaded current_etag (not the client's stale
+    one) because background workers advance the file etag while the user edits
+    a different item. The save should succeed regardless of client etag."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
@@ -5584,9 +5587,9 @@ async def test_slack_save_draft_conflict_returns_409(client, slack_file):
         "generatedDraft": "d", "status": "needs-review", "ts": 1,
     }]}), encoding="utf-8")
     resp = await client.put("/api/slack/queue/i1", json={"draft": "x", "etag": "stale-etag"})
-    assert resp.status == 409
+    assert resp.status == 200
     body = await resp.json()
-    assert body["error"] == "conflict"
+    assert body["item"]["draft"] == "x"
 
 
 async def test_slack_dismiss_sets_status_not_delete(client, slack_file):
