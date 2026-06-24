@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import {
-  FiRefreshCw, FiRotateCw, FiTrash2, FiSave, FiChevronDown, FiChevronRight,
+  FiRefreshCw, FiRotateCw, FiTrash2, FiTrash, FiSave, FiChevronDown, FiChevronRight,
   FiCheckCircle, FiAlertCircle, FiClock, FiBellOff, FiPause, FiPlay,
   FiClipboard, FiFeather,
 } from 'react-icons/fi';
@@ -87,6 +87,7 @@ function wordDiff(before, after) {
 const NEEDS_REVIEW_BADGE_STYLE = { background: '#1a2a3a', color: '#7ab8e6' };
 const NEEDS_DRAFT_BADGE_STYLE = { background: '#262b31', color: '#9aa3ad' };
 const DISMISSED_BADGE_STYLE = { background: '#23262b', color: '#7c8088' };
+const DELETED_BADGE_STYLE = { background: '#2b1a1a', color: '#e67a7a' };
 const FYI_BADGE_STYLE = { background: '#26262e', color: '#9a9ab0' };
 const NEEDS_CLASSIFY_BADGE_STYLE = { background: '#2b2730', color: '#a39aad' };
 const APPROVED_BADGE_STYLE = { background: '#1a2e1a', color: '#7ae67a' };
@@ -98,6 +99,7 @@ function statusBadge(item) {
   if (status === 'approved') return { label: 'approved', className: 'badge', style: APPROVED_BADGE_STYLE };
   if (status === 'edited') return { label: 'edited', className: 'badge badge-warn', style: undefined };
   if (status === 'dismissed') return { label: 'dismissed', className: 'badge', style: DISMISSED_BADGE_STYLE };
+  if (status === 'deleted') return { label: 'deleted', className: 'badge', style: DELETED_BADGE_STYLE };
   if (status === 'needs-classify') return { label: 'classifying', className: 'badge', style: NEEDS_CLASSIFY_BADGE_STYLE };
   if (classification === 'fyi') return { label: 'fyi', className: 'badge', style: FYI_BADGE_STYLE };
   if (status === 'needs-draft') return { label: 'needs draft', className: 'badge', style: NEEDS_DRAFT_BADGE_STYLE };
@@ -174,6 +176,7 @@ export default function EmailPage() {
   // Collapsible sections
   const [approvedOpen, setApprovedOpen] = useState(false);
   const [dismissedOpen, setDismissedOpen] = useState(false);
+  const [deletedOpen, setDeletedOpen] = useState(false);
   const [fyiOpen, setFyiOpen] = useState(true);
 
   // Style memory section
@@ -630,6 +633,36 @@ export default function EmailPage() {
     }
   };
 
+  // Delete from Outlook (moves to Deleted Items — distinct from dismiss)
+  const deleteEmail = async (id) => {
+    setBusyId(id);
+    try {
+      const res = await fetch(`/api/email/queue/${encodeURIComponent(id)}/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ etag }),
+      });
+      if (res.status === 409) {
+        setError('Conflict: the queue was modified elsewhere. Refreshing...');
+        refresh();
+        return;
+      }
+      if (!res.ok) {
+        setError('Failed to delete the email.');
+        return;
+      }
+      const json = await res.json();
+      setEtag(json.etag ?? null);
+      if (expandedId === id) { setExpandedId(null); setEditingId(null); }
+      setError(null);
+      refresh();
+    } catch {
+      setError('Failed to delete the email.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   // Undismiss
   const undismiss = async (id) => {
     setBusyId(id);
@@ -785,9 +818,10 @@ export default function EmailPage() {
     const isBusy = busyId === item.id;
     const isApproved = item.status === 'approved';
     const isDismissed = item.status === 'dismissed';
+    const isDeleted = item.status === 'deleted';
     const isClassifying = item.status === 'needs-classify';
     const isFyiClassified = item.classification === 'fyi';
-    const isReadOnly = isApproved || isDismissed || isClassifying;
+    const isReadOnly = isApproved || isDismissed || isDeleted || isClassifying;
     const drafting = draftingIds.has(item.id);
     const draftFailed = draftFailedIds.has(item.id);
     const hasDraft = (item.draft || '').trim() !== '';
@@ -1050,12 +1084,10 @@ export default function EmailPage() {
               style={{ width: '100%' }}
             />
           )}
-          {/* --- Draft tools — operate on the text in the box above ----------
-              Polish (rewrite for fluency) sits WITH the textarea because it
-              shapes the draft, distinct from the disposition row (Approve /
-              Dismiss / Mute) below. Shown on any editable, drafted row; disabled
-              while polishing/busy or when there's no draft text to polish. */}
-          {!isReadOnly && !undrafted && (() => {
+          {/* --- Draft tools — Polish / Save / Regenerate sit WITH the textarea
+              because they shape the draft, distinct from the disposition row
+              (Approve / Dismiss / Delete / Mute) below. Matches Slack layout. */}
+          {!isReadOnly && !undrafted && dirty && (() => {
             const polishText = (editing ? draftText : (item.draft || ''));
             const noText = polishText.trim() === '';
             const isPolishing = polishingId === item.id;
@@ -1065,12 +1097,16 @@ export default function EmailPage() {
                   className="btn"
                   disabled={isBusy || isPolishing || noText}
                   onClick={() => polishDraft(item.id)}
-                  title={noText
-                    ? 'Write or generate a draft first'
-                    : 'Rewrite the current text to read more fluently while keeping your own wording and language'}
+                  title="Rewrite the current text to read more fluently while keeping your own wording and language"
                 >
                   <FiFeather size={13} /> {isPolishing ? 'Polishing...' : 'Polish'}
                 </button>
+                <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
+                  <FiSave size={13} /> Save edit
+                </button>
+                <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
+                  Unsaved edits — Approve will use the edited text.
+                </span>
               </div>
             );
           })()}
@@ -1109,7 +1145,8 @@ export default function EmailPage() {
           </div>
         )}
 
-        {/* --- Actions --- */}
+        {/* --- Disposition actions (matches Slack layout: primary left,
+            destructive pushed right via marginLeft:auto) --- */}
         {isDismissed && (
           <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center' }}>
             <button className="btn" disabled={isBusy} onClick={() => undismiss(item.id)} title="Restore this item to the review queue">
@@ -1119,21 +1156,19 @@ export default function EmailPage() {
         )}
         {undrafted && !isReadOnly && (
           <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center' }}>
-            <button className="btn btn-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
+            <button className="btn btn-quiet-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying (marks read in Outlook)">
               <FiTrash2 size={13} /> Dismiss
             </button>
-            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this conversation — dismiss and ignore future messages">
-              <FiBellOff size={13} /> Mute conversation
+            <button className="btn btn-danger" disabled={isBusy} onClick={() => deleteEmail(item.id)} title="Delete this email from Outlook (moves to Deleted Items)">
+              <FiTrash size={13} /> Delete
+            </button>
+            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this conversation — dismiss and stop surfacing future messages">
+              <FiBellOff size={13} /> Mute
             </button>
           </div>
         )}
         {!isReadOnly && !undrafted && (
           <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center' }}>
-            {dirty && (
-              <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
-                <FiSave size={13} /> Save edit
-              </button>
-            )}
             <button
               className="btn btn-primary"
               disabled={isBusy}
@@ -1142,20 +1177,15 @@ export default function EmailPage() {
             >
               <FiClipboard size={13} /> Approve
             </button>
-            <button className="btn" disabled={isBusy} onClick={() => regenerate(item.id)} title="Regenerate this draft">
-              <FiRotateCw size={13} /> Regenerate
-            </button>
-            <button className="btn btn-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying">
+            <button className="btn btn-quiet-danger" disabled={isBusy} onClick={() => dismiss(item.id)} title="Dismiss without replying (marks read in Outlook)" style={{ marginLeft: 'auto' }}>
               <FiTrash2 size={13} /> Dismiss
             </button>
-            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this conversation — dismiss and ignore future messages">
-              <FiBellOff size={13} /> Mute conversation
+            <button className="btn btn-danger" disabled={isBusy} onClick={() => deleteEmail(item.id)} title="Delete this email from Outlook (moves to Deleted Items)">
+              <FiTrash size={13} /> Delete
             </button>
-            {dirty && (
-              <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
-                Unsaved edits — Approve will use the edited text.
-              </span>
-            )}
+            <button className="btn" disabled={isBusy} onClick={() => mute(item.id)} title="Mute this conversation — dismiss and stop surfacing future messages">
+              <FiBellOff size={13} /> Mute
+            </button>
           </div>
         )}
 
@@ -1309,6 +1339,7 @@ export default function EmailPage() {
   const needsReviewItems = items.filter(isActionable);
   const approvedItems = items.filter(it => it.status === 'approved');
   const dismissedItems = items.filter(it => it.status === 'dismissed');
+  const deletedItems = items.filter(it => it.status === 'deleted');
 
   const replyItems = needsReviewItems.filter(it => reviewGroup(it) === 'reply');
 
@@ -1557,6 +1588,21 @@ export default function EmailPage() {
           {dismissedOpen && (
             <div className="card" style={{ marginTop: '0.5em' }}>
               {renderTable(dismissedItems)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* --- Deleted (collapsible, collapsed by default) --- */}
+      {deletedItems.length > 0 && (
+        <div style={{ marginTop: 'var(--space-md)' }}>
+          <button type="button" style={collapsibleStyle} onClick={() => setDeletedOpen(v => !v)}>
+            {deletedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+            Deleted ({deletedItems.length})
+          </button>
+          {deletedOpen && (
+            <div className="card" style={{ marginTop: '0.5em' }}>
+              {renderTable(deletedItems)}
             </div>
           )}
         </div>

@@ -554,6 +554,11 @@ _mcp_connect_lock: asyncio.Lock | None = None
 _graph_mcp_state = _PersistentMcpState()
 _graph_mcp_connect_lock: asyncio.Lock | None = None
 
+# Third persistent session: aws-outlook-mcp with WRITES ENABLED (for email_draft).
+# Distinct from _mcp_state (which is read-only) and _graph_mcp_state (Graph tools).
+_owa_write_state = _PersistentMcpState()
+_owa_write_lock: asyncio.Lock | None = None
+
 # Strong refs to in-flight fire-and-forget mark-read tasks so the event loop
 # does not GC them mid-flight (asyncio only holds weak refs to bare tasks).
 _MARK_READ_TASKS: set = set()
@@ -723,6 +728,119 @@ async def _disconnect_graph_mcp() -> None:
         logger.info("Email Graph (manager-outlook-mcp) MCP session disconnected.")
 
 
+def _get_owa_write_lock() -> asyncio.Lock:
+    """Lazy-init the aws-outlook-mcp write session connect lock."""
+    global _owa_write_lock
+    if _owa_write_lock is None:
+        _owa_write_lock = asyncio.Lock()
+    return _owa_write_lock
+
+
+def _owa_write_params() -> StdioServerParameters:
+    """Build StdioServerParameters for aws-outlook-mcp WITH writes enabled."""
+    entry = _find_email_mcp_entry()
+    if entry is None:
+        entry = dict(_EMAIL_MCP_FALLBACK)
+
+    command = entry.get("command") or _EMAIL_MCP_FALLBACK["command"]
+    raw_args = entry.get("args")
+    args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+
+    raw_env = entry.get("env")
+    env = {}
+    if isinstance(raw_env, dict):
+        env = {
+            str(k): str(v)
+            for k, v in raw_env.items()
+            if not (_looks_secret(str(k)) or _looks_secret(str(v)))
+        }
+    env["OUTLOOK_MCP_ENABLE_WRITES"] = "true"
+    return StdioServerParameters(command=str(command), args=args, env=env)
+
+
+async def _connect_owa_write() -> None:
+    """Lazily connect the persistent aws-outlook-mcp write session."""
+    lock = _get_owa_write_lock()
+    async with lock:
+        if _owa_write_state.session is not None:
+            return
+
+        params = _owa_write_params()
+        stdio_cm = None
+        session_cm = None
+        try:
+            stdio_cm = stdio_client(params)
+            read_stream, write_stream = await stdio_cm.__aenter__()
+
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+
+            await session.initialize()
+
+            _owa_write_state.session = session
+            _owa_write_state.stdio_cm = stdio_cm
+            _owa_write_state.session_cm = session_cm
+            _owa_write_state.read_stream = read_stream
+            _owa_write_state.write_stream = write_stream
+            _owa_write_state.connected_at = time.time()
+            logger.info("Email OWA write (aws-outlook-mcp) MCP session connected.")
+        except BaseException:
+            if session_cm is not None:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            if stdio_cm is not None:
+                try:
+                    await stdio_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            raise
+
+
+async def _disconnect_owa_write() -> None:
+    """Tear down the persistent aws-outlook-mcp write session."""
+    lock = _get_owa_write_lock()
+    async with lock:
+        if _owa_write_state.session is None:
+            return
+
+        if _owa_write_state.session_cm is not None:
+            try:
+                await _owa_write_state.session_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("OWA write session_cm teardown: %s", _scrub(str(e)))
+        if _owa_write_state.stdio_cm is not None:
+            try:
+                await _owa_write_state.stdio_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("OWA write stdio_cm teardown: %s", _scrub(str(e)))
+
+        _owa_write_state.session = None
+        _owa_write_state.stdio_cm = None
+        _owa_write_state.session_cm = None
+        _owa_write_state.read_stream = None
+        _owa_write_state.write_stream = None
+        _owa_write_state.connected_at = None
+        logger.info("Email OWA write (aws-outlook-mcp) MCP session disconnected.")
+
+
+_OWA_GATED_WRITE_TOOLS = frozenset({"email_draft"})
+
+
+async def _call_owa_write_tool(name: str, arguments: dict) -> object:
+    """Gated path for aws-outlook-mcp write tools (email_draft only)."""
+    if name not in _OWA_GATED_WRITE_TOOLS:
+        raise EmailMcpError(
+            f"Refusing OWA write tool {name!r}: not in the gated allowlist."
+        )
+    return await _call_session_tool(
+        name=name, arguments=arguments, state=_owa_write_state,
+        connect=_connect_owa_write, disconnect=_disconnect_owa_write,
+        label="Email OWA write",
+    )
+
+
 class EmailMcpError(Exception):
     """A direct-MCP read failed (connect/handshake/call/parse/tool error)."""
 
@@ -831,7 +949,7 @@ async def call_read_tool(name: str, arguments: dict) -> object:
 # DELIBERATELY tiny: mark_email_read is the only write this change authorizes. It
 # is NOT in _EMAIL_READ_ONLY_TOOLS and NEVER routes through call_read_tool, so the
 # read client can never reach send/reply/forward/delete/move.
-_GRAPH_GATED_WRITE_TOOLS = frozenset({"mark_email_read"})
+_GRAPH_GATED_WRITE_TOOLS = frozenset({"mark_email_read", "delete_email"})
 
 
 async def _call_graph_write_tool(name: str, arguments: dict) -> object:
@@ -1490,6 +1608,57 @@ def _skeleton_for(raw: dict) -> dict:
     }
 
 
+def _html_to_text(html: str) -> str:
+    """Strip HTML to readable plain text. Handles email HTML from Graph/OWA.
+
+    Tables are converted to pipe-separated markdown-style rows so columnar
+    data (status updates, metrics) remains scannable rather than collapsing
+    into an unstructured line dump.
+    """
+    if not html or "<" not in html:
+        return html
+    text = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Tables: convert to pipe-separated rows. Strategy: mark cell boundaries
+    # with sentinel characters, strip all other tags, then replace sentinels.
+    _CELL_SEP = "\x01"
+    _ROW_SEP = "\x02"
+    text = re.sub(r"</?(?:table|thead|tbody|tfoot|colgroup|col|caption)[^>]*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<tr[^>]*>", _ROW_SEP, text, flags=re.IGNORECASE)
+    text = re.sub(r"</tr>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<t[hd][^>]*>", _CELL_SEP, text, flags=re.IGNORECASE)
+    text = re.sub(r"</t[hd]>", "", text, flags=re.IGNORECASE)
+    # List items get a bullet
+    text = re.sub(r"<li[^>]*>", "  • ", text, flags=re.IGNORECASE)
+    # Block-level breaks
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</h[1-6]>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<h[1-6][^>]*>", "\n", text, flags=re.IGNORECASE)
+    # Strip remaining tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Decode common HTML entities
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&nbsp;", " ").replace("&quot;", '"')
+    # Collapse whitespace (preserve newlines and sentinels)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    # Convert table sentinels to readable pipe-separated format.
+    # Each ROW_SEP starts a new line; each CELL_SEP within a row becomes " | ".
+    # Clean up: strip inner newlines within cells (HTML content between <td> tags
+    # often has <p> or <br> that became \n — flatten to space within a cell).
+    lines = text.split(_ROW_SEP)
+    out_lines = []
+    for line in lines:
+        if _CELL_SEP in line:
+            cells = [c.replace("\n", " ").strip() for c in line.split(_CELL_SEP)]
+            cells = [c for c in cells if c]
+            out_lines.append(" | ".join(cells))
+        else:
+            out_lines.append(line)
+    text = "\n".join(out_lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _msg_sender_name(msg: dict) -> str:
     """Flatten a message's sender/from into a display name (never a dict repr)."""
     sender = msg.get("from")
@@ -1542,17 +1711,17 @@ def _extract_email_body(payload) -> str:
     if msgs:
         parts = []
         for msg in msgs:
-            body = msg.get("body", "")
+            body = _html_to_text(str(msg.get("body", "") or ""))
             sender = _msg_sender_name(msg)
             subject = msg.get("subject", "")
             if body:
                 header = f"From: {sender}\nSubject: {subject}\n\n" if sender else ""
-                parts.append(header + str(body))
+                parts.append(header + body)
         if parts:
             return "\n---\n".join(parts)
     # Fallback: top-level body or content as string
     body = payload.get("body", "") or payload.get("content", "")
-    return str(body) if body else ""
+    return _html_to_text(str(body)) if body else ""
 
 
 def _extract_thread_history(payload) -> list[dict]:
@@ -1577,7 +1746,7 @@ def _extract_thread_history(payload) -> list[dict]:
     for idx, msg in enumerate(emails):
         if not isinstance(msg, dict):
             continue
-        body = str(msg.get("body", "") or "")
+        body = _html_to_text(str(msg.get("body", "") or ""))
         body = _scrub(body)[:_THREAD_TURN_BODY_CAP].strip()
         if not body:
             continue  # never fabricate a turn for a body-less message
@@ -1788,9 +1957,30 @@ async def _scan_once(app) -> None:
                 if history:
                     raw["threadHistory"] = history
             except Exception as e:  # noqa: BLE001 -- body fetch is best-effort
-                # Non-fatal: we can still classify/draft from the snippet alone, and
-                # we NEVER fabricate turns — threadHistory simply stays absent.
-                logger.debug("Email body fetch failed for %s: %s", msg_id, _scrub(str(e)))
+                logger.warning("Email body fetch failed for %s: %s", msg_id, _scrub(str(e)))
+
+    # Backfill: retry body fetch for existing items that have an empty emailBody
+    # (prior scan failures, timeouts, or transient errors). Cap at 5 per cycle to
+    # avoid overwhelming the MCP session.
+    _BACKFILL_PER_CYCLE = 5
+    missing_body = [
+        it for it in data["items"]
+        if not it.get("emailBody")
+        and it.get("status") in {"needs-classify", "needs-draft", "needs-review", "edited"}
+        and (it.get("messageId") or it.get("conversationId"))
+    ][:_BACKFILL_PER_CYCLE]
+    for it in missing_body:
+        msg_id = str(it.get("messageId", "") or it.get("conversationId", ""))
+        try:
+            body_payload = await call_read_tool("get_email", {"message_id": msg_id})
+            body_text = _extract_email_body(body_payload)
+            if body_text:
+                it["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+            history = _extract_thread_history(body_payload)
+            if history:
+                it["threadHistory"] = history
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Email body backfill failed for %s: %s", msg_id, _scrub(str(e)))
 
     # Write needs-classify skeletons
     for raw in new_items:
@@ -2454,6 +2644,102 @@ async def undismiss_item(request: web.Request) -> web.Response:
     return web.json_response({"item": item, "etag": new_etag})
 
 
+async def _delete_messages_outlook(messages: dict) -> None:
+    """Delete one or more messages in Outlook via Graph delete_email (soft-delete).
+
+    ``messages`` is a {message_id: subject-or-None} map. Moves to Deleted Items
+    (permanent=false) which is recoverable. Batched ≤10 ids/call like mark-read.
+    Logs failures at WARNING; never raises.
+    """
+    clean = {
+        str(mid): (subj if subj is None else str(subj))
+        for mid, subj in (messages or {}).items()
+        if str(mid or "").strip()
+    }
+    if not clean:
+        return
+
+    ids = list(clean.keys())
+    for start in range(0, len(ids), _MARK_READ_BATCH):
+        chunk = ids[start:start + _MARK_READ_BATCH]
+        batch = {mid: clean[mid] for mid in chunk}
+        try:
+            result = await _call_graph_write_tool(
+                "delete_email", {"emails": batch, "permanent": False}
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "delete-email failed for %d message(s): %s",
+                len(chunk), _scrub(str(e)),
+            )
+            continue
+
+        results = result.get("results") if isinstance(result, dict) else None
+        if not isinstance(results, list) or not results:
+            logger.warning(
+                "delete-email returned no results for %d message(s) (response: %s)",
+                len(chunk), _scrub(_one_line(str(result), 200)),
+            )
+            continue
+        failed = [
+            str(r.get("message_id", ""))
+            for r in results
+            if isinstance(r, dict) and not r.get("success")
+        ]
+        if failed:
+            logger.warning(
+                "delete-email did NOT delete %d message(s): %s",
+                len(failed), _scrub(_one_line(", ".join(failed), 200)),
+            )
+
+
+def _spawn_delete_email(messages: dict) -> None:
+    """Fire-and-forget the Outlook delete so the API response stays snappy."""
+    if not messages:
+        return
+    try:
+        task = asyncio.ensure_future(_delete_messages_outlook(dict(messages)))
+        _MARK_READ_TASKS.add(task)
+        task.add_done_callback(_MARK_READ_TASKS.discard)
+    except RuntimeError:
+        logger.debug("delete-email skipped: no running loop")
+
+
+async def delete_item(request: web.Request) -> web.Response:
+    """POST /api/email/queue/{item_id}/delete -- delete the email from Outlook.
+
+    Removes the item from the queue AND moves the email to Outlook's Deleted Items
+    (soft-delete, recoverable from Outlook trash). Distinct from dismiss: dismiss
+    only marks read and hides from the queue; delete actually trashes the message.
+    """
+    item_id = request.match_info["item_id"]
+    body = await read_json_body(request) if request.can_read_body else {}
+    expected_etag = body.get("etag")
+
+    data, current_etag = await _load_async()
+    item = next((it for it in data["items"] if it.get("id") == item_id), None)
+    if not item:
+        raise web.HTTPNotFound(reason=f"item {item_id} not found")
+
+    delete_map = _mark_read_map_for(item)
+    item["status"] = "deleted"
+
+    try:
+        new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
+    except filestore.ConflictError as e:
+        current, current_etag = filestore.read_json(EMAIL_PATH)
+        return web.json_response(
+            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            status=409,
+        )
+
+    _spawn_delete_email(delete_map)
+
+    ws = request.app["ws_manager"]
+    await ws.broadcast("email_changed", {"id": item_id, "deleted": True})
+    return web.json_response({"ok": True, "id": item_id, "etag": new_etag})
+
+
 async def regenerate_item(request: web.Request) -> web.Response:
     """POST /api/email/queue/{item_id}/refresh -- regenerate the draft."""
     item_id = request.match_info["item_id"]
@@ -2513,9 +2799,9 @@ async def regenerate_item(request: web.Request) -> web.Response:
 async def approve_item(request: web.Request) -> web.Response:
     """POST /api/email/queue/{item_id}/approve -- approve and save draft.
 
-    The system NEVER sends email directly. Approve saves the draft via the
-    delegation seam (action 'save_draft') and marks the item as 'approved'.
-    The user sends from their own email client.
+    The system NEVER sends email directly. Approve calls email_draft directly
+    via the aws-outlook-mcp write session (no claude subprocess) and marks the
+    item as 'approved'. The user sends from their own email client.
     """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request) if request.can_read_body else {}
@@ -2528,34 +2814,48 @@ async def approve_item(request: web.Request) -> web.Response:
     if item.get("status") == "approved":
         raise web.HTTPConflict(reason="item already approved")
 
-    final_draft = item.get("draft", "")
+    final_draft = str(item.get("draft", "")).strip()
 
-    # Delegate to save_draft action (NEVER 'reply' or 'send')
-    result = await _run_email_agent("save_draft", {
-        "id": item_id,
-        "draft": final_draft,
-        "item": item,
-    })
+    # Call email_draft directly via MCP (no LLM subprocess — instant).
+    # Response shape: {success:true, content:{draftId, draftChangeKey, recipients}}
+    # or {success:false, error:{message:"BLOCKED: ..."}} for domain-blocked recipients.
+    draft_saved = False
+    draft_id = None
+    if final_draft:
+        recipient = str(item.get("senderEmail", "") or "").strip()
+        if recipient:
+            try:
+                result = await _call_owa_write_tool("email_draft", {
+                    "operation": "create",
+                    "to": [recipient],
+                    "subject": f"Re: {item.get('subject', '')}",
+                    "body": final_draft.replace("\n", "<br>"),
+                })
+                if isinstance(result, dict):
+                    draft_saved = bool(result.get("success"))
+                    content = result.get("content") or {}
+                    if isinstance(content, dict):
+                        draft_id = content.get("draftId")
+                    if not draft_saved:
+                        err = result.get("error") or {}
+                        reason = err.get("message", "") if isinstance(err, dict) else str(err)
+                        logger.warning("Email approve: draft not saved: %s", _scrub(reason))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Email approve: draft save failed: %s", _scrub(str(e)))
+        else:
+            logger.warning("Email approve: no senderEmail — cannot save draft")
 
-    draft_saved = result.get("draftSaved", False) if result.get("available") else False
-
-    # Topic memory (best-effort, logged): record what we just replied about so
-    # future drafts to this contact reference prior context. It RE-READS then
-    # appends (filestore handles its own etag) so a concurrent note isn't
-    # blind-overwritten. A topic-write failure must NEVER block or fail the
-    # approve — approve stays draft-save + clipboard ONLY (no send path).
+    # Topic memory (best-effort, logged)
     try:
         _append_email_topic_note(item.get("sender", ""), item, final_draft)
-    except Exception as e:  # noqa: BLE001 — best-effort; never fail the approve
+    except Exception as e:  # noqa: BLE001
         logger.warning("Email approve: topic-note append failed: %s", _scrub(str(e)))
 
-    # Mark approved regardless of whether the save succeeded
     item["status"] = "approved"
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
     except filestore.ConflictError:
-        # Re-read and retry once
         data, current_etag = await _load_async()
         item = next((it for it in data["items"] if it.get("id") == item_id), None)
         if item and item.get("status") != "approved":
@@ -2567,11 +2867,14 @@ async def approve_item(request: web.Request) -> web.Response:
         else:
             new_etag = current_etag
 
+    _spawn_mark_read(_mark_read_map_for(item))
+
     ws = request.app["ws_manager"]
     await ws.broadcast("email_changed", {"id": item_id, "approved": True})
     return web.json_response({
-        "available": result.get("available", False),
+        "available": True,
         "draftSaved": draft_saved,
+        "draftId": draft_id,
         "item": item,
         "etag": new_etag,
     })
@@ -2788,6 +3091,7 @@ def register(app: web.Application):
     app.router.add_put("/api/email/queue/{item_id}", save_draft)
     app.router.add_delete("/api/email/queue/{item_id}", dismiss_item)
     app.router.add_post("/api/email/queue/{item_id}/undismiss", undismiss_item)
+    app.router.add_post("/api/email/queue/{item_id}/delete", delete_item)
     app.router.add_post("/api/email/queue/{item_id}/refresh", regenerate_item)
     app.router.add_post("/api/email/queue/{item_id}/approve", approve_item)
     app.router.add_post("/api/email/queue/{item_id}/mute", mute_item)

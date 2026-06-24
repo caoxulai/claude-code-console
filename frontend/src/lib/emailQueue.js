@@ -25,7 +25,7 @@
 // NavBar badge and the page's "N to review" count drift apart.
 export function isActionable(item) {
   const s = item && item.status;
-  return s !== 'approved' && s !== 'dismissed';
+  return s !== 'approved' && s !== 'dismissed' && s !== 'deleted';
 }
 
 export function countActionable(items) {

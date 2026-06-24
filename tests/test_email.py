@@ -259,16 +259,14 @@ async def test_email_dismiss_conflict_does_not_mark_read(client, email_file, mon
     assert calls == []  # no mark-read on a conflict
 
 
-async def test_email_approve_and_mute_do_not_mark_read(client, email_file, monkeypatch):
-    """Only dismiss marks read -- approve and mute must NOT (the user's choice).
-
-    Approve still saves an Outlook draft + clipboard and mute still soft-dismisses,
-    but neither touches the conversation's read-state.
-    """
+async def test_email_approve_marks_read_but_mute_does_not(client, email_file, monkeypatch):
+    """Approve and dismiss mark read; mute does NOT."""
     calls = _capture_mark_read(monkeypatch)
-    _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    async def fake_owa_write(name, arguments):
+        return {"success": True, "draftId": "D1"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
     _seed(email_file, [
-        _make_item("i1", messageId="AAMkA", conversationId="AAMkA"),
+        _make_item("i1", messageId="AAMkA", conversationId="AAMkA", senderEmail="x@amazon.com"),
         _make_item("i2", messageId="AAMkB", conversationId="AAMkB"),
     ])
 
@@ -277,8 +275,9 @@ async def test_email_approve_and_mute_do_not_mark_read(client, email_file, monke
     resp = await client.post("/api/email/queue/i2/mute", json={})
     assert resp.status == 200
 
-    # Neither terminal action marked a conversation read.
-    assert calls == []
+    # Approve marks read (AAMkA); mute does NOT (AAMkB absent).
+    assert len(calls) == 1
+    assert "AAMkA" in calls[0]
 
 
 async def test_email_undismiss_restores(client, email_file):
@@ -426,14 +425,21 @@ async def test_email_regenerate_unavailable_does_not_fabricate(client, email_fil
 
 
 async def test_email_approve_saves_draft_and_returns_ok(client, email_file, monkeypatch):
-    """Approve marks status→approved and draftSaved:true when agent succeeds."""
-    _seed(email_file, [_make_item("i1", draft="final reply")])
-    agent = _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    """Approve marks status→approved and draftSaved:true when MCP draft succeeds."""
+    _seed(email_file, [_make_item("i1", draft="final reply", senderEmail="bob@example.com")])
+    calls = []
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "DRAFT123"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
     resp = await client.post("/api/email/queue/i1/approve", json={})
     assert resp.status == 200
     body = await resp.json()
     assert body["item"]["status"] == "approved"
     assert body.get("draftSaved") is True
+    assert len(calls) == 1
+    assert calls[0][0] == "email_draft"
+    assert calls[0][1]["operation"] == "create"
     # Persisted to disk
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
     assert saved["status"] == "approved"
@@ -459,18 +465,19 @@ async def test_email_approve_already_approved_is_409(client, email_file, monkeyp
 
 
 async def test_email_approve_never_calls_email_reply_or_send(client, email_file, monkeypatch):
-    """Assert the agent stub was called with 'save_draft' action only, never
-    'reply' or 'send'. The system NEVER sends email directly."""
-    _seed(email_file, [_make_item("i1", draft="final reply")])
-    agent = _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    """Approve calls ONLY email_draft (create) — never reply/send/forward."""
+    _seed(email_file, [_make_item("i1", draft="final reply", senderEmail="bob@example.com")])
+    calls = []
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "D1"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
     await client.post("/api/email/queue/i1/approve", json={})
-    # Only save_draft action should have been called
-    actions = [call[0] for call in agent.calls]
-    assert "reply" not in actions, "approve must NEVER call the 'reply' action"
-    assert "send" not in actions, "approve must NEVER call the 'send' action"
-    # The action should be 'save_draft' (the ONE write-tool cold-start)
-    assert any(a == "save_draft" for a in actions), \
-        f"expected 'save_draft' action, got: {actions}"
+    tool_names = [c[0] for c in calls]
+    assert "email_reply" not in tool_names, "approve must NEVER call email_reply"
+    assert "email_send" not in tool_names, "approve must NEVER call email_send"
+    assert "email_forward" not in tool_names, "approve must NEVER call email_forward"
+    assert "email_draft" in tool_names, f"expected email_draft, got: {tool_names}"
 
 
 async def test_email_mute_dismisses_and_records_key(client, email_file):
@@ -919,13 +926,17 @@ async def test_email_approve_topic_note_failure_is_best_effort(
 async def test_email_approve_still_only_saves_draft_never_sends(
     client, email_file, topics_dir, monkeypatch
 ):
-    """Approve remains draft-save + clipboard ONLY — no reply/send action."""
-    _seed(email_file, [_make_item("i1", draft="final")])
-    agent = _stub_agent(monkeypatch, {"available": True, "draftSaved": True})
+    """Approve remains draft-save + clipboard ONLY — no reply/send tool call."""
+    _seed(email_file, [_make_item("i1", draft="final", senderEmail="x@y.com")])
+    calls = []
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "D2"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
     await client.post("/api/email/queue/i1/approve", json={})
-    actions = [c[0] for c in agent.calls]
-    assert "reply" not in actions and "send" not in actions
-    assert "save_draft" in actions
+    tool_names = [c[0] for c in calls]
+    assert "email_reply" not in tool_names and "email_send" not in tool_names
+    assert "email_draft" in tool_names
 
 
 # --- (2a) polish endpoint -----------------------------------------------------
