@@ -18,6 +18,7 @@ import {
   polishSource,
   autoSizeHeight,
   displayTimestamp,
+  deleteOutcome,
 } from './emailDetail.js';
 
 let passed = 0;
@@ -397,6 +398,72 @@ test('displayTimestamp: an empty turn timestamp -> "" so the slot renders nothin
   // Falsy -> the page's `{turn.timestamp && ...}`-style guard skips the slot.
   assert.equal(slot, '');
   assert.notEqual(slot, '--');
+});
+
+// --- deleteOutcome: honest delete confirmation (Fix task 6 frontend half) ---
+// The delete POST is fire-and-forget at the HTTP envelope (the backend can
+// return 200/ok:true while the Outlook MOVE later 429s on the GRASP quota), so
+// the row must flip to "deleted" ONLY when the response BODY confirms
+// `deleted === true`. A non-2xx, a 409 conflict, OR a 2xx-with-`deleted:false`
+// (or no `deleted` flag) all leave the row VISIBLE in its prior state with an
+// inline error — never the SWALLOWED-200 / FRONTEND-ONLY-409 lie. deleteOutcome
+// turns (httpStatus, body) into {outcome, etag, reason}:
+//   outcome 'deleted'  -> collapse/move the row to Deleted; adopt body.etag
+//   outcome 'conflict' -> the queue moved elsewhere (409); re-read + banner
+//   outcome 'failed'   -> keep the row, show `reason` inline (e.g. quota)
+// Pure — no DOM, no fetch.
+
+test('deleteOutcome: 2xx with deleted:true -> "deleted", adopts the etag', () => {
+  const r = deleteOutcome(200, { ok: true, deleted: true, id: 'i1', etag: 'e9' });
+  assert.equal(r.outcome, 'deleted');
+  assert.equal(r.etag, 'e9');
+});
+
+test('deleteOutcome: 409 conflict -> "conflict" (re-read, never treated as deleted)', () => {
+  const r = deleteOutcome(409, { error: 'conflict', etag: 'e2', current: {} });
+  assert.equal(r.outcome, 'conflict');
+  assert.notEqual(r.outcome, 'deleted');
+});
+
+test('deleteOutcome: SWALLOWED-200 trap — 2xx ok:true but deleted:false -> "failed", row stays', () => {
+  // The HTTP layer "handled" it (200, ok:true) but the Outlook move 429d on the
+  // GRASP quota: deleted is false. This MUST be a failure, not a clean delete.
+  const r = deleteOutcome(200, {
+    ok: true, deleted: false, id: 'i1',
+    error: 'Outlook rate-limited (GRASP quota -> 429)', etag: 'e3',
+  });
+  assert.equal(r.outcome, 'failed');
+  assert.notEqual(r.outcome, 'deleted');
+  assert.ok(r.reason.includes('GRASP quota'));
+  // still adopt the etag so a follow-up write isn't stale
+  assert.equal(r.etag, 'e3');
+});
+
+test('deleteOutcome: 2xx with NO deleted flag (old backend) -> "failed", not a silent delete', () => {
+  // Anti-FRONTEND-ONLY-409: keying on res.ok alone would treat this as deleted.
+  // Absence of an explicit deleted:true is NOT a confirmation.
+  const r = deleteOutcome(200, { ok: true, id: 'i1', etag: 'e4' });
+  assert.equal(r.outcome, 'failed');
+  assert.notEqual(r.outcome, 'deleted');
+});
+
+test('deleteOutcome: non-2xx (500) -> "failed" with a readable reason', () => {
+  const r = deleteOutcome(500, { error: 'boom' });
+  assert.equal(r.outcome, 'failed');
+  assert.ok(r.reason && typeof r.reason === 'string');
+});
+
+test('deleteOutcome: failure reason prefers the body error, falls back to a default string', () => {
+  const withErr = deleteOutcome(200, { ok: true, deleted: false, error: 'quota_exceeded -> 429' });
+  assert.equal(withErr.reason, 'quota_exceeded -> 429');
+  const noErr = deleteOutcome(200, { ok: true, deleted: false });
+  assert.ok(noErr.reason && noErr.reason.length > 0);
+  assert.notEqual(noErr.reason, 'undefined');
+});
+
+test('deleteOutcome: a null/garbage body never crashes and is treated as failure', () => {
+  assert.equal(deleteOutcome(200, null).outcome, 'failed');
+  assert.equal(deleteOutcome(502, undefined).outcome, 'failed');
 });
 
 console.log(`\nall green: ${passed} tests passed`);

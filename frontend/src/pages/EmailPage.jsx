@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome } from './emailDetail';
 
 // --- Constants ---
 
@@ -115,6 +115,17 @@ export default function EmailPage() {
   const [lastScanAt, setLastScanAt] = useState(null);
   const [paused, setPaused] = useState(false);
   const [pausing, setPausing] = useState(false);
+  // GRASP quota / Microsoft Graph rate-limit state, read from GET /api/email/queue.
+  // graphThrottled gates an honest page-level banner instead of a falsely-calm
+  // "No items to review"; it CLEARS as soon as the backend reports it false again
+  // (anti-STICKY-THROTTLE), so the banner never lingers past recovery.
+  const [graphThrottled, setGraphThrottled] = useState(false);
+  const [lastGraphError, setLastGraphError] = useState(null);
+  // Per-item delete failures: id -> human reason. A delete that the backend could
+  // not confirm (429/quota or any error) records its reason here so the row stays
+  // VISIBLE with an inline error instead of vanishing as if deleted. Cleared when
+  // the next delete attempt starts or the item confirms deleted.
+  const [deleteFailed, setDeleteFailed] = useState(() => new Map());
   const [, setTick] = useState(0);
   const [scanning, setScanning] = useState(false);
   const scanHintRef = useRef(null);
@@ -267,6 +278,12 @@ export default function EmailPage() {
       setError(null);
       setLastScanAt(finiteOrNull(json.lastScanAt));
       setPaused(json.paused === true);
+      // Read the GRASP-quota / Graph-throttle flag every refresh so the banner
+      // CLEARS the moment the backend reports recovery (graphThrottled false) —
+      // never sticky. lastGraphError is a human string for the banner detail.
+      setGraphThrottled(json.graphThrottled === true);
+      setLastGraphError(typeof json.lastGraphError === 'string' && json.lastGraphError.trim()
+        ? json.lastGraphError.trim() : null);
     } catch {
       setError('Failed to load the email queue.');
     }
@@ -633,31 +650,58 @@ export default function EmailPage() {
     }
   };
 
-  // Delete from Outlook (moves to Deleted Items — distinct from dismiss)
+  // Delete from Outlook (moves to Deleted Items — distinct from dismiss).
+  //
+  // HONEST delete (Fix task 6): the Outlook move is fire-and-forget at the HTTP
+  // envelope — the backend can answer 200/ok:true while the move later 429s on
+  // the exhausted GRASP quota. So we DO NOT key "deleted" on res.ok / non-409;
+  // deleteOutcome (emailDetail.js) keys it on the response BODY's `deleted` flag
+  // (the verify-effect-not-caller principle). On a confirmed delete we collapse
+  // the row (it re-renders in the Deleted section). On failure we leave the row
+  // VISIBLE in its prior state and attach an inline per-item error so the user
+  // sees WHY (e.g. GRASP quota) instead of the row silently vanishing.
   const deleteEmail = async (id) => {
     setBusyId(id);
+    // Clear any prior delete error for this item before retrying.
+    setDeleteFailed(prev => {
+      if (!prev.has(id)) return prev;
+      const n = new Map(prev); n.delete(id); return n;
+    });
     try {
       const res = await fetch(`/api/email/queue/${encodeURIComponent(id)}/delete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ etag }),
       });
-      if (res.status === 409) {
+      const json = await res.json().catch(() => null);
+      const { outcome, etag: nextEtag, reason } = deleteOutcome(res.status, json);
+      if (nextEtag) setEtag(nextEtag);
+
+      if (outcome === 'conflict') {
         setError('Conflict: the queue was modified elsewhere. Refreshing...');
         refresh();
         return;
       }
-      if (!res.ok) {
-        setError('Failed to delete the email.');
+      if (outcome === 'deleted') {
+        // Confirmed: the email actually moved to Deleted Items. Collapse the row
+        // (it reappears under the Deleted section) and clear any stale error.
+        // (deleteFailed for this id was already cleared at the top of the call.)
+        if (expandedId === id) { setExpandedId(null); setEditingId(null); }
+        setError(null);
+        refresh();
         return;
       }
-      const json = await res.json();
-      setEtag(json.etag ?? null);
-      if (expandedId === id) { setExpandedId(null); setEditingId(null); }
-      setError(null);
+      // outcome === 'failed': the move did not confirm (429/quota or an error).
+      // Keep the row exactly where it is — do NOT collapse the panel as if it
+      // were deleted — and surface the reason inline next to the Delete button.
+      setDeleteFailed(prev => new Map(prev).set(id, reason));
+      // Re-read so the row reflects its true (still-actionable) state. The
+      // backend leaves the item in its prior status, so the row won't flicker
+      // to "deleted" and reappear — it simply stays put with the inline error.
       refresh();
     } catch {
-      setError('Failed to delete the email.');
+      setDeleteFailed(prev => new Map(prev).set(
+        id, "Couldn't delete — the request did not complete. The email was NOT removed."));
     } finally {
       setBusyId(null);
     }
@@ -816,6 +860,13 @@ export default function EmailPage() {
       border: 'none', padding: 0,
     };
     const isBusy = busyId === item.id;
+    // A confirmed-failed delete (429/quota or any error) keeps the row visible
+    // and attaches the reason here; prefer the live per-item state, falling back
+    // to the item's persisted lastActionError so a reload still shows WHY.
+    const deleteError = deleteFailed.has(item.id)
+      ? deleteFailed.get(item.id)
+      : (typeof item.lastActionError === 'string' && item.lastActionError.trim()
+        ? item.lastActionError.trim() : null);
     const isApproved = item.status === 'approved';
     const isDismissed = item.status === 'dismissed';
     const isDeleted = item.status === 'deleted';
@@ -1209,6 +1260,28 @@ export default function EmailPage() {
           </div>
         )}
 
+        {/* Inline delete-failure notice (Fix task 6). A delete that the backend
+            could NOT confirm (429/quota or any error) keeps this item right here,
+            actionable, and shows WHY — never the silent-vanish lie. Uses the same
+            --warning/--muted/--border tokens as the rest of the page; no new
+            tokens. The reason text is external/log-derived → React {…} only. */}
+        {deleteError && (
+          <div
+            style={{
+              display: 'flex', alignItems: 'flex-start', gap: '0.4em',
+              color: 'var(--warning)', fontSize: '0.82em', marginTop: 'var(--space-sm)',
+              padding: '0.5em 0.7em', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius)', background: 'var(--surface)',
+            }}
+          >
+            <FiAlertCircle size={14} style={{ flexShrink: 0, marginTop: '0.1em' }} />
+            <span>
+              {deleteError}
+              <span style={{ color: 'var(--muted)' }}> The email was NOT deleted — it is still in your inbox. Try again later.</span>
+            </span>
+          </div>
+        )}
+
         {/* Approve confirmation */}
         {approveMsg[item.id] && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', color: 'var(--accent)', fontSize: '0.85em', marginTop: 'var(--space-sm)', fontWeight: 600 }}>
@@ -1463,6 +1536,28 @@ export default function EmailPage() {
             <FiAlertCircle size={13} /> not wired{health.detail ? `: ${health.detail}` : ''}
           </div>
         )
+      )}
+
+      {/* GRASP-quota / Graph rate-limit banner (Fix task 5/6). When the backend
+          reports graphThrottled we say so honestly instead of letting an empty
+          queue read as a falsely-calm "No items to review" / green-ready state.
+          It is gated on graphThrottled, so it CLEARS automatically the moment the
+          backend reports recovery (anti-STICKY-THROTTLE). lastGraphError carries
+          the human detail (status + GRASP code) and is log-derived → React {…}. */}
+      {graphThrottled && (
+        <div
+          className="badge badge-warn"
+          style={{
+            display: 'flex', alignItems: 'flex-start', gap: '0.4em',
+            marginBottom: 'var(--space-md)', maxWidth: '100%', whiteSpace: 'normal',
+          }}
+        >
+          <FiAlertCircle size={14} style={{ flexShrink: 0, marginTop: '0.1em' }} />
+          <span>
+            Outlook temporarily rate-limited (GRASP quota) — retrying later. Scanning and deletes are backed off until it recovers.
+            {lastGraphError ? <span style={{ opacity: 0.85 }}> ({lastGraphError})</span> : null}
+          </span>
+        </div>
       )}
 
       {/* Progress summary */}

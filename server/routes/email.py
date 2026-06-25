@@ -127,6 +127,18 @@ EMAIL_CLASSIFY_BATCH = 10          # max items per classify LLM call
 EMAIL_DRAFT_POLL_INTERVAL_S = 7    # draft worker poll interval
 EMAIL_DRAFT_CONCURRENCY = 3        # parallel draft subprocess cap
 
+# Idle teardown of the persistent Graph (manager-outlook-mcp) session. The GRASP
+# bundle's internal TokenRefreshRunner fires a full SAML re-auth every ~10 min for
+# as long as the session is held open, burning GRASP's API-Gateway quota. We must
+# NOT hold it alive while the Email tab is idle: if no Graph call has run for this
+# long (or the queue is paused), the reaper tears the session down so the refresh
+# timer dies with the subprocess. Kept UNDER one ~10-min refresh cycle.
+_GRAPH_IDLE_TEARDOWN_S = 180
+
+# When a Graph read 429s / hits a GRASP quota_exceeded, back the scan worker off
+# for this long before retrying so it can't keep hammering the exhausted quota.
+_GRAPH_THROTTLE_WINDOW_S = 15 * 60  # 15 minutes
+
 # Subprocess timeout budgets:
 _AGENT_TIMEOUT_S = 120   # classify/draft/regenerate
 _SAVE_DRAFT_TIMEOUT_S = 60  # save_draft (simpler, shorter)
@@ -553,10 +565,18 @@ _mcp_state = _PersistentMcpState()
 _mcp_connect_lock: asyncio.Lock | None = None
 
 # Second persistent session: manager-outlook-mcp (Microsoft Graph via GRASP). It
-# is the migrated READ path (get_emails/get_email) AND the gated mark-read write
-# path. It has its OWN state + connect-lock, mirroring the aws-outlook session.
+# is the migrated READ path (get_emails/get_email). It has its OWN state +
+# connect-lock, mirroring the aws-outlook session.
 _graph_mcp_state = _PersistentMcpState()
 _graph_mcp_connect_lock: asyncio.Lock | None = None
+
+# Wall-clock epoch of the last Graph call that actually ran on the PERSISTENT
+# session. The idle reaper (_reap_idle_graph_session) tears the session down once
+# no Graph call has run for _GRAPH_IDLE_TEARDOWN_S (or the queue is paused) so the
+# bundle's TokenRefreshRunner can't churn auth while the tab is idle. Stamped only
+# from the persistent path; the short-lived write spawn does NOT stamp it (it
+# spawns + exits, leaving no refresh timer to keep alive).
+_graph_last_activity: float = 0.0
 
 # Third persistent session: aws-outlook-mcp with WRITES ENABLED (for email_draft).
 # Distinct from _mcp_state (which is read-only) and _graph_mcp_state (Graph tools).
@@ -899,12 +919,24 @@ async def _call_session_tool(*, name: str, arguments: dict, state: _PersistentMc
             if state.session is None:
                 raise EmailMcpError(f"{label} MCP session failed to connect.")
 
+            # Stamp last-activity on the PERSISTENT Graph session so the idle reaper
+            # only tears down a genuinely-quiet session. The one-shot write spawn
+            # uses its OWN state, so it never refreshes this clock.
+            if state is _graph_mcp_state:
+                global _graph_last_activity
+                _graph_last_activity = time.time()
+
             result = await state.session.call_tool(name, arguments)
 
             if getattr(result, "isError", False):
+                # UN-TRUNCATED error body: the HTTP status code + GRASP error code
+                # ("quota_exceeded" / "-> 429") often sit at the END of a long body,
+                # so a 200-char cap chopped exactly the bytes an operator needs to
+                # tell a GRASP-quota 429 from a Microsoft Graph throttle. Cap at a
+                # generous 2000 chars so the code+reason always survive.
                 raise EmailMcpError(
                     _scrub(f"{label} MCP tool {name!r} returned an error: "
-                           + _one_line(str(getattr(result, "content", "")), 200))
+                           + _one_line(str(getattr(result, "content", "")), 2000))
                 )
 
             return _normalize_tool_result(result)
@@ -974,6 +1006,68 @@ async def _call_graph_write_tool(name: str, arguments: dict) -> object:
     )
 
 
+async def _call_graph_write_tool_oneshot(name: str, arguments: dict) -> object:
+    """SHORT-LIVED spawn-on-demand path for a gated Graph WRITE tool.
+
+    A user-initiated write (delete_email, mark_email_read) must NOT depend on the
+    always-on persistent session (which we now tear down while idle/paused to stop
+    GRASP's TokenRefreshRunner from burning the API-Gateway quota). So this spawns a
+    FRESH manager-outlook-mcp subprocess, reuses the cached on-disk GRASP token,
+    performs the single tool call, and ALWAYS tears the subprocess down in a finally
+    -- nothing keeps a refresh timer alive afterward.
+
+    SAME boundary as the persistent path: it refuses any name not in
+    _GRAPH_GATED_WRITE_TOOLS FIRST, before any spawn. It does NOT stamp
+    _graph_last_activity (it owns its own subprocess; there is no persistent session
+    to reap). FAILS LOUD (EmailMcpError) on connect/handshake/call/tool error so a
+    quota-exhausted delete surfaces honestly instead of silently "succeeding".
+    """
+    if name not in _GRAPH_GATED_WRITE_TOOLS:
+        raise EmailMcpError(
+            f"Refusing graph write tool {name!r}: not in the gated write allowlist."
+        )
+
+    params = _graph_mcp_params()  # may raise GraphMcpNodeError (fail loud)
+    stdio_cm = None
+    session_cm = None
+    try:
+        stdio_cm = stdio_client(params)
+        read_stream, write_stream = await stdio_cm.__aenter__()
+
+        session_cm = ClientSession(read_stream, write_stream)
+        session = await session_cm.__aenter__()
+        await session.initialize()
+
+        result = await session.call_tool(name, arguments)
+        if getattr(result, "isError", False):
+            raise EmailMcpError(
+                _scrub(f"Email Graph write (one-shot) tool {name!r} returned an "
+                       "error: " + _one_line(str(getattr(result, "content", "")), 2000))
+            )
+        return _normalize_tool_result(result)
+    except EmailMcpError:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except GraphMcpNodeError:
+        raise
+    except BaseException as e:
+        raise EmailMcpError(
+            _scrub(f"Email Graph write (one-shot) call failed: {e}")
+        ) from e
+    finally:
+        if session_cm is not None:
+            try:
+                await session_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Graph one-shot session_cm teardown: %s", _scrub(str(e)))
+        if stdio_cm is not None:
+            try:
+                await stdio_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Graph one-shot stdio_cm teardown: %s", _scrub(str(e)))
+
+
 def _normalize_tool_result(result) -> object:
     """Normalize a CallToolResult into a plain dict/list/str."""
     structured = getattr(result, "structuredContent", None)
@@ -1017,6 +1111,30 @@ def _normalize_tool_result(result) -> object:
                         pass
                 break
         return blob
+
+
+_QUOTA_BODY_RE = re.compile(r"quota_exceeded", re.IGNORECASE)
+_HTTP_429_RE = re.compile(r"(?<!\d)429(?!\d)")
+
+
+def _is_graph_quota_error(exc_or_result) -> bool:
+    """True if exc/result is an HTTP 429 or a GRASP ``quota_exceeded`` body.
+
+    Distinguishes the GRASP API-Gateway quota exhaustion (no Retry-After, body
+    ``{"error":"quota_exceeded"}`` with x-amz-apigw-id headers) from an ordinary
+    400 so the scan worker can back off ONLY on the condition that warrants it.
+    Matches the EmailMcpError message text we raise un-truncated (which carries the
+    full body incl. the status code and error code), a raw string, or a dict body.
+    """
+    if exc_or_result is None:
+        return False
+    if isinstance(exc_or_result, dict):
+        text = json.dumps(exc_or_result)
+    else:
+        text = str(exc_or_result)
+    if not text:
+        return False
+    return bool(_QUOTA_BODY_RE.search(text) or _HTTP_429_RE.search(text))
 
 
 # ── Prompt builders ────────────────────────────────────────────────────────
@@ -2087,6 +2205,60 @@ def _apply_latest_sender(item: dict, history) -> None:
         item["senderList"] = sender_list
 
 
+def _normalize_subject(subject: str) -> str:
+    """Strip leading Re:/Fwd:/Fw: prefixes and lowercase, for thread matching.
+
+    'Re: [Action needed] MAWS' and '[Action needed] MAWS' normalize to the same
+    key so a standalone original and its reply thread are recognized as the same
+    conversation.
+    """
+    s = str(subject or "").strip()
+    while True:
+        m = re.match(r"^\s*(re|fwd|fw)\s*:\s*", s, re.IGNORECASE)
+        if not m:
+            break
+        s = s[m.end():]
+    return s.strip().lower()
+
+
+def _quoted_body_index(items) -> dict:
+    """Build a lookup of {(normalized_subject, sender_lower): turn} from items that
+    already carry a parsed multi-turn threadHistory.
+
+    Some Graph message_ids fail ``get_email`` persistently while the SAME message
+    is quoted inside a reply thread we DID fetch and split into turns. This index
+    lets the backfill recover a body-less item's content from that already-parsed
+    quoted copy instead of leaving the card stuck on the truncated snippet. We only
+    index turns from multi-turn histories (a genuine quoted chain), never an item's
+    own single self-turn, and keep the LONGEST body seen per key so a fuller quote
+    wins. Never raises on malformed input.
+    """
+    index: dict = {}
+    if not isinstance(items, list):
+        return index
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        history = it.get("threadHistory")
+        if not isinstance(history, list) or len(history) < 2:
+            continue  # only a real quoted chain carries other people's messages
+        subj_key = _normalize_subject(it.get("subject", ""))
+        if not subj_key:
+            continue
+        for turn in history:
+            if not isinstance(turn, dict):
+                continue
+            sender = str(turn.get("sender", "") or "").strip().lower()
+            body = str(turn.get("body", "") or "")
+            if not sender or not body:
+                continue
+            key = (subj_key, sender)
+            prev = index.get(key)
+            if prev is None or len(body) > len(prev.get("body", "")):
+                index[key] = turn
+    return index
+
+
 def _parse_ts(value: str):
     """Best-effort parse of an email timestamp into a sortable datetime.
 
@@ -2211,14 +2383,56 @@ async def _scan_once(app) -> None:
     """
     global _LAST_SCAN_TS_MS
     now_ms = int(time.time() * 1000)
+    now_epoch = now_ms / 1000.0
+
+    # Read the persisted throttle window first so a quota-exhausted GRASP isn't
+    # re-hammered: while now < graphThrottledUntil we SKIP the Graph reads entirely
+    # (a REAL delay, not a hot re-fire) and let the window lapse so GRASP's quota
+    # can reset.
+    data, current_etag = _load()
+    throttled_until = data.get("graphThrottledUntil")
+    throttled = (
+        isinstance(throttled_until, (int, float))
+        and not isinstance(throttled_until, bool)
+        and now_epoch < throttled_until
+    )
+
+    quota_hit = False  # set if THIS cycle's inbox read hits a 429/quota condition
 
     # Fetch the unread inbox via Graph (get_emails -> {emails:[...], count, folder}).
-    inbox_payload = await call_read_tool("get_emails", {
-        "folder": "inbox", "limit": 25, "unread_only": True,
-    })
-    raw_items = _unwrap_list(inbox_payload, "emails", "messages", "items", "value")
-
-    data, current_etag = _load()
+    # GRASP intermittently 400s this call; a transient inbox-fetch failure must NOT
+    # abort the whole cycle, because the body-BACKFILL of items ALREADY in the queue
+    # (below) is independent of fetching new mail. So we degrade to "no new items
+    # this cycle" (raw_items=[]) and still run backfill, rather than raising and
+    # leaving body-less items stuck. This is not fabrication: an empty new-item list
+    # only means we discovered nothing new, and backfill operates solely on items
+    # already persisted. (A persistent failure simply yields empty cycles, visible
+    # via lastScanAt not advancing meaningfully and the warning log.)
+    if throttled:
+        logger.info(
+            "Email scan: Graph throttled until %s (backing off, skipping read).",
+            throttled_until,
+        )
+        raw_items = []
+    else:
+        try:
+            inbox_payload = await call_read_tool("get_emails", {
+                "folder": "inbox", "limit": 25, "unread_only": True,
+            })
+            raw_items = _unwrap_list(inbox_payload, "emails", "messages", "items", "value")
+        except Exception as e:  # noqa: BLE001 -- inbox fetch is best-effort per cycle
+            logger.warning("Email inbox fetch failed (continuing with backfill only): %s",
+                           _scrub(str(e)))
+            raw_items = []
+            if _is_graph_quota_error(e):
+                quota_hit = True
+                reason = _scrub(_one_line(str(e), 2000))
+                data["graphThrottledUntil"] = now_epoch + _GRAPH_THROTTLE_WINDOW_S
+                data["lastGraphError"] = {"reason": reason, "ts": now_ms}
+                logger.warning(
+                    "Email scan: GRASP quota/429 detected -> backing off for %ds: %s",
+                    _GRAPH_THROTTLE_WINDOW_S, reason,
+                )
 
     # Prune mutes
     now_s = now_ms / 1000.0
@@ -2279,23 +2493,55 @@ async def _scan_once(app) -> None:
         and it.get("status") in {"needs-classify", "needs-draft", "needs-review", "edited"}
         and (it.get("messageId") or it.get("conversationId"))
     ][:_BACKFILL_PER_CYCLE]
+    # Quoted-copy fallback: some Graph message_ids fail get_email persistently while
+    # the SAME message is quoted inside a reply thread we already fetched and split.
+    # Build the index once so a body-less item can recover its content from that
+    # parsed quoted copy instead of being stuck on the truncated snippet.
+    quoted_index = _quoted_body_index(data["items"])
+    # While throttled (or after THIS cycle's inbox read hit a quota/429) skip the
+    # per-message Graph get_email so we don't keep hammering the exhausted quota;
+    # the MCP-FREE quoted-copy recovery below still runs.
+    skip_graph_reads = throttled or quota_hit
     for it in missing_body:
         msg_id = str(it.get("messageId", "") or it.get("conversationId", ""))
-        try:
-            body_payload = await call_read_tool("get_email", {"message_id": msg_id})
-            body_text = _extract_email_body(body_payload)
-            if body_text:
-                it["emailBody"] = body_text[:_EMAIL_BODY_CAP]
-            history = _extract_thread_history(body_payload)
-            if history:
-                it["threadHistory"] = history
-                # Same overwrite as the new-item path: land the latest sender +
-                # participant list on the EXISTING persisted item `it` so a thread
-                # last replied to by someone other than the original sender shows
-                # the latest sender in the From column.
-                _apply_latest_sender(it, history)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Email body backfill failed for %s: %s", msg_id, _scrub(str(e)))
+        body_text = ""
+        history = None
+        if not skip_graph_reads:
+            try:
+                body_payload = await call_read_tool("get_email", {"message_id": msg_id})
+                body_text = _extract_email_body(body_payload)
+                history = _extract_thread_history(body_payload)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Email body backfill failed for %s: %s", msg_id, _scrub(str(e)))
+                if _is_graph_quota_error(e):
+                    skip_graph_reads = True
+                    reason = _scrub(_one_line(str(e), 2000))
+                    data["graphThrottledUntil"] = now_epoch + _GRAPH_THROTTLE_WINDOW_S
+                    data["lastGraphError"] = {"reason": reason, "ts": now_ms}
+
+        if not body_text:
+            # get_email failed or returned nothing — try to recover from a copy of
+            # this message quoted in another already-fetched thread (same subject
+            # sans Re:/Fwd:, same sender). Never fabricates: only used when a real
+            # quoted copy exists.
+            quoted = quoted_index.get(
+                (_normalize_subject(it.get("subject", "")),
+                 str(it.get("sender", "") or "").strip().lower())
+            )
+            if quoted and quoted.get("body"):
+                body_text = str(quoted["body"])
+                history = [dict(quoted)]
+                logger.info("Email body recovered from quoted copy for %s", msg_id)
+
+        if body_text:
+            it["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+        if history:
+            it["threadHistory"] = history
+            # Same overwrite as the new-item path: land the latest sender +
+            # participant list on the EXISTING persisted item `it` so a thread
+            # last replied to by someone other than the original sender shows
+            # the latest sender in the From column.
+            _apply_latest_sender(it, history)
 
     # Write needs-classify skeletons
     for raw in new_items:
@@ -2326,6 +2572,33 @@ async def _scan_once(app) -> None:
         return
 
     await app["ws_manager"].broadcast("email_changed", {"scanned": True})
+
+
+async def _reap_idle_graph_session(app) -> None:
+    """Tear down the persistent Graph session when paused or idle.
+
+    The GRASP bundle's TokenRefreshRunner fires a full SAML re-auth every ~10 min
+    for as long as the manager-outlook-mcp session is held open -- burning GRASP's
+    API-Gateway quota even while the scan worker is paused. So we must NOT hold it:
+    if the queue is paused OR no Graph call has run for _GRAPH_IDLE_TEARDOWN_S, we
+    call the EXISTING _disconnect_graph_mcp (NOT a no-reconnect flag -- the session
+    re-connects lazily on the next scan/read via _connect_graph_mcp). Best-effort:
+    a corrupt sidecar or a teardown error must never break the worker tick.
+    """
+    try:
+        data, _ = _load()
+        paused = bool(data.get("paused"))
+    except Exception:
+        paused = False
+
+    idle = (time.time() - _graph_last_activity) > _GRAPH_IDLE_TEARDOWN_S
+    if not (paused or idle):
+        return
+
+    try:
+        await _disconnect_graph_mcp()
+    except Exception as e:  # noqa: BLE001 -- reaping must never break the tick
+        logger.debug("Graph idle reaper teardown failed: %s", _scrub(str(e)))
 
 
 async def _run_guarded_scan(app) -> bool:
@@ -2359,6 +2632,12 @@ async def _scan_worker(app) -> None:
         event.clear()
 
         try:
+            # Reap the persistent Graph session on EVERY tick -- BEFORE the
+            # readiness/pause early-returns -- so a session that got reconnected by
+            # a race (or held open while idle) is torn down and GRASP's refresh
+            # timer can't keep burning quota.
+            await _reap_idle_graph_session(app)
+
             if not _probe_readiness().get("ready"):
                 continue
 
@@ -2674,13 +2953,16 @@ async def _stop_draft_worker(app) -> None:
 
 
 async def _cleanup_persistent_mcp(app) -> None:
-    """on_cleanup: tear down BOTH persistent email MCP sessions (reap subprocesses).
+    """on_cleanup: tear down ALL persistent email MCP sessions (reap subprocesses).
 
-    Disconnects the legacy aws-outlook-mcp session AND the manager-outlook-mcp
-    (Graph) session so neither child subprocess is left orphaned on shutdown.
+    Disconnects the legacy aws-outlook-mcp READ session, the manager-outlook-mcp
+    (Graph) session AND the aws-outlook-mcp WRITE session so no child subprocess
+    is left orphaned on shutdown (and so GRASP's refresh timer dies with the
+    Graph subprocess).
     """
     await _disconnect_mcp()
     await _disconnect_graph_mcp()
+    await _disconnect_owa_write()
 
 
 # ── Route handlers ──────────────────────────────────────────────────────────
@@ -2702,6 +2984,35 @@ async def get_health(request: web.Request) -> web.Response:
     })
 
 
+def _graph_throttled_live(data: dict) -> bool:
+    """Compute graphThrottled LIVE as now < graphThrottledUntil (self-clearing).
+
+    NEVER persisted as a sticky bool: an expired window reads False the instant it
+    lapses, so the UI can show "rate-limited" only while it's actually true and the
+    banner self-clears on recovery (no inverse-lie permanent banner).
+    """
+    until = data.get("graphThrottledUntil")
+    if not (isinstance(until, (int, float)) and not isinstance(until, bool)):
+        return False
+    return time.time() < until
+
+
+def _last_graph_error_reason(data: dict) -> str | None:
+    """Flatten the persisted lastGraphError ({reason, ts}) to its human string.
+
+    The sidecar stores a machine-readable dict (reason + ts) so backoff has a
+    timestamp; the queue response exposes just the human ``reason`` string for the
+    UI banner. Tolerates a bare string (older shape) and returns None when absent.
+    """
+    err = data.get("lastGraphError")
+    if isinstance(err, dict):
+        reason = err.get("reason")
+        return reason if isinstance(reason, str) and reason.strip() else None
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    return None
+
+
 async def get_queue(request: web.Request) -> web.Response:
     """GET /api/email/queue -- return the email queue."""
     data, etag = await _load_async()
@@ -2710,6 +3021,11 @@ async def get_queue(request: web.Request) -> web.Response:
         "etag": etag,
         "lastScanAt": data.get("lastScanAt"),
         "paused": data.get("paused", False),
+        # Machine-readable throttle flag (computed LIVE -> self-clearing) + the
+        # human/operator reason so the UI can honestly show "Outlook temporarily
+        # rate-limited (GRASP quota) — retrying later" instead of silently failing.
+        "graphThrottled": _graph_throttled_live(data),
+        "lastGraphError": _last_graph_error_reason(data),
     })
 
 
@@ -2832,7 +3148,10 @@ async def _mark_messages_read(messages: dict) -> None:
         chunk = ids[start:start + _MARK_READ_BATCH]
         batch = {mid: clean[mid] for mid in chunk}
         try:
-            result = await _call_graph_write_tool(
+            # SHORT-LIVED spawn: reuses the cached token, performs the call, exits.
+            # Never depends on the always-on persistent session (which we now reap
+            # while idle) and never re-arms GRASP's refresh timer.
+            result = await _call_graph_write_tool_oneshot(
                 "mark_email_read", {"emails": batch, "is_read": True}
             )
         except Exception as e:  # noqa: BLE001 -- never fail the dismiss
@@ -2968,73 +3287,93 @@ async def undismiss_item(request: web.Request) -> web.Response:
     return web.json_response({"item": item, "etag": new_etag})
 
 
-async def _delete_messages_outlook(messages: dict) -> None:
+async def _delete_messages_outlook(messages: dict) -> dict:
     """Delete one or more messages in Outlook via Graph delete_email (soft-delete).
 
     ``messages`` is a {message_id: subject-or-None} map. Moves to Deleted Items
     (permanent=false) which is recoverable. Batched ≤10 ids/call like mark-read.
-    Logs failures at WARNING; never raises.
+    Goes through the SHORT-LIVED spawn (never the always-on persistent session) so
+    a user delete works even with that session torn down and never re-arms GRASP's
+    quota-burning refresh timer.
+
+    RETURNS a per-message outcome map ``{message_id: {success: bool, error: str}}``
+    so the caller can flip an item to deleted ONLY on a confirmed success:true (the
+    "verify effect, not caller" honesty rule). PROPAGATES r.get('error') instead of
+    discarding it -- a failed delete records WHY (status + GRASP error code), and a
+    quota/429 failure is logged scrubbed WITH the id. Never raises.
     """
     clean = {
         str(mid): (subj if subj is None else str(subj))
         for mid, subj in (messages or {}).items()
         if str(mid or "").strip()
     }
+    outcomes: dict = {}
     if not clean:
-        return
+        return outcomes
 
     ids = list(clean.keys())
     for start in range(0, len(ids), _MARK_READ_BATCH):
         chunk = ids[start:start + _MARK_READ_BATCH]
         batch = {mid: clean[mid] for mid in chunk}
         try:
-            result = await _call_graph_write_tool(
+            result = await _call_graph_write_tool_oneshot(
                 "delete_email", {"emails": batch, "permanent": False}
             )
         except Exception as e:  # noqa: BLE001
+            reason = _scrub(_one_line(str(e), 2000))
             logger.warning(
-                "delete-email failed for %d message(s): %s",
-                len(chunk), _scrub(str(e)),
+                "delete-email failed for %d message(s): %s", len(chunk), reason,
             )
+            for mid in chunk:
+                outcomes[mid] = {"success": False, "error": reason}
             continue
 
         results = result.get("results") if isinstance(result, dict) else None
         if not isinstance(results, list) or not results:
+            reason = _scrub(_one_line(str(result), 2000)) or "no results returned"
             logger.warning(
                 "delete-email returned no results for %d message(s) (response: %s)",
-                len(chunk), _scrub(_one_line(str(result), 200)),
+                len(chunk), reason,
             )
+            for mid in chunk:
+                outcomes[mid] = {"success": False, "error": reason}
             continue
-        failed = [
-            str(r.get("message_id", ""))
-            for r in results
-            if isinstance(r, dict) and not r.get("success")
-        ]
-        if failed:
-            logger.warning(
-                "delete-email did NOT delete %d message(s): %s",
-                len(failed), _scrub(_one_line(", ".join(failed), 200)),
-            )
 
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            mid = str(r.get("message_id", ""))
+            if not mid:
+                continue
+            ok = bool(r.get("success"))
+            # PROPAGATE the per-message error -- do not discard it. A failed delete
+            # records the WHY (GRASP status + error code), not just the id.
+            err = _scrub(_one_line(str(r.get("error") or ""), 2000)) if not ok else ""
+            outcomes[mid] = {"success": ok, "error": err}
+            if not ok:
+                logger.warning(
+                    "delete-email did NOT delete %s: %s", mid, err or "(no reason given)",
+                )
+        # An id present in the batch but absent from results -> treat as failed.
+        for mid in chunk:
+            outcomes.setdefault(mid, {"success": False, "error": "no per-message result"})
 
-def _spawn_delete_email(messages: dict) -> None:
-    """Fire-and-forget the Outlook delete so the API response stays snappy."""
-    if not messages:
-        return
-    try:
-        task = asyncio.ensure_future(_delete_messages_outlook(dict(messages)))
-        _MARK_READ_TASKS.add(task)
-        task.add_done_callback(_MARK_READ_TASKS.discard)
-    except RuntimeError:
-        logger.debug("delete-email skipped: no running loop")
+    return outcomes
 
 
 async def delete_item(request: web.Request) -> web.Response:
     """POST /api/email/queue/{item_id}/delete -- delete the email from Outlook.
 
-    Removes the item from the queue AND moves the email to Outlook's Deleted Items
-    (soft-delete, recoverable from Outlook trash). Distinct from dismiss: dismiss
-    only marks read and hides from the queue; delete actually trashes the message.
+    HONEST DELETE (verify effect, not caller): the item is flipped to status
+    "deleted" / written / broadcast ONLY AFTER the Outlook move returns success:true
+    for that message. The delete goes through a SHORT-LIVED spawn that reuses the
+    cached GRASP token (no dependency on the always-on persistent session), so it
+    works even while that session is correctly torn down.
+
+    On failure (429/quota or any error) the item is LEFT in its prior actionable
+    state, item.lastActionError records the scrubbed reason, and the response body
+    carries ``deleted:false`` + ``error`` so the frontend never relies on the HTTP
+    envelope alone (a 200 with the move queued is NOT proof the email was deleted).
     """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request) if request.can_read_body else {}
@@ -3046,10 +3385,41 @@ async def delete_item(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
 
     delete_map = _mark_read_map_for(item)
-    item["status"] = "deleted"
+    msg_id = next(iter(delete_map), None) if delete_map else None
+
+    # Await the actual Outlook move BEFORE touching the item's status. No id to
+    # delete -> treat as a failure (we can't confirm an effect we never requested).
+    if msg_id is None:
+        reason = "no Outlook message id resolvable for this item"
+        item["lastActionError"] = {"action": "delete", "reason": reason}
+    else:
+        outcomes = await _delete_messages_outlook(delete_map)
+        outcome = outcomes.get(msg_id) or {"success": False, "error": "no per-message result"}
+        if outcome.get("success"):
+            item.pop("lastActionError", None)
+            item["status"] = "deleted"
+        else:
+            item["lastActionError"] = {
+                "action": "delete",
+                "reason": outcome.get("error") or "delete failed",
+            }
+
+    # Re-read fresh and re-locate by id so we write against the CURRENT etag and
+    # never clobber a concurrent change (the body-recovery / scan worker may have
+    # rewritten the file while we awaited the Outlook move).
+    fresh_data, fresh_etag = await _load_async()
+    fresh_item = next((it for it in fresh_data["items"] if it.get("id") == item_id), None)
+    if fresh_item is None:
+        # Item vanished mid-delete (e.g. dismissed elsewhere) -- nothing to persist.
+        raise web.HTTPNotFound(reason=f"item {item_id} not found")
+    if item.get("status") == "deleted":
+        fresh_item["status"] = "deleted"
+        fresh_item.pop("lastActionError", None)
+    else:
+        fresh_item["lastActionError"] = item.get("lastActionError")
 
     try:
-        new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
+        new_etag = filestore.write_json(EMAIL_PATH, fresh_data, expected_etag or fresh_etag)
     except filestore.ConflictError as e:
         current, current_etag = filestore.read_json(EMAIL_PATH)
         return web.json_response(
@@ -3057,11 +3427,23 @@ async def delete_item(request: web.Request) -> web.Response:
             status=409,
         )
 
-    _spawn_delete_email(delete_map)
-
     ws = request.app["ws_manager"]
-    await ws.broadcast("email_changed", {"id": item_id, "deleted": True})
-    return web.json_response({"ok": True, "id": item_id, "etag": new_etag})
+    deleted = fresh_item.get("status") == "deleted"
+    await ws.broadcast("email_changed", {"id": item_id, "deleted": deleted})
+
+    if deleted:
+        return web.json_response(
+            {"ok": True, "id": item_id, "deleted": True, "etag": new_etag}
+        )
+    # The body carries deleted:false + the WHY so the frontend keeps the row.
+    return web.json_response({
+        "ok": False,
+        "id": item_id,
+        "deleted": False,
+        "error": (fresh_item.get("lastActionError") or {}).get("reason") or "delete failed",
+        "item": fresh_item,
+        "etag": new_etag,
+    })
 
 
 async def regenerate_item(request: web.Request) -> web.Response:

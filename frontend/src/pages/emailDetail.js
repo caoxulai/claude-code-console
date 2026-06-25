@@ -134,6 +134,35 @@ export function displayTimestamp(ts) {
   return typeof ts === 'string' ? raw : '';
 }
 
+// Decide whether a delete POST actually deleted the email (Fix task 6 frontend
+// half). The delete is fire-and-forget at the HTTP envelope — the backend can
+// answer 200/ok:true while the Outlook MOVE later 429s on the exhausted GRASP
+// quota — so "handled at the HTTP layer" is NOT "the email was deleted" (the
+// verify-effect-not-caller principle). The row flips to "deleted" ONLY when the
+// response BODY confirms `deleted === true`. Everything else keeps the row
+// VISIBLE in its prior state:
+//   - HTTP 409          -> { outcome: 'conflict' }  (queue moved elsewhere; re-read + banner)
+//   - non-2xx           -> { outcome: 'failed' }     (show the reason inline)
+//   - 2xx & deleted:true-> { outcome: 'deleted' }    (collapse/move to Deleted; adopt etag)
+//   - 2xx & !deleted    -> { outcome: 'failed' }     (SWALLOWED-200: move 429'd / old backend)
+// The `reason` is the body's error text when present, else a readable default,
+// so the page surfaces WHY without ever rendering 'undefined'. Pure — no DOM.
+export function deleteOutcome(httpStatus, body) {
+  const b = (body && typeof body === 'object') ? body : {};
+  const etag = typeof b.etag === 'string' ? b.etag : null;
+  if (httpStatus === 409) {
+    return { outcome: 'conflict', etag, reason: '' };
+  }
+  const ok2xx = httpStatus >= 200 && httpStatus < 300;
+  if (ok2xx && b.deleted === true) {
+    return { outcome: 'deleted', etag, reason: '' };
+  }
+  const reason = (typeof b.error === 'string' && b.error.trim())
+    ? b.error.trim()
+    : "Couldn't delete — Outlook rate-limited (GRASP quota), retrying later.";
+  return { outcome: 'failed', etag, reason };
+}
+
 // Shrink-then-grow a textarea to its content: height = min(scrollHeight + 2, cap).
 // The +2 avoids a 1px scrollbar flicker; the cap keeps a pathologically long
 // draft from eating the panel (it scrolls past the cap). Extracted from the DOM

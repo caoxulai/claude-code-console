@@ -1186,7 +1186,14 @@ def test_email_polish_parse_failloud_on_missing_draft():
 
 
 def _capture_graph_write(monkeypatch, return_value=None):
-    """Patch the separate gated graph write path to record (name, args) calls."""
+    """Patch the gated graph write paths to record (name, args) calls.
+
+    Patches BOTH the persistent (_call_graph_write_tool) and the SHORT-LIVED
+    (_call_graph_write_tool_oneshot) seams: the dismiss/delete paths now route
+    through the one-shot spawn (which reuses the cached token without re-arming the
+    always-on session), so a stub that patched only the persistent path would let
+    the real MCP subprocess spawn.
+    """
     calls = []
 
     async def fake_write(name, arguments):
@@ -1201,6 +1208,7 @@ def _capture_graph_write(monkeypatch, return_value=None):
         }
 
     monkeypatch.setattr(email_mod, "_call_graph_write_tool", fake_write)
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_write)
     return calls
 
 
@@ -1251,7 +1259,7 @@ async def test_mark_messages_read_failure_logs_warning_nonfatal(monkeypatch, cap
             "summary": {"total": len(ids), "success": 0, "failed": len(ids)},
         }
 
-    monkeypatch.setattr(email_mod, "_call_graph_write_tool", fake_write)
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_write)
     with caplog.at_level(logging.WARNING, logger=email_mod.logger.name):
         # Must not raise.
         await email_mod._mark_messages_read({"AAMkX": "Re: X"})
@@ -1266,7 +1274,7 @@ async def test_mark_messages_read_raise_is_nonfatal(monkeypatch, caplog):
     async def boom(name, arguments):
         raise email_mod.EmailMcpError("mark-read blew up")
 
-    monkeypatch.setattr(email_mod, "_call_graph_write_tool", boom)
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", boom)
     with caplog.at_level(logging.WARNING, logger=email_mod.logger.name):
         await email_mod._mark_messages_read({"AAMkX": "Re: X"})
         await email_mod._mark_messages_read({})  # empty map is a no-op
@@ -1979,3 +1987,477 @@ def test_html_to_text_prose_before_table_stays_prose():
     assert lines[1] == "| Service | State |"
     assert lines[2] == "| --- | --- |"             # separator after the header
     assert lines[3] == "| MAWS | Deprecating |"
+
+
+# ─── D-052: backfill an un-fetchable body from a copy quoted in another thread ──
+# Some Graph message_ids fail get_email persistently (observed: a standalone
+# original whose id 400s every time) while the SAME message is quoted inside a
+# reply thread we already fetched and split. When the item's own get_email fails,
+# recover its body from that already-parsed quoted copy instead of leaving the
+# card stuck on the truncated snippet.
+
+
+def test_quoted_body_index_keys_by_normalized_subject_and_sender():
+    """_quoted_body_index maps (subject sans Re:/Fwd:, sender) -> the quoted turn
+    body, built from items that already carry a parsed multi-turn threadHistory."""
+    re_item = _make_item(
+        "re1",
+        subject="Re: [Action needed] MAWS CN deprecation",
+        sender="Han, Bingfeng",
+        threadHistory=[
+            {"sender": "Wang, Yibo", "timestamp": "Wed", "body": "Yibo full original body", "recipients": "a; b"},
+            {"sender": "Han, Bingfeng", "timestamp": "", "body": "Han reply", "recipients": ""},
+        ],
+    )
+    idx = email_mod._quoted_body_index([re_item])
+    # Yibo's original is recoverable by (normalized subject, his name)
+    key = ("[action needed] maws cn deprecation", "wang, yibo")
+    assert key in idx
+    assert idx[key]["body"] == "Yibo full original body"
+
+
+async def test_scan_backfills_body_from_quoted_copy_when_get_email_fails(email_file, monkeypatch):
+    """A body-less standalone item whose get_email FAILS recovers its body from the
+    same message quoted in an already-fetched reply thread (no fabrication)."""
+    re_item = _make_item(
+        "re1",
+        messageId="AAMkRE",
+        conversationId="AAMkRE",
+        subject="Re: [Action needed] MAWS CN deprecation",
+        sender="Han, Bingfeng",
+        emailBody="...",
+        threadHistory=[
+            {"sender": "Wang, Yibo", "timestamp": "Wednesday, June 24, 2026 at 10:23",
+             "body": "GL L7 SDMs,\n\nSDO is moving to deprecate MAWS ... Thanks,\nYibo",
+             "recipients": "Agarwal, Ankit; Xu, Jun"},
+            {"sender": "Han, Bingfeng", "timestamp": "", "body": "Thanks Yibo", "recipients": ""},
+        ],
+    )
+    solo = _make_item(
+        "solo1",
+        messageId="AAMkSOLO",
+        conversationId="AAMkSOLO",
+        subject="[Action needed] MAWS CN deprecation",
+        sender="Wang, Yibo",
+        emailBody="",            # body fetch never succeeded
+        threadHistory=[],
+        status="needs-review",
+        snippet="GL L7 SDMs, SDO is moving to deprecate MAWS hosting in the China (PEK) reg",
+    )
+    _seed(email_file, [re_item, solo])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [], "count": 0, "folder": "inbox"}   # no new mail
+        if name == "get_email":
+            raise email_mod.EmailMcpError("GRASP mail GET 400 for this id")
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
+    recovered = saved["solo1"]
+    # Body recovered from the quoted copy — the FULL original, not the truncated snippet
+    assert "Thanks,\nYibo" in recovered["emailBody"]
+    assert recovered["emailBody"] != recovered["snippet"]
+    # A threadHistory turn now exists so the card renders the full body, not snippet
+    assert len(recovered.get("threadHistory") or []) >= 1
+    assert recovered["threadHistory"][0]["sender"] == "Wang, Yibo"
+
+
+async def test_scan_does_not_fabricate_body_when_no_quoted_copy_exists(email_file, monkeypatch):
+    """If get_email fails AND no quoted copy exists anywhere, the body stays empty —
+    we never invent content (fail-loud / fall back to snippet, AC degrade)."""
+    solo = _make_item(
+        "solo2",
+        messageId="AAMkONLY",
+        conversationId="AAMkONLY",
+        subject="[Action needed] Unique unfetchable thread",
+        sender="Wang, Yibo",
+        emailBody="",
+        threadHistory=[],
+        status="needs-review",
+    )
+    _seed(email_file, [solo])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [], "count": 0, "folder": "inbox"}
+        if name == "get_email":
+            raise email_mod.EmailMcpError("GRASP 400")
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
+    assert saved["solo2"]["emailBody"] == ""          # never fabricated
+    assert not saved["solo2"].get("threadHistory")
+
+
+async def test_scan_inbox_fetch_failure_still_runs_backfill(email_file, monkeypatch):
+    """A get_emails (inbox) failure must NOT abort the cycle — body backfill of items
+    ALREADY in the queue is independent of fetching new mail and must still run.
+
+    This is the real-world GRASP-400 case: the standalone item can't fetch its own
+    body, and the inbox call also intermittently 400s; the quoted-copy recovery must
+    still fire instead of the whole scan aborting at the top.
+    """
+    re_item = _make_item(
+        "re1",
+        messageId="AAMkRE2",
+        conversationId="AAMkRE2",
+        subject="Re: [Action needed] MAWS CN deprecation",
+        sender="Han, Bingfeng",
+        emailBody="...",
+        threadHistory=[
+            {"sender": "Wang, Yibo", "timestamp": "Wed", "body": "Yibo full original ... Thanks,\nYibo", "recipients": "x; y"},
+            {"sender": "Han, Bingfeng", "timestamp": "", "body": "Han reply", "recipients": ""},
+        ],
+    )
+    solo = _make_item(
+        "solo3",
+        messageId="AAMkSOLO3",
+        conversationId="AAMkSOLO3",
+        subject="[Action needed] MAWS CN deprecation",
+        sender="Wang, Yibo",
+        emailBody="",
+        threadHistory=[],
+        status="needs-review",
+        snippet="GL L7 SDMs, SDO is moving to deprecate MAWS hosting in the China (PEK) reg",
+    )
+    _seed(email_file, [re_item, solo])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            raise email_mod.EmailMcpError("GRASP mail GET 400 on inbox")  # the abort case
+        if name == "get_email":
+            raise email_mod.EmailMcpError("GRASP mail GET 400 on message")
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    # Must NOT raise even though get_emails failed
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
+    # Backfill still ran and recovered the standalone body from the quoted copy
+    assert "Thanks,\nYibo" in saved["solo3"]["emailBody"]
+    assert saved["solo3"]["emailBody"] != saved["solo3"]["snippet"]
+
+
+# ─── (D-054) stop the GRASP quota burn + honest delete/throttle ──────────────
+# The always-on persistent Graph session kept GRASP's TokenRefreshRunner alive,
+# firing a full SAML re-auth every ~10 min and exhausting GRASP's API-Gateway
+# quota (429 {"error":"quota_exceeded"}). These tests pin the fix:
+#   (1) the persistent session is torn down when paused/idle,
+#   (2) a user delete works via a SHORT-LIVED spawn with the persistent session
+#       torn down,
+#   (3) only a confirmed success:true flips an item to deleted,
+#   (4) a 429/quota condition surfaces graphThrottled + lastGraphError (and is
+#       logged un-truncated).
+
+
+class _NoopWS:
+    async def broadcast(self, *a, **k):
+        pass
+
+
+async def test_paused_tick_tears_down_persistent_graph_session(email_file, monkeypatch):
+    """(1/HALF-TEARDOWN) On a paused scan tick the worker reaps the persistent
+    Graph session via the EXISTING _disconnect_graph_mcp, so GRASP's refresh timer
+    dies with the subprocess and no auth churn accrues while paused."""
+    _seed(email_file, [], paused=True)
+
+    disconnect_calls = []
+
+    async def fake_disconnect():
+        disconnect_calls.append(True)
+
+    monkeypatch.setattr(email_mod, "_disconnect_graph_mcp", fake_disconnect)
+    monkeypatch.setattr(email_mod, "_probe_readiness", lambda: {"ready": True})
+
+    await email_mod._reap_idle_graph_session({"ws_manager": _NoopWS()})
+
+    assert disconnect_calls, \
+        "a paused tick must call _disconnect_graph_mcp (not just guard reconnects)"
+
+
+async def test_idle_tick_tears_down_persistent_graph_session(email_file, monkeypatch):
+    """(1) Even when NOT paused, a session idle past _GRAPH_IDLE_TEARDOWN_S is
+    reaped so the refresh timer can't churn during a quiet inbox."""
+    _seed(email_file, [])
+
+    disconnect_calls = []
+
+    async def fake_disconnect():
+        disconnect_calls.append(True)
+
+    monkeypatch.setattr(email_mod, "_disconnect_graph_mcp", fake_disconnect)
+    # Last Graph activity is way in the past -> idle past the teardown threshold.
+    monkeypatch.setattr(
+        email_mod, "_graph_last_activity",
+        __import__("time").time() - (email_mod._GRAPH_IDLE_TEARDOWN_S + 60),
+    )
+
+    await email_mod._reap_idle_graph_session({"ws_manager": _NoopWS()})
+
+    assert disconnect_calls, "an idle session must be reaped past the idle threshold"
+
+
+async def test_recent_activity_does_not_tear_down_graph_session(email_file, monkeypatch):
+    """(1/STICKY guard) A session with RECENT activity and not paused is left
+    connected — the reaper must not kill an actively-used session."""
+    _seed(email_file, [])
+
+    disconnect_calls = []
+
+    async def fake_disconnect():
+        disconnect_calls.append(True)
+
+    monkeypatch.setattr(email_mod, "_disconnect_graph_mcp", fake_disconnect)
+    monkeypatch.setattr(email_mod, "_graph_last_activity", __import__("time").time())
+
+    await email_mod._reap_idle_graph_session({"ws_manager": _NoopWS()})
+
+    assert not disconnect_calls, "a recently-active, unpaused session must not be reaped"
+
+
+async def test_delete_works_via_oneshot_with_persistent_session_torn_down(
+    client, email_file, monkeypatch
+):
+    """(2/SESSION-REUSE) A user delete must succeed through a SHORT-LIVED spawn that
+    reuses the cached token, with NO dependency on the persistent Graph session.
+
+    The persistent session is torn down (session=None) and the persistent write
+    path is made to BLOW UP — the delete must still flip to deleted because it goes
+    through the one-shot spawn, never the persistent _call_graph_write_tool.
+    """
+    _seed(email_file, [_make_item("d1", messageId="AAMkDEL", conversationId="AAMkDEL",
+                                  status="needs-review")])
+
+    # Persistent session is correctly torn down.
+    email_mod._graph_mcp_state.session = None
+
+    # The persistent write path must NOT be used for delete — make it fail loud.
+    async def persistent_must_not_run(name, arguments):
+        raise AssertionError("delete must NOT route through the persistent session")
+
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool", persistent_must_not_run)
+
+    oneshot_calls = []
+
+    async def fake_oneshot(name, arguments):
+        oneshot_calls.append((name, arguments))
+        ids = list((arguments.get("emails") or {}).keys())
+        return {"results": [{"message_id": i, "success": True} for i in ids],
+                "summary": {"total": len(ids), "success": len(ids), "failed": 0}}
+
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_oneshot)
+
+    resp = await client.post("/api/email/queue/d1/delete", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body.get("deleted") is True
+
+    assert oneshot_calls and oneshot_calls[0][0] == "delete_email"
+    saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
+    assert saved["d1"]["status"] == "deleted"
+
+
+async def test_delete_failure_keeps_item_actionable_and_records_error(
+    client, email_file, monkeypatch
+):
+    """(3/THE DELETE LIE + SWALLOWED 200) A delete whose Outlook move FAILS (429/
+    quota) must NOT flip the item to deleted. The item stays in its prior actionable
+    state, records lastActionError, and the response body carries deleted:false so
+    the frontend never relies on the HTTP envelope alone."""
+    _seed(email_file, [_make_item("d2", messageId="AAMkDEL2", conversationId="AAMkDEL2",
+                                  status="needs-review")])
+    email_mod._graph_mcp_state.session = None
+
+    async def fake_oneshot(name, arguments):
+        ids = list((arguments.get("emails") or {}).keys())
+        # Graph reports the delete FAILED with a quota error per id.
+        return {"results": [{"message_id": i, "success": False,
+                             "error": "GRASP delete -> 429 quota_exceeded"} for i in ids],
+                "summary": {"total": len(ids), "success": 0, "failed": len(ids)}}
+
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_oneshot)
+
+    resp = await client.post("/api/email/queue/d2/delete", json={})
+    # The body must say the delete did NOT happen.
+    body = await resp.json()
+    assert body.get("deleted") is False
+    assert body.get("error")
+
+    saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
+    item = saved["d2"]
+    # NOT flipped to deleted — still actionable in its prior state.
+    assert item["status"] == "needs-review"
+    # The WHY is recorded on the item for the frontend.
+    assert item.get("lastActionError", {}).get("action") == "delete"
+    assert item["lastActionError"].get("reason")
+
+
+async def test_delete_messages_outlook_returns_per_message_error(monkeypatch):
+    """(4/DROP THE WHY) _delete_messages_outlook returns a per-message outcome map
+    that PROPAGATES r.get('error'), instead of discarding it (fire-and-forget)."""
+    async def fake_oneshot(name, arguments):
+        ids = list((arguments.get("emails") or {}).keys())
+        return {"results": [{"message_id": i, "success": False,
+                             "error": "GRASP delete -> 429 quota_exceeded"} for i in ids],
+                "summary": {"total": len(ids), "success": 0, "failed": len(ids)}}
+
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_oneshot)
+
+    outcomes = await email_mod._delete_messages_outlook({"AAMk1": "Re: A"})
+    assert isinstance(outcomes, dict)
+    out = outcomes["AAMk1"]
+    assert out["success"] is False
+    assert "quota_exceeded" in (out.get("error") or "")
+
+
+async def test_delete_oneshot_refuses_non_allowlisted_tool():
+    """(2/boundary) The one-shot write spawn refuses any name not in the gated
+    write allowlist BEFORE any spawn — the read/write boundary is unchanged."""
+    for forbidden in ("send_email", "reply_to_email", "move_email",
+                      "get_emails", "get_email"):
+        with pytest.raises(email_mod.EmailMcpError):
+            await email_mod._call_graph_write_tool_oneshot(forbidden, {})
+
+
+def test_is_graph_quota_error_matches_429_and_quota_body():
+    """(5) The quota detector matches HTTP 429 and a quota_exceeded body."""
+    assert email_mod._is_graph_quota_error(email_mod.EmailMcpError("GET -> 429"))
+    assert email_mod._is_graph_quota_error(email_mod.EmailMcpError('{"error":"quota_exceeded"}'))
+    assert email_mod._is_graph_quota_error('{"error":"quota_exceeded"}')
+    assert not email_mod._is_graph_quota_error(email_mod.EmailMcpError("ordinary 400"))
+
+
+async def test_quota_error_surfaces_graphthrottled_in_queue(client, email_file, monkeypatch, caplog):
+    """(5+3/TRUNCATED-HONESTY + STICKY) A 429/quota_exceeded read failure:
+      - sets graphThrottledUntil + lastGraphError on the store,
+      - GET /api/email/queue computes graphThrottled LIVE (self-clearing),
+      - is logged UN-TRUNCATED so the status code + quota_exceeded are visible.
+    """
+    import logging
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            raise email_mod.EmailMcpError(
+                'Email Graph MCP tool returned an error: ' + ('x' * 400)
+                + ' -> 429 {"error":"quota_exceeded","x-amz-apigw-id":"abc"}'
+            )
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    with caplog.at_level(logging.WARNING, logger=email_mod.logger.name):
+        await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    # The store now carries the throttle window + a machine-readable reason
+    # ({reason, ts}) so backoff has a timestamp.
+    data = json.loads(email_file.read_text(encoding="utf-8"))
+    assert data.get("graphThrottledUntil")
+    assert "quota_exceeded" in (data.get("lastGraphError", {}).get("reason") or "")
+
+    # GET /api/email/queue exposes graphThrottled (live) + the human reason STRING
+    # (the queue flattens the persisted dict to its reason for the UI banner).
+    resp = await client.get("/api/email/queue")
+    q = await resp.json()
+    assert q.get("graphThrottled") is True
+    assert "quota_exceeded" in (q.get("lastGraphError") or "")
+
+    # The error was logged UN-TRUNCATED: the 'quota_exceeded' code at the END of a
+    # >200-char body must still be visible (the old _one_line(.., 200) chopped it).
+    blob = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "quota_exceeded" in blob, "the quota code must survive un-truncated in the log"
+
+
+async def test_graphthrottled_self_clears_after_window(client, email_file):
+    """(5/STICKY-THROTTLE) graphThrottled is computed LIVE as now<until, so an
+    EXPIRED throttle window reads False — never a permanent 'rate-limited' lie."""
+    _seed(email_file, [],
+          graphThrottledUntil=(__import__("time").time() - 5),  # already expired
+          lastGraphError={"reason": "GET -> 429 quota_exceeded", "ts": 1})
+    resp = await client.get("/api/email/queue")
+    q = await resp.json()
+    assert q.get("graphThrottled") is False
+
+
+async def test_scan_skips_graph_read_while_throttled(email_file, monkeypatch):
+    """(5/HOT-RETRY) While now < graphThrottledUntil the scan SKIPS the Graph read
+    entirely (a real delay), so it can't keep hammering the exhausted quota."""
+    import time as _time
+    _seed(email_file, [],
+          graphThrottledUntil=(_time.time() + 600),  # throttled for 10 min
+          lastGraphError={"reason": "GET -> 429 quota_exceeded", "ts": 1})
+
+    read_calls = []
+
+    async def fake_read_tool(name, arguments):
+        read_calls.append(name)
+        return {"emails": [], "count": 0, "folder": "inbox"}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    assert "get_emails" not in read_calls, \
+        "a throttled scan must NOT re-fire the Graph inbox read"
+
+
+def test_error_body_not_truncated_at_200(monkeypatch):
+    """(3/TRUNCATED-HONESTY unit) The ERROR-body path in _call_session_tool keeps a
+    >200-char body (so '429'/'quota_exceeded' at the end survive). We exercise the
+    raised EmailMcpError message directly via a fake session."""
+    long_tail = "x" * 400 + ' -> 429 {"error":"quota_exceeded"}'
+
+    class _ErrResult:
+        isError = True
+        content = long_tail
+
+    class _FakeSession:
+        async def call_tool(self, name, arguments):
+            return _ErrResult()
+
+    state = email_mod._PersistentMcpState()
+    state.session = _FakeSession()
+
+    async def _connect():
+        pass
+
+    async def _disconnect():
+        pass
+
+    async def _run():
+        try:
+            await email_mod._call_session_tool(
+                name="get_emails", arguments={}, state=state,
+                connect=_connect, disconnect=_disconnect, label="Email Graph",
+            )
+            return None
+        except email_mod.EmailMcpError as e:
+            return str(e)
+
+    import asyncio as _asyncio
+    msg = _asyncio.new_event_loop().run_until_complete(_run())
+    assert msg is not None
+    assert "quota_exceeded" in msg, "the error body must NOT be truncated before the quota code"
