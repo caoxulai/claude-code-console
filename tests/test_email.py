@@ -726,6 +726,186 @@ def test_extract_thread_history_handles_garbage_without_fabricating():
     assert turns == []
 
 
+# --- (D-053) split a SINGLE inline-quoted Graph body into per-message turns ---
+
+
+# The REAL MAWS-shaped body: Graph returns the whole thread as ONE message whose
+# body has the latest reply on top and the quoted original below an Outlook
+# From:/Date:/To:/Cc:/Subject: header block. There is NO messages[] array — the
+# split helper is the ONLY thing that can produce >1 turn from this fixture, so
+# the test goes RED the moment the split is reverted (anti-bogus-green).
+_MAWS_BODY = (
+    "+ Grace, Sailini\n"
+    "\n"
+    "Thanks Yibo for the background.\n"
+    "\n"
+    "Hi, managers, check this doc: https://chorus.aws.dev/doc/6SQyJYQGewO7 ...\n"
+    "--\n"
+    "Regrads,\n"
+    "Han, Bingfeng\n"
+    "\n"
+    "From: Wang, Yibo mei@example.com\n"
+    "Date: Wednesday, June 24, 2026 at 10:23\n"
+    "To: Agarwal, Ankit sjones@example.com; Lakshmanan, Geetika priya@example.com; "
+    "Seah, Yi Ling jkim@example.com\n"
+    "Cc: Han, Bingfeng asmith@example.com; agl-pe agl-pe@amazon.com\n"
+    "Subject: [Action needed] MAWS CN deprecation\n"
+    "\n"
+    "GL L7 SDMs,\n"
+    "\n"
+    "SDO is moving to deprecate MAWS hosting in the China (PEK) region ...\n"
+    "Please review and confirm the migration plan by EOW.\n"
+)
+
+
+def _maws_payload() -> dict:
+    """Graph get_email shape: a SINGLE message, the whole chain inline in body."""
+    return {
+        "email": {
+            "from": {"name": "Han, Bingfeng", "email": "asmith@example.com"},
+            "toRecipients": [
+                {"name": "Wang, Yibo", "email": "mei@example.com"},
+            ],
+            "received": "2026-06-24T14:00:00Z",
+            "subject": "[Action needed] MAWS CN deprecation",
+            "body": _MAWS_BODY,
+        }
+    }
+
+
+def test_extract_thread_history_splits_inline_quoted_chain():
+    """A single inline-quoted Graph body splits into TWO ordered turns.
+
+    turn[0] = Wang, Yibo (oldest, the quoted original, with his two asks + his To:
+    list parsed into recipients); turn[1] = Han, Bingfeng (newest, his reply).
+    NO From:/Date:/Subject: header text remains in either turn's body — those
+    fields are promoted to the structured turn fields, so the run-on blob is gone.
+    """
+    turns = email_mod._extract_thread_history(_maws_payload())
+    assert len(turns) == 2, f"expected a 2-way split, got {len(turns)}"
+
+    oldest, newest = turns[0], turns[1]
+
+    # Oldest = the quoted original from Wang, Yibo (sender PARSED from From:).
+    assert "Wang, Yibo" in oldest["sender"]
+    assert "mei@example.com" not in oldest["sender"]  # flattened to a name
+    # His two asks survived (no message content lost).
+    assert "SDO is moving to deprecate MAWS" in oldest["body"]
+    assert "confirm the migration plan" in oldest["body"]
+    # The Date: string is kept verbatim (un-ISO, _parse_ts returns None — fine).
+    assert oldest["timestamp"] == "Wednesday, June 24, 2026 at 10:23"
+    # His To: list was parsed into the recipients field.
+    assert "Agarwal, Ankit" in oldest["recipients"]
+    assert "Seah, Yi Ling" in oldest["recipients"]
+
+    # Newest = Han, Bingfeng's reply (sender/recipients/timestamp from top_msg).
+    assert "Han, Bingfeng" in newest["sender"]
+    assert "Thanks Yibo for the background." in newest["body"]
+    assert "Wang, Yibo" in newest["recipients"]  # from top_msg toRecipients
+    assert newest["timestamp"] == "2026-06-24T14:00:00Z"
+
+    # CRITICAL: the run-on header blob is gone from BOTH bodies.
+    for t in turns:
+        assert "From:" not in t["body"]
+        assert "Date:" not in t["body"]
+        assert "Subject:" not in t["body"]
+        assert "Cc:" not in t["body"]
+
+    # SEGMENT-BLEED guard: the reply text must NOT bleed into the quoted card,
+    # nor the quoted original into the reply card.
+    assert "SDO is moving to deprecate MAWS" not in newest["body"]
+    assert "Thanks Yibo for the background." not in oldest["body"]
+
+
+def test_extract_thread_history_single_fresh_email_is_one_turn():
+    """A genuine single email with NO quoted-header boundary yields ONE turn,
+    byte-identical to the pre-split whole-body behavior (backward compat)."""
+    payload = {
+        "email": {
+            "from": {"name": "Jane Doe", "email": "jane@amazon.com"},
+            "received": "2026-06-24T10:00:00Z",
+            "subject": "Lunch?",
+            "body": "Hey team,\n\nWant to grab lunch at noon? Let me know.\n\nJane",
+        }
+    }
+    turns = email_mod._extract_thread_history(payload)
+    assert len(turns) == 1
+    assert "Jane Doe" in turns[0]["sender"]
+    assert "Want to grab lunch at noon?" in turns[0]["body"]
+    assert turns[0]["timestamp"] == "2026-06-24T10:00:00Z"
+
+
+def test_extract_thread_history_prose_from_keyword_does_not_false_split():
+    """A stray 'from:' / 'Subject:' in prose must NOT trigger a phantom split —
+    the multi-line header SHAPE is required, not a single keyword."""
+    payload = {
+        "email": {
+            "from": {"name": "Bob", "email": "bob@amazon.com"},
+            "received": "2026-06-24T10:00:00Z",
+            "body": (
+                "Here is the update you asked for.\n"
+                "The data came from: the warehouse export.\n"
+                "Subject matter experts agree it looks correct.\n"
+                "Let me know if you have questions.\n"
+            ),
+        }
+    }
+    turns = email_mod._extract_thread_history(payload)
+    assert len(turns) == 1, "a single keyword in prose must not shatter the body"
+    assert "warehouse export" in turns[0]["body"]
+    assert "Subject matter experts" in turns[0]["body"]
+
+
+def test_split_quoted_thread_no_content_lost():
+    """Concatenating the parsed segment bodies accounts for all substantive text:
+    every non-header line of the original body lands in exactly one turn."""
+    turns = email_mod._extract_thread_history(_maws_payload())
+    joined = "\n".join(t["body"] for t in turns)
+    for line in _MAWS_BODY.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == "--":
+            continue
+        # Header lines are promoted to fields, not kept in any body.
+        if stripped.split(":", 1)[0] in ("From", "Date", "Sent", "To", "Cc", "Subject"):
+            continue
+        assert stripped in joined, f"lost body line: {stripped!r}"
+
+
+def test_extract_thread_history_boundary_only_no_reply_text_degrades_to_one_turn():
+    """AC-10 empty-segment degrade: a body that STARTS with a quoted-header block
+    (no latest-reply text above the boundary) must NOT emit a blank top card.
+
+    The segment above the first boundary is empty, so the split falls back to a
+    SINGLE whole-body turn rather than dropping the quoted content or inventing a
+    blank reply. The fallback turn keeps the top message's sender/timestamp and the
+    quoted text is preserved (no message content silently lost)."""
+    payload = {
+        "email": {
+            "from": {"name": "Han, Bingfeng", "email": "asmith@example.com"},
+            "received": "2026-06-24T14:00:00Z",
+            "subject": "Fwd: [Action needed] MAWS CN deprecation",
+            "body": (
+                "From: Wang, Yibo mei@example.com\n"
+                "Date: Wednesday, June 24, 2026 at 10:23\n"
+                "To: Agarwal, Ankit sjones@example.com\n"
+                "Subject: [Action needed] MAWS CN deprecation\n"
+                "\n"
+                "GL L7 SDMs,\n"
+                "\n"
+                "SDO is moving to deprecate MAWS hosting in the China (PEK) region ...\n"
+            ),
+        }
+    }
+    turns = email_mod._extract_thread_history(payload)
+    # No blank card: exactly one turn, with the body preserved.
+    assert len(turns) == 1, f"a boundary with no reply above it must not add a blank card, got {len(turns)}"
+    assert turns[0]["body"], "the single fallback turn must not be empty"
+    # The quoted content is not dropped.
+    assert "SDO is moving to deprecate MAWS" in turns[0]["body"]
+    # No empty/blank-bodied turn snuck in alongside it.
+    assert all(t["body"].strip() for t in turns)
+
+
 def test_extract_email_body_flattens_sender_dict():
     """Outlook delivers sender as {'name','email'} -- the body header must read
     'From: <name>', NEVER a leaked Python dict repr ('From: {\\'name\\': ...}').

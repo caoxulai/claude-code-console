@@ -1795,23 +1795,203 @@ def _extract_email_body(payload) -> str:
     return _html_to_text(str(body)) if body else ""
 
 
+# Quoted-reply header boundaries. These match the multi-line header SHAPE, never a
+# single stray keyword in prose (AC-9): an Outlook ``From:`` line is only a
+# boundary if a ``Sent:``/``Date:`` AND a ``Subject:`` line follow within a few
+# lines (confirmed in _split_quoted_thread); the Gmail ``On ... wrote:`` and the
+# ``-----Original Message-----`` separator stand alone.
+_RE_FROM_LINE = re.compile(r"^\s*From:\s*(.+?)\s*$", re.IGNORECASE)
+_RE_DATE_LINE = re.compile(r"^\s*(?:Date|Sent):\s*(.+?)\s*$", re.IGNORECASE)
+_RE_TO_LINE = re.compile(r"^\s*To:\s*(.+?)\s*$", re.IGNORECASE)
+_RE_CC_LINE = re.compile(r"^\s*Cc:\s*(.+?)\s*$", re.IGNORECASE)
+_RE_SUBJECT_LINE = re.compile(r"^\s*Subject:\s*(.+?)\s*$", re.IGNORECASE)
+_RE_GMAIL_WROTE = re.compile(r"^\s*On\s+.+\bwrote:\s*$", re.IGNORECASE)
+_RE_ORIGINAL_SEP = re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE)
+# How far below a ``From:`` line we look for the Date:/Subject: confirmation.
+_OUTLOOK_HEADER_LOOKAHEAD = 5
+# A 'Name <email>' / 'Name email@x' header value -> display name (drop the addr).
+_RE_ADDR_ANGLE = re.compile(r"\s*<[^>]+>\s*$")
+_RE_ADDR_BARE = re.compile(r"\s+\S+@\S+\s*$")
+# Split a header recipient line between entries. Outlook joins recipients with
+# ';' and names are 'Last, First' (commas INSIDE a name), so prefer ';'; only fall
+# back to ',' when no ';' is present (a Gmail-style comma-joined list).
+_RE_RECIP_SPLIT_SEMI = re.compile(r"\s*;\s*")
+_RE_RECIP_SPLIT_COMMA = re.compile(r"\s*,\s*")
+
+
+def _flatten_header_name(value: str) -> str:
+    """Flatten ONE header 'Name <email>' / 'Name email@x' value to a display name.
+
+    Drops a trailing ``<addr>`` or bare ``addr@host``; if only an email is present
+    the email is kept (better than ""). Mirrors the name-else-email intent of
+    _flatten_recipient for parsed-header text.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    stripped = _RE_ADDR_ANGLE.sub("", v).strip()
+    if not stripped:
+        # Was just '<addr>' — unwrap the angle brackets.
+        return v.strip("<> ").strip()
+    bare = _RE_ADDR_BARE.sub("", stripped).strip()
+    return (bare or stripped).strip()
+
+
+def _flatten_header_recipients(value: str) -> str:
+    """Flatten a 'To:'/'Cc:' header value (a ';'/','-separated list) to names."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    splitter = _RE_RECIP_SPLIT_SEMI if ";" in v else _RE_RECIP_SPLIT_COMMA
+    names = [n for n in (_flatten_header_name(p) for p in splitter.split(v)) if n]
+    return "; ".join(names)
+
+
+def _is_outlook_boundary(lines: list[str], i: int) -> bool:
+    """True iff line ``i`` opens an Outlook header BLOCK (From: + Date/Sent: +
+    Subject: within the lookahead window) — the multi-line SHAPE, not a keyword."""
+    if not _RE_FROM_LINE.match(lines[i]):
+        return False
+    window = lines[i + 1 : i + 1 + _OUTLOOK_HEADER_LOOKAHEAD]
+    has_date = any(_RE_DATE_LINE.match(ln) for ln in window)
+    has_subject = any(_RE_SUBJECT_LINE.match(ln) for ln in window)
+    return has_date and has_subject
+
+
+def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
+    """Split a SINGLE inline-quoted reply chain into per-message turns.
+
+    ``body`` is the already-_html_to_text'd body of ``top_msg`` (the latest reply
+    on top, each older quoted message below an Outlook/Gmail/Original-Message
+    header boundary). Returns turns NEWEST-FIRST as ``{sender, timestamp, body,
+    recipients}``:
+
+    * the FIRST segment (text above the first boundary) is the latest reply — its
+      sender/recipients/timestamp come from ``top_msg``;
+    * each subsequent segment is one older quoted message — its From:/Date:(Sent:)/
+      To:(+Cc:) header lines are PARSED into the structured fields and STRIPPED out
+      of the body (killing the run-on blob), Subject: is dropped.
+
+    Returns [] when there is NO detectable boundary (the caller then falls back to
+    the single whole-body turn — byte-identical backward compat) or when the split
+    would be empty/garbage. No substantive body text is ever lost: the body is
+    partitioned at boundaries, never truncated.
+    """
+    if not body:
+        return []
+    lines = body.split("\n")
+    # Find boundary line indices (oldest segments start at each boundary).
+    boundaries: list[int] = []
+    i = 0
+    while i < len(lines):
+        if _is_outlook_boundary(lines, i):
+            boundaries.append(i)
+            i += 1
+        elif _RE_GMAIL_WROTE.match(lines[i]) or _RE_ORIGINAL_SEP.match(lines[i]):
+            boundaries.append(i)
+            i += 1
+        else:
+            i += 1
+    if not boundaries:
+        return []  # genuine single fresh email — caller keeps today's behavior
+
+    # Segment span = [start, end). The first segment is the latest reply (text
+    # above boundaries[0]); each later segment runs from its boundary to the next.
+    spans = [(0, boundaries[0])]
+    for n, start in enumerate(boundaries):
+        end = boundaries[n + 1] if n + 1 < len(boundaries) else len(lines)
+        spans.append((start, end))
+
+    turns: list[dict] = []
+    for seg_idx, (start, end) in enumerate(spans):
+        seg = lines[start:end]
+        if seg_idx == 0:
+            # Latest reply — fields from top_msg, whole segment is the body.
+            seg_body = "\n".join(seg)
+            sender = _msg_sender_name(top_msg)
+            timestamp = (
+                top_msg.get("received") or top_msg.get("receivedDateTime")
+                or top_msg.get("timestamp") or top_msg.get("sentDateTime")
+                or top_msg.get("date") or ""
+            )
+            recipients = _msg_recipients_str(top_msg)
+        else:
+            # Quoted message — parse the header lines, strip them from the body.
+            sender = timestamp = recipients = ""
+            cc = ""
+            consumed = 0
+            for ln in seg:
+                m_from = _RE_FROM_LINE.match(ln)
+                m_date = _RE_DATE_LINE.match(ln)
+                m_to = _RE_TO_LINE.match(ln)
+                m_cc = _RE_CC_LINE.match(ln)
+                m_subject = _RE_SUBJECT_LINE.match(ln)
+                if m_from:
+                    sender = _flatten_header_name(m_from.group(1))
+                elif m_date:
+                    timestamp = m_date.group(1).strip()
+                elif m_to:
+                    recipients = _flatten_header_recipients(m_to.group(1))
+                elif m_cc:
+                    cc = _flatten_header_recipients(m_cc.group(1))
+                elif m_subject:
+                    pass  # Subject: dropped (not a turn field)
+                elif _RE_ORIGINAL_SEP.match(ln) or _RE_GMAIL_WROTE.match(ln):
+                    pass  # the separator line itself is not body
+                else:
+                    break  # first non-header line -> body starts here
+                consumed += 1
+            if cc:
+                recipients = (recipients + "; " + cc) if recipients else cc
+            seg_body = "\n".join(seg[consumed:])
+
+        seg_body = _scrub(seg_body)[:_THREAD_TURN_BODY_CAP].strip()
+        if not seg_body:
+            continue  # never emit a blank/ghost card
+        ts_str = _one_line(str(timestamp), 100)
+        turns.append({
+            "sender": _scrub(_one_line(str(sender), 200)),
+            "timestamp": ts_str,
+            "body": seg_body,
+            "recipients": _scrub(_one_line(str(recipients), 200)),
+        })
+    return turns
+
+
 def _extract_thread_history(payload) -> list[dict]:
     """Build a structured threadHistory array from a body MCP response.
 
     Handles the Graph {email:{...}} shape AND the legacy {content:{emails:[...]}}
-    shape (via _email_messages_from_payload). The MCP returns the conversation's
-    messages newest-first, so we reverse to oldest->newest (or sort by a parseable
-    timestamp when every turn carries one). Each turn is ``{sender, timestamp,
-    body}`` with the body scrubbed and capped at _THREAD_TURN_BODY_CAP, and the
-    array bounded to the _THREAD_HISTORY_MAX_TURNS newest turns. An email with no
-    body is NOT emitted (we never fabricate a turn). Returns [] for any
-    unexpected/empty payload so the caller can fall back to the snippet/body alone.
+    shape (via _email_messages_from_payload). When the payload yields EXACTLY ONE
+    message (the common Graph case — no messages[] array), the whole reply chain is
+    quoted inline in that one body, so we route it through _split_quoted_thread to
+    recover per-message turns. Otherwise (a real multi-message array) the MCP
+    returns the conversation's messages newest-first, so we reverse to
+    oldest->newest (or sort by a parseable timestamp when every turn carries one).
+    Each turn is ``{sender, timestamp, body, recipients}`` with the body scrubbed
+    and capped at _THREAD_TURN_BODY_CAP, and the array bounded to the
+    _THREAD_HISTORY_MAX_TURNS newest turns. An email with no body is NOT emitted
+    (we never fabricate a turn). Returns [] for any unexpected/empty payload so the
+    caller can fall back to the snippet/body alone.
     """
     if not isinstance(payload, dict):
         return []
     emails = _email_messages_from_payload(payload)
     if not emails:
         return []
+
+    # Single-message Graph case: the chain is quoted INLINE in the one body. Try to
+    # split it into per-message turns; >=2 segments means we recovered the chain.
+    # 0/1 segment (no boundary / garbage) falls through to the single whole-body
+    # turn below — byte-identical to the pre-split behavior (backward compat).
+    if len(emails) == 1 and isinstance(emails[0], dict):
+        top_msg = emails[0]
+        inline_body = _html_to_text(str(top_msg.get("body", "") or ""))
+        split = _split_quoted_thread(inline_body, top_msg)
+        if len(split) >= 2:
+            # _split_quoted_thread returns newest-first; reverse to oldest->newest.
+            split.reverse()
+            return split[-_THREAD_HISTORY_MAX_TURNS:]
 
     turns: list[dict] = []
     for idx, msg in enumerate(emails):
