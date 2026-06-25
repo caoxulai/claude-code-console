@@ -10323,3 +10323,42 @@ async def test_clarify_finalize_rejects_traversal_sessionId(client, tasks_layout
         })
     assert resp.status == 200
     assert (await resp.json())["task"]["clarification"]["summary"] == "# scope"
+
+
+# ---------------------------------------------------------------------------
+# Regression: _mention_candidates must use the NEWEST message (messages[-1])
+# for DM/group_dm channels, not the oldest (messages[0]).
+# ---------------------------------------------------------------------------
+
+def test_slack_mention_candidates_uses_newest_message():
+    """_mention_candidates picks the LAST message (newest) for DMs/group DMs,
+    not the first (oldest). get_unreads returns messages oldest-first, so
+    messages[-1] is the most recent. Regression guard for the messages[0] bug."""
+    # Two messages in oldest-first order (as get_unreads returns them).
+    # The channel is a 1:1 DM (channelId starts with 'D') so it hits the
+    # else branch at line 2800, NOT the mention path.
+    payload = {"channels": [
+        {
+            "channelId": "D_regression_dm",
+            "name": "alice",
+            "messages": [
+                {"user": "alice", "text": "first old message", "ts": "1700000000.000000"},
+                {"user": "alice", "text": "second newer message", "ts": "1700000060.000000"},
+            ],
+            # NO top-level latest/text/snippet/ts — forces the code through the
+            # messages path (raw.get("latest") etc. all return None).
+        },
+    ]}
+    cands = slack_mod._mention_candidates(payload)
+    assert len(cands) == 1
+    c = cands[0]
+    # The snippet MUST come from the NEWER (last) message, not the older (first).
+    assert "second newer message" in c["snippet"], (
+        f"Expected snippet from newest message; got: {c['snippet']!r}"
+    )
+    assert "first old message" not in c["snippet"]
+    # The ts MUST be the integer-ms form of the NEWER ts (1700000060 * 1000).
+    assert c["ts"] == 1700000060000, f"Expected ts=1700000060000; got: {c['ts']}"
+    # Verify it's classified as a DM (not mention).
+    assert c["channelType"] == "dm"
+    assert c["channelId"] == "D_regression_dm"

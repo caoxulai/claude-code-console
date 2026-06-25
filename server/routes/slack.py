@@ -2289,7 +2289,8 @@ async def _draft_pending(app, sem: asyncio.Semaphore) -> None:
     # reads the item's history3d/needsRedraft to choose a fresh-draft vs re-draft
     # prompt; we build it now against the current item view.
     pending = [
-        (it.get("id"), build_draft_prompt(it), it.get("history3d"),
+        (it.get("id"), build_draft_prompt(it),
+         None if it.get("needsRedraft") else it.get("history3d"),
          it.get("channelId", ""))
         for it in data["items"]
         if it.get("id") and _needs_draft(it)
@@ -2798,7 +2799,7 @@ def _mention_candidates(unreads_payload) -> list[dict]:
             ts_raw = mention_msg.get("ts")
         else:
             # DMs/group DMs: use the most recent message.
-            latest_msg = messages[0] if messages else {}
+            latest_msg = messages[-1] if messages else {}
             sender = str(
                 raw.get("sender") or raw.get("user") or raw.get("author")
                 or latest_msg.get("user") or latest_msg.get("sender") or ""
@@ -2931,6 +2932,24 @@ def _merge_scan_candidates(items: list[dict], candidates: list[dict]) -> bool:
                     active["snippet"] = cand["snippet"]
                 active["ts"] = cand_ts
                 changed = True
+            elif (active.get("status") == "needs-review"
+                    and not active.get("needsRedraft")
+                    and cand_ts == _as_int_ms(active.get("ts"))
+                    and cand_ts > 0):
+                # History-staleness check: the item's ts matches the scan (no NEW
+                # messages) but the fetched history3d doesn't cover up to ts — the
+                # draft was generated from incomplete history. Flag a redraft so the
+                # worker re-fetches history and re-drafts with full context.
+                h3d = active.get("history3d")
+                if isinstance(h3d, list) and h3d:
+                    last_h_ts = _as_int_ms(h3d[-1].get("ts") if isinstance(h3d[-1], dict) else None)
+                    if last_h_ts < cand_ts:
+                        # Only flag if draft is machine-generated (untouched).
+                        draft = str(active.get("draft", ""))
+                        gen = str(active.get("generatedDraft", ""))
+                        if draft.strip() == gen.strip():
+                            active["needsRedraft"] = True
+                            changed = True
             continue
 
         # No active item — but a 'sent' item suppresses ONLY while the conversation
