@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp } from './emailDetail';
 
 // --- Constants ---
 
@@ -870,7 +870,16 @@ export default function EmailPage() {
       </ErrorBoundary>
     );
 
-    const renderTurnCard = (turn, key) => (
+    const renderTurnCard = (turn, key) => {
+      // displayTimestamp (emailDetail.js) returns a relative-time string for an
+      // epoch/ISO timestamp, the VERBATIM human date for a quoted-header date
+      // string that `new Date()` can't parse ("Wednesday, June 24, 2026 at
+      // 10:23" — NEVER the broken "--"), and '' when there's nothing to show.
+      // Gating the slot on the resolved string keeps an empty/unusable
+      // timestamp from rendering an empty span. Untrusted email text -> React
+      // {…} interpolation only.
+      const tsLabel = displayTimestamp(turn.timestamp);
+      return (
       <div
         key={key}
         className="card"
@@ -882,8 +891,8 @@ export default function EmailPage() {
       >
         <div style={{ display: 'flex', gap: '0.6em', alignItems: 'baseline', flexWrap: 'wrap' }}>
           <span style={{ fontWeight: 600, color: 'var(--text)' }}>{turn.sender || 'unknown'}</span>
-          {turn.timestamp && (
-            <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{relativeTime(turn.timestamp)}</span>
+          {tsLabel && (
+            <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{tsLabel}</span>
           )}
         </div>
         {/* Optional "To:" line — who this turn was sent to. Rendered ONLY when
@@ -900,7 +909,8 @@ export default function EmailPage() {
           {renderBody(turn.body)}
         </div>
       </div>
-    );
+      );
+    };
 
     const subjectText = (item.subject || '').trim();
 

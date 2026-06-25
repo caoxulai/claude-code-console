@@ -370,4 +370,33 @@ test('displayTimestamp: a free-text date-like string Date cannot parse -> verbat
   assert.notEqual(out, '--');
 });
 
+// renderTurnCard's timestamp slot is `displayTimestamp(turn.timestamp)`, NOT
+// relativeTime — a quoted-header turn carries the verbatim human date, which
+// relativeTime would render as the broken "--". This pins the slot's exact
+// two-branch contract straight off the turn shape so a regression to
+// relativeTime (or back to "--") goes RED here, even though the JSX itself is
+// browser-unverified (no jsdom/vitest).
+test('displayTimestamp: drives the turn-card slot for a MAWS quoted-header turn (verbatim, renders)', () => {
+  const quotedTurn = {
+    sender: 'Wang, Yibo',
+    timestamp: 'Wednesday, June 24, 2026 at 10:23',
+    body: 'GL L7 SDMs, ...',
+    recipients: 'Agarwal, Ankit; Lakshmanan, Geetika',
+  };
+  const slot = displayTimestamp(quotedTurn.timestamp);
+  // The page renders the slot only when this is truthy -> a real date shows,
+  // never "--" and never empty (so the date is NOT silently dropped).
+  assert.equal(slot, 'Wednesday, June 24, 2026 at 10:23');
+  assert.notEqual(slot, '--');
+  assert.ok(slot, 'a real quoted-header date must produce a non-empty slot');
+});
+
+test('displayTimestamp: an empty turn timestamp -> "" so the slot renders nothing (no "--")', () => {
+  const freshTurn = { sender: 'Han, Bingfeng', timestamp: '', body: 'Thanks Yibo.' };
+  const slot = displayTimestamp(freshTurn.timestamp);
+  // Falsy -> the page's `{turn.timestamp && ...}`-style guard skips the slot.
+  assert.equal(slot, '');
+  assert.notEqual(slot, '--');
+});
+
 console.log(`\nall green: ${passed} tests passed`);
