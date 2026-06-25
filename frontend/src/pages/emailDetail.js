@@ -102,6 +102,38 @@ export function polishSource(id, editingId, draftText, item) {
   return { ok: true, text };
 }
 
+// Decide the per-turn timestamp slot text (D-053 clause 7). A turn from the
+// Graph message carries an epoch/ISO timestamp that resolves to a relative-time
+// string ("3h ago"); a turn PARSED from a quoted-reply header carries a human
+// date string verbatim ("Wednesday, June 24, 2026 at 10:23") that `new Date()`
+// cannot parse. Returns:
+//   - '' for null/undefined/empty (so renderTurnCard renders no timestamp slot)
+//   - the relative-time string when the value parses to a finite Date (same
+//     just-now / Nm / Nh / Nd math as EmailPage's relativeTime, kept in sync here)
+//   - the VERBATIM trimmed string when it is a non-empty string Date can't parse
+//     — NEVER the broken-looking '--' placeholder for a real human date (AC-8)
+// Pure — no DOM, no fetch. The page maps an '' result to "render nothing".
+export function displayTimestamp(ts) {
+  if (ts === null || ts === undefined) return '';
+  const raw = typeof ts === 'string' ? ts.trim() : ts;
+  if (raw === '') return '';
+  const t = new Date(raw).getTime();
+  if (Number.isFinite(t)) {
+    const diff = Date.now() - t;
+    if (diff < 0) return 'just now';
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+  }
+  // Unparseable but real (a quoted-header human date) — show it verbatim,
+  // never '--'. A non-string unparseable value (e.g. NaN) has no useful text.
+  return typeof ts === 'string' ? raw : '';
+}
+
 // Shrink-then-grow a textarea to its content: height = min(scrollHeight + 2, cap).
 // The +2 avoids a 1px scrollbar flicker; the cap keeps a pathologically long
 // draft from eating the panel (it scrolls past the cap). Extracted from the DOM

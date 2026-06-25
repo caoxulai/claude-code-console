@@ -17,6 +17,7 @@ import {
   sortedMutedKeys,
   polishSource,
   autoSizeHeight,
+  displayTimestamp,
 } from './emailDetail.js';
 
 let passed = 0;
@@ -308,6 +309,65 @@ test('autoSizeHeight grows to scrollHeight + 2 below the cap', () => {
 
 test('autoSizeHeight is capped for a very long draft', () => {
   assert.equal(autoSizeHeight(5000, 320), 320);
+});
+
+// --- displayTimestamp: the per-turn timestamp slot text (D-053 clause 7) ----
+// renderTurnCard shows a per-turn timestamp. A turn from the Graph message has
+// an epoch/ISO timestamp that resolves to a relative-time string ("3h ago").
+// But a turn PARSED from a quoted-reply header carries the human date string
+// verbatim ("Wednesday, June 24, 2026 at 10:23") which `new Date(ts)` can't
+// parse — we MUST show that string as-is, NEVER the broken-looking "--"
+// placeholder (AC-8). An empty/missing timestamp yields "" so no slot renders
+// at all. Pure — no DOM, no fetch.
+
+test('displayTimestamp: null/undefined/empty -> "" (no slot renders)', () => {
+  assert.equal(displayTimestamp(null), '');
+  assert.equal(displayTimestamp(undefined), '');
+  assert.equal(displayTimestamp(''), '');
+  assert.equal(displayTimestamp('   '), '');
+});
+
+test('displayTimestamp: a parseable epoch ms -> a relative-ish string (not "--", not the input)', () => {
+  const fiveMinAgo = Date.now() - 5 * 60000;
+  const out = displayTimestamp(fiveMinAgo);
+  assert.notEqual(out, '');
+  assert.notEqual(out, '--');
+  assert.notEqual(out, String(fiveMinAgo));
+  assert.equal(out, '5m ago');
+});
+
+test('displayTimestamp: a parseable ISO string -> a relative-ish string (not "--", not verbatim)', () => {
+  const iso = new Date(Date.now() - 3 * 3600000).toISOString();
+  const out = displayTimestamp(iso);
+  assert.notEqual(out, '');
+  assert.notEqual(out, '--');
+  assert.notEqual(out, iso); // not echoed back verbatim
+  assert.equal(out, '3h ago');
+});
+
+test('displayTimestamp: matches relativeTime math across units (just now / m / h / d)', () => {
+  assert.equal(displayTimestamp(Date.now() - 10000), 'just now'); // <1 min
+  assert.equal(displayTimestamp(Date.now() - 30 * 60000), '30m ago');
+  assert.equal(displayTimestamp(Date.now() - 5 * 3600000), '5h ago');
+  assert.equal(displayTimestamp(Date.now() - 2 * 86400000), '2d ago');
+  assert.equal(displayTimestamp(Date.now() + 60000), 'just now'); // future -> just now
+});
+
+test('displayTimestamp: an UNPARSEABLE human date string -> returned VERBATIM, never "--" (AC-8)', () => {
+  const human = 'Wednesday, June 24, 2026 at 10:23';
+  const out = displayTimestamp(human);
+  assert.equal(out, human);
+  assert.notEqual(out, '--');
+});
+
+test('displayTimestamp: an unparseable string with surrounding whitespace -> trimmed verbatim', () => {
+  assert.equal(displayTimestamp('  Wednesday, June 24, 2026 at 10:23  '), 'Wednesday, June 24, 2026 at 10:23');
+});
+
+test('displayTimestamp: a free-text date-like string Date cannot parse -> verbatim, not "--"', () => {
+  const out = displayTimestamp('sometime next week');
+  assert.equal(out, 'sometime next week');
+  assert.notEqual(out, '--');
 });
 
 console.log(`\nall green: ${passed} tests passed`);
