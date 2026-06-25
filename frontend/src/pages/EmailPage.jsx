@@ -901,7 +901,7 @@ export default function EmailPage() {
             entirely otherwise so we never show an empty "To:" or a placeholder.
             All text via React {…} interpolation, never dangerouslySetInnerHTML. */}
         {typeof turn.recipients === 'string' && turn.recipients.trim() && (
-          <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginTop: '0.15em' }}>
+          <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginTop: '0.15em', wordBreak: 'break-word' }}>
             To: {turn.recipients}
           </div>
         )}
