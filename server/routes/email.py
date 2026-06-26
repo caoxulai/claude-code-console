@@ -120,6 +120,15 @@ _CLASSIFY_NEXT_STATUS = {
     "fyi": "needs-draft",
 }
 
+# Cap on the ACTIVE TO-DO LIST (the actionable queue), NOT the per-fetch read
+# window. This is a REPLENISH-ON-CLEAR cap: each scan admits at most
+# (CAP - current_actionable) new items, so as the user clears items (approve/
+# dismiss/delete drops them out of _count_actionable) the next scan tops the list
+# back up from the remaining unread inbox, oldest-first, until the inbox is drained.
+# The actionable set is defined by _count_actionable / _TERMINAL_STATUSES (the SAME
+# predicate as the "N to review" count, D-035) — never a second inline definition.
+EMAIL_ACTIVE_TODO_CAP = 50
+
 # Worker tuning constants (mirroring Slack module):
 EMAIL_SCAN_INTERVAL_S = 300        # 5 minutes between scans
 EMAIL_CLASSIFY_POLL_INTERVAL_S = 6  # classify worker poll interval
@@ -2485,11 +2494,28 @@ async def _scan_once(app) -> None:
             continue
         new_items.append(raw)
 
-    # For each new email, pre-fetch body + thread history via Graph get_email. The
-    # SAME response ({email:{...}}) yields BOTH the concatenated body
+    # Active-to-do cap (replenish-on-clear): bound the actionable queue at
+    # EMAIL_ACTIVE_TODO_CAP. Compute the current actionable count from the persisted
+    # store using the SAME predicate as the "N to review" count (_count_actionable /
+    # _TERMINAL_STATUSES, D-035) — never a second inline definition — then admit at
+    # most the remaining headroom this cycle. Admit OLDEST-FIRST (FIFO) so the
+    # backlog drains toward zero and nothing starves under steady incoming mail; the
+    # Graph fetch returns newest-first, so we sort eligible new_items by their Graph
+    # timestamp (the same epoch the skeleton `ts` uses, stable tie-break on msg id)
+    # before truncating to headroom. Non-admitted unread are simply not ingested THIS
+    # cycle (no half-ingested body-less ghosts) and get picked up later once a cleared
+    # item frees a slot. This caps the ACTIVE LIST, not the get_emails read window.
+    current_actionable = _count_actionable(data["items"])
+    headroom = max(0, EMAIL_ACTIVE_TODO_CAP - current_actionable)
+    new_items.sort(key=lambda r: (_graph_ts_ms(r),
+                                  str(r.get("id", "") or r.get("messageId", ""))))
+    admitted = new_items[:headroom]
+
+    # For each admitted email, pre-fetch body + thread history via Graph get_email.
+    # The SAME response ({email:{...}}) yields BOTH the concatenated body
     # (_extract_email_body) and the structured multi-turn threadHistory
     # (_extract_thread_history), so the draft worker needs no further MCP call.
-    for raw in new_items:
+    for raw in admitted:
         msg_id = str(raw.get("id", "") or raw.get("messageId", ""))
         if msg_id:
             try:
@@ -2563,8 +2589,9 @@ async def _scan_once(app) -> None:
             # the latest sender in the From column.
             _apply_latest_sender(it, history)
 
-    # Write needs-classify skeletons
-    for raw in new_items:
+    # Write needs-classify skeletons (admitted items only — the cap was applied
+    # above, so non-admitted unread are NOT persisted this cycle).
+    for raw in admitted:
         skeleton = _skeleton_for(raw)
         if raw.get("emailBody"):
             skeleton["emailBody"] = raw["emailBody"]
@@ -2908,8 +2935,42 @@ async def _draft_worker(app) -> None:
 
 # ── Worker lifecycle ────────────────────────────────────────────────────────
 
+# Single env flag gating the three PERIODIC email workers (scan/classify/draft),
+# default OFF. Parsed against an explicit truthy allowlist (case-insensitive) — a
+# bare bool(os.environ.get(...)) would treat the common "set it to 0 to disable"
+# operator habit ('0'/'false' are non-empty -> truthy) as ENABLE, silently breaking
+# the default-OFF guarantee. Does NOT gate the persistent-MCP cleanup or any
+# non-email worker.
+_EMAIL_WORKERS_ENV = "CLAUDE_WEB_EMAIL_WORKERS"
+_EMAIL_WORKERS_TRUTHY = {"1", "true", "yes"}
+# Guard so the three start hooks don't triple-log the "disabled" line on startup.
+_EMAIL_WORKERS_DISABLED_LOGGED = False
+
+
+def _email_workers_enabled() -> bool:
+    """True iff CLAUDE_WEB_EMAIL_WORKERS is a truthy token (1/true/yes, any case)."""
+    return os.environ.get(_EMAIL_WORKERS_ENV, "").strip().lower() in _EMAIL_WORKERS_TRUTHY
+
+
+def _email_workers_gate_open() -> bool:
+    """Gate for the start hooks: log ONCE when disabled, then early-return falsey."""
+    if _email_workers_enabled():
+        return True
+    global _EMAIL_WORKERS_DISABLED_LOGGED
+    if not _EMAIL_WORKERS_DISABLED_LOGGED:
+        logger.info(
+            "Email workers disabled (%s unset/falsey) — no scan/classify/draft loops "
+            "will run. Set %s=1 to enable.",
+            _EMAIL_WORKERS_ENV, _EMAIL_WORKERS_ENV,
+        )
+        _EMAIL_WORKERS_DISABLED_LOGGED = True
+    return False
+
+
 async def _start_scan_worker(app) -> None:
     """on_startup: seed _LAST_SCAN_TS_MS from persisted lastScanAt, then launch."""
+    if not _email_workers_gate_open():
+        return
     global _LAST_SCAN_TS_MS
     if _LAST_SCAN_TS_MS is None:
         try:
@@ -2937,6 +2998,8 @@ async def _stop_scan_worker(app) -> None:
 
 
 async def _start_classify_worker(app) -> None:
+    if not _email_workers_gate_open():
+        return
     task = app.get("email_classify_task")
     if task is None or task.done():
         app["email_classify_task"] = asyncio.create_task(_classify_worker(app))
@@ -2955,6 +3018,8 @@ async def _stop_classify_worker(app) -> None:
 
 
 async def _start_draft_worker(app) -> None:
+    if not _email_workers_gate_open():
+        return
     task = app.get("email_draft_task")
     if task is None or task.done():
         app["email_draft_task"] = asyncio.create_task(_draft_worker(app))
@@ -3050,18 +3115,21 @@ async def get_queue(request: web.Request) -> web.Response:
 
 
 # Terminal statuses that do NOT count toward "to review" — kept in lockstep with
-# the frontend's countEmailActionable (frontend/src/lib/emailQueue.js). Email's
-# terminal outbound state is 'approved' (NOT 'sent'). An explicit denylist of the
-# two terminal states means a new active status (or a missing/empty status on an
-# older item) ALWAYS counts, so the count can never silently undercount.
-_TERMINAL_STATUSES = ("approved", "dismissed")
+# the frontend's isActionable (frontend/src/lib/emailQueue.js, D-035). Email's
+# terminal outbound state is 'approved' (NOT 'sent'); 'deleted' is set by
+# delete_item once a message is moved to Deleted Items, so a deleted-but-not-purged
+# item is terminal and must NOT eat a capped active-to-do slot (AC-5). An explicit
+# denylist of these three states means a new active status (or a missing/empty
+# status on an older item) ALWAYS counts, so the count can never silently undercount.
+_TERMINAL_STATUSES = ("approved", "dismissed", "deleted")
 
 
 def _count_actionable(items) -> int:
     """Count items that still need attention — mirrors frontend countEmailActionable.
 
-    Actionable == status NOT in the terminal set {approved, dismissed}; a
-    missing/empty status counts.
+    Actionable == status NOT in the terminal set {approved, dismissed, deleted}; a
+    missing/empty status counts. This is the SINGLE source of truth shared by the
+    "N to review" count and the active-to-do cap (EMAIL_ACTIVE_TODO_CAP).
     """
     if not isinstance(items, list):
         return 0

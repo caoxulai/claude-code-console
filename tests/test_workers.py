@@ -35,6 +35,9 @@ from server.app import create_app  # noqa: E402
 def app(tmp_path: Path, monkeypatch) -> web.Application:
     monkeypatch.setattr("server.app.ALLOWED_CWD_ROOTS", [tmp_path])
     monkeypatch.setenv("CLAUDE_WEB_CWD", str(tmp_path))
+    # Email workers are gated behind CLAUDE_WEB_EMAIL_WORKERS (default OFF, D-055);
+    # enable them here so the registry shows all built-in workers as this suite asserts.
+    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", "1")
     application = create_app()
     application["allowed_cwd_roots"] = [tmp_path]
     application["default_cwd"] = tmp_path

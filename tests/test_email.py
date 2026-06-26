@@ -2493,3 +2493,642 @@ def test_error_body_not_truncated_at_200(monkeypatch):
     msg = _asyncio.new_event_loop().run_until_complete(_run())
     assert msg is not None
     assert "quota_exceeded" in msg, "the error body must NOT be truncated before the quota code"
+
+
+# ─── D-055 (1) Active-to-do cap (FIFO replenish-on-clear) ────────────────────
+
+
+def _unread_raw(n, ts_iso):
+    """Build one raw Graph inbox message with a deterministic id + timestamp."""
+    return {
+        "id": f"MSG-{n}",
+        "subject": f"Subject {n}",
+        "from": {"name": f"Sender {n}", "email": f"s{n}@example.com"},
+        "received": ts_iso,
+        "is_read": False,
+        "preview": f"preview {n}",
+    }
+
+
+def _make_actionable(n):
+    """An already-queued actionable item (status NOT terminal)."""
+    return _make_item(
+        f"existing-{n}",
+        messageId=f"EXIST-{n}",
+        conversationId=f"EXIST-{n}",
+        status="needs-review",
+    )
+
+
+def test_active_todo_cap_is_named_constant_fifty():
+    """The cap is a single named constant reusing the terminal/actionable predicate."""
+    assert email_mod.EMAIL_ACTIVE_TODO_CAP == 50
+
+
+async def test_scan_at_cap_admits_zero_new(email_file, monkeypatch):
+    """(CAP) A store already holding 50 actionable items admits ZERO new to-dos."""
+    _seed(email_file, [_make_actionable(i) for i in range(50)])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            # 5 brand-new unread, none already queued.
+            return {"emails": [_unread_raw(900 + i, f"2026-06-0{i+1}T10:00:00Z")
+                               for i in range(5)], "count": 5, "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {"id": arguments.get("message_id"), "body": "body"}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert email_mod._count_actionable(saved) == 50
+    # No new MSG-* skeletons were ingested.
+    assert not any(str(it.get("messageId", "")).startswith("MSG-") for it in saved)
+
+
+async def test_scan_below_cap_admits_oldest_first_up_to_headroom(email_file, monkeypatch):
+    """(CAP+FIFO) With 42 actionable, a scan admits at most 8 — the OLDEST eligible
+    unread first — and never exceeds 50."""
+    _seed(email_file, [_make_actionable(i) for i in range(42)])
+
+    # 12 eligible unread returned NEWEST-FIRST (as Graph does): MSG-12 .. MSG-1,
+    # with MSG-1 the OLDEST. Headroom is 8, so the 8 OLDEST (MSG-1..MSG-8) win.
+    raws = []
+    for n in range(12, 0, -1):
+        # day = n so a larger n is a LATER (newer) timestamp.
+        raws.append(_unread_raw(n, f"2026-06-{n:02d}T10:00:00Z"))
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": raws, "count": len(raws), "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {"id": arguments.get("message_id"), "body": "body"}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert email_mod._count_actionable(saved) == 50  # 42 + 8, never more
+    admitted_ids = sorted(
+        str(it.get("messageId")) for it in saved
+        if str(it.get("messageId", "")).startswith("MSG-")
+    )
+    assert len(admitted_ids) == 8
+    # The 8 OLDEST eligible unread (MSG-1..MSG-8) are admitted; MSG-9..MSG-12 wait.
+    assert admitted_ids == [f"MSG-{n}" for n in range(1, 9)]
+
+
+async def test_scan_never_exceeds_cap_with_many_new(email_file, monkeypatch):
+    """(CAP) Far more eligible unread than headroom never pushes past 50."""
+    _seed(email_file, [_make_actionable(i) for i in range(10)])  # headroom 40
+
+    raws = [_unread_raw(n, f"2026-{(n % 12) + 1:02d}-01T10:00:00Z") for n in range(100)]
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": raws, "count": len(raws), "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {"id": arguments.get("message_id"), "body": "body"}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert email_mod._count_actionable(saved) == 50
+
+
+async def test_deleted_status_does_not_eat_a_capped_slot(email_file, monkeypatch):
+    """(CAP+TERMINAL RECONCILE) A 'deleted' item is terminal, so it frees headroom."""
+    items = [_make_actionable(i) for i in range(49)]
+    items.append(_make_item("gone", messageId="GONE", conversationId="GONE",
+                            status="deleted"))
+    _seed(email_file, items)  # 49 actionable + 1 deleted (terminal)
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [_unread_raw(500, "2026-06-01T10:00:00Z"),
+                               _unread_raw(501, "2026-06-02T10:00:00Z")],
+                    "count": 2, "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {"id": arguments.get("message_id"), "body": "body"}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    # Headroom was 50 - 49 = 1, so exactly ONE new item is admitted (the oldest).
+    admitted = [it for it in saved if str(it.get("messageId", "")).startswith("MSG-")]
+    assert len(admitted) == 1
+    assert admitted[0]["messageId"] == "MSG-500"
+    assert email_mod._count_actionable(saved) == 50
+
+
+# ─── D-055 (2) Terminal-predicate reconciliation ─────────────────────────────
+
+
+def test_deleted_is_terminal():
+    """'deleted' joins approved/dismissed in the terminal set (D-035 lockstep)."""
+    assert "deleted" in email_mod._TERMINAL_STATUSES
+    assert email_mod._count_actionable([
+        {"status": "deleted"},
+        {"status": "approved"},
+        {"status": "dismissed"},
+        {"status": "needs-review"},
+    ]) == 1
+
+
+# ─── D-055 (3) Default-OFF worker gate ───────────────────────────────────────
+
+
+def test_email_workers_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("CLAUDE_WEB_EMAIL_WORKERS", raising=False)
+    assert email_mod._email_workers_enabled() is False
+
+
+@pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "yes", "True"])
+def test_email_workers_enabled_for_truthy_allowlist(monkeypatch, val):
+    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", val)
+    assert email_mod._email_workers_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["0", "false", "no", "", "off", "disable"])
+def test_email_workers_disabled_for_falsey_strings(monkeypatch, val):
+    """'0'/'false' are TRUTHY strings to bool() — they must NOT enable workers."""
+    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", val)
+    assert email_mod._email_workers_enabled() is False
+
+
+async def test_start_hooks_register_no_task_when_flag_unset(monkeypatch):
+    """All three start hooks early-return (register NO task) when the flag is unset."""
+    monkeypatch.delenv("CLAUDE_WEB_EMAIL_WORKERS", raising=False)
+
+    created = []
+    monkeypatch.setattr(email_mod.asyncio, "create_task",
+                        lambda coro: created.append(coro) or _DummyTask(coro))
+
+    app = {}
+    await email_mod._start_scan_worker(app)
+    await email_mod._start_classify_worker(app)
+    await email_mod._start_draft_worker(app)
+
+    assert created == [], "no email worker coroutine may be scheduled when disabled"
+    assert "email_scan_task" not in app
+    assert "email_classify_task" not in app
+    assert "email_draft_task" not in app
+
+
+async def test_start_hooks_register_task_when_flag_set(monkeypatch):
+    """With CLAUDE_WEB_EMAIL_WORKERS=1 all three hooks register their task (wiring)."""
+    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", "1")
+
+    monkeypatch.setattr(email_mod, "register_worker", lambda *a, **k: None)
+    # Avoid the scan hook actually reading the sidecar.
+    monkeypatch.setattr(email_mod, "_load", lambda: ({"items": []}, None))
+
+    created = []
+
+    def fake_create_task(coro):
+        created.append(coro)
+        coro.close()  # never run the worker body
+        return _DummyTask(coro)
+
+    monkeypatch.setattr(email_mod.asyncio, "create_task", fake_create_task)
+
+    app = {}
+    await email_mod._start_scan_worker(app)
+    await email_mod._start_classify_worker(app)
+    await email_mod._start_draft_worker(app)
+
+    assert len(created) == 3
+    assert "email_scan_task" in app
+    assert "email_classify_task" in app
+    assert "email_draft_task" in app
+
+
+class _DummyTask:
+    def __init__(self, coro):
+        self._coro = coro
+
+    def done(self):
+        return False
+
+
+# ─── D-055 (1) Cap clause (4): admitted get bodies, non-admitted not persisted ──
+
+
+async def test_scan_cap_prefetches_admitted_bodies_and_drops_non_admitted(
+    email_file, monkeypatch
+):
+    """(CAP/BODY-PREFETCH + NO-GHOST) Only ADMITTED unread get the expensive body
+    pre-fetch (emailBody + threadHistory) AND get persisted; the non-admitted
+    overflow is NOT ingested this cycle at all — no body-less ghost rows.
+
+    Seeds 48 actionable (headroom = 2) and returns 5 eligible unread NEWEST-FIRST
+    (MSG-5..MSG-1, MSG-1 oldest). The 2 OLDEST (MSG-1, MSG-2) are admitted: each
+    must carry a body AND a multi-turn threadHistory, AND get_email must have been
+    called for EXACTLY those two ids (the cap gates the body fetch, not just the
+    persist). MSG-3..MSG-5 must be wholly absent (no skeleton, no get_email)."""
+    _seed(email_file, [_make_actionable(i) for i in range(48)])  # headroom 2
+
+    # 5 eligible unread, newest-first (day=n so larger n is newer; MSG-1 oldest).
+    raws = [_unread_raw(n, f"2026-06-{n:02d}T10:00:00Z") for n in range(5, 0, -1)]
+
+    get_email_calls = []
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": raws, "count": len(raws), "folder": "inbox"}
+        if name == "get_email":
+            mid = arguments.get("message_id")
+            get_email_calls.append(mid)
+            # A 2-turn body so the admitted skeleton lands a real threadHistory.
+            return {"email": {
+                "id": mid,
+                "subject": "Re: thread",
+                "from": {"name": "Sender", "email": "s@example.com"},
+                "body": "From: Sender\n\nlatest\n---\nFrom: Me\n\nearlier",
+                "messages": [
+                    {"from": {"name": "Sender"}, "received": "2026-06-02T10:00:00Z",
+                     "body": "latest"},
+                    {"from": {"name": "Me"}, "received": "2026-06-01T10:00:00Z",
+                     "body": "earlier"},
+                ],
+            }}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _NoopWS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    by_msg = {it.get("messageId"): it for it in saved
+              if str(it.get("messageId", "")).startswith("MSG-")}
+
+    # Exactly the 2 OLDEST eligible unread were admitted (MSG-1, MSG-2).
+    assert sorted(by_msg) == ["MSG-1", "MSG-2"]
+    assert email_mod._count_actionable(saved) == 50
+
+    # Each admitted item got the expensive body pre-fetch (emailBody + history).
+    for mid in ("MSG-1", "MSG-2"):
+        item = by_msg[mid]
+        assert item.get("emailBody"), f"{mid} must have a pre-fetched body"
+        th = item.get("threadHistory")
+        assert isinstance(th, list) and len(th) == 2, \
+            f"{mid} must carry the multi-turn threadHistory"
+
+    # The non-admitted overflow (MSG-3..MSG-5) is wholly absent — no ghost rows.
+    assert "MSG-3" not in by_msg and "MSG-4" not in by_msg and "MSG-5" not in by_msg
+
+    # And the cap gated the BODY FETCH itself: get_email ran ONLY for the admitted
+    # two, never for the dropped three (the body pre-fetch is the expensive step).
+    assert sorted(get_email_calls) == ["MSG-1", "MSG-2"]
+    assert "MSG-3" not in get_email_calls
+    assert "MSG-4" not in get_email_calls
+    assert "MSG-5" not in get_email_calls
+
+
+# ─── scripts/email_validate.py — standalone pre-flight ────────────────────────
+#
+# The validation job is a STANDALONE script (no aiohttp server, no periodic
+# worker) that PROVES the core email functions end-to-end against the live OWA
+# path. These OFFLINE tests pin its core control-flow seams (step accounting,
+# exit-code logic, the GRASP-quota fail-loud short-circuit, the cap/FIFO check)
+# with the live MCP seams stubbed — the LIVE end-to-end run happens only when an
+# operator runs `python3 scripts/email_validate.py`.
+
+validate_mod = pytest.importorskip(
+    "scripts.email_validate",
+    reason="scripts/email_validate.py not yet implemented — tests activate once it lands",
+)
+
+
+def _vrun(coro):
+    """Run an async coroutine on a throwaway loop (these tests are server-free)."""
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def test_validate_step_result_shape():
+    """A StepResult carries (name, passed, detail) and renders a PASS/FAIL line."""
+    ok = validate_mod.StepResult("read", True, "got 7 messages")
+    bad = validate_mod.StepResult("draft", False, "draft not found in Drafts")
+    assert ok.passed is True and "read" in ok.render() and "PASS" in ok.render()
+    assert bad.passed is False and "FAIL" in bad.render() and "draft" in bad.render()
+
+
+def test_validate_runner_exit_zero_only_on_full_success():
+    """run_steps returns exit 0 iff EVERY step passes; non-zero on any failure."""
+    async def _good():
+        return validate_mod.StepResult("a", True, "ok")
+
+    async def _also_good():
+        return validate_mod.StepResult("b", True, "ok")
+
+    async def _bad():
+        return validate_mod.StepResult("c", False, "nope")
+
+    results, code = _vrun(validate_mod.run_steps([_good, _also_good]))
+    assert code == 0
+    assert all(r.passed for r in results) and len(results) == 2
+
+    results, code = _vrun(validate_mod.run_steps([_good, _bad, _also_good]))
+    assert code != 0, "any failing step must yield a non-zero exit code"
+
+
+def test_validate_runner_stops_early_and_fails_loud_on_quota():
+    """A GRASP 429/quota_exceeded must STOP the run early, surface the RAW body
+    untruncated, and exit non-zero (the job's whole reason to exist: catch a
+    non-OWA backend BEFORE enabling always-on workers)."""
+    raw_body = "x" * 500 + ' HTTP 429 {"error":"quota_exceeded","x-amz-apigw-id":"abc"}'
+    ran = {"after_quota": False}
+
+    async def _quota_step():
+        raise email_mod.EmailMcpError(raw_body)
+
+    async def _should_not_run():
+        ran["after_quota"] = True
+        return validate_mod.StepResult("later", True, "ok")
+
+    results, code = _vrun(validate_mod.run_steps([_quota_step, _should_not_run]))
+    assert code != 0, "a quota error must exit non-zero"
+    assert ran["after_quota"] is False, "the run must STOP EARLY on a quota error"
+    blob = "".join(r.detail for r in results)
+    assert "quota_exceeded" in blob, "raw quota body must be surfaced, not swallowed"
+    assert any("quota_exceeded" in r.detail and len(r.detail) > 200 for r in results), \
+        "the quota body must be surfaced un-truncated (raw-bytes-before-root-cause)"
+
+
+def test_validate_runner_non_quota_failure_does_not_claim_quota():
+    """An ordinary step failure must NOT be mislabeled as a quota backend problem."""
+    async def _ordinary_fail():
+        raise RuntimeError("draft did not land in Drafts")
+
+    results, code = _vrun(validate_mod.run_steps([_ordinary_fail]))
+    assert code != 0
+    blob = "".join(r.detail for r in results).lower()
+    assert "quota" not in blob, "a non-quota failure must not be reported as a quota error"
+
+
+def test_validate_cap_check_passes_only_on_correct_fifo_admission():
+    """assert_scan_cap: PASS only when the post-cycle actionable count respects the
+    cap AND the admitted items are the OLDEST eligible unread (FIFO)."""
+    cap = validate_mod.ACTIVE_TODO_CAP
+    pre_count = cap - 8  # e.g. 42 when cap is 50
+    eligible_ts = list(range(20, 0, -1))  # 20 (newest) .. 1 (oldest), newest-first
+
+    # CORRECT: admit the 8 OLDEST (ts 1..8); post count == cap.
+    admitted_oldest = sorted(eligible_ts)[:8]
+    ok = validate_mod.assert_scan_cap(
+        pre_actionable=pre_count, post_actionable=pre_count + len(admitted_oldest),
+        admitted_ts=admitted_oldest, eligible_ts=eligible_ts,
+    )
+    assert ok.passed is True, ok.detail
+
+    # WRONG (FIFO inversion): admit the 8 NEWEST (ts 20..13) — must FAIL.
+    admitted_newest = sorted(eligible_ts, reverse=True)[:8]
+    bad = validate_mod.assert_scan_cap(
+        pre_actionable=pre_count, post_actionable=pre_count + len(admitted_newest),
+        admitted_ts=admitted_newest, eligible_ts=eligible_ts,
+    )
+    assert bad.passed is False, "newest-first admission must FAIL the FIFO check"
+
+    # WRONG (over cap): post count exceeds the cap — must FAIL.
+    over = validate_mod.assert_scan_cap(
+        pre_actionable=cap, post_actionable=cap + 3,
+        admitted_ts=[1, 2, 3], eligible_ts=eligible_ts,
+    )
+    assert over.passed is False, "exceeding the cap must FAIL"
+
+    # At cap already: zero admitted is correct.
+    full = validate_mod.assert_scan_cap(
+        pre_actionable=cap, post_actionable=cap,
+        admitted_ts=[], eligible_ts=eligible_ts,
+    )
+    assert full.passed is True, full.detail
+
+
+def test_validate_uses_real_active_todo_cap_constant():
+    """The script's cap MUST reuse the backend's single source of truth, not a
+    second hand-rolled literal (D-035 lockstep). When the backend exposes
+    EMAIL_ACTIVE_TODO_CAP the script must mirror it."""
+    backend_cap = getattr(email_mod, "EMAIL_ACTIVE_TODO_CAP", None)
+    if backend_cap is not None:
+        assert validate_mod.ACTIVE_TODO_CAP == backend_cap, \
+            "the validation script must reuse the backend cap constant, not a copy"
+    else:
+        assert validate_mod.ACTIVE_TODO_CAP == 50
+
+
+def test_validate_never_references_a_send_tool_name():
+    """Send-safety boundary: the script must NEVER reference reply/send/forward
+    write tools — only read tools + the gated write seams it is allowed to use."""
+    import inspect
+    src = inspect.getsource(validate_mod)
+    for forbidden in ("send_email", "reply_email", "forward_email", '"send"', "'send'"):
+        assert forbidden not in src, f"validation script must never reference {forbidden!r}"
+
+
+def test_validate_mark_read_roundtrip_restores_original():
+    """The mark-read step is a NET NO-OP: it flips is_read then RESTORES to the
+    original, asserting the destination effect at each leg (not a success string)."""
+    state = {"is_read": False}
+    writes = []
+
+    async def fake_get_email(message_id):
+        return {"email": {"id": message_id, "is_read": state["is_read"]}}
+
+    async def fake_write(name, args):
+        writes.append((name, args))
+        if name == "mark_email_read":
+            state["is_read"] = bool(args.get("is_read", True))
+        return {"results": [{"success": True}]}
+
+    res = _vrun(validate_mod.mark_read_roundtrip(
+        message_id="SAFE-MSG-1",
+        get_email=fake_get_email,
+        write_tool=fake_write,
+    ))
+    assert res.passed is True, res.detail
+    assert state["is_read"] is False, "mark-read roundtrip must restore the original state"
+    assert len(writes) == 2, "roundtrip must flip then restore"
+    assert all(w[0] == "mark_email_read" for w in writes)
+
+
+def test_validate_mark_read_fails_if_flip_not_observed():
+    """Anti VALIDATION-THEATER: if the re-read does NOT show the flip, the step
+    FAILS even though the write tool returned success:true."""
+    state = {"is_read": False}
+
+    async def fake_get_email(message_id):
+        return {"email": {"id": message_id, "is_read": state["is_read"]}}
+
+    async def fake_write(name, args):
+        return {"results": [{"success": True}]}  # claims success but no effect
+
+    res = _vrun(validate_mod.mark_read_roundtrip(
+        message_id="SAFE-MSG-1",
+        get_email=fake_get_email,
+        write_tool=fake_write,
+    ))
+    assert res.passed is False, "a success string without the observed flip must FAIL"
+
+
+def test_validate_save_draft_confirms_landing_and_cleans_up():
+    """SAVE-DRAFT proves the EFFECT (draft is IN Drafts), then DELETEs it (soft)
+    and confirms it LEFT Drafts — idempotent, leaves no residue."""
+    drafts = {}  # message_id -> subject, simulated Drafts folder
+    deleted = []
+
+    async def fake_owa_write(name, args):
+        # email_draft create lands a draft in Drafts and returns its id.
+        assert name == "email_draft"
+        assert args.get("operation") == "create"
+        did = "DRAFT-XYZ"
+        drafts[did] = args.get("subject", "")
+        return {"id": did, "saved": True}
+
+    async def fake_get_emails(folder, limit):
+        if folder == "drafts":
+            return {"emails": [{"id": d, "subject": s} for d, s in drafts.items()]}
+        return {"emails": []}
+
+    async def fake_write_tool(name, args):
+        # delete_email(permanent=false) soft-deletes the draft.
+        assert name == "delete_email"
+        assert args.get("permanent") is False
+        for mid in (args.get("emails") or {}):
+            drafts.pop(mid, None)
+            deleted.append(mid)
+        return {"results": [{"success": True}]}
+
+    res = _vrun(validate_mod.save_draft_roundtrip(
+        subject="[email_validate throwaway] preflight",
+        body="throwaway",
+        to=["user@example.com"],
+        owa_write=fake_owa_write,
+        get_emails=fake_get_emails,
+        write_tool=fake_write_tool,
+    ))
+    assert res.passed is True, res.detail
+    assert "DRAFT-XYZ" in deleted, "the throwaway draft must be soft-deleted"
+    assert drafts == {}, "no residue: the draft must be cleaned up from Drafts"
+
+
+def test_validate_save_draft_fails_if_draft_never_lands():
+    """Anti VALIDATION-THEATER: a 'saved' return that does not actually appear in
+    Drafts must FAIL the step (verify-effect-not-caller)."""
+    async def fake_owa_write(name, args):
+        return {"id": "DRAFT-XYZ", "saved": True}  # claims saved
+
+    async def fake_get_emails(folder, limit):
+        return {"emails": []}  # but Drafts is empty — the save was a lie
+
+    async def fake_write_tool(name, args):
+        return {"results": [{"success": True}]}
+
+    res = _vrun(validate_mod.save_draft_roundtrip(
+        subject="[email_validate throwaway] preflight",
+        body="throwaway",
+        to=["user@example.com"],
+        owa_write=fake_owa_write,
+        get_emails=fake_get_emails,
+        write_tool=fake_write_tool,
+    ))
+    assert res.passed is False, "a draft that never lands in Drafts must FAIL"
+
+
+def test_validate_save_draft_deletes_by_stored_itemid_not_create_id():
+    """REGRESSION (AC-9/AC-10 id divergence): the aws-outlook email_draft create
+    returns an EWS-form draftId, but Graph lists the SAME draft in Drafts under a
+    DIFFERENT itemId and Graph delete_email only removes it when given that itemId.
+
+    The old roundtrip deleted by the create-returned id, so the move 400'd, the
+    REAL draft stayed in Drafts (residue), and the post-delete check — looking for
+    the never-present create-id — falsely PASSED. The fix deletes (and re-verifies)
+    by the itemId the draft actually carries in Drafts, so:
+      - delete is issued against the STORED itemId, and
+      - the residue check catches the real draft by itemId OR subject.
+    This test goes RED on the old create-id behavior and GREEN on the fix.
+    """
+    subject = "[email_validate throwaway] preflight"
+    create_id = "EWS-DRAFT-FORM-1"      # what create returns (EWS form)
+    item_id = "GRAPH-ITEMID-9"          # what Drafts actually exposes (Graph form)
+    drafts = {item_id: subject}         # the draft lives under the GRAPH itemId
+    deleted_targets = []
+
+    async def fake_owa_write(name, args):
+        assert name == "email_draft" and args.get("operation") == "create"
+        return {"id": create_id, "saved": True}
+
+    async def fake_get_emails(folder, limit):
+        if folder == "drafts":
+            return {"emails": [{"id": d, "subject": s} for d, s in drafts.items()]}
+        return {"emails": []}
+
+    async def fake_write_tool(name, args):
+        # delete_email succeeds ONLY when given the real Drafts itemId; the
+        # create-form id is unknown to Graph and removes nothing (the live 400).
+        assert name == "delete_email" and args.get("permanent") is False
+        for mid in (args.get("emails") or {}):
+            deleted_targets.append(mid)
+            drafts.pop(mid, None)
+        return {"results": [{"success": True}]}
+
+    res = _vrun(validate_mod.save_draft_roundtrip(
+        subject=subject,
+        body="throwaway",
+        to=["user@example.com"],
+        owa_write=fake_owa_write,
+        get_emails=fake_get_emails,
+        write_tool=fake_write_tool,
+    ))
+    assert res.passed is True, res.detail
+    # The delete MUST target the stored Graph itemId, never the create-returned id.
+    assert deleted_targets == [item_id], \
+        f"delete must target the stored itemId, not the create id; got {deleted_targets}"
+    assert create_id not in deleted_targets, \
+        "deleting by the create-returned EWS id is the residue bug"
+    # No residue: the real draft left Drafts.
+    assert drafts == {}, "the real draft must be removed from Drafts (no residue)"
+
+
+def test_validate_save_draft_detects_residue_when_real_draft_remains():
+    """Anti VALIDATION-THEATER: if the soft-delete does NOT actually remove the
+    draft from Drafts, the step FAILS — even if a wrong-id check would have passed.
+
+    Simulates the residue defect directly: delete_email removes nothing (the move
+    fails), so the real draft (by subject AND itemId) is still in Drafts on the
+    re-read. The step must FAIL rather than confirm a never-present absence."""
+    subject = "[email_validate throwaway] preflight"
+    item_id = "GRAPH-ITEMID-RESIDUE"
+    drafts = {item_id: subject}
+
+    async def fake_owa_write(name, args):
+        return {"id": "EWS-DRAFT-FORM-2", "saved": True}
+
+    async def fake_get_emails(folder, limit):
+        if folder == "drafts":
+            return {"emails": [{"id": d, "subject": s} for d, s in drafts.items()]}
+        return {"emails": []}
+
+    async def fake_write_tool(name, args):
+        # Move fails (e.g. wrong id form / 400): nothing leaves Drafts.
+        return {"results": [{"success": False, "error": "move -> 400"}]}
+
+    res = _vrun(validate_mod.save_draft_roundtrip(
+        subject=subject,
+        body="throwaway",
+        to=["user@example.com"],
+        owa_write=fake_owa_write,
+        get_emails=fake_get_emails,
+        write_tool=fake_write_tool,
+    ))
+    assert res.passed is False, "a draft left behind in Drafts must FAIL (residue)"
+    assert "residue" in res.detail.lower()

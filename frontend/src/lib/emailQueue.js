@@ -11,18 +11,20 @@
 // approve with one click; it just sits in the FYI group because a reply is unlikely.
 
 // Counts toward "N to review" and the nav bubble: everything that still needs your
-// attention — i.e. anything NOT terminal. 'approved' and 'dismissed' are the only
-// terminal (non-counting) states. So needs-classify (still classifying), fyi
-// (classified, you may still want to act), needs-draft, needs-review and edited
+// attention — i.e. anything NOT terminal. 'approved', 'dismissed' and 'deleted' are
+// the only terminal (non-counting) states. So needs-classify (still classifying),
+// fyi (classified, you may still want to act), needs-draft, needs-review and edited
 // ALL count — and a missing/empty status (older items) counts too. This is an
-// explicit denylist of the two terminal states so a new active status can never
+// explicit denylist of the three terminal states so a new active status can never
 // silently fall out of the count.
 //
 // LOCKSTEP CONTRACT (D-035): this MUST stay in sync with server/routes/email.py
-// `_count_actionable` / `_TERMINAL_STATUSES` (the GET /api/email/queue/count backend
-// the NavBar bubble reads). The terminal denylist here and the one there are two
-// halves of one contract — an editor of either side must update the other, or the
-// NavBar badge and the page's "N to review" count drift apart.
+// `_count_actionable` / `_TERMINAL_STATUSES` (terminal = approved|dismissed|deleted)
+// — the GET /api/email/queue/count backend the NavBar bubble reads AND the source of
+// truth for the active-to-do cap (EMAIL_ACTIVE_TODO_CAP). The terminal denylist here
+// and the one there are two halves of one contract — an editor of either side must
+// update the other, or the NavBar badge and the page's "N to review" count drift
+// apart.
 export function isActionable(item) {
   const s = item && item.status;
   return s !== 'approved' && s !== 'dismissed' && s !== 'deleted';
