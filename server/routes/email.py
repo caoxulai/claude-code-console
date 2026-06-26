@@ -112,12 +112,16 @@ _VALID_STATUS = {
 
 _VALID_CLASSIFICATIONS = {"needs-reply", "fyi", "actionable"}
 
-# Classification routing: all labels flow to needs-draft so every item gets a
-# draft. The label is recorded for UI grouping, not lifecycle gating.
+# Classification routing. needs-reply / actionable flow to needs-draft so the
+# draft worker auto-drafts them. FYI does NOT auto-draft (D-056 #2): it lands in
+# the review queue with NO draft and the user generates one ON DEMAND (the
+# Generate-reply button -> regenerate_item). needs-review is non-draft (not picked
+# up by _needs_draft / _draft_pending) AND non-terminal (still counted by
+# _count_actionable, so an undrafted FYI stays an active to-do, D-035 lockstep).
 _CLASSIFY_NEXT_STATUS = {
     "needs-reply": "needs-draft",
     "actionable": "needs-draft",
-    "fyi": "needs-draft",
+    "fyi": "needs-review",
 }
 
 # Cap on the ACTIVE TO-DO LIST (the actionable queue), NOT the per-fetch read
@@ -1647,18 +1651,69 @@ def _unwrap_list(payload, *keys) -> list:
 _MY_EMAIL = "user@example.com"
 
 
+def _detail_recipients(payload, key: str) -> list:
+    """Pull the ``to``/``cc`` recipient list ({name,email} dicts) from a Graph
+    get_email DETAIL payload, tolerating the ``{email:{...}}`` nesting.
+
+    The inbox-LIST call (get_emails) carries NO recipients, so this reads the
+    detail payload only. Returns [] (never None) for a missing key / wrong shape
+    so callers never fabricate. ``key`` is "to" or "cc".
+    """
+    if not isinstance(payload, dict):
+        return []
+    src = payload.get("email") if isinstance(payload.get("email"), dict) else payload
+    val = src.get(key) if isinstance(src, dict) else None
+    if not isinstance(val, list):
+        return []
+    return [e for e in val if isinstance(e, dict)]
+
+
+def _capture_recipients(target: dict, body_payload) -> None:
+    """Persist the detail payload's ``to``/``cc`` onto ``target`` as
+    ``toRecipients``/``ccRecipients`` (lists of {name,email}).
+
+    Writes ONLY when the detail carries a non-empty list for a key, so a body-less
+    retry / a payload missing recipients never blanks a value already captured
+    (never fabricates). Also re-derives ``recipientType`` from the freshly captured
+    lists so a previously-"unknown" item gets correctly classified. ZERO extra MCP
+    cost — reads the SAME get_email payload the body/thread came from.
+    """
+    if not isinstance(target, dict):
+        return
+    to_list = _detail_recipients(body_payload, "to")
+    cc_list = _detail_recipients(body_payload, "cc")
+    if to_list:
+        target["toRecipients"] = [
+            {"name": str(e.get("name") or "").strip(),
+             "email": str(e.get("email") or "").strip()}
+            for e in to_list
+        ]
+    if cc_list:
+        target["ccRecipients"] = [
+            {"name": str(e.get("name") or "").strip(),
+             "email": str(e.get("email") or "").strip()}
+            for e in cc_list
+        ]
+    if to_list or cc_list:
+        target["recipientType"] = _recipient_type({"to": to_list, "cc": cc_list})
+
+
 def _recipient_type(raw: dict) -> str:
     """Determine whether the user is in To (only), To (shared), or CC.
 
-    Returns: 'to-only' | 'to' | 'cc' | 'unknown'.
+    Returns: 'to-only' | 'to' | 'cc' | 'dl' | 'unknown'.
 
-    Heuristic: since the email reached my inbox, I'm definitely a recipient.
-    If toRecipients/ccRecipients are populated, match my personal email OR
-    treat the absence of my address in both as 'to' (via a distribution list).
-    If the lists are empty/absent, fall back to 'unknown'.
+    Reads the DETAIL payload's ``to``/``cc`` keys (each a {name,email} list) — the
+    ONLY place Graph exposes recipients (the inbox-list call has none, so the old
+    ``toRecipients``/``ccRecipients`` raw read was always None and returned
+    "unknown" for every item, D-056 #3). Also accepts an already-captured item
+    carrying ``toRecipients``/``ccRecipients`` so the persisted item re-classifies
+    correctly. Since the email reached my inbox I'm a recipient: match my personal
+    email in To (length picks to-only vs shared) or CC; not in either == a
+    distribution list ('dl'); both empty/absent == 'unknown'.
     """
-    to_list = raw.get("toRecipients") or []
-    cc_list = raw.get("ccRecipients") or []
+    to_list = raw.get("to") or raw.get("toRecipients") or []
+    cc_list = raw.get("cc") or raw.get("ccRecipients") or []
 
     # If neither list is populated, we can't determine
     if not to_list and not cc_list:
@@ -1686,6 +1741,86 @@ def _recipient_type(raw: dict) -> str:
         return "cc"
     # I'm not explicitly in To or CC — reached me via a distribution list
     return "dl"
+
+
+_RE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _recipient_email(entry) -> str:
+    """Pull the EMAIL address from a recipient entry ({name,email} dict or string).
+
+    Mirrors _flatten_recipient but yields the ADDRESS, not the display name, since
+    the reply-all default + the email_draft create call key on addresses. Returns
+    "" for anything without a usable address (never a fabricated value).
+    """
+    if isinstance(entry, dict):
+        return str(entry.get("email") or "").strip()
+    return str(entry or "").strip()
+
+
+def _valid_email(addr: str) -> bool:
+    """Basic shape check for a recipient address (user-data; never fabricate)."""
+    return bool(_RE_EMAIL.match(str(addr or "").strip()))
+
+
+def _dedupe_emails_ci(addrs) -> list[str]:
+    """De-dupe a list of email addresses case-insensitively, first-seen wins.
+
+    Drops empties/duplicates (key = lowercased) while preserving order and the
+    first-seen display form. Used by the reply-all resolver and save_draft persist.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for a in addrs or []:
+        s = str(a or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _reply_all_recipients(item: dict) -> tuple[list[str], list[str]]:
+    """Resolve the reply-all To/CC default for an item (PURE, no I/O).
+
+    To  = original sender (senderEmail) + the original ``to`` recipients, with the
+          user's own address (_MY_EMAIL) removed.
+    CC  = the original ``cc`` recipients with _MY_EMAIL removed, then _MY_EMAIL
+          ALWAYS appended (so the user stays on their own thread's CC).
+    Both are de-duped case-insensitively. When the item carries NO captured to/cc
+    (older item / data absent) it degrades to To=[sender], CC=[_MY_EMAIL] — NEVER
+    a fabricated address. This MUST mirror the frontend replyAllRecipients rule so a
+    never-opened editor and the persisted edit resolve identically. Reads
+    ``toRecipients``/``ccRecipients`` (the captured {name,email} lists) via
+    _recipient_email.
+    """
+    me = _MY_EMAIL.lower()
+    sender = str(item.get("senderEmail", "") or "").strip()
+
+    orig_to = item.get("toRecipients") or []
+    orig_cc = item.get("ccRecipients") or []
+
+    # Validate + drop my own address; dedupe CI. Mirrors the frontend
+    # replyAllRecipients (which validates via _dedupeByEmailCI) so a malformed
+    # captured address is dropped identically on both sides.
+    to_addrs = ([sender] if sender else []) + [
+        a for a in (_recipient_email(e) for e in orig_to) if a and a.lower() != me
+    ]
+    to = _dedupe_emails_ci([a for a in to_addrs if _valid_email(a)])
+
+    cc_addrs = [
+        a for a in (_recipient_email(e) for e in orig_cc) if a and a.lower() != me
+    ]
+    cc_addrs.append(_MY_EMAIL)
+    cc = _dedupe_emails_ci([a for a in cc_addrs if _valid_email(a)])
+
+    # Degrade for an item with no captured to/cc: To=[sender], CC=[me].
+    if not to and _valid_email(sender):
+        to = [sender]
+    return to, cc
 
 
 def _flatten_from(raw: dict) -> tuple[str, str]:
@@ -2526,6 +2661,10 @@ async def _scan_once(app) -> None:
                 history = _extract_thread_history(body_payload)
                 if history:
                     raw["threadHistory"] = history
+                # Capture To/CC from the SAME detail payload (the inbox-LIST call
+                # has none) at ZERO extra MCP cost. These drive the reply-all
+                # default + recipientType (D-056 #3); a missing key yields [].
+                _capture_recipients(raw, body_payload)
             except Exception as e:  # noqa: BLE001 -- body fetch is best-effort
                 logger.warning("Email body fetch failed for %s: %s", msg_id, _scrub(str(e)))
 
@@ -2557,6 +2696,10 @@ async def _scan_once(app) -> None:
                 body_payload = await call_read_tool("get_email", {"message_id": msg_id})
                 body_text = _extract_email_body(body_payload)
                 history = _extract_thread_history(body_payload)
+                # Backfill To/CC onto the existing item from the SAME detail payload
+                # (zero extra MCP cost); only writes when the detail actually carries
+                # them so a body-less retry never blanks prior recipients.
+                _capture_recipients(it, body_payload)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Email body backfill failed for %s: %s", msg_id, _scrub(str(e)))
                 if _is_graph_quota_error(e):
@@ -2595,6 +2738,15 @@ async def _scan_once(app) -> None:
         skeleton = _skeleton_for(raw)
         if raw.get("emailBody"):
             skeleton["emailBody"] = raw["emailBody"]
+        # Carry forward the To/CC captured from the get_email detail payload above
+        # (the inbox-list `raw` _skeleton_for sees has none) plus the resolved
+        # recipientType, so the reply-all default has the data on first render.
+        if raw.get("toRecipients"):
+            skeleton["toRecipients"] = raw["toRecipients"]
+        if raw.get("ccRecipients"):
+            skeleton["ccRecipients"] = raw["ccRecipients"]
+        if raw.get("recipientType"):
+            skeleton["recipientType"] = raw["recipientType"]
         history = raw.get("threadHistory")
         if history:
             skeleton["threadHistory"] = history
@@ -3174,8 +3326,29 @@ async def put_config(request: web.Request) -> web.Response:
     return web.json_response({"paused": data["paused"], "etag": new_etag})
 
 
+def _sanitize_recipient_emails(value) -> list[str]:
+    """Validate + de-dupe a user-supplied recipient list into email strings.
+
+    Accepts a list of email strings (the editor's shape) or {name,email} dicts;
+    keeps only basically-valid addresses (_valid_email), de-dupes case-insensitively
+    and NEVER fabricates. A non-list yields []. Recipient emails are user-data, so
+    this is the validation gate before the value is persisted/applied.
+    """
+    if not isinstance(value, list):
+        return []
+    addrs = [_recipient_email(e) for e in value]
+    return _dedupe_emails_ci([a for a in addrs if _valid_email(a)])
+
+
 async def save_draft(request: web.Request) -> web.Response:
-    """PUT /api/email/queue/{item_id} -- save an edited draft."""
+    """PUT /api/email/queue/{item_id} -- save an edited draft (+ optional To/CC).
+
+    ``draft`` is the ONLY required field. Optional ``toRecipients``/``ccRecipients``
+    arrays (email strings) are the user's reply-all edits: validated, de-duped
+    case-insensitively, persisted as plain email-string lists so they survive a
+    refresh and become the values approve applies (recipientsEdited flag flips so
+    approve uses them verbatim instead of recomputing the default, D-056 #3).
+    """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request)
     expected_etag = body.get("etag")
@@ -3191,6 +3364,15 @@ async def save_draft(request: web.Request) -> web.Response:
     item["draft"] = new_draft
     if new_draft.strip() != str(item.get("generatedDraft", "")).strip():
         item["status"] = "edited"
+
+    # Optional reply-all recipient edits. Only touch the item when the key is
+    # present so a draft-only save never wipes captured/edited recipients.
+    if "toRecipients" in body or "ccRecipients" in body:
+        if "toRecipients" in body:
+            item["toRecipients"] = _sanitize_recipient_emails(body.get("toRecipients"))
+        if "ccRecipients" in body:
+            item["ccRecipients"] = _sanitize_recipient_emails(body.get("ccRecipients"))
+        item["recipientsEdited"] = True
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -3616,12 +3798,25 @@ async def approve_item(request: web.Request) -> web.Response:
     draft_saved = False
     draft_id = None
     if final_draft:
-        recipient = str(item.get("senderEmail", "") or "").strip()
-        if recipient:
+        # Resolve the reply-all To/CC. Prefer the user's persisted edit (the
+        # editor flips recipientsEdited and stores final email-string lists),
+        # else compute the reply-all default from the captured recipients. NEVER
+        # sends: these only pre-fill the saved Outlook draft (D-056 #3).
+        if item.get("recipientsEdited"):
+            to_addrs = _sanitize_recipient_emails(item.get("toRecipients"))
+            cc_addrs = _sanitize_recipient_emails(item.get("ccRecipients"))
+            if not to_addrs:
+                # An edit that cleared To still needs a recipient: fall back to
+                # the sender (never an empty/fabricated draft recipient).
+                to_addrs, _ = _reply_all_recipients(item)
+        else:
+            to_addrs, cc_addrs = _reply_all_recipients(item)
+        if to_addrs:
             try:
                 result = await _call_owa_write_tool("email_draft", {
                     "operation": "create",
-                    "to": [recipient],
+                    "to": to_addrs,
+                    "cc": cc_addrs,
                     "subject": f"Re: {item.get('subject', '')}",
                     "body": final_draft.replace("\n", "<br>"),
                 })
@@ -3637,7 +3832,7 @@ async def approve_item(request: web.Request) -> web.Response:
             except Exception as e:  # noqa: BLE001
                 logger.warning("Email approve: draft save failed: %s", _scrub(str(e)))
         else:
-            logger.warning("Email approve: no senderEmail — cannot save draft")
+            logger.warning("Email approve: no recipient resolved — cannot save draft")
 
     # Topic memory (best-effort, logged)
     try:
