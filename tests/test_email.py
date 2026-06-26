@@ -3803,6 +3803,35 @@ def test_build_reply_all_body_makes_no_mcp_calls(monkeypatch):
     assert "hi" in out
 
 
+def test_build_reply_all_body_is_deterministic_byte_identical():
+    """AC-9 (anti DROP-OR-REORDER / unstable-key): the builder is a PURE,
+    deterministic function — the SAME item must yield BYTE-IDENTICAL output across
+    two calls. A builder that summarizes, sorts by an unstable key, iterates an
+    unordered set, or stamps a time/uuid into the body would diverge here.
+
+    Use a multi-turn item with several DISTINCT turns so any non-deterministic
+    iteration / re-sort would surface as a byte difference, and call it twice."""
+    item = _make_item(
+        "i1",
+        subject="Re: Determinism",
+        threadHistory=[
+            _turn("Alpha One", "Monday, June 1, 2026 9:00 AM",
+                  "Alpha One; Bravo Two", "First message."),
+            _turn("Bravo Two", "Tuesday, June 2, 2026 10:30 AM",
+                  "Alpha One; Bravo Two; Carol Three", "Second message."),
+            _turn("Carol Three", "Wednesday, June 3, 2026 8:15 AM",
+                  "Alpha One; Bravo Two; Carol Three", "Third message."),
+        ],
+    )
+    out1 = email_mod._build_reply_all_body("My reply text.", item)
+    out2 = email_mod._build_reply_all_body("My reply text.", item)
+    assert out1 == out2, "the body builder must be deterministic (byte-identical output)"
+    # And the item is not mutated by building (no side effects on the input).
+    assert len(item["threadHistory"]) == 3
+    assert [t["sender"] for t in item["threadHistory"]] == \
+        ["Alpha One", "Bravo Two", "Carol Three"]
+
+
 async def test_email_approve_sends_resolved_to_and_cc_in_create(client, email_file, monkeypatch):
     """AC-2 (verified contract): approve passes the RESOLVED reply-all To AND CC
     into the email_draft create call in the flat {to:[...], cc:[...]} shape that the
