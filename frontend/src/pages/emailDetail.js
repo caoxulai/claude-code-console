@@ -24,6 +24,19 @@ export function threadTurns(item) {
 export function latestThreadView(item) {
   const turns = threadTurns(item);
   if (turns.length > 0) {
+    // FEATURE #1: for a SINGLE-turn item the turn card IS the whole email, so
+    // the card's body source is the FULL item.emailBody (32k cap) — NOT the
+    // 4096-capped threadHistory[0].body that cut the CRIS Flash mid-sentence
+    // (the SINGLE-MESSAGE-STILL-CAPPED trap). Fall back to the turn body then
+    // the snippet so an item lacking emailBody still renders. Multi-turn
+    // threads keep each per-turn body verbatim (who-said-what preserved) — we
+    // do NOT swap in the full concatenation there.
+    if (turns.length === 1) {
+      const only = turns[0];
+      const fullBody = (item && item.emailBody) || only.body || (item && item.snippet) || '';
+      const latest = { ...only, body: fullBody };
+      return { latest, count: 1, turns: [latest], fallbackBody: '' };
+    }
     return { latest: turns[turns.length - 1], count: turns.length, turns, fallbackBody: '' };
   }
   return {
@@ -32,6 +45,189 @@ export function latestThreadView(item) {
     turns: [],
     fallbackBody: (item && (item.emailBody || item.snippet)) || '',
   };
+}
+
+// The user's own address. SINGLE named const, cross-referenced with the backend
+// server/routes/email.py `_MY_EMAIL = "user@example.com"` (the minus-me /
+// always-CC-me default). If one side changes, change the other.
+export const MY_EMAIL = 'user@example.com';
+
+// --- autoFormatBody: conservative, idempotent, content-preserving formatter --
+// FEATURE #1 (light auto-formatting, NO LLM). Make flat newsletter prose
+// scannable with cheap, deterministic heuristics applied BEFORE the markdown
+// render, while PRESERVING paragraph breaks, real markdown lists, GFM tables and
+// clickable links. The heuristics are intentionally conservative — they must
+// never mangle a normal paragraph, never drop or reorder content, and be
+// idempotent: f(f(x)) === f(x), and every word of the original survives one pass
+// in the same order.
+//
+// Two heuristics, both line-based on a blank-line-delimited block model:
+//   (1) HEADING: promote a bare line to a markdown subheading ("### ") ONLY when
+//       it is SHORT (<= HEADING_MAX_LEN chars, single line) AND it is FOLLOWED
+//       BY A BLANK LINE AND it is either (a) a question (ends in '?') or (b) a
+//       Title-Case header-like line (every significant word capitalized, no
+//       terminal sentence punctuation). The followed-by-blank-line + short bars
+//       are load-bearing: they keep a normal sentence that happens to end in '?'
+//       or start a paragraph from being mangled (the OVER-EAGER-HEADINGS trap).
+//   (2) LIST: leave existing markdown list lines ('- ', '* ', '1. ') intact.
+// Both are idempotent — an already-heading line ('### …') is skipped, an
+// already-markdown list line is left as-is.
+const HEADING_MAX_LEN = 60;
+
+function _isAlreadyMarkdownHeading(line) {
+  return /^#{1,6}\s+/.test(line);
+}
+
+function _isTableLine(line) {
+  // A GFM table row / divider — never reinterpret these as prose/heading.
+  return /^\s*\|/.test(line) || /^\s*\|?\s*:?-{3,}/.test(line);
+}
+
+function _isListLine(line) {
+  // Existing markdown list markers (unordered or ordered) — leave intact.
+  return /^\s*([-*+]\s+|\d+[.)]\s+)/.test(line);
+}
+
+function _isTitleCaseHeaderLine(line) {
+  // Header-like: a short line of mostly Title-Case words with NO terminal
+  // sentence punctuation. Conservative: requires >= 2 significant words all
+  // starting uppercase (ignoring short connectors like "the"/"of"/"and") and no
+  // trailing . , ; : so a normal capitalized sentence is never promoted.
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (/[.,;:]$/.test(trimmed)) return false;
+  if (trimmed.endsWith('?')) return false; // questions take the dedicated branch
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length < 2 || tokens.length > 8) return false;
+  const minor = new Set(['the', 'of', 'and', 'or', 'a', 'an', 'to', 'for', 'in', 'on', 'with', 'at', 'by']);
+  let significant = 0;
+  for (const tok of tokens) {
+    const word = tok.replace(/[^A-Za-z0-9]/g, '');
+    if (!word) return false; // punctuation-only token -> not a clean header
+    if (minor.has(word.toLowerCase())) continue;
+    significant += 1;
+    if (!/^[A-Z0-9]/.test(word)) return false; // a significant word not capitalized -> prose
+  }
+  return significant >= 2;
+}
+
+function _isShortQuestionLine(line) {
+  const trimmed = line.trim();
+  return trimmed.endsWith('?') && trimmed.length <= HEADING_MAX_LEN && !trimmed.includes('\n');
+}
+
+export function autoFormatBody(text) {
+  if (typeof text !== 'string' || text === '') return '';
+  // Split into blank-line-delimited blocks WITHOUT collapsing the blank lines —
+  // we rebuild with the exact original separators so paragraph breaks survive.
+  const lines = text.split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    // The next non-removed line tells us whether this line is "followed by a
+    // blank line" (the required heading guard). A line is followed-by-blank when
+    // the immediately next line is blank OR it is the last line.
+    const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
+    const followedByBlank = i + 1 >= lines.length || nextLine.trim() === '';
+
+    const isHeadingCandidate =
+      trimmed.length > 0 &&
+      trimmed.length <= HEADING_MAX_LEN &&
+      followedByBlank &&
+      !_isAlreadyMarkdownHeading(trimmed) &&
+      !_isListLine(line) &&
+      !_isTableLine(line) &&
+      (_isShortQuestionLine(line) || _isTitleCaseHeaderLine(line));
+
+    if (isHeadingCandidate) {
+      // Only the leading whitespace of the line is dropped (insignificant); the
+      // text content is preserved verbatim after the "### " marker.
+      out.push(`### ${trimmed}`);
+    } else {
+      out.push(line);
+    }
+  }
+  return out.join('\n');
+}
+
+// --- replyAllRecipients: reply-all default To/CC resolution -----------------
+// FEATURE #3 (UI default). When the draft editor opens, compute the reply-all
+// recipients from the item the backend captured:
+//   To = original sender (item.senderEmail) + the original `to` recipients,
+//        with the user's own address (MY_EMAIL) removed (never reply to self).
+//   CC = the original `cc` recipients with MY_EMAIL removed, then ALWAYS add
+//        MY_EMAIL (always-CC-me, even when the original CC was empty).
+// Both lists are de-duped case-insensitively by email. If the item carries no
+// captured to/cc (an older item, or the data was absent) it degrades to
+// To=[sender], CC=[me] — NEVER fabricating another address. Recipient entries
+// may be {name,email} dicts OR bare email strings; blank or shape-invalid
+// entries are skipped (no fabrication). Pure — no DOM, no fetch.
+function _emailOf(entry) {
+  if (entry && typeof entry === 'object') return String(entry.email || '').trim();
+  if (typeof entry === 'string') return entry.trim();
+  return '';
+}
+
+function _looksLikeEmail(addr) {
+  // Basic shape check only — local@domain.tld-ish. Conservative: drops obvious
+  // non-addresses ("not-an-email") without trying to validate exhaustively.
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr);
+}
+
+function _dedupeByEmailCI(emails) {
+  const seen = new Set();
+  const out = [];
+  for (const e of emails) {
+    const addr = (e || '').trim();
+    if (!addr || !_looksLikeEmail(addr)) continue;
+    const key = addr.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(addr);
+  }
+  return out;
+}
+
+export function replyAllRecipients(item) {
+  const it = item || {};
+  const myKey = MY_EMAIL.toLowerCase();
+  const sender = String(it.senderEmail || '').trim();
+  const origTo = Array.isArray(it.toRecipients) ? it.toRecipients : [];
+  const origCc = Array.isArray(it.ccRecipients) ? it.ccRecipients : [];
+
+  // To = sender + original To, minus me. De-dupe CI so a sender who is also in
+  // the original To list isn't doubled.
+  const toRaw = [sender, ...origTo.map(_emailOf)].filter(
+    addr => addr && addr.toLowerCase() !== myKey,
+  );
+  const to = _dedupeByEmailCI(toRaw);
+
+  // CC = original CC minus me, then always add me last.
+  const ccRaw = origCc.map(_emailOf).filter(addr => addr && addr.toLowerCase() !== myKey);
+  const cc = _dedupeByEmailCI([...ccRaw, MY_EMAIL]);
+
+  return { to, cc };
+}
+
+// Decide which recipients the reply-all editor opens with (FEATURE #3, AC-12).
+// When the backend flipped item.recipientsEdited (save_draft persisted the user's
+// edited To/CC as plain email-string lists — see email.py save_draft), seed
+// DIRECTLY from those persisted lists so a page refresh keeps the user's exact
+// edit verbatim (we must NOT re-run replyAllRecipients, which would re-add the
+// sender / re-add me and clobber an intentional removal — the RECIPIENTS-NOT-
+// PERSISTED trap). Otherwise (a fresh item, only the captured {name,email}
+// lists) compute the reply-all default. Either way the result is validated +
+// de-duped case-insensitively so a persisted list is never trusted blindly.
+// Pure — no DOM, no fetch.
+export function seedRecipients(item) {
+  const it = item || {};
+  if (it.recipientsEdited === true) {
+    const to = _dedupeByEmailCI((Array.isArray(it.toRecipients) ? it.toRecipients : []).map(_emailOf));
+    const cc = _dedupeByEmailCI((Array.isArray(it.ccRecipients) ? it.ccRecipients : []).map(_emailOf));
+    return { to, cc };
+  }
+  return replyAllRecipients(it);
 }
 
 // Decide what the Thread Summary section's two AI-derived sub-parts show. The

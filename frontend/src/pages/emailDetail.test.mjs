@@ -19,6 +19,10 @@ import {
   autoSizeHeight,
   displayTimestamp,
   deleteOutcome,
+  autoFormatBody,
+  replyAllRecipients,
+  seedRecipients,
+  MY_EMAIL,
 } from './emailDetail.js';
 
 let passed = 0;
@@ -464,6 +468,302 @@ test('deleteOutcome: failure reason prefers the body error, falls back to a defa
 test('deleteOutcome: a null/garbage body never crashes and is treated as failure', () => {
   assert.equal(deleteOutcome(200, null).outcome, 'failed');
   assert.equal(deleteOutcome(502, undefined).outcome, 'failed');
+});
+
+// --- latestThreadView: a SINGLE-turn item exposes the FULL emailBody --------
+// FEATURE #1: for a single-turn item the turn card IS the whole email, so the
+// card body source must be the FULL item.emailBody (32k cap), NOT the
+// 4096-capped threadHistory[0].body that cut the CRIS Flash mid-sentence (the
+// SINGLE-MESSAGE-STILL-CAPPED trap). latestThreadView returns the full body on
+// the single card's `body`, falling back to the turn body then snippet, while
+// multi-turn threads keep one card per real turn (who-said-what preserved).
+
+test('latestThreadView: single turn -> latest.body is the FULL item.emailBody, not the capped turn body', () => {
+  const cappedTurnBody = 'A'.repeat(4096); // the silently-truncated threadHistory[0].body
+  const fullBody = 'A'.repeat(4096) + ' ...and the rest down to the Weblab Exakt wiki line.';
+  const v = latestThreadView({
+    threadHistory: [{ sender: 'CRIS', timestamp: 't', body: cappedTurnBody }],
+    emailBody: fullBody,
+  });
+  assert.equal(v.count, 1);
+  assert.equal(v.latest.body, fullBody);
+  assert.equal(v.latest.sender, 'CRIS'); // who-said-what preserved on the card
+  assert.ok(v.latest.body.length > 4096, 'the single card must serve the FULL body, never the 4096 cut');
+});
+
+test('latestThreadView: single turn with no emailBody falls back to the turn body then snippet', () => {
+  const a = latestThreadView({ threadHistory: [{ sender: 'X', timestamp: 1, body: 'turn body only' }] });
+  assert.equal(a.latest.body, 'turn body only');
+  const b = latestThreadView({ threadHistory: [{ sender: 'X', timestamp: 1, body: '' }], snippet: 'just a snip' });
+  assert.equal(b.latest.body, 'just a snip');
+});
+
+test('latestThreadView: MULTI-turn item keeps each per-turn body (does NOT swap in the full body)', () => {
+  const hist = [
+    { sender: 'Alice', timestamp: 1, body: 'first turn' },
+    { sender: 'Bob', timestamp: 2, body: 'second turn (newest)' },
+  ];
+  const v = latestThreadView({ threadHistory: hist, emailBody: 'WHOLE concatenated thread' });
+  assert.equal(v.count, 2);
+  // The newest card shows the real per-turn body, NOT the full concatenation.
+  assert.equal(v.latest.body, 'second turn (newest)');
+  assert.deepEqual(v.turns.map(t => t.body), ['first turn', 'second turn (newest)']);
+});
+
+// --- autoFormatBody: conservative, idempotent, content-preserving formatter --
+// FEATURE #1: flat newsletter prose becomes scannable WITHOUT an LLM. Promote a
+// bare line to a markdown subheading ONLY when it is SHORT and (ends in '?' OR
+// is a Title-Case header-like line) AND is FOLLOWED BY A BLANK LINE. Convert a
+// contiguous run of dash/number/bullet-like lines into a real markdown list.
+// PRESERVE paragraph breaks, real lists, GFM tables, links. Guarantees: every
+// word of the original present in the same order after one pass; a normal
+// paragraph untouched; f(f(x)) === f(x).
+
+const words = (s) => s.split(/\s+/).filter(Boolean);
+
+test('autoFormatBody: a normal paragraph is left untouched (no over-eager headings)', () => {
+  const para = 'We met yesterday to discuss the roadmap and agreed to ship in Q3. '
+    + 'The team will follow up with the detailed plan next week.';
+  assert.equal(autoFormatBody(para), para);
+});
+
+test('autoFormatBody: a normal multi-paragraph body keeps its blank-line breaks (no reflow/collapse)', () => {
+  const body = 'First paragraph of normal prose that is fairly long and just keeps going.\n\n'
+    + 'Second paragraph, also normal prose, nothing to promote here at all.';
+  const out = autoFormatBody(body);
+  assert.ok(out.includes('\n\n'), 'paragraph break must be preserved');
+  assert.deepEqual(words(out), words(body), 'no words added/dropped/reordered');
+});
+
+test('autoFormatBody: a long line ending in "?" is NOT promoted (heading bar is SHORT + blank-after)', () => {
+  const body = 'This is a genuinely long sentence that happens to end with a question mark '
+    + 'because the author was being rhetorical about the whole situation here?\n\nSome follow-up text.';
+  const out = autoFormatBody(body);
+  assert.ok(!out.includes('### This is a genuinely long sentence'), 'a long question line is prose, not a heading');
+});
+
+test('autoFormatBody: a SHORT question line followed by a blank line becomes a subheading', () => {
+  const body = 'How do I request access?\n\nFile a ticket with the team and they will grant it within a day.';
+  const out = autoFormatBody(body);
+  assert.ok(/^###?\s+How do I request access\?/m.test(out), 'short question + blank-after -> heading');
+  // content preserved (heading markers are non-word, words intact)
+  assert.deepEqual(words(out.replace(/#/g, '')), words(body));
+});
+
+test('autoFormatBody: a question line NOT followed by a blank line stays prose', () => {
+  const body = 'How do I request access?\nFile a ticket and they will grant it.';
+  const out = autoFormatBody(body);
+  assert.ok(!/^#+\s+How do I request access\?/m.test(out), 'no blank-after -> not a heading');
+});
+
+test('autoFormatBody: a short Title-Case header-like line followed by a blank line becomes a subheading', () => {
+  const body = 'Weekly Highlights\n\nWe shipped three features and fixed a dozen bugs this sprint.';
+  const out = autoFormatBody(body);
+  assert.ok(/^###?\s+Weekly Highlights$/m.test(out), 'short Title-Case + blank-after -> heading');
+});
+
+test('autoFormatBody: a contiguous run of dash lines becomes a real markdown list', () => {
+  const body = 'Action items:\n\n- buy milk\n- walk the dog\n- file the report\n\nThanks!';
+  const out = autoFormatBody(body);
+  // already markdown-dash lines stay dash lines (idempotent, real list preserved)
+  assert.ok(out.includes('- buy milk'));
+  assert.deepEqual(words(out), words(body));
+});
+
+test('autoFormatBody: bullet-glyph / numbered lines normalize to markdown list markers, content preserved', () => {
+  const body = 'Steps:\n\n1. open the door\n2. walk inside\n3. close the door\n\nDone.';
+  const out = autoFormatBody(body);
+  assert.deepEqual(words(out), words(body), 'numbered list content preserved');
+});
+
+test('autoFormatBody: a GFM table is left intact', () => {
+  const table = '| Name | Role |\n| --- | --- |\n| Alice | SDE |\n| Bob | PM |';
+  const body = 'Roster:\n\n' + table;
+  const out = autoFormatBody(body);
+  assert.ok(out.includes('| Name | Role |'));
+  assert.ok(out.includes('| --- | --- |'));
+  assert.ok(out.includes('| Alice | SDE |'));
+});
+
+test('autoFormatBody: a markdown link is left clickable (not mangled)', () => {
+  const body = 'See [the wiki](https://wiki.example.com/page) for details.';
+  assert.equal(autoFormatBody(body), body);
+});
+
+test('autoFormatBody: IDEMPOTENT — f(f(x)) === f(x) on a mixed body', () => {
+  const body = 'Weekly Update\n\n'
+    + 'We made good progress this week on the migration.\n\n'
+    + 'How do I get involved?\n\n'
+    + 'Ping the team channel and pick up a task.\n\n'
+    + '- review the doc\n- run the tests\n- ship it\n\n'
+    + 'Thanks everyone.';
+  const once = autoFormatBody(body);
+  const twice = autoFormatBody(once);
+  assert.equal(twice, once, 'second pass must be a no-op');
+});
+
+test('autoFormatBody: NEVER drops content — every original word survives one pass (in order)', () => {
+  const body = 'CRIS Weekly Flash\n\n'
+    + 'This week the team launched the new pipeline.\n\n'
+    + 'What changed?\n\n'
+    + 'The build is now 30% faster and uses less memory.\n\n'
+    + '- faster builds\n- less memory\n- happier engineers\n\n'
+    + 'Weblab Exakt wiki';
+  const out = autoFormatBody(body);
+  assert.deepEqual(words(out.replace(/[#]/g, '')).filter(Boolean), words(body));
+  assert.ok(out.includes('Weblab Exakt wiki'), 'the final line is never cut');
+});
+
+test('autoFormatBody: empty / non-string input -> "" (never crashes, never "undefined")', () => {
+  assert.equal(autoFormatBody(''), '');
+  assert.equal(autoFormatBody(null), '');
+  assert.equal(autoFormatBody(undefined), '');
+  assert.equal(autoFormatBody(42), '');
+});
+
+// --- replyAllRecipients: reply-all default To/CC resolution -----------------
+// FEATURE #3: when the draft editor opens, default To = sender + original To
+// MINUS me; CC = original CC MINUS me, then ALWAYS add me; de-dupe BOTH
+// case-insensitively by email. No captured to/cc => To=[sender], CC=[me] only
+// (never fabricate). MY_EMAIL is the single named const (cross-ref backend
+// email.py _MY_EMAIL = "user@example.com").
+
+test('MY_EMAIL matches the backend _MY_EMAIL constant', () => {
+  assert.equal(MY_EMAIL, 'user@example.com');
+});
+
+test('replyAllRecipients: full reply-all — To=sender+origTo-me, CC=origCc-me+me, de-duped (all four clauses)', () => {
+  const item = {
+    senderEmail: 'alice@amazon.com',
+    toRecipients: [
+      { name: 'Me', email: 'user@example.com' }, // me must be stripped from To
+      { name: 'Bob', email: 'bob@amazon.com' },
+    ],
+    ccRecipients: [
+      { name: 'Carol', email: 'carol@amazon.com' },
+      { name: 'Me', email: 'XULAICAO@amazon.com' }, // me (different case) stripped from CC
+    ],
+  };
+  const r = replyAllRecipients(item);
+  // To = sender + (original To minus me)
+  assert.deepEqual(r.to, ['alice@amazon.com', 'bob@amazon.com']);
+  // CC = (original CC minus me) + me (always)
+  assert.deepEqual(r.cc, ['carol@amazon.com', 'user@example.com']);
+});
+
+test('replyAllRecipients: de-dupes case-insensitively (sender also appearing in To is not doubled)', () => {
+  const item = {
+    senderEmail: 'Alice@Amazon.com',
+    toRecipients: [
+      { name: 'Alice', email: 'alice@amazon.com' }, // dup of sender (different case)
+      { name: 'Bob', email: 'bob@amazon.com' },
+    ],
+    ccRecipients: [],
+  };
+  const r = replyAllRecipients(item);
+  // sender kept once, no case-variant duplicate
+  assert.equal(r.to.filter(e => e.toLowerCase() === 'alice@amazon.com').length, 1);
+  assert.ok(r.to.includes('bob@amazon.com'));
+  // CC degrades to just me
+  assert.deepEqual(r.cc, ['user@example.com']);
+});
+
+test('replyAllRecipients: always adds me to CC even when original CC is empty', () => {
+  const item = { senderEmail: 'alice@amazon.com', toRecipients: [], ccRecipients: [] };
+  const r = replyAllRecipients(item);
+  assert.deepEqual(r.cc, ['user@example.com']);
+});
+
+test('replyAllRecipients: DEGRADE — no captured to/cc => To=[sender], CC=[me] (never fabricated)', () => {
+  const item = { senderEmail: 'dana@amazon.com' }; // older item, no toRecipients/ccRecipients
+  const r = replyAllRecipients(item);
+  assert.deepEqual(r.to, ['dana@amazon.com']);
+  assert.deepEqual(r.cc, ['user@example.com']);
+});
+
+test('replyAllRecipients: only me in original To/CC => To=[sender], CC=[me] (no self-reply)', () => {
+  const item = {
+    senderEmail: 'eve@amazon.com',
+    toRecipients: [{ name: 'Me', email: 'user@example.com' }],
+    ccRecipients: [{ name: 'Me', email: 'user@example.com' }],
+  };
+  const r = replyAllRecipients(item);
+  assert.deepEqual(r.to, ['eve@amazon.com']); // me stripped from To, never reply to self
+  assert.deepEqual(r.cc, ['user@example.com']); // me re-added (always-CC-me)
+});
+
+test('replyAllRecipients: tolerates string-email entries and skips blank/invalid ones (no fabrication)', () => {
+  const item = {
+    senderEmail: 'frank@amazon.com',
+    toRecipients: ['grace@amazon.com', { email: '' }, { email: 'not-an-email' }, { name: 'no email' }],
+    ccRecipients: ['heidi@amazon.com'],
+  };
+  const r = replyAllRecipients(item);
+  assert.ok(r.to.includes('frank@amazon.com'));
+  assert.ok(r.to.includes('grace@amazon.com'));
+  assert.ok(!r.to.includes('')); // blank dropped
+  assert.ok(!r.to.includes('not-an-email')); // invalid shape dropped, never fabricated
+  assert.ok(r.cc.includes('heidi@amazon.com'));
+  assert.ok(r.cc.includes('user@example.com'));
+});
+
+test('replyAllRecipients: empty/missing sender still degrades safely (To may be empty, CC=[me])', () => {
+  const r = replyAllRecipients({});
+  assert.deepEqual(r.cc, ['user@example.com']);
+  assert.ok(Array.isArray(r.to));
+});
+
+// --- seedRecipients: which recipients the editor opens with (persist vs default)
+// FEATURE #3 (AC-12). The editor seeds from the item's PERSISTED edit when the
+// backend flipped recipientsEdited (save_draft stored plain email-string lists),
+// so a page refresh keeps the user's exact To/CC. Otherwise it computes the
+// reply-all default via replyAllRecipients (reading the captured {name,email}
+// lists). This is the load-bearing decision that makes a refresh NOT reset the
+// edit (the RECIPIENTS-NOT-PERSISTED trap).
+
+test('seedRecipients: recipientsEdited -> uses the PERSISTED email lists verbatim (refresh keeps the edit)', () => {
+  const item = {
+    senderEmail: 'alice@amazon.com',
+    recipientsEdited: true,
+    toRecipients: ['bob@amazon.com'], // user removed the sender; must NOT be re-added
+    ccRecipients: ['carol@amazon.com'], // user removed me; must NOT be re-added
+  };
+  const r = seedRecipients(item);
+  assert.deepEqual(r.to, ['bob@amazon.com']);
+  assert.deepEqual(r.cc, ['carol@amazon.com']);
+});
+
+test('seedRecipients: NOT edited -> computes the reply-all default from captured {name,email} lists', () => {
+  const item = {
+    senderEmail: 'alice@amazon.com',
+    toRecipients: [
+      { name: 'Me', email: 'user@example.com' },
+      { name: 'Bob', email: 'bob@amazon.com' },
+    ],
+    ccRecipients: [{ name: 'Carol', email: 'carol@amazon.com' }],
+  };
+  const r = seedRecipients(item);
+  assert.deepEqual(r.to, ['alice@amazon.com', 'bob@amazon.com']); // sender added, me stripped
+  assert.deepEqual(r.cc, ['carol@amazon.com', 'user@example.com']); // me always added
+});
+
+test('seedRecipients: edited but To cleared -> To stays empty (the persisted edit is authoritative)', () => {
+  const item = { senderEmail: 'alice@amazon.com', recipientsEdited: true, toRecipients: [], ccRecipients: [] };
+  const r = seedRecipients(item);
+  assert.deepEqual(r.to, []);
+  assert.deepEqual(r.cc, []);
+});
+
+test('seedRecipients: edited persisted lists are still de-duped/validated (no fabrication)', () => {
+  const item = {
+    senderEmail: 'alice@amazon.com',
+    recipientsEdited: true,
+    toRecipients: ['bob@amazon.com', 'BOB@amazon.com', 'garbage'],
+    ccRecipients: ['carol@amazon.com'],
+  };
+  const r = seedRecipients(item);
+  assert.deepEqual(r.to, ['bob@amazon.com']); // de-duped CI, invalid dropped
+  assert.deepEqual(r.cc, ['carol@amazon.com']);
 });
 
 console.log(`\nall green: ${passed} tests passed`);

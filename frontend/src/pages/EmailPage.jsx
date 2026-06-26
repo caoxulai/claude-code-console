@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import {
   FiRefreshCw, FiRotateCw, FiTrash2, FiTrash, FiSave, FiChevronDown, FiChevronRight,
   FiCheckCircle, FiAlertCircle, FiClock, FiBellOff, FiPause, FiPlay,
-  FiClipboard, FiFeather,
+  FiClipboard, FiFeather, FiPlus, FiX,
 } from 'react-icons/fi';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients } from './emailDetail';
 
 // --- Constants ---
 
@@ -138,6 +138,20 @@ export default function EmailPage() {
   const [draftText, setDraftText] = useState('');
   const [busyId, setBusyId] = useState(null);
   const [polishingId, setPolishingId] = useState(null); // item mid fluency-polish
+
+  // Editable reply-all recipients for the currently-expanded row (Feature #3).
+  // Seeded when a row expands: from the item's PERSISTED toRecipients/ccRecipients
+  // (if a prior save recorded them as a plain email list) else from the
+  // replyAllRecipients(item) default (sender + original To minus me; original CC
+  // minus me plus me; de-duped). Held as plain email-string arrays so the chips,
+  // the save-draft PUT, and Approve all share one shape. recipientsDirty tracks an
+  // unsaved recipient edit so the Save/Approve flow persists it. recipientInput is
+  // the per-field "add" text box value.
+  const [recipientsTo, setRecipientsTo] = useState([]);
+  const [recipientsCc, setRecipientsCc] = useState([]);
+  const [recipientsDirty, setRecipientsDirty] = useState(false);
+  const [toInput, setToInput] = useState('');
+  const [ccInput, setCcInput] = useState('');
 
   // The draft <textarea>, auto-sized to its content so a short reply isn't framed
   // by a tall empty box. autoSizeDraft() shrinks-then-grows to scrollHeight
@@ -424,6 +438,18 @@ export default function EmailPage() {
     }
   };
 
+  // Seed the reply-all editor from an item: the user's persisted edit if the
+  // backend flipped recipientsEdited, else the computed reply-all default. Shared
+  // by toggleExpand and the on-demand FYI generate path so they stay in sync.
+  const seedRecipientEditor = (item) => {
+    const seeded = seedRecipients(item);
+    setRecipientsTo(seeded.to);
+    setRecipientsCc(seeded.cc);
+    setRecipientsDirty(false);
+    setToInput('');
+    setCcInput('');
+  };
+
   // Expand/collapse a row
   const toggleExpand = (item) => {
     if (expandedId === item.id) {
@@ -431,22 +457,66 @@ export default function EmailPage() {
       setEditingId(null);
       setDraftText('');
       setEmailBodyOpen(false);
+      setRecipientsTo([]);
+      setRecipientsCc([]);
+      setRecipientsDirty(false);
+      setToInput('');
+      setCcInput('');
     } else {
       setExpandedId(item.id);
       setEditingId(null);
       setDraftText(item.draft || '');
       setEmailBodyOpen(false);
       setError(null);
+      seedRecipientEditor(item);
     }
   };
 
-  // Save edited draft
+  // Add a recipient to a reply-all list (To or CC). Basic shape validation +
+  // case-insensitive de-dupe — never fabricate, never double an existing address.
+  const RECIPIENT_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const addRecipient = (field) => {
+    const setter = field === 'cc' ? setRecipientsCc : setRecipientsTo;
+    const list = field === 'cc' ? recipientsCc : recipientsTo;
+    const raw = (field === 'cc' ? ccInput : toInput).trim();
+    if (!raw) return;
+    if (!RECIPIENT_RE.test(raw)) {
+      setError(`"${raw}" doesn't look like an email address.`);
+      return;
+    }
+    if (list.some(e => e.toLowerCase() === raw.toLowerCase())) {
+      // Already present (case-insensitive) — just clear the box.
+      (field === 'cc' ? setCcInput : setToInput)('');
+      return;
+    }
+    setter([...list, raw]);
+    setRecipientsDirty(true);
+    (field === 'cc' ? setCcInput : setToInput)('');
+    setError(null);
+  };
+
+  const removeRecipient = (field, email) => {
+    const setter = field === 'cc' ? setRecipientsCc : setRecipientsTo;
+    const list = field === 'cc' ? recipientsCc : recipientsTo;
+    setter(list.filter(e => e.toLowerCase() !== email.toLowerCase()));
+    setRecipientsDirty(true);
+  };
+
+  // Save edited draft. When the user changed the reply-all recipients we send the
+  // resolved To/CC email arrays alongside the draft so they persist (the backend
+  // flips recipientsEdited and uses them on approve — D-056 #3). A draft-only save
+  // omits the recipient keys so it never wipes captured/edited recipients.
   const saveDraft = async (id) => {
     try {
+      const payload = { draft: draftText, etag };
+      if (recipientsDirty) {
+        payload.toRecipients = recipientsTo;
+        payload.ccRecipients = recipientsCc;
+      }
       const res = await fetch(`/api/email/queue/${encodeURIComponent(id)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft: draftText, etag }),
+        body: JSON.stringify(payload),
       });
       if (res.status === 409) {
         setError('Conflict: the queue was modified elsewhere. Refreshing...');
@@ -461,6 +531,7 @@ export default function EmailPage() {
       const json = await res.json();
       setEtag(json.etag ?? null);
       setEditingId(null);
+      setRecipientsDirty(false);
       setError(null);
       refresh();
     } catch {
@@ -476,12 +547,21 @@ export default function EmailPage() {
       const item = items.find(it => it.id === id);
       const text = (editingId === id) ? draftText : (item ? (item.draft || '') : '');
 
-      // If the draft was edited, save it first
-      if (editingId === id && draftText !== (item ? (item.draft || '') : '')) {
+      // If the draft OR the reply-all recipients were edited, persist first so
+      // approve reads the latest values (the backend resolves To/CC from the
+      // persisted item — D-056 #3). We send the recipient arrays only when the
+      // user actually changed them, so a draft-only approve never rewrites them.
+      const draftDirty = editingId === id && draftText !== (item ? (item.draft || '') : '');
+      if (draftDirty || recipientsDirty) {
+        const savePayload = { draft: text, etag };
+        if (recipientsDirty) {
+          savePayload.toRecipients = recipientsTo;
+          savePayload.ccRecipients = recipientsCc;
+        }
         const saveRes = await fetch(`/api/email/queue/${encodeURIComponent(id)}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ draft: draftText, etag }),
+          body: JSON.stringify(savePayload),
         });
         if (saveRes.status === 409) {
           setError('Conflict: the queue was modified elsewhere. Refreshing...');
@@ -495,6 +575,7 @@ export default function EmailPage() {
         }
         const saveJson = await saveRes.json();
         setEtag(saveJson.etag ?? null);
+        setRecipientsDirty(false);
       }
 
       // POST approve
@@ -956,8 +1037,16 @@ export default function EmailPage() {
             To: {turn.recipients}
           </div>
         )}
+        {/* The body is run through autoFormatBody first (FEATURE #1): a pure,
+            conservative, idempotent, content-preserving transform that promotes
+            short question/Title-Case header lines (followed by a blank line) into
+            markdown subheadings and leaves real lists/tables/links/paragraphs
+            intact — making flat newsletter prose scannable WITHOUT an LLM. The
+            single-turn card's body is the FULL item.emailBody (latestThreadView),
+            so the CRIS Flash renders end-to-end, never the 4096 mid-sentence cut.
+            Still rendered via ReactMarkdown ({…} escaped), never dangerouslySetInnerHTML. */}
         <div style={{ marginTop: '0.3em' }}>
-          {renderBody(turn.body)}
+          {renderBody(autoFormatBody(turn.body))}
         </div>
       </div>
       );
@@ -1046,7 +1135,7 @@ export default function EmailPage() {
               }}
             >
               {view.fallbackBody
-                ? renderBody(view.fallbackBody)
+                ? renderBody(autoFormatBody(view.fallbackBody))
                 : <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>(no email body available)</span>}
             </div>
           )}
@@ -1079,7 +1168,7 @@ export default function EmailPage() {
           </div>
           {isFyiClassified && !isReadOnly && (
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35em', color: 'var(--muted)', fontSize: '0.8em', marginBottom: '0.4em' }}>
-              <FiCheckCircle size={12} /> Classified FYI — no reply likely needed, but a draft is ready if you want to approve.
+              <FiCheckCircle size={12} /> Classified FYI — no reply auto-drafted. Generate one below if you want to reply.
             </div>
           )}
           {updating && (
@@ -1128,6 +1217,15 @@ export default function EmailPage() {
                 <FiClock size={13} /> drafting...
               </div>
             ) : (
+              // On-demand draft generation (FEATURE #2-UI). An FYI item lands here
+              // undrafted (it is NOT auto-drafted — D-056 #2; the backend routes
+              // fyi -> needs-review with no draft and _draft_pending skips it). The
+              // user generates a reply ON DEMAND with this button, which reuses the
+              // existing generateDraft -> POST /queue/{id}/refresh path and works
+              // whether the workers are OFF (default) or ON. After it lands the
+              // item becomes a normal drafted item (textarea + Polish + Save +
+              // Approve + the To/CC editor). A needs-draft item that simply hasn't
+              // been auto-drafted yet also gets a manual escape hatch here.
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em' }}>
                 {draftFailed && (
                   <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', color: 'var(--muted)', fontSize: '0.82em' }}>
@@ -1135,13 +1233,17 @@ export default function EmailPage() {
                   </div>
                 )}
                 <button
-                  className="btn"
+                  className={isFyiClassified ? 'btn btn-primary' : 'btn'}
                   disabled={isBusy}
                   onClick={() => generateDraft(item.id, { quiet: false })}
-                  title="Generate a draft reply for this item"
+                  title={isFyiClassified
+                    ? 'Generate a reply draft for this FYI item (none is drafted automatically)'
+                    : 'Generate a draft reply for this item'}
                   style={{ alignSelf: 'flex-start' }}
                 >
-                  <FiRotateCw size={13} /> {draftFailed ? 'Retry draft' : 'Generate draft'}
+                  <FiRotateCw size={13} /> {draftFailed
+                    ? 'Retry draft'
+                    : (isFyiClassified ? 'Generate reply' : 'Generate draft')}
                 </button>
               </div>
             )
@@ -1155,28 +1257,127 @@ export default function EmailPage() {
               style={{ width: '100%' }}
             />
           )}
+          {/* --- Reply-all To/CC editor (FEATURE #3-UI) ----------------------
+              Shown once a draft exists (the recipients only matter for a reply
+              you're about to approve). Seeded on row-expand from seedRecipients:
+              the user's persisted edit if recipientsEdited, else the reply-all
+              default (To = sender + original To minus me; CC = original CC minus
+              me plus me, de-duped). The user adds/removes chips; the edit persists
+              via the save-draft PUT (recipientsDirty), so a refresh keeps it and
+              Approve uses it. All addresses render via React {…} interpolation —
+              never dangerouslySetInnerHTML. */}
+          {!isReadOnly && !undrafted && (() => {
+            const chipRow = (field, list) => (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35em', alignItems: 'center' }}>
+                {list.length === 0 && (
+                  <span style={{ color: 'var(--muted)', fontSize: '0.78em', fontStyle: 'italic' }}>
+                    {field === 'cc' ? '(no CC)' : '(no recipients)'}
+                  </span>
+                )}
+                {list.map(addr => (
+                  <span
+                    key={addr}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: '0.3em',
+                      background: 'var(--surface2)', color: 'var(--text)',
+                      border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                      fontSize: '0.78em', padding: '0.12em 0.2em 0.12em 0.5em',
+                    }}
+                  >
+                    {addr}
+                    <button
+                      type="button"
+                      onClick={() => removeRecipient(field, addr)}
+                      title={`Remove ${addr}`}
+                      aria-label={`Remove ${addr}`}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                        cursor: 'pointer', background: 'none', border: 'none', padding: '0.1em',
+                        color: 'var(--muted)', lineHeight: 1, borderRadius: 'var(--radius)',
+                      }}
+                    >
+                      <FiX size={12} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            );
+            const addBox = (field) => {
+              const value = field === 'cc' ? ccInput : toInput;
+              const setVal = field === 'cc' ? setCcInput : setToInput;
+              return (
+                <div style={{ display: 'flex', gap: '0.35em', alignItems: 'center', marginTop: '0.3em' }}>
+                  <input
+                    type="email"
+                    value={value}
+                    onChange={e => setVal(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addRecipient(field); } }}
+                    placeholder={`Add ${field === 'cc' ? 'CC' : 'To'} address`}
+                    style={{
+                      flex: 1, minWidth: 0, fontSize: '0.8em', padding: '0.25em 0.5em',
+                      background: 'var(--surface)', color: 'var(--text)',
+                      border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => addRecipient(field)}
+                    disabled={!value.trim()}
+                    title={`Add ${field === 'cc' ? 'CC' : 'To'} recipient`}
+                    style={{ fontSize: '0.78em', padding: '0.2em 0.5em' }}
+                  >
+                    <FiPlus size={12} /> Add
+                  </button>
+                </div>
+              );
+            };
+            return (
+              <div style={{ marginTop: '0.6em', display: 'flex', flexDirection: 'column', gap: '0.6em' }}>
+                <div>
+                  <div style={{ ...labelStyle, fontSize: '0.66em', marginBottom: '0.25em' }}>To</div>
+                  {chipRow('to', recipientsTo)}
+                  {addBox('to')}
+                </div>
+                <div>
+                  <div style={{ ...labelStyle, fontSize: '0.66em', marginBottom: '0.25em' }}>CC</div>
+                  {chipRow('cc', recipientsCc)}
+                  {addBox('cc')}
+                </div>
+                {recipientsDirty && (
+                  <span style={{ color: 'var(--muted)', fontSize: '0.78em' }}>
+                    Recipients edited — Save or Approve to keep them on the Outlook draft.
+                  </span>
+                )}
+              </div>
+            );
+          })()}
           {/* --- Draft tools — Polish / Save / Regenerate sit WITH the textarea
               because they shape the draft, distinct from the disposition row
-              (Approve / Dismiss / Delete / Mute) below. Matches Slack layout. */}
-          {!isReadOnly && !undrafted && dirty && (() => {
+              (Approve / Dismiss / Delete / Mute) below. Matches Slack layout.
+              Shown when the draft text OR the reply-all recipients are dirty so a
+              recipients-only edit still gets a Save (Polish stays gated on text). */}
+          {!isReadOnly && !undrafted && (dirty || recipientsDirty) && (() => {
             const polishText = (editing ? draftText : (item.draft || ''));
             const noText = polishText.trim() === '';
             const isPolishing = polishingId === item.id;
             return (
               <div style={{ display: 'flex', gap: '0.5em', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.5em' }}>
-                <button
-                  className="btn"
-                  disabled={isBusy || isPolishing || noText}
-                  onClick={() => polishDraft(item.id)}
-                  title="Rewrite the current text to read more fluently while keeping your own wording and language"
-                >
-                  <FiFeather size={13} /> {isPolishing ? 'Polishing...' : 'Polish'}
-                </button>
-                <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft">
+                {dirty && (
+                  <button
+                    className="btn"
+                    disabled={isBusy || isPolishing || noText}
+                    onClick={() => polishDraft(item.id)}
+                    title="Rewrite the current text to read more fluently while keeping your own wording and language"
+                  >
+                    <FiFeather size={13} /> {isPolishing ? 'Polishing...' : 'Polish'}
+                  </button>
+                )}
+                <button className="btn" disabled={isBusy} onClick={() => saveDraft(item.id)} title="Save the edited draft and recipients">
                   <FiSave size={13} /> Save edit
                 </button>
                 <span style={{ color: 'var(--muted)', fontSize: '0.8em' }}>
-                  Unsaved edits — Approve will use the edited text.
+                  Unsaved edits — Approve will use the edited {dirty && recipientsDirty ? 'text and recipients' : dirty ? 'text' : 'recipients'}.
                 </span>
               </div>
             );
