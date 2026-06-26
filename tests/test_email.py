@@ -3646,3 +3646,228 @@ async def test_scan_persists_full_body_for_single_message(email_file, monkeypatc
     if th:
         assert len(th[0]["body"]) <= email_mod._THREAD_TURN_BODY_CAP
         assert len(item["emailBody"]) > len(th[0]["body"])
+
+
+# ─── D-057: reply-all draft body builder + To/CC land on the saved draft ──────
+
+
+def _turn(sender, timestamp, recipients, body):
+    """A threadHistory turn (the shape _scan_once persists: sender/timestamp/
+    recipients display-string/body)."""
+    return {"sender": sender, "timestamp": timestamp,
+            "recipients": recipients, "body": body}
+
+
+def test_build_reply_all_body_multi_turn_includes_every_turn_in_order():
+    """AC-4/AC-5: the builder puts the reply on top, then quotes EVERY thread turn
+    oldest->newest, each under an Outlook-style From/Sent/To/Subject header block.
+
+    Three turns with DISTINCT sender/timestamp/body so an exact-substring +
+    ordering assertion proves no turn is dropped, summarized, or reordered (a
+    quote-only-the-latest / drop-a-turn builder fails this)."""
+    item = _make_item(
+        "i1",
+        subject="Re: Launch plan",
+        threadHistory=[
+            _turn("Alpha One", "Monday, June 1, 2026 9:00 AM",
+                  "Alpha One; Bravo Two", "First message about the launch."),
+            _turn("Bravo Two", "Tuesday, June 2, 2026 10:30 AM",
+                  "Alpha One; Bravo Two; Carol Three", "Second reply with a question."),
+            _turn("Carol Three", "Wednesday, June 3, 2026 8:15 AM",
+                  "Alpha One; Bravo Two; Carol Three", "Third and latest message."),
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("Here is my reply.", item)
+
+    # Reply text on top, before any quoted turn.
+    assert "Here is my reply." in html_body
+    i_reply = html_body.index("Here is my reply.")
+    i_t1 = html_body.index("First message about the launch.")
+    i_t2 = html_body.index("Second reply with a question.")
+    i_t3 = html_body.index("Third and latest message.")
+    # Reply precedes all quoted turns; turns appear oldest->newest.
+    assert i_reply < i_t1 < i_t2 < i_t3, "reply on top, then turns oldest->newest"
+
+    # Every turn's sender + timestamp + body present (no turn dropped).
+    for sender, ts, body in [
+        ("Alpha One", "Monday, June 1, 2026 9:00 AM", "First message about the launch."),
+        ("Bravo Two", "Tuesday, June 2, 2026 10:30 AM", "Second reply with a question."),
+        ("Carol Three", "Wednesday, June 3, 2026 8:15 AM", "Third and latest message."),
+    ]:
+        assert sender in html_body, f"missing sender {sender!r}"
+        assert ts in html_body, f"missing timestamp {ts!r}"
+        assert body in html_body, f"missing body {body!r}"
+
+    # Outlook-style attribution labels appear (per-turn header block).
+    assert "From:" in html_body
+    assert "Sent:" in html_body
+    assert "To:" in html_body
+    assert "Subject:" in html_body
+    # Subject reproduced from the item.
+    assert "Re: Launch plan" in html_body
+
+
+def test_build_reply_all_body_html_escapes_hostile_turn_and_drops_nothing():
+    """AC-6: every external field is HTML-escaped — a hostile turn body with a
+    <script>/<img onerror> tag appears INERT (escaped), never as live markup; and
+    a benign sibling turn is still present (no turn dropped by the escaping)."""
+    item = _make_item(
+        "i1",
+        subject="<b>Subj & co</b>",
+        threadHistory=[
+            _turn("Mallory <script>x</script>", "ts-1",
+                  "victim@example.com",
+                  "benign first turn body"),
+            _turn("Eve", "ts-2", "victim@example.com",
+                  '<script>alert(1)</script><img src=x onerror="evil()">'),
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("my reply & <b>note</b>", item)
+
+    # No LIVE script/img tags anywhere — the angle brackets must be escaped, so
+    # the browser never sees a real tag or event-handler attribute.
+    assert "<script>" not in html_body, "hostile <script> must be escaped"
+    assert "<img" not in html_body, "hostile <img> tag must be escaped (no live <img)"
+    # The escaped forms are present (the text is preserved, just inert): the
+    # angle brackets and the attribute quotes are entity-encoded.
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_body
+    assert "&lt;img" in html_body, "the <img must appear only as escaped text"
+    assert 'onerror="' not in html_body, "the event-handler quote must be escaped (&quot;)"
+    # The reply text is escaped too (& -> &amp;).
+    assert "my reply &amp; &lt;b&gt;note&lt;/b&gt;" in html_body
+    # Hostile subject escaped.
+    assert "<b>Subj & co</b>" not in html_body
+    assert "&lt;b&gt;Subj &amp; co&lt;/b&gt;" in html_body
+    # Both turns still present (escaping didn't drop a turn).
+    assert "benign first turn body" in html_body
+    assert "Mallory" in html_body and "Eve" in html_body
+
+
+def test_build_reply_all_body_single_turn_yields_reply_plus_one_quote():
+    """AC-8: the common single-turn case yields reply + exactly one quoted message,
+    no empty quote and no doubled message."""
+    item = _make_item(
+        "i1",
+        subject="Re: One-off",
+        threadHistory=[
+            _turn("Solo Sender", "Friday, June 5, 2026 2:00 PM",
+                  "Solo Sender; me@example.com", "The only message in the thread."),
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("Short reply.", item)
+    assert "Short reply." in html_body
+    assert "Solo Sender" in html_body
+    assert "Friday, June 5, 2026 2:00 PM" in html_body
+    # Exactly one occurrence of the single message body (not doubled).
+    assert html_body.count("The only message in the thread.") == 1
+    assert "From:" in html_body and "Subject:" in html_body
+
+
+def test_build_reply_all_body_missing_fields_no_literal_none_or_undefined():
+    """AC-10: a turn missing sender/timestamp/recipients renders a blank/omitted
+    header line — NEVER literal None/undefined/[object Object]; never crashes."""
+    item = _make_item(
+        "i1",
+        subject="",
+        threadHistory=[
+            {"body": "body with no header fields at all"},  # all fields absent
+            _turn("", "", "", "second body also bare"),
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("reply", item)
+    assert "None" not in html_body, "no Python None literal in the draft"
+    assert "undefined" not in html_body, "no JS undefined literal in the draft"
+    assert "[object Object]" not in html_body
+    # Bodies still present.
+    assert "body with no header fields at all" in html_body
+    assert "second body also bare" in html_body
+
+
+def test_build_reply_all_body_preserves_newline_to_br_in_reply():
+    """AC-3: the existing \\n -> <br> transform is preserved for the reply portion."""
+    item = _make_item("i1", threadHistory=[_turn("S", "t", "r", "b")])
+    html_body = email_mod._build_reply_all_body("line one\nline two", item)
+    assert "line one<br>line two" in html_body
+
+
+def test_build_reply_all_body_makes_no_mcp_calls(monkeypatch):
+    """The builder is PURE: it must read only item['threadHistory']/['subject'] and
+    make NO MCP/network call (guard against a future refactor sneaking I/O in)."""
+    async def boom(*a, **k):
+        raise AssertionError("the body builder must not call any MCP write tool")
+
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", boom)
+    item = _make_item("i1", threadHistory=[_turn("S", "t", "r", "b")])
+    # Pure function; calling it must not raise (no MCP seam touched).
+    out = email_mod._build_reply_all_body("hi", item)
+    assert "hi" in out
+
+
+async def test_email_approve_sends_resolved_to_and_cc_in_create(client, email_file, monkeypatch):
+    """AC-2 (verified contract): approve passes the RESOLVED reply-all To AND CC
+    into the email_draft create call in the flat {to:[...], cc:[...]} shape that the
+    live aws-outlook-mcp backend applies to the saved draft (verified by a live
+    create+read-back: `recipients` == To, `cc` == CC both populate the draft).
+
+    Here recipientsEdited is set, so approve uses the persisted edit verbatim."""
+    _seed(email_file, [_make_item(
+        "i1",
+        draft="final reply",
+        senderEmail="origsender@example.com",
+        recipientsEdited=True,
+        toRecipients=["alice@example.com", "bob@example.com"],
+        ccRecipients=["carol@example.com"],
+    )])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D1"}}
+
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+    monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda m: None)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200
+    assert len(calls) == 1
+    name, args = calls[0]
+    assert name == "email_draft"
+    assert args["operation"] == "create"
+    # The verified flat shape: both lists carry the resolved edited recipients.
+    assert args["to"] == ["alice@example.com", "bob@example.com"]
+    assert args["cc"] == ["carol@example.com"]
+
+
+async def test_email_approve_body_is_reply_all_with_quoted_thread(client, email_file, monkeypatch):
+    """AC-4: the create call's body is a real reply-all — the user's reply on top
+    then the ENTIRE quoted thread (every turn), not just the bare reply text."""
+    _seed(email_file, [_make_item(
+        "i1",
+        draft="My approved reply.",
+        senderEmail="origsender@example.com",
+        toRecipients=["alice@example.com"],
+        ccRecipients=[],
+        threadHistory=[
+            _turn("Alpha One", "Mon 9:00 AM", "Alpha One", "Oldest thread message."),
+            _turn("Bravo Two", "Tue 10:00 AM", "Alpha One; Bravo Two", "Newest thread message."),
+        ],
+    )])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D1"}}
+
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+    monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda m: None)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200
+    body_html = calls[0][1]["body"]
+    # Reply on top, then BOTH thread turns, oldest->newest.
+    i_reply = body_html.index("My approved reply.")
+    i_old = body_html.index("Oldest thread message.")
+    i_new = body_html.index("Newest thread message.")
+    assert i_reply < i_old < i_new
+    # Per-turn attribution present (not a bare reply).
+    assert "From:" in body_html and "Sent:" in body_html

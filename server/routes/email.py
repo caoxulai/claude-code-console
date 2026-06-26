@@ -25,6 +25,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import glob
+import html
 import json
 import logging
 import os
@@ -1821,6 +1822,88 @@ def _reply_all_recipients(item: dict) -> tuple[list[str], list[str]]:
     if not to and _valid_email(sender):
         to = [sender]
     return to, cc
+
+
+def _esc(value) -> str:
+    """HTML-escape any external value (None-safe → '') for the draft body.
+
+    Every email-derived field (sender / timestamp / recipients / subject / body)
+    passes through here BEFORE it reaches the HTML so a hostile thread can never
+    inject live markup into the saved Outlook draft. A missing field becomes ''
+    (never the literal 'None'/'undefined').
+    """
+    if value is None:
+        return ""
+    return html.escape(str(value), quote=True)
+
+
+def _build_reply_all_body(reply_text: str, item: dict) -> str:
+    """Build the Outlook reply-all HTML draft body (PURE — no I/O, deterministic).
+
+    Layout: the user's ``reply_text`` on top (with the existing ``\\n`` → ``<br>``
+    transform preserved), then an Outlook-style quoted block reproducing the
+    ENTIRE thread — EVERY turn in ``item['threadHistory']`` in the array's existing
+    oldest→newest order, never re-sorted / de-duped / summarized / skipped. Each
+    quoted message carries a From/Sent/To/Subject header block above its body.
+
+    ALL external text (sender / timestamp / recipients / subject / each turn body)
+    is ``html.escape``-d FIRST, then the per-turn body's ``\\n`` → ``<br>`` is
+    applied AFTER escaping (escape-first-then-inject-<br>) so a hostile turn body
+    can't smuggle markup. Reads only ``threadHistory`` + ``subject`` already on the
+    item — makes NO MCP / network call (the thread data is already captured). A
+    turn missing a field renders that header line omitted, never a literal
+    None/undefined. The send-safety boundary is untouched: this only shapes the
+    DRAFT body; approve still calls email_draft create only.
+    """
+    reply_html = _esc(reply_text).replace("\n", "<br>")
+    subject = str(item.get("subject", "") or "")
+
+    thread_history = item.get("threadHistory")
+    if not isinstance(thread_history, list):
+        thread_history = []
+
+    quoted_blocks = []
+    # Iterate the array AS-IS (oldest→newest) — never re-order or skip a turn.
+    for turn in thread_history:
+        if not isinstance(turn, dict):
+            continue
+        sender = _esc(turn.get("sender"))
+        timestamp = _esc(turn.get("timestamp"))
+        recipients = _esc(turn.get("recipients"))
+        # Escape the body FIRST, then convert its newlines to <br> (escape can't
+        # touch the <br> tags this way, and the body text stays inert).
+        body_html = _esc(turn.get("body")).replace("\n", "<br>")
+
+        header_lines = []
+        if sender:
+            header_lines.append(f"<b>From:</b> {sender}")
+        if timestamp:
+            header_lines.append(f"<b>Sent:</b> {timestamp}")
+        if recipients:
+            header_lines.append(f"<b>To:</b> {recipients}")
+        if subject:
+            header_lines.append(f"<b>Subject:</b> {_esc(subject)}")
+        header_html = "<br>".join(header_lines)
+
+        quoted_blocks.append(
+            f'<div style="margin-top:12px">{header_html}'
+            f'<div style="margin-top:6px">{body_html}</div></div>'
+        )
+
+    if not quoted_blocks:
+        return reply_html
+
+    # Outlook separates the reply from the quoted thread with a horizontal rule,
+    # and indents the quoted conversation as a blockquote.
+    quoted_html = "<hr>".join(quoted_blocks)
+    return (
+        f"{reply_html}"
+        '<br><br><hr>'
+        '<blockquote style="margin:0 0 0 8px;padding-left:8px;'
+        'border-left:1px solid #ccc">'
+        f"{quoted_html}"
+        "</blockquote>"
+    )
 
 
 def _flatten_from(raw: dict) -> tuple[str, str]:
@@ -3818,7 +3901,10 @@ async def approve_item(request: web.Request) -> web.Response:
                     "to": to_addrs,
                     "cc": cc_addrs,
                     "subject": f"Re: {item.get('subject', '')}",
-                    "body": final_draft.replace("\n", "<br>"),
+                    # Real reply-all: the user's reply on top + the ENTIRE quoted
+                    # thread below it (every turn, oldest→newest, each external
+                    # field HTML-escaped). Pure builder, no extra MCP call.
+                    "body": _build_reply_all_body(final_draft, item),
                 })
                 if isinstance(result, dict):
                     draft_saved = bool(result.get("success"))
