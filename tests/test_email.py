@@ -3132,3 +3132,517 @@ def test_validate_save_draft_detects_residue_when_real_draft_remains():
     ))
     assert res.passed is False, "a draft left behind in Drafts must FAIL (residue)"
     assert "residue" in res.detail.lower()
+
+
+# ─── D-056: FYI-on-demand + reply-all To/CC capture/fix/persist/apply ─────────
+#
+# Contract pinned by D-056 (sequenced AFTER the backend task that lands it). These
+# are the offline/mock-based guards required by the feature spec's T3:
+#   (a) a `fyi` classification does NOT route to needs-draft and is NOT picked up
+#       by _draft_pending, while needs-reply/actionable still are;
+#   (b) _scan_once persists toRecipients/ccRecipients from a get_email payload
+#       carrying `to`/`cc` lists (degrades cleanly when absent, never fabricated);
+#   (c) _recipient_type classifies to-only/to/cc using the `to`/`cc` keys
+#       (regression on the always-"unknown" bug that read toRecipients/ccRecipients);
+#   (d) the reply-all default resolution (To = sender + orig-To minus me; CC =
+#       orig-cc minus me, PLUS me; de-duped ci) + the no-captured-data degrade;
+#   (e) approve passes the resolved `to` AND `cc` into the email_draft create
+#       payload, and never reaches a send path;
+#   (f) a single-message body longer than 4096 is served/persisted in FULL (32k
+#       cap) on the path the single-turn card uses, distinct from the 4096-capped
+#       threadHistory turn body.
+
+
+# The user's own address — read from the backend's single source of truth so the
+# tests can never drift from the constant the reply-all/minus-me logic uses.
+_MY_EMAIL = email_mod._MY_EMAIL
+
+
+# --- (a) FYI does NOT auto-draft; needs-reply/actionable still do ------------
+
+
+def test_classify_routing_fyi_is_not_needs_draft():
+    """AC-6: the classification router must send fyi to a NON-draft holding status,
+    while needs-reply/actionable still route to needs-draft.
+
+    Pins the routing table directly so the FYI-STILL-AUTO-DRAFTS trap (leaving
+    fyi -> needs-draft) goes RED: the value for 'fyi' must not be 'needs-draft'."""
+    routing = email_mod._CLASSIFY_NEXT_STATUS
+    assert routing["needs-reply"] == "needs-draft"
+    assert routing["actionable"] == "needs-draft"
+    # The headline: fyi must NOT auto-route into draft generation.
+    assert routing.get("fyi") != "needs-draft", \
+        "fyi must NOT route to needs-draft (would auto-draft, AC-6)"
+    # And whatever holding status it uses must be a real, NON-terminal status so
+    # the undrafted FYI still counts as active to-do (D-035 lockstep, AC-8).
+    fyi_status = routing.get("fyi")
+    assert fyi_status in email_mod._VALID_STATUS, "fyi holding status must be a valid status"
+    assert fyi_status not in email_mod._TERMINAL_STATUSES, \
+        "an undrafted FYI must stay non-terminal (active to-do count, AC-8)"
+
+
+def test_fyi_item_not_needs_draft_but_needs_reply_is():
+    """AC-6: _needs_draft is the draft-selection predicate. An item parked at the
+    fyi holding status is NOT awaiting a draft; a needs-draft item IS."""
+    fyi_status = email_mod._CLASSIFY_NEXT_STATUS["fyi"]
+    fyi_item = _make_item("fyi1", status=fyi_status, classification="fyi",
+                          draft="", generatedDraft="")
+    nr_item = _make_item("nr1", status="needs-draft", classification="needs-reply",
+                         draft="", generatedDraft="")
+    ac_item = _make_item("ac1", status="needs-draft", classification="actionable",
+                         draft="", generatedDraft="")
+    assert email_mod._needs_draft(fyi_item) is False, \
+        "a fyi item must NOT be selected for auto-drafting (AC-6)"
+    assert email_mod._needs_draft(nr_item) is True
+    assert email_mod._needs_draft(ac_item) is True
+
+
+async def test_draft_pending_skips_fyi_drafts_only_needs_draft(email_file, monkeypatch):
+    """AC-6 end-to-end: _draft_pending picks up needs-draft items (needs-reply /
+    actionable) but leaves a parked FYI undrafted, so FYI never gets an auto-draft
+    even when a draft run happens (workers OFF -> manual one-shot path)."""
+    fyi_status = email_mod._CLASSIFY_NEXT_STATUS["fyi"]
+    _seed(email_file, [
+        _make_item("fyi1", status=fyi_status, classification="fyi",
+                   draft="", generatedDraft=""),
+        _make_item("nr1", status="needs-draft", classification="needs-reply",
+                   draft="", generatedDraft=""),
+        _make_item("ac1", status="needs-draft", classification="actionable",
+                   draft="", generatedDraft=""),
+    ])
+
+    drafted_ids = []
+    _stub_agent(monkeypatch, {
+        "available": True, "draft": "auto reply", "generatedDraft": "auto reply",
+        "threadContext": "ctx",
+    })
+
+    # Capture which item ids the draft path actually drafts.
+    orig_draft_one = email_mod._draft_one
+
+    async def spy_draft_one(app, sem, item_id):
+        drafted_ids.append(item_id)
+        return await orig_draft_one(app, sem, item_id)
+
+    monkeypatch.setattr(email_mod, "_draft_one", spy_draft_one)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    sem = email_mod.asyncio.Semaphore(3)
+    await email_mod._draft_pending({"ws_manager": _WS()}, sem)
+
+    # The FYI item was NOT drafted; the needs-draft (needs-reply/actionable) were.
+    assert "fyi1" not in drafted_ids, "FYI must NOT be auto-drafted (AC-6)"
+    assert set(drafted_ids) == {"nr1", "ac1"}, \
+        f"only needs-draft items drafted, got {drafted_ids}"
+
+    saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
+    # FYI item is untouched (no draft fabricated, stays at its holding status).
+    assert saved["fyi1"]["draft"] == ""
+    assert saved["fyi1"]["status"] == fyi_status
+    # needs-reply/actionable got their auto-draft and flipped to needs-review.
+    assert saved["nr1"]["status"] == "needs-review" and saved["nr1"]["draft"] == "auto reply"
+    assert saved["ac1"]["status"] == "needs-review" and saved["ac1"]["draft"] == "auto reply"
+
+
+def test_undrafted_fyi_still_counts_as_active_todo():
+    """AC-8 (D-035 lockstep): a parked, undrafted FYI is NOT terminal — it still
+    counts toward the active to-do total alongside the other live statuses, while
+    approved/dismissed/deleted do not."""
+    fyi_status = email_mod._CLASSIFY_NEXT_STATUS["fyi"]
+    items = [
+        {"status": fyi_status},      # undrafted FYI -> active
+        {"status": "needs-review"},  # active
+        {"status": "approved"},      # terminal
+        {"status": "dismissed"},     # terminal
+        {"status": "deleted"},       # terminal
+    ]
+    assert email_mod._count_actionable(items) == 2, \
+        "an undrafted FYI must remain in the active to-do count (AC-8)"
+
+
+# --- (b) _scan_once captures toRecipients/ccRecipients from the detail payload --
+
+
+async def test_scan_captures_recipients_from_detail_payload(email_file, monkeypatch):
+    """AC-15/capture: the body pre-fetch reads `to`/`cc` from the SAME get_email
+    detail payload (the inbox-LIST call has none) and persists them on the item as
+    toRecipients/ccRecipients ({name,email} lists) — ZERO extra MCP calls."""
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkRecip", "subject": "Re: Planning",
+                "from": {"name": "Jane", "email": "jane@example.com"},
+                "received": "2026-06-03T10:00:00Z", "is_read": False, "preview": "x",
+            }], "count": 1, "folder": "inbox"}
+        if name == "get_email":
+            # The DETAIL payload carries recipients under `to`/`cc` (verified shape),
+            # NOT toRecipients/ccRecipients.
+            return {"email": {
+                "id": "AAMkRecip", "subject": "Re: Planning",
+                "from": {"name": "Jane", "email": "jane@example.com"},
+                "body": "Here is the plan.",
+                "to": [{"name": "Me", "email": _MY_EMAIL},
+                       {"name": "Bob", "email": "bob@example.com"}],
+                "cc": [{"name": "Carol", "email": "carol@example.com"}],
+            }}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 1
+    item = saved[0]
+    # Captured as {name,email} lists straight off the detail `to`/`cc`.
+    to_emails = [r.get("email") for r in item.get("toRecipients") or []]
+    cc_emails = [r.get("email") for r in item.get("ccRecipients") or []]
+    assert _MY_EMAIL in to_emails and "bob@example.com" in to_emails
+    assert cc_emails == ["carol@example.com"]
+    # recipientType was re-derived from the captured lists (no longer "unknown").
+    assert item.get("recipientType") == "to"  # me in To with >1 recipient
+
+
+async def test_scan_recipients_absent_degrades_not_fabricated(email_file, monkeypatch):
+    """An item whose detail payload carries NO `to`/`cc` degrades — no toRecipients/
+    ccRecipients are fabricated (the reply-all default later falls back to sender)."""
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkNoRecip", "subject": "Hi",
+                "from": {"name": "Solo", "email": "solo@example.com"},
+                "received": "2026-06-03T10:00:00Z", "is_read": False, "preview": "x",
+            }], "count": 1, "folder": "inbox"}
+        if name == "get_email":
+            # No to/cc anywhere in the detail.
+            return {"email": {"id": "AAMkNoRecip", "subject": "Hi",
+                              "from": {"name": "Solo", "email": "solo@example.com"},
+                              "body": "Just a quick note."}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    item = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    # Never fabricated — absent/empty, not invented.
+    assert not item.get("toRecipients")
+    assert not item.get("ccRecipients")
+
+
+# --- (c) _recipient_type reads the to/cc keys (regression on always-"unknown") --
+
+
+def test_recipient_type_reads_to_cc_keys_not_always_unknown():
+    """AC-15 (anti RECIPIENT_TYPE-FIX-READS-WRONG-KEYS): _recipient_type must read
+    the DETAIL payload's `to`/`cc` keys. The latent bug read toRecipients/
+    ccRecipients (always None on these payloads) and returned 'unknown' for every
+    item. Construct payloads with _MY_EMAIL in to/cc and assert a real label."""
+    # to-only: me alone in To.
+    assert email_mod._recipient_type(
+        {"to": [{"name": "Me", "email": _MY_EMAIL}], "cc": []}) == "to-only"
+    # to (shared): me in To alongside others.
+    assert email_mod._recipient_type(
+        {"to": [{"name": "Me", "email": _MY_EMAIL},
+                {"name": "Bob", "email": "bob@example.com"}], "cc": []}) == "to"
+    # cc: me only in CC.
+    assert email_mod._recipient_type(
+        {"to": [{"name": "Bob", "email": "bob@example.com"}],
+         "cc": [{"name": "Me", "email": _MY_EMAIL}]}) == "cc"
+    # Case-insensitive match on my address.
+    assert email_mod._recipient_type(
+        {"to": [{"name": "Me", "email": _MY_EMAIL.upper()}], "cc": []}) == "to-only"
+    # When the keys ARE present, the result is NEVER the always-"unknown" bug.
+    for payload in (
+        {"to": [{"email": _MY_EMAIL}], "cc": []},
+        {"to": [{"email": "other@example.com"}], "cc": [{"email": _MY_EMAIL}]},
+    ):
+        assert email_mod._recipient_type(payload) != "unknown", \
+            f"populated to/cc must classify, not return 'unknown': {payload}"
+    # Genuinely empty/absent still degrades to 'unknown' (not fabricated).
+    assert email_mod._recipient_type({"to": [], "cc": []}) == "unknown"
+    assert email_mod._recipient_type({}) == "unknown"
+
+
+def test_recipient_type_ignores_legacy_inbox_keys_only():
+    """REGRESSION: a raw inbox-LIST shape that has ONLY toRecipients/ccRecipients
+    populated would have classified under the OLD code; the new code still reads
+    the detail `to`/`cc` first. Either way the classification is real, never the
+    spurious 'unknown' the old code returned on the actual (to/cc-keyed) payloads.
+
+    This pins that the fix targets the keys Graph actually delivers: a detail
+    payload using `to` is classified, where the old code returned 'unknown'."""
+    detail_shape = {"to": [{"email": _MY_EMAIL}], "cc": []}
+    # The fixed code classifies this (the old code returned 'unknown' here because
+    # it only looked at toRecipients/ccRecipients, which are absent).
+    assert email_mod._recipient_type(detail_shape) == "to-only"
+
+
+# --- (d) reply-all default resolution (the pure backend helper) ----------------
+
+
+def test_reply_all_default_four_clauses_simultaneously():
+    """AC-10 (four-way AND): the reply-all default must hold ALL clauses at once —
+    To = sender + orig-To MINUS me; CC = orig-CC MINUS me, PLUS me; de-duped ci.
+
+    This single fixture exercises every clause so the REPLY-ALL-FORGETS-MINUS-ME
+    and FORGETS-ALWAYS-ADD-ME traps both go RED."""
+    item = _make_item(
+        "r1",
+        senderEmail="sender@example.com",
+        toRecipients=[
+            {"name": "Me", "email": _MY_EMAIL},          # must be removed from To
+            {"name": "Bob", "email": "bob@example.com"},
+            {"name": "Bob dup", "email": "BOB@EXAMPLE.COM"},  # ci dup of bob
+        ],
+        ccRecipients=[
+            {"name": "Carol", "email": "carol@example.com"},
+            {"name": "Me again", "email": _MY_EMAIL.upper()},  # must be removed then re-added once
+        ],
+    )
+    to, cc = email_mod._reply_all_recipients(item)
+
+    # Clause 1: To carries the original sender.
+    assert "sender@example.com" in to
+    # Clause 1b: To carries the original To recipients (Bob).
+    assert "bob@example.com" in [a.lower() for a in to]
+    # Clause 2 (MINUS-ME on To): my address is NOT in To.
+    assert _MY_EMAIL.lower() not in [a.lower() for a in to]
+    # Clause 3 (CC from orig-CC, MINUS-ME): Carol present, my dup removed.
+    assert "carol@example.com" in [a.lower() for a in cc]
+    # Clause 4 (ALWAYS-ADD-ME to CC): my address IS in CC, exactly once.
+    cc_lower = [a.lower() for a in cc]
+    assert _MY_EMAIL.lower() in cc_lower
+    assert cc_lower.count(_MY_EMAIL.lower()) == 1, "self must appear in CC exactly once"
+    # De-dupe ci: bob appears once in To despite the dup entry.
+    assert [a.lower() for a in to].count("bob@example.com") == 1
+
+
+def test_reply_all_default_degrades_to_sender_only_and_self_cc():
+    """AC-11 (anti FABRICATED-RECIPIENTS-ON-DEGRADE): an item with NO captured
+    to/cc degrades to To=[sender], CC=[_MY_EMAIL] — never an invented address."""
+    item = _make_item("r2", senderEmail="lonely@example.com")
+    item.pop("toRecipients", None)
+    item.pop("ccRecipients", None)
+    to, cc = email_mod._reply_all_recipients(item)
+    assert to == ["lonely@example.com"], "degrade To must be sender-only"
+    assert cc == [_MY_EMAIL], "degrade CC must be self-only"
+    # Nothing fabricated beyond sender + self.
+    assert all(a in ("lonely@example.com", _MY_EMAIL) for a in to + cc)
+
+
+def test_reply_all_default_self_only_thread_keeps_self_in_cc():
+    """A thread where I am the sole captured recipient still re-adds me to CC (so I
+    stay on my own thread) and never leaves me replying only to myself in To."""
+    item = _make_item(
+        "r3",
+        senderEmail="boss@example.com",
+        toRecipients=[{"name": "Me", "email": _MY_EMAIL}],  # only me in To
+        ccRecipients=[],
+    )
+    to, cc = email_mod._reply_all_recipients(item)
+    # Me stripped from To (would be replying to self), so To is just the sender.
+    assert to == ["boss@example.com"]
+    assert _MY_EMAIL.lower() not in [a.lower() for a in to]
+    # Always-add-me still puts me in CC.
+    assert cc == [_MY_EMAIL]
+
+
+# --- (e) approve passes resolved to AND cc into email_draft create -------------
+
+
+async def test_approve_passes_resolved_to_and_cc_into_draft(client, email_file, monkeypatch):
+    """AC-13 (anti APPROVE-IGNORES-CC): approve resolves the reply-all default and
+    passes BOTH `to` AND `cc` into the email_draft create payload (today's bug
+    hardcoded to=[senderEmail] with no cc)."""
+    _seed(email_file, [_make_item(
+        "a1",
+        senderEmail="sender@example.com",
+        draft="Sounds good.",
+        toRecipients=[{"name": "Me", "email": _MY_EMAIL},
+                      {"name": "Bob", "email": "bob@example.com"}],
+        ccRecipients=[{"name": "Carol", "email": "carol@example.com"}],
+    )])
+
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D1"}}
+
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/a1/approve", json={})
+    assert resp.status == 200
+
+    assert len(calls) == 1
+    name, args = calls[0]
+    assert name == "email_draft" and args["operation"] == "create"
+    # BOTH to AND cc are present and carry the resolved reply-all values.
+    to_lower = [a.lower() for a in args["to"]]
+    cc_lower = [a.lower() for a in args.get("cc", [])]
+    assert "sender@example.com" in to_lower
+    assert "bob@example.com" in to_lower
+    assert _MY_EMAIL.lower() not in to_lower            # minus-me on To
+    assert "carol@example.com" in cc_lower
+    assert _MY_EMAIL.lower() in cc_lower                # always-add-me on CC
+    # The CC must be a non-empty list (the APPROVE-IGNORES-CC bug omitted it).
+    assert isinstance(args.get("cc"), list) and args["cc"], "approve must pass a cc list"
+
+
+async def test_approve_applies_persisted_edited_recipients(client, email_file, monkeypatch):
+    """AC-12+AC-13: when the user has edited+persisted recipients (recipientsEdited),
+    approve uses THOSE verbatim, not the recomputed default."""
+    _seed(email_file, [_make_item(
+        "a2",
+        senderEmail="sender@example.com",
+        draft="Thanks.",
+        recipientsEdited=True,
+        toRecipients=["chosen-to@example.com"],
+        ccRecipients=["chosen-cc@example.com"],
+    )])
+
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D2"}}
+
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/a2/approve", json={})
+    assert resp.status == 200
+    _, args = calls[0]
+    assert [a.lower() for a in args["to"]] == ["chosen-to@example.com"]
+    assert [a.lower() for a in args["cc"]] == ["chosen-cc@example.com"]
+
+
+async def test_approve_with_cc_never_sends(client, email_file, monkeypatch):
+    """AC-14 (send-safety): approve passing to/cc STILL only calls email_draft —
+    never reply/send/forward. The to/cc go into the DRAFT only."""
+    _seed(email_file, [_make_item(
+        "a3", senderEmail="x@example.com", draft="final",
+        toRecipients=[{"name": "Bob", "email": "bob@example.com"}],
+        ccRecipients=[{"name": "Carol", "email": "carol@example.com"}],
+    )])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D3"}}
+
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+    await client.post("/api/email/queue/a3/approve", json={})
+    tool_names = [c[0] for c in calls]
+    assert "email_send" not in tool_names
+    assert "email_reply" not in tool_names
+    assert "email_forward" not in tool_names
+    assert tool_names == ["email_draft"], f"approve must ONLY save a draft, got {tool_names}"
+
+
+async def test_save_draft_persists_edited_recipients(client, email_file):
+    """AC-12 (anti RECIPIENTS-NOT-PERSISTED): the save-draft PUT accepts edited
+    toRecipients/ccRecipients, sanitizes + de-dupes them, and persists them on the
+    item (with recipientsEdited) so they survive a refresh and drive approve."""
+    _seed(email_file, [_make_item("p1", draft="hi", generatedDraft="hi")])
+    resp = await client.put("/api/email/queue/p1", json={
+        "draft": "hi",
+        "toRecipients": ["keep@example.com", "KEEP@EXAMPLE.COM", "not an email"],
+        "ccRecipients": ["cc@example.com"],
+    })
+    assert resp.status == 200
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    # ci de-dupe + drops the invalid address; never fabricated.
+    assert [a.lower() for a in saved["toRecipients"]] == ["keep@example.com"]
+    assert [a.lower() for a in saved["ccRecipients"]] == ["cc@example.com"]
+    assert saved.get("recipientsEdited") is True
+
+
+# --- (f) a single-message body > 4096 is served/persisted in FULL --------------
+
+
+def test_single_message_body_over_4096_served_full_not_capped_at_turn():
+    """AC-1 (anti SINGLE-MESSAGE-STILL-CAPPED): for a single-message email the full
+    body lives in emailBody (32k cap), distinct from the 4096-capped threadHistory
+    turn body. The single-turn card must source emailBody (the full body), so the
+    backend must serve the FULL body there, never the mid-sentence 4096 cut."""
+    big = "A" * 6000  # a single-message body well past the 4096 turn cap
+    payload = {"email": {
+        "id": "AAMkBig", "subject": "CRIS Weekly Flash",
+        "from": {"name": "News", "email": "news@example.com"},
+        "body": big,
+    }}
+    full_body = email_mod._extract_email_body(payload)
+    # emailBody is the FULL body (capped only at the generous 32k email cap).
+    # _extract_email_body prepends a small From:/Subject: header, so the full
+    # body is AT LEAST the raw body length — the point is it is NOT cut at 4096.
+    assert big in full_body, "the single-message body must be served in FULL"
+    assert len(full_body) >= 6000, "the single-message body must be served in FULL"
+    assert len(full_body) <= email_mod._EMAIL_BODY_CAP
+    assert len(full_body) > email_mod._THREAD_TURN_BODY_CAP, \
+        "the full body must exceed the per-turn cap (proves it is not turn-capped)"
+
+    # The threadHistory turn for the SAME message is capped at the 4096 turn cap —
+    # rendering THAT for the single-turn card is the mid-sentence cut we must avoid.
+    turns = email_mod._extract_thread_history(payload)
+    assert len(turns) == 1
+    assert len(turns[0]["body"]) == email_mod._THREAD_TURN_BODY_CAP, \
+        "the per-turn body is 4096-capped (the field the card must NOT source)"
+    # The two are genuinely different lengths — the card must use the longer one.
+    assert len(full_body) != len(turns[0]["body"])
+
+
+async def test_scan_persists_full_body_for_single_message(email_file, monkeypatch):
+    """AC-1 end-to-end: _scan_once stores the FULL emailBody (not the 4096-capped
+    turn body) for a long single-message email, so the single-turn card has the
+    complete text to render."""
+    big = "B" * 8000
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkFull", "subject": "CRIS Weekly Flash | 25-Jun-2026",
+                "from": {"name": "News", "email": "news@example.com"},
+                "received": "2026-06-25T10:00:00Z", "is_read": False, "preview": "x",
+            }], "count": 1, "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {"id": "AAMkFull", "subject": "CRIS Weekly Flash | 25-Jun-2026",
+                              "from": {"name": "News", "email": "news@example.com"},
+                              "body": big}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    item = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    # emailBody carries the full body (the source the single-turn card uses) — the
+    # full 8000-char body is present, never cut at the 4096 turn cap.
+    assert big in item["emailBody"], "the persisted full body must contain the whole message"
+    assert len(item["emailBody"]) >= 8000, "the persisted full body must not be 4096-capped"
+    # If a threadHistory turn was attached it is the 4096-capped variant — distinct.
+    th = item.get("threadHistory") or []
+    if th:
+        assert len(th[0]["body"]) <= email_mod._THREAD_TURN_BODY_CAP
+        assert len(item["emailBody"]) > len(th[0]["body"])
