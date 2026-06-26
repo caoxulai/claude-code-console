@@ -1551,6 +1551,38 @@ def test_graph_mcp_params_injects_node24_path(monkeypatch, tmp_path):
     assert __import__("os").environ.get("PATH", "") == before_os_path
 
 
+def test_graph_mcp_params_forces_owa_backend(monkeypatch, tmp_path):
+    """_graph_mcp_params bakes MMCP_AUTH_BACKEND=owa into the subprocess env so the
+    Graph path goes direct-to-Microsoft (off the GRASP 500/day shared quota) instead
+    of the bundle's default 'grasp' backend. See docs/email-owa-backend-runbook.md."""
+    node24 = tmp_path / "node24bin"
+    node24.mkdir()
+    monkeypatch.setenv("CLAUDE_WEB_NODE24_BIN", str(node24))
+
+    params = email_mod._graph_mcp_params()
+    env = params.env or {}
+    assert env.get("MMCP_AUTH_BACKEND") == "owa", \
+        "the Graph subprocess must run the OWA backend (off the GRASP quota)"
+
+
+def test_graph_mcp_params_owa_default_yields_to_explicit_config(monkeypatch, tmp_path):
+    """setdefault, not hard-set: an explicit MMCP_AUTH_BACKEND in the discovered
+    mcpServers entry env still wins, so the backend remains operator-overridable."""
+    node24 = tmp_path / "node24bin"
+    node24.mkdir()
+    monkeypatch.setenv("CLAUDE_WEB_NODE24_BIN", str(node24))
+    monkeypatch.setattr(
+        email_mod, "_find_graph_mcp_entry",
+        lambda: {"command": "manager-outlook-mcp", "args": [],
+                 "env": {"MMCP_AUTH_BACKEND": "grasp"}},
+    )
+
+    params = email_mod._graph_mcp_params()
+    env = params.env or {}
+    assert env.get("MMCP_AUTH_BACKEND") == "grasp", \
+        "an explicit backend in the config entry must override the owa default"
+
+
 def test_find_graph_mcp_entry_does_not_match_aws_outlook(monkeypatch, tmp_path):
     """The graph finder matches 'manager-outlook'/'graph' names, NOT 'aws-outlook'
     — so the existing aws-outlook draft path is untouched."""

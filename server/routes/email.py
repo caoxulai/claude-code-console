@@ -127,12 +127,16 @@ EMAIL_CLASSIFY_BATCH = 10          # max items per classify LLM call
 EMAIL_DRAFT_POLL_INTERVAL_S = 7    # draft worker poll interval
 EMAIL_DRAFT_CONCURRENCY = 3        # parallel draft subprocess cap
 
-# Idle teardown of the persistent Graph (manager-outlook-mcp) session. The GRASP
-# bundle's internal TokenRefreshRunner fires a full SAML re-auth every ~10 min for
-# as long as the session is held open, burning GRASP's API-Gateway quota. We must
-# NOT hold it alive while the Email tab is idle: if no Graph call has run for this
-# long (or the queue is paused), the reaper tears the session down so the refresh
-# timer dies with the subprocess. Kept UNDER one ~10-min refresh cycle.
+# Idle teardown of the persistent Graph (manager-outlook-mcp) session. The bundle's
+# internal TokenRefreshRunner fires a background re-auth while the session is held
+# open. On the now-default OWA backend that's a cheap refresh-token call against
+# Microsoft (no shared quota), so this is defense-in-depth rather than the primary
+# guard -- but on the legacy GRASP backend it was a FULL SAML re-auth every ~10 min
+# that drained GRASP's shared API-Gateway quota. Either way we do NOT hold the
+# session alive while the Email tab is idle: if no Graph call has run for this long
+# (or the queue is paused), the reaper tears it down so the refresh timer dies with
+# the subprocess. Kept UNDER one ~10-min refresh cycle. See
+# docs/email-owa-backend-runbook.md.
 _GRAPH_IDLE_TEARDOWN_S = 180
 
 # When a Graph read 429s / hits a GRASP quota_exceeded, back the scan worker off
@@ -159,10 +163,11 @@ _EMAIL_MCP_FALLBACK = {
     "env": {},
 }
 
-# Fallback manager-outlook-mcp (Graph via GRASP) launch spec. The wrapper at
+# Fallback manager-outlook-mcp (Microsoft Graph) launch spec. The wrapper at
 # ~/.aim/mcp-servers/manager-outlook-mcp runs `aim mcp start-server
 # manager-outlook-mcp`; prefer the bare command (it's on PATH after `aim mcp
-# install`), else fall back to the explicit aim invocation.
+# install`), else fall back to the explicit aim invocation. The auth backend is
+# forced to OWA in _graph_mcp_params (see runbook), not here.
 _GRAPH_MCP_FALLBACK = {
     "command": "manager-outlook-mcp",
     "args": [],
@@ -544,6 +549,20 @@ def _graph_mcp_params() -> StdioServerParameters:
     node24_bin = _resolve_node24_bin()  # fail-loud if absent
     base_path = env.get("PATH") or os.environ.get("PATH", "")
     env["PATH"] = node24_bin + (os.pathsep + base_path if base_path else "")
+
+    # Force the OWA auth backend (direct-to-Microsoft) instead of the bundle's
+    # DEFAULT 'grasp' backend. This is the durable fix for the quota outage
+    # (verified 2026-06-26; see docs/email-owa-backend-runbook.md):
+    #   - GRASP routes every call through an API-Gateway proxy with a SHARED
+    #     500-requests/day quota AND requests no offline_access -> the bundle's
+    #     TokenRefreshRunner does a FULL SAML re-auth every ~10 min, draining that
+    #     quota until every call (reads AND delete) 429s `quota_exceeded`.
+    #   - OWA hits login.microsoftonline.com + outlook.office.com DIRECTLY (no
+    #     GRASP quota) and its scope includes offline_access -> it holds a real
+    #     refresh_token and refreshes cheaply, so there is no SAML storm.
+    # setdefault so an explicit override in ~/.claude.json's mcpServers env still
+    # wins; the safe baked-in default is owa. Tokens cache to ~/.o365_mcp/.
+    env.setdefault("MMCP_AUTH_BACKEND", "owa")
 
     return StdioServerParameters(command=str(command), args=args, env=env)
 
@@ -1010,9 +1029,10 @@ async def _call_graph_write_tool_oneshot(name: str, arguments: dict) -> object:
     """SHORT-LIVED spawn-on-demand path for a gated Graph WRITE tool.
 
     A user-initiated write (delete_email, mark_email_read) must NOT depend on the
-    always-on persistent session (which we now tear down while idle/paused to stop
-    GRASP's TokenRefreshRunner from burning the API-Gateway quota). So this spawns a
-    FRESH manager-outlook-mcp subprocess, reuses the cached on-disk GRASP token,
+    always-on persistent session (which we tear down while idle/paused so the
+    bundle's TokenRefreshRunner can't churn auth in the background). So this spawns a
+    FRESH manager-outlook-mcp subprocess, reuses the cached on-disk auth token
+    (~/.o365_mcp on the default OWA backend; _graph_mcp_params forces that backend),
     performs the single tool call, and ALWAYS tears the subprocess down in a finally
     -- nothing keeps a refresh timer alive afterward.
 
