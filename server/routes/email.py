@@ -2100,41 +2100,95 @@ def _html_to_text(html: str) -> str:
     # Convert table sentinels to GFM markdown tables. Each ROW_SEP starts a new
     # row; each CELL_SEP within a row is a column boundary. remarkGfm needs the
     # FULL GFM form to render an HTML <table>: every row wrapped in leading/
-    # trailing '|', AND a '| --- | --- | ... |' separator row immediately after the
-    # FIRST row of each contiguous table block. The separator is load-bearing —
-    # pipe-wrapped rows WITHOUT it render as literal '|' text.
+    # trailing '|', AND a '| --- | --- | ... |' separator row whose column count
+    # MATCHES the table's real data columns. The separator is load-bearing —
+    # pipe-wrapped rows WITHOUT it (or with a mismatched width) render as literal
+    # '|' text / a malformed table in remarkGfm.
+    #
+    # MERGED-TITLE handling (D-061 §1): Outlook status/report tables almost always
+    # LEAD with a merged single-cell TITLE row spanning the table (a colspan over
+    # the N-column body). Sizing the separator from that 1-cell first row produced
+    # MALFORMED GFM (1-col separator over 4-col data). Instead we BUFFER each
+    # contiguous table block, compute its data width as the MODAL (most-common)
+    # cell count across the block's rows (robust to a stray short/long row), lift a
+    # narrower-than-modal FIRST row OUT as a bold caption line ABOVE the table, size
+    # the separator to the modal width, and PAD any genuinely-short non-title row
+    # with empty trailing cells. No cell text is ever dropped, merged, or reordered.
     #
     # BACKWARD-COMPAT: this fires ONLY for rows that actually contain a cell
     # sentinel (a real <td>/<th>). A non-table row (ordinary prose, or a literal
-    # '|' typed in text) carries no sentinel, so it passes through untouched — no
-    # injected pipes, no separator row.
+    # '|' typed in text) carries no sentinel, so it passes through untouched. A
+    # normal table whose first row already matches the modal width gets NO caption
+    # and the same separator as before — byte-identical output.
+    #
+    # IDEMPOTENT: the emitted caption is a plain bold-markdown PROSE line (no cell
+    # sentinel) and the rows are pipe rows (no <table>/sentinel), so a second
+    # _html_to_text pass sees no sentinels and re-emits them unchanged.
     lines = text.split(_ROW_SEP)
     out_lines = []
-    in_table = False  # tracks a contiguous run of cell-bearing rows
+    table_block = []  # buffered cell-row lists for the current contiguous block
+
+    def _flush_table_block():
+        """Emit the buffered contiguous table block as valid GFM (caption +
+        modal-sized separator + padded short rows), then clear the buffer."""
+        if not table_block:
+            return
+        # Modal (most-common) cell count across the block's rows. Tie-break toward
+        # the LARGER count so a table never under-sizes (we pad short rows, never
+        # widen them past the real grid). Deterministic for a given input.
+        counts = [len(r) for r in table_block]
+        best_count, best_key = counts[0], (counts.count(counts[0]), counts[0])
+        for n in set(counts):
+            key = (counts.count(n), n)  # (frequency, value) — value breaks ties hi
+            if key > best_key:
+                best_count, best_key = n, key
+        data_width = best_count
+        rows = list(table_block)
+        # A leading row NARROWER than the data width is a merged/colspan TITLE: lift
+        # it out as a bold caption above the table (never row 1 of the grid).
+        if len(rows) >= 2 and len(rows[0]) < data_width:
+            title = " ".join(rows[0]).strip()
+            if title:
+                out_lines.append("**" + title + "**")
+                out_lines.append("")  # blank line so the caption reads as prose
+            rows = rows[1:]
+        if not rows:
+            return
+        for i, cells in enumerate(rows):
+            # PAD a short row with empty trailing cells so it is >= the separator
+            # width — never drop a cell or fuse columns. A genuinely WIDER row keeps
+            # all its cells (valid GFM tolerates extra cells beyond the header).
+            padded = list(cells)
+            if len(padded) < data_width:
+                padded += [""] * (data_width - len(padded))
+            out_lines.append("| " + " | ".join(padded) + " |")
+            if i == 0:
+                out_lines.append("| " + " | ".join(["---"] * data_width) + " |")
+
     for line in lines:
         if _CELL_SEP in line:
             # Any text BEFORE the first cell sentinel is prose (a real cell always
-            # opens with _CELL_SEP), so emit it on its own line first and break any
-            # open table block — it must not be folded into the row's first cell.
+            # opens with _CELL_SEP), so flush any open block, emit the prose on its
+            # own line, and start fresh — it must not be folded into the first cell.
             prefix, _, rest = line.partition(_CELL_SEP)
             prefix = prefix.strip()
             if prefix:
-                in_table = False
+                _flush_table_block()
+                table_block = []
                 out_lines.append(prefix)
             cells = [c.replace("\n", " ").strip() for c in rest.split(_CELL_SEP)]
             cells = [c for c in cells if c]
             if not cells:
-                in_table = False
+                _flush_table_block()
+                table_block = []
                 continue
-            out_lines.append("| " + " | ".join(cells) + " |")
-            if not in_table:
-                # First row of this table block -> emit the GFM separator matching
-                # the column count so remarkGfm parses a real table.
-                out_lines.append("| " + " | ".join(["---"] * len(cells)) + " |")
-                in_table = True
+            table_block.append(cells)
         else:
-            in_table = False
+            _flush_table_block()
+            table_block = []
             out_lines.append(line)
+    _flush_table_block()
+    table_block = []
     text = "\n".join(out_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()

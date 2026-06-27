@@ -2319,6 +2319,146 @@ def test_html_to_text_prose_before_table_stays_prose():
     assert lines[3] == "| MAWS | Deprecating |"
 
 
+# ─── D-061 §1: merged-title Outlook tables become VALID GFM (caption + modal-sized
+# separator + padded short rows). The fixture mirrors the REAL be475732 status
+# report ("[RED] TTS & Amazon Shipping- PD26 Peak Status Report"): a 1-cell merged
+# TITLE row spanning the table, then a 4-column header, then 4-column data rows. ──
+
+# The real be475732 table shape: a single merged title cell over a 4-column grid.
+_MERGED_TITLE_TABLE_HTML = (
+    "<table>"
+    "<tr><td>TTS &amp; Amazon Shipping Org Level Details</td></tr>"
+    "<tr><th>Business Function Name</th><th>Leader</th><th>Status</th>"
+    "<th>Impact Details</th></tr>"
+    "<tr><td>Relay Safety and Trust Tech</td><td>Vineet Gupta</td>"
+    "<td>GREEN</td><td>None</td></tr>"
+    "<tr><td>Relay Spot Supply</td><td>Tobias Mueller</td><td>RED</td>"
+    "<td>Capacity shortfall in EU</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_merged_title_table_becomes_caption_plus_valid_gfm():
+    """The 1-cell merged title row lifts OUT to a bold caption line ABOVE the table,
+    and the GFM table starts at the real 4-column header — separator sized to 4."""
+    out = email_mod._html_to_text(_MERGED_TITLE_TABLE_HTML)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # (1) The merged title is a bold caption on its own line ABOVE the table —
+    #     NOT folded into row 1 of the grid, NOT dropped.
+    assert lines[0] == "**TTS & Amazon Shipping Org Level Details**"
+    # (2) The table starts at the REAL 4-column header.
+    assert lines[1] == "| Business Function Name | Leader | Status | Impact Details |"
+    # (3) The separator matches the 4 real data columns (NOT 1 from the title).
+    assert lines[2] == "| --- | --- | --- | --- |"
+    # (4) Every data row is preserved with all 4 cells + text intact.
+    assert lines[3] == "| Relay Safety and Trust Tech | Vineet Gupta | GREEN | None |"
+    assert (
+        lines[4]
+        == "| Relay Spot Supply | Tobias Mueller | RED | Capacity shortfall in EU |"
+    )
+    # The caption is plain bold MARKDOWN (escaped via remarkGfm), never raw HTML.
+    assert "<" not in out and ">" not in out
+
+
+def test_html_to_text_merged_title_table_no_one_col_separator():
+    """Regression guard for the bug: the separator must NEVER be the 1-column
+    '| --- |' sized from the merged title (that is the malformed-GFM defect)."""
+    out = email_mod._html_to_text(_MERGED_TITLE_TABLE_HTML)
+    sep_lines = [ln.strip() for ln in out.splitlines() if set(ln.strip()) <= set("|- ")
+                 and "-" in ln]
+    # The ONLY separator emitted is the 4-column one.
+    assert sep_lines == ["| --- | --- | --- | --- |"]
+    # No line is the lone 1-col separator '| --- |' (the malformed-GFM defect).
+    assert "| --- |" not in out.splitlines()
+
+
+def test_html_to_text_merged_title_table_no_cell_text_lost():
+    """No-data-loss: every cell's text from the original table survives into the
+    rendered output — nothing dropped, merged, or reordered."""
+    original_cells = [
+        "TTS & Amazon Shipping Org Level Details",
+        "Business Function Name", "Leader", "Status", "Impact Details",
+        "Relay Safety and Trust Tech", "Vineet Gupta", "GREEN", "None",
+        "Relay Spot Supply", "Tobias Mueller", "RED", "Capacity shortfall in EU",
+    ]
+    out = email_mod._html_to_text(_MERGED_TITLE_TABLE_HTML)
+    for cell in original_cells:
+        assert cell in out, f"cell text lost: {cell!r}"
+
+
+def test_html_to_text_merged_title_table_is_idempotent():
+    """f(f(x)) == f(x): a second pass sees pipe rows + a '**...**' caption (no
+    <table>) and must NOT re-wrap rows, re-emit a separator, or double-caption."""
+    once = email_mod._html_to_text(_MERGED_TITLE_TABLE_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    # The caption appears exactly once (no double-wrapping into ****...****).
+    assert once.count("**TTS & Amazon Shipping Org Level Details**") == 1
+    assert "****" not in once
+
+
+def test_html_to_text_short_data_row_is_padded_not_dropped():
+    """A genuinely-short NON-title data row is PADDED with empty trailing cells so
+    every grid row is >= the separator width — a cell is NEVER dropped or merged."""
+    html = (
+        "<table>"
+        "<tr><td>Quarterly Metrics</td></tr>"                       # 1-cell title
+        "<tr><th>Metric</th><th>Q1</th><th>Q2</th></tr>"            # 3-col header
+        "<tr><td>Revenue</td><td>10</td><td>12</td></tr>"          # 3-col data
+        "<tr><td>Notes</td><td>partial</td></tr>"                  # 2-col short data
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "**Quarterly Metrics**"
+    assert lines[1] == "| Metric | Q1 | Q2 |"
+    assert lines[2] == "| --- | --- | --- |"
+    assert lines[3] == "| Revenue | 10 | 12 |"
+    # The short row is padded to 3 columns — text kept, trailing cell empty.
+    assert lines[4] == "| Notes | partial |  |"
+    assert "partial" in out and "Notes" in out
+
+
+def test_html_to_text_modal_width_robust_to_stray_row():
+    """Column count is the MODAL (most-common) cell count of the block, not the
+    first data row's width — one stray short/long row must not mis-size the grid."""
+    html = (
+        "<table>"
+        "<tr><th>A</th><th>B</th></tr>"            # 2-col (the modal width)
+        "<tr><td>1</td><td>2</td></tr>"            # 2-col
+        "<tr><td>3</td><td>4</td></tr>"            # 2-col
+        "<tr><td>only</td></tr>"                   # stray 1-col row
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # No merged title here (first row already == modal width 2) -> no caption.
+    assert not lines[0].startswith("**")
+    assert lines[0] == "| A | B |"
+    assert lines[1] == "| --- | --- |"          # separator sized to modal 2, not 1
+    assert lines[2] == "| 1 | 2 |"
+    assert lines[3] == "| 3 | 4 |"
+    assert lines[4] == "| only |  |"             # stray short row padded to 2
+
+
+def test_html_to_text_normal_table_byte_identical_backward_compat():
+    """Backward-compat: a normal table whose first row already matches the data
+    width gets NO caption and the SAME separator as before — byte-identical."""
+    html = (
+        "<table><tr><th>Status</th><th>Owner</th><th>ETA</th></tr>"
+        "<tr><td>Green</td><td>Han</td><td>Fri</td></tr>"
+        "<tr><td>Red</td><td>Bingfeng</td><td>Mon</td></tr></table>"
+    )
+    out = email_mod._html_to_text(html)
+    # Exactly the output the pre-existing test asserts — no caption, 3-col sep.
+    assert out == (
+        "| Status | Owner | ETA |\n"
+        "| --- | --- | --- |\n"
+        "| Green | Han | Fri |\n"
+        "| Red | Bingfeng | Mon |"
+    )
+
+
 # ─── D-052: backfill an un-fetchable body from a copy quoted in another thread ──
 # Some Graph message_ids fail get_email persistently (observed: a standalone
 # original whose id 400s every time) while the SAME message is quoted inside a
