@@ -2093,10 +2093,14 @@ async def _slack_watcher(app) -> None:
 
 async def _start_watcher(app) -> None:
     """on_startup: launch the single read-only file-watcher task (idempotent)."""
-    task = app.get("slack_watch_task")
-    if task is None or task.done():
-        app["slack_watch_task"] = asyncio.create_task(_slack_watcher(app))
-        register_worker(app, 'Slack Watcher', 'slack_watch_task', SLACK_WATCH_INTERVAL_S, project='claude-web', description='Pushes live updates to the browser when the Slack queue changes')
+    try:
+        task = app.get("slack_watch_task")
+        if task is None or task.done():
+            app["slack_watch_task"] = asyncio.create_task(_slack_watcher(app))
+            register_worker(app, 'Slack Watcher', 'slack_watch_task', SLACK_WATCH_INTERVAL_S, project='claude-web', description='Pushes live updates to the browser when the Slack queue changes')
+    except Exception:
+        logger.error("Failed to start Slack watcher", exc_info=True)
+        raise
 
 
 async def _stop_watcher(app) -> None:
@@ -2347,10 +2351,14 @@ async def _draft_worker(app) -> None:
 
 async def _start_draft_worker(app) -> None:
     """on_startup: launch the single draft-worker task (idempotent)."""
-    task = app.get("slack_draft_task")
-    if task is None or task.done():
-        app["slack_draft_task"] = asyncio.create_task(_draft_worker(app))
-        register_worker(app, 'Slack Draft Worker', 'slack_draft_task', SLACK_DRAFT_POLL_INTERVAL_S, project='claude-web', description='Generates draft replies for Slack messages awaiting your review')
+    try:
+        task = app.get("slack_draft_task")
+        if task is None or task.done():
+            app["slack_draft_task"] = asyncio.create_task(_draft_worker(app))
+            register_worker(app, 'Slack Draft Worker', 'slack_draft_task', SLACK_DRAFT_POLL_INTERVAL_S, project='claude-web', description='Generates draft replies for Slack messages awaiting your review')
+    except Exception:
+        logger.error("Failed to start Slack draft worker", exc_info=True)
+        raise
 
 
 async def _stop_draft_worker(app) -> None:
@@ -2530,10 +2538,14 @@ async def _classify_worker(app) -> None:
 
 async def _start_classify_worker(app) -> None:
     """on_startup: launch the single classify-worker task (idempotent)."""
-    task = app.get("slack_classify_task")
-    if task is None or task.done():
-        app["slack_classify_task"] = asyncio.create_task(_classify_worker(app))
-        register_worker(app, 'Slack Classify Worker', 'slack_classify_task', SLACK_CLASSIFY_POLL_INTERVAL_S, project='claude-web', description='Sorts new Slack messages into actionable vs. ignorable')
+    try:
+        task = app.get("slack_classify_task")
+        if task is None or task.done():
+            app["slack_classify_task"] = asyncio.create_task(_classify_worker(app))
+            register_worker(app, 'Slack Classify Worker', 'slack_classify_task', SLACK_CLASSIFY_POLL_INTERVAL_S, project='claude-web', description='Sorts new Slack messages into actionable vs. ignorable')
+    except Exception:
+        logger.error("Failed to start Slack classify worker", exc_info=True)
+        raise
 
 
 async def _stop_classify_worker(app) -> None:
@@ -3302,20 +3314,24 @@ async def _start_scan_worker(app) -> None:
     sane across a restart instead of falling back to the wide first-scan window.
     Best-effort: a missing/odd value leaves it None (the wide-window fallback).
     """
-    global _LAST_SCAN_TS_MS
-    if _LAST_SCAN_TS_MS is None:
-        try:
-            data, _ = _load()
-            persisted = data.get("lastScanAt")
-            if isinstance(persisted, (int, float)) and not isinstance(persisted, bool):
-                _LAST_SCAN_TS_MS = int(persisted)
-        except Exception:  # noqa: BLE001 — seeding is best-effort, never blocks startup
-            pass
+    try:
+        global _LAST_SCAN_TS_MS
+        if _LAST_SCAN_TS_MS is None:
+            try:
+                data, _ = _load()
+                persisted = data.get("lastScanAt")
+                if isinstance(persisted, (int, float)) and not isinstance(persisted, bool):
+                    _LAST_SCAN_TS_MS = int(persisted)
+            except Exception:  # noqa: BLE001 — seeding is best-effort, never blocks startup
+                pass
 
-    task = app.get("slack_scan_task")
-    if task is None or task.done():
-        app["slack_scan_task"] = asyncio.create_task(_scan_worker(app))
-        register_worker(app, 'Slack Scanner', 'slack_scan_task', SLACK_SCAN_INTERVAL_S, project='claude-web', description='Fetches new Slack messages from monitored channels')
+        task = app.get("slack_scan_task")
+        if task is None or task.done():
+            app["slack_scan_task"] = asyncio.create_task(_scan_worker(app))
+            register_worker(app, 'Slack Scanner', 'slack_scan_task', SLACK_SCAN_INTERVAL_S, project='claude-web', description='Fetches new Slack messages from monitored channels')
+    except Exception:
+        logger.error("Failed to start Slack scan worker", exc_info=True)
+        raise
 
 
 async def _stop_scan_worker(app) -> None:

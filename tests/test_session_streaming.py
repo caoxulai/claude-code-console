@@ -771,3 +771,80 @@ async def test_stop_all_stops_and_clears_warm_pool(monkeypatch):
 
     assert stopped["v"] is True
     assert mgr._warm_pool == {}
+
+
+# --------------------------------------------------------------------------- #
+# B-4: Bounded event queue with drop-oldest policy
+# --------------------------------------------------------------------------- #
+async def test_event_queue_has_bounded_maxsize():
+    """PersistentSession._events queue has maxsize=2000."""
+    s = session_mod.PersistentSession(session_id="sess-bounded")
+    assert s._events.maxsize == 2000
+
+
+async def test_enqueue_event_drops_oldest_when_full():
+    """When the queue is full, _enqueue_event drops the oldest event and logs."""
+    s = session_mod.PersistentSession(session_id="sess-drop")
+    # Fill the queue to capacity with numbered events.
+    for i in range(s._events.maxsize):
+        s._events.put_nowait({"seq": i})
+    assert s._events.full()
+
+    # Enqueue one more event — drop-oldest policy should discard seq=0.
+    s._enqueue_event({"seq": 9999})
+
+    # The queue is still full (maxsize items).
+    assert s._events.qsize() == s._events.maxsize
+    # The oldest (seq=0) was dropped; the new (seq=9999) is at the tail.
+    # Drain and verify the head is seq=1 (the second-oldest survived).
+    first = s._events.get_nowait()
+    assert first["seq"] == 1
+    # The last should be our freshly-enqueued event.
+    items = [first]
+    while not s._events.empty():
+        items.append(s._events.get_nowait())
+    assert items[-1]["seq"] == 9999
+
+
+async def test_enqueue_event_logs_warning_on_drop(caplog):
+    """A warning is logged when an event is dropped due to queue overflow."""
+    import logging
+    s = session_mod.PersistentSession(session_id="sess-log-drop")
+    # Fill to capacity.
+    for i in range(s._events.maxsize):
+        s._events.put_nowait({"seq": i})
+
+    with caplog.at_level(logging.WARNING, logger="server.session_manager"):
+        s._enqueue_event({"seq": "overflow"})
+
+    assert any("Event queue full" in r.message and "sess-log-drop" in r.message
+               for r in caplog.records)
+
+
+async def test_drain_stdout_uses_bounded_enqueue():
+    """_drain_stdout pushes events via _enqueue_event (bounded, drop-oldest)."""
+    # Create a session with a TINY maxsize to prove it does NOT raise QueueFull.
+    s = session_mod.PersistentSession(session_id="sess-drain-bounded")
+    # Monkey-patch to a very small queue to force overflow.
+    s._events = asyncio.Queue(maxsize=2)
+
+    # Fabricate 5 stdout lines — more than maxsize=2.
+    lines = [_line({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": f"msg-{i}"}]}}) for i in range(5)]
+    s._proc = _FakeProc(lines)
+    s._started = True
+
+    # Launch the reader and let it finish.
+    s._reader_task = asyncio.create_task(s._drain_stdout())
+    await asyncio.wait_for(s._reader_task, timeout=2.0)
+
+    # The queue should hold maxsize items (the last 2 data events OR the
+    # sentinel). It must NOT have raised asyncio.QueueFull — the drop-oldest
+    # policy handled the overflow silently.
+    assert s._events.qsize() <= s._events.maxsize
+    # Verify the _STDOUT_EOF sentinel made it (never dropped — sentinels use
+    # _enqueue_event too, and when they need room they drop an older DATA event).
+    drained = []
+    while not s._events.empty():
+        drained.append(s._events.get_nowait())
+    assert any(e is session_mod._STDOUT_EOF for e in drained)

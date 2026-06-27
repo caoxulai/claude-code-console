@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
 from aiohttp import web
+
+logger = logging.getLogger(__name__)
 
 from server.cli import load_config
 from server.routes import read_json_body
@@ -80,16 +83,20 @@ async def _start_reaper(app: web.Application):
     reads app[taskKey] — reports the reaper's live status alongside the other
     background workers.
     """
-    manager: SessionManager = app["session_manager"]
-    app["session_reaper_task"] = manager.start_reaper()
-    register_worker(
-        app,
-        "Session Reaper",
-        "session_reaper_task",
-        _REAPER_INTERVAL_SECONDS,
-        project=None,
-        description="Shuts down idle chat sessions after 30 min of inactivity",
-    )
+    try:
+        manager: SessionManager = app["session_manager"]
+        app["session_reaper_task"] = manager.start_reaper()
+        register_worker(
+            app,
+            "Session Reaper",
+            "session_reaper_task",
+            _REAPER_INTERVAL_SECONDS,
+            project=None,
+            description="Shuts down idle chat sessions after 30 min of inactivity",
+        )
+    except Exception:
+        logger.error("Failed to start session reaper", exc_info=True)
+        raise
 
 
 async def _on_shutdown(app: web.Application):

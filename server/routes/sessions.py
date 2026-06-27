@@ -1335,10 +1335,14 @@ async def _session_watcher(app) -> None:
 
 async def _start_watcher(app) -> None:
     """on_startup: launch the session-transcript file-watcher task (idempotent)."""
-    task = app.get("session_watch_task")
-    if task is None or task.done():
-        app["session_watch_task"] = asyncio.create_task(_session_watcher(app))
-        register_worker(app, 'Session Watcher', 'session_watch_task', SESSION_WATCH_INTERVAL_S, project=None, description='Pushes live updates to the browser when session transcripts change')
+    try:
+        task = app.get("session_watch_task")
+        if task is None or task.done():
+            app["session_watch_task"] = asyncio.create_task(_session_watcher(app))
+            register_worker(app, 'Session Watcher', 'session_watch_task', SESSION_WATCH_INTERVAL_S, project=None, description='Pushes live updates to the browser when session transcripts change')
+    except Exception:
+        logger.error("Failed to start session watcher", exc_info=True)
+        raise
 
 
 async def _stop_watcher(app) -> None:
@@ -1439,10 +1443,14 @@ async def _session_cleanup_worker(app) -> None:
 
 async def _start_cleanup_worker(app) -> None:
     """on_startup: launch the session-cleanup background task (idempotent)."""
-    task = app.get("session_cleanup_task")
-    if task is None or task.done():
-        app["session_cleanup_task"] = asyncio.create_task(_session_cleanup_worker(app))
-        register_worker(app, 'Session Cleanup', 'session_cleanup_task', _CLEANUP_INTERVAL_S, project=None, description='Removes background session files older than 30 days to free disk space')
+    try:
+        task = app.get("session_cleanup_task")
+        if task is None or task.done():
+            app["session_cleanup_task"] = asyncio.create_task(_session_cleanup_worker(app))
+            register_worker(app, 'Session Cleanup', 'session_cleanup_task', _CLEANUP_INTERVAL_S, project=None, description='Removes background session files older than 30 days to free disk space')
+    except Exception:
+        logger.error("Failed to start session cleanup worker", exc_info=True)
+        raise
 
 
 async def _stop_cleanup_worker(app) -> None:

@@ -193,3 +193,87 @@ async def test_slack_count_helper_pins_terminal_denylist():
     assert slack_mod._count_actionable(None) == 0
     assert slack_mod._count_actionable("nope") == 0
     assert slack_mod._count_actionable([None, 1, "x", {"status": "edited"}]) == 1
+
+
+# ─── B-3: Startup hook exception handling ───────────────────────────────────
+
+
+import asyncio
+import logging
+
+
+async def test_start_watcher_logs_and_reraises_on_error(monkeypatch, caplog):
+    """_start_watcher logs 'Failed to start Slack watcher' and re-raises."""
+    app = {}
+
+    async def _boom(app_):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(slack_mod, "_slack_watcher", _boom)
+    # asyncio.create_task needs a running loop; the hook calls create_task which
+    # schedules the coroutine — but create_task itself can't raise from inside
+    # the coro (it raises on the task). We need to make the hook itself raise,
+    # so we monkeypatch asyncio.create_task to raise.
+    def _create_task_boom(coro):
+        # Close the coroutine to avoid RuntimeWarning
+        coro.close()
+        raise RuntimeError("task creation failed")
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_task", _create_task_boom)
+
+    with caplog.at_level(logging.ERROR, logger="server.routes.slack"):
+        with pytest.raises(RuntimeError, match="task creation failed"):
+            await slack_mod._start_watcher(app)
+
+    assert "Failed to start Slack watcher" in caplog.text
+
+
+async def test_start_draft_worker_logs_and_reraises_on_error(monkeypatch, caplog):
+    """_start_draft_worker logs 'Failed to start Slack draft worker' and re-raises."""
+    app = {}
+
+    def _create_task_boom(coro):
+        coro.close()
+        raise RuntimeError("draft boom")
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_task", _create_task_boom)
+
+    with caplog.at_level(logging.ERROR, logger="server.routes.slack"):
+        with pytest.raises(RuntimeError, match="draft boom"):
+            await slack_mod._start_draft_worker(app)
+
+    assert "Failed to start Slack draft worker" in caplog.text
+
+
+async def test_start_classify_worker_logs_and_reraises_on_error(monkeypatch, caplog):
+    """_start_classify_worker logs 'Failed to start Slack classify worker' and re-raises."""
+    app = {}
+
+    def _create_task_boom(coro):
+        coro.close()
+        raise RuntimeError("classify boom")
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_task", _create_task_boom)
+
+    with caplog.at_level(logging.ERROR, logger="server.routes.slack"):
+        with pytest.raises(RuntimeError, match="classify boom"):
+            await slack_mod._start_classify_worker(app)
+
+    assert "Failed to start Slack classify worker" in caplog.text
+
+
+async def test_start_scan_worker_logs_and_reraises_on_error(monkeypatch, caplog):
+    """_start_scan_worker logs 'Failed to start Slack scan worker' and re-raises."""
+    app = {}
+
+    def _create_task_boom(coro):
+        coro.close()
+        raise RuntimeError("scan boom")
+
+    monkeypatch.setattr(slack_mod.asyncio, "create_task", _create_task_boom)
+
+    with caplog.at_level(logging.ERROR, logger="server.routes.slack"):
+        with pytest.raises(RuntimeError, match="scan boom"):
+            await slack_mod._start_scan_worker(app)
+
+    assert "Failed to start Slack scan worker" in caplog.text

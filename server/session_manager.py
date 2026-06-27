@@ -116,14 +116,17 @@ class PersistentSession:
 
         # Single-reader + queue design. ONE background task (_drain_stdout) owns
         # the stdout read loop for the session's whole lifetime and pushes parsed
-        # events onto this unbounded queue; send() consumes from the queue rather
-        # than reading stdout directly. Because the reader keeps draining even
-        # when no send() is awaiting (the SSE client went away), the subprocess
-        # never blocks on a full ~64KB stdout pipe — so an abandoned mid-stream
-        # turn still runs to its `result` and the claude CLI flushes the complete
-        # transcript to disk. The single reader also prevents send() and the drain
-        # from both consuming stdout and stealing each other's events.
-        self._events: asyncio.Queue = asyncio.Queue()
+        # events onto this bounded queue (maxsize=2000, drop-oldest policy);
+        # send() consumes from the queue rather than reading stdout directly.
+        # Because the reader keeps draining even when no send() is awaiting (the
+        # SSE client went away), the subprocess never blocks on a full ~64KB
+        # stdout pipe — so an abandoned mid-stream turn still runs to its `result`
+        # and the claude CLI flushes the complete transcript to disk. The single
+        # reader also prevents send() and the drain from both consuming stdout and
+        # stealing each other's events. When the queue is full, the oldest event
+        # is discarded to make room (drop-oldest) — this bounds memory usage for
+        # long-running sessions while ensuring critical sentinels always enqueue.
+        self._events: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._reader_task: asyncio.Task | None = None
         # RESULT-COUNTING turn-boundary mechanism (replaces the old "drain the
         # queue before writing the prompt" approach, which was empirically
@@ -208,17 +211,36 @@ class PersistentSession:
     def _recent_stderr(self) -> str:
         return "\n".join(self._stderr_tail)
 
+    def _enqueue_event(self, event) -> None:
+        """Enqueue an event with drop-oldest policy when the queue is full.
+
+        When the bounded queue (maxsize=2000) is at capacity, discard the oldest
+        event to make room for the new one. This ensures critical sentinels
+        (_STDOUT_EOF, _STDOUT_ERROR) are never lost — they evict stale data
+        events rather than being dropped themselves.
+        """
+        if self._events.full():
+            try:
+                self._events.get_nowait()  # discard oldest
+            except asyncio.QueueEmpty:
+                pass
+            logger.warning(
+                "Event queue full for session %s, dropping oldest event",
+                self.session_id,
+            )
+        self._events.put_nowait(event)
+
     async def _drain_stdout(self):
         """Own the stdout read loop for the session's whole lifetime.
 
         Reads every line the subprocess emits, parses it, and pushes the event
-        onto self._events via put_nowait (an UNBOUNDED queue, so this never
-        blocks on a slow/absent consumer). This is the load-bearing fix: because
-        the reader keeps draining even when no send() is awaiting (the SSE client
-        disconnected), the subprocess can never stall on a full ~64KB stdout
-        pipe, so an abandoned mid-stream turn still runs to its `result` and the
-        claude CLI flushes the complete transcript to
-        ~/.claude/projects/<slug>/<id>.jsonl.
+        onto self._events via _enqueue_event (a bounded queue with drop-oldest
+        policy, so this never blocks on a slow/absent consumer and memory is
+        capped). This is the load-bearing fix: because the reader keeps draining
+        even when no send() is awaiting (the SSE client disconnected), the
+        subprocess can never stall on a full ~64KB stdout pipe, so an abandoned
+        mid-stream turn still runs to its `result` and the claude CLI flushes
+        the complete transcript to ~/.claude/projects/<slug>/<id>.jsonl.
 
         Side effects that USED to live in send() now happen here so they fire
         regardless of whether a consumer is attached:
@@ -267,7 +289,7 @@ class PersistentSession:
                     if evt.get("type") == "result":
                         self._results_emitted += 1
 
-                    self._events.put_nowait(evt)
+                    self._enqueue_event(evt)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — a read failure must end cleanly
@@ -277,10 +299,10 @@ class PersistentSession:
             # in the finally. send() turns this into a synthetic error result
             # so a crashed/errored subprocess is a visible error turn, never a
             # silent blank one (the clean-empty-break trap).
-            self._events.put_nowait((_STDOUT_ERROR, str(e)))
+            self._enqueue_event((_STDOUT_ERROR, str(e)))
         finally:
             # Signal end-of-stream so a waiting consumer stops blocking on get().
-            self._events.put_nowait(_STDOUT_EOF)
+            self._enqueue_event(_STDOUT_EOF)
 
     def _ensure_reader(self) -> None:
         """Launch the stdout reader if it is not already running.
