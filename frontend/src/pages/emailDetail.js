@@ -264,6 +264,23 @@ export function fromColumnLabel(item) {
   return base;
 }
 
+// Decide the per-row source-folder badge label (D-058 §5, AC-2). Every item the
+// scan worker produces carries a `sourceFolder`: the folder DISPLAY name
+// ("1 GSD", "1 managers", ...) for an item ingested from an Inbox subfolder, and
+// "Inbox" for the existing Inbox-root path. The badge renders this value
+// VERBATIM. The only decision is a safe default: an OLDER persisted item that
+// predates the field (or a blank/non-string value) defaults to "Inbox" so no row
+// ever reads blank — but we NEVER invent a folder name and NEVER render a raw
+// AAMk... id, because the backend always sets a real display name on BOTH paths
+// (the helper only guards the missing/blank case; a present string is trimmed and
+// returned as-is). Pure — no DOM, no fetch.
+export function sourceFolderLabel(item) {
+  const raw = item && item.sourceFolder;
+  if (typeof raw !== 'string') return 'Inbox';
+  const trimmed = raw.trim();
+  return trimmed === '' ? 'Inbox' : trimmed;
+}
+
 // Resolve a mute key to a human-friendly label. The email mute key is the raw
 // conversationId (no _threadTs suffix — see email.py _mute_key_for), so we look
 // up any queue item on the same conversation and borrow its subject (then sender),

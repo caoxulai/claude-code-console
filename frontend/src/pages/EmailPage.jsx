@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients } from './emailDetail';
 
 // --- Constants ---
 
@@ -92,6 +92,18 @@ const FYI_BADGE_STYLE = { background: '#26262e', color: '#9a9ab0' };
 const NEEDS_CLASSIFY_BADGE_STYLE = { background: '#2b2730', color: '#a39aad' };
 const APPROVED_BADGE_STYLE = { background: '#1a2e1a', color: '#7ae67a' };
 const PULSE_ICON_STYLE = { animation: 'pulse 1.4s ease-in-out infinite' };
+// Source-folder badge (D-058 §5): a small neutral metadata chip on each row that
+// names where the item was ingested from ("Inbox", "1 GSD", ...). Neutral
+// surface/border/muted-text tokens so it reads as quiet provenance metadata, not
+// a status the user must act on (it sits next to the status badge but must not
+// compete with it). Sized down so the From cell stays scannable.
+const SOURCE_FOLDER_BADGE_STYLE = {
+  display: 'inline-flex', alignItems: 'center',
+  background: 'var(--surface2)', color: 'var(--muted)',
+  border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+  fontSize: '0.72em', padding: '0.05em 0.4em', whiteSpace: 'nowrap',
+  fontWeight: 500, lineHeight: 1.4,
+};
 
 function statusBadge(item) {
   const status = typeof item === 'string' ? item : (item && item.status);
@@ -931,6 +943,65 @@ export default function EmailPage() {
     refresh();
   };
 
+  // "Delete all (N)" for a group header — moves EVERY item in the group to
+  // Outlook's Deleted Items (the real, honest delete; distinct from the
+  // recoverable soft-dismiss above). Irreversible from this app, so it confirms
+  // first. Mirrors deleteEmail's verify-effect-not-caller contract per item:
+  // success is keyed on the response BODY's `deleted` flag (not res.ok), and a
+  // per-item failure (429/GRASP quota or error) is surfaced inline on that row
+  // (setDeleteFailed) and the item is LEFT in place — never silently vanished.
+  // Etag is chained item-to-item like dismissAll, with a fresh re-read on 409.
+  const deleteAll = async (list) => {
+    // Skip only items already in Outlook's Deleted Items (re-deleting is a no-op).
+    // Dismissed and approved items are still real Outlook messages, so "Delete all"
+    // on those archive sections genuinely moves them to Deleted Items — the backend
+    // delete_item has no status guard, it just resolves the message id and moves it.
+    const targets = list.filter(it => it.status !== 'deleted');
+    if (!targets.length) return;
+    if (!window.confirm(
+      `Move ${targets.length} email${targets.length === 1 ? '' : 's'} to Outlook's Deleted Items? ` +
+      `This can't be undone here.`)) return;
+    let cur = etag;
+    for (const item of targets) {
+      // Clear any prior delete error for this item before retrying it.
+      setDeleteFailed(prev => {
+        if (!prev.has(item.id)) return prev;
+        const n = new Map(prev); n.delete(item.id); return n;
+      });
+      const del = (withEtag) =>
+        fetch(`/api/email/queue/${encodeURIComponent(item.id)}/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ etag: withEtag }),
+        });
+      try {
+        let res = await del(cur);
+        let json = await res.json().catch(() => null);
+        let { outcome, etag: nextEtag, reason } = deleteOutcome(res.status, json);
+        if (outcome === 'conflict') {
+          // Etag raced by something outside this loop — re-read fresh and retry once.
+          const fresh = await fetch('/api/email/queue').then(r => r.json()).catch(() => null);
+          if (fresh && fresh.etag) {
+            cur = fresh.etag;
+            res = await del(cur);
+            json = await res.json().catch(() => null);
+            ({ outcome, etag: nextEtag, reason } = deleteOutcome(res.status, json));
+          }
+        }
+        if (nextEtag) cur = nextEtag;
+        if (outcome !== 'deleted' && outcome !== 'conflict') {
+          // Confirmed failure (e.g. GRASP quota) — keep the row, attach the reason.
+          setDeleteFailed(prev => new Map(prev).set(item.id, reason));
+        }
+      } catch {
+        setDeleteFailed(prev => new Map(prev).set(
+          item.id, "Couldn't delete — the request did not complete. The email was NOT removed."));
+      }
+    }
+    setEtag(cur ?? null);
+    refresh();
+  };
+
   // --- Detail panel ---
   const renderDetailPanel = (item) => {
     const sectionStyle = { marginBottom: 'var(--space-md)' };
@@ -1518,11 +1589,20 @@ export default function EmailPage() {
             <Fragment key={item.id}>
               <tr onClick={() => toggleExpand(item)} style={{ cursor: 'pointer' }}>
                 <td>
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em' }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', flexWrap: 'wrap' }}>
                     <span style={{ color: 'var(--muted)' }}>
                       {open ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
                     </span>
                     <span>{fromColumnLabel(item)}</span>
+                    {/* Source-folder provenance badge (D-058 §5, AC-2): names where
+                        the scan ingested this item ("Inbox" for the root path, the
+                        subfolder display name like "1 GSD" for folder-sourced items).
+                        Rendered VERBATIM from sourceFolderLabel(item), which defaults
+                        an older item lacking the field to "Inbox" so no row reads
+                        blank — never an invented name, never a raw AAMk... id. */}
+                    <span className="badge" style={SOURCE_FOLDER_BADGE_STYLE} title={`Source folder: ${sourceFolderLabel(item)}`}>
+                      {sourceFolderLabel(item)}
+                    </span>
                   </span>
                 </td>
                 <td style={{ fontWeight: 500 }}>
@@ -1626,6 +1706,21 @@ export default function EmailPage() {
       title="Dismiss every item in this group (recoverable from the Dismissed section)"
     >
       <FiTrash2 size={11} /> Dismiss all ({list.length})
+    </button>
+  );
+
+  // "Delete all (N)" for a group header — the irreversible counterpart to
+  // "Dismiss all": moves every item in the group to Outlook's Deleted Items
+  // (confirms first, see deleteAll). Danger-styled so it reads distinctly from
+  // the recoverable dismiss sitting beside it.
+  const deleteAllBtn = (list) => (
+    <button
+      className="btn btn-danger"
+      style={{ fontSize: '0.78em', padding: '0.2em 0.5em' }}
+      onClick={() => deleteAll(list)}
+      title="Delete every item in this group from Outlook (moves to Deleted Items — cannot be undone here)"
+    >
+      <FiTrash size={11} /> Delete all ({list.length})
     </button>
   );
 
@@ -1801,7 +1896,10 @@ export default function EmailPage() {
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   To me only ({toOnlyItems.length})
                 </span>
-                {dismissAllBtn(toOnlyItems)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
+                  {dismissAllBtn(toOnlyItems)}
+                  {deleteAllBtn(toOnlyItems)}
+                </div>
               </div>
               <div className="card">{renderTable(toOnlyItems)}</div>
             </div>
@@ -1812,7 +1910,10 @@ export default function EmailPage() {
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Me in To ({toItems.length})
                 </span>
-                {dismissAllBtn(toItems)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
+                  {dismissAllBtn(toItems)}
+                  {deleteAllBtn(toItems)}
+                </div>
               </div>
               <div className="card">{renderTable(toItems)}</div>
             </div>
@@ -1823,7 +1924,10 @@ export default function EmailPage() {
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Me in CC ({ccItems.length})
                 </span>
-                {dismissAllBtn(ccItems)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
+                  {dismissAllBtn(ccItems)}
+                  {deleteAllBtn(ccItems)}
+                </div>
               </div>
               <div className="card">{renderTable(ccItems)}</div>
             </div>
@@ -1834,7 +1938,10 @@ export default function EmailPage() {
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Via DL ({dlItems.length})
                 </span>
-                {dismissAllBtn(dlItems)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
+                  {dismissAllBtn(dlItems)}
+                  {deleteAllBtn(dlItems)}
+                </div>
               </div>
               <div className="card">{renderTable(dlItems)}</div>
             </div>
@@ -1845,7 +1952,10 @@ export default function EmailPage() {
                 <span style={{ fontWeight: 600, fontSize: '0.9em', color: 'var(--text)' }}>
                   Other ({unknownItems.length})
                 </span>
-                {dismissAllBtn(unknownItems)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
+                  {dismissAllBtn(unknownItems)}
+                  {deleteAllBtn(unknownItems)}
+                </div>
               </div>
               <div className="card">{renderTable(unknownItems)}</div>
             </div>
@@ -1859,7 +1969,10 @@ export default function EmailPage() {
                   {fyiOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
                   FYI — no reply needed ({fyiItems.length})
                 </button>
-                {dismissAllBtn(fyiItems)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4em' }}>
+                  {dismissAllBtn(fyiItems)}
+                  {deleteAllBtn(fyiItems)}
+                </div>
               </div>
               {fyiOpen && (
                 <div className="card" style={{ marginTop: '0.5em' }}>{renderTable(fyiItems)}</div>
@@ -1882,10 +1995,13 @@ export default function EmailPage() {
       {/* --- Approved (collapsible, collapsed by default) --- */}
       {approvedItems.length > 0 && (
         <div style={{ marginTop: 'var(--space-md)' }}>
-          <button type="button" style={collapsibleStyle} onClick={() => setApprovedOpen(v => !v)}>
-            {approvedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
-            Approved ({approvedItems.length})
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
+            <button type="button" style={collapsibleStyle} onClick={() => setApprovedOpen(v => !v)}>
+              {approvedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+              Approved ({approvedItems.length})
+            </button>
+            {deleteAllBtn(approvedItems)}
+          </div>
           {approvedOpen && (
             <div className="card" style={{ marginTop: '0.5em' }}>
               {renderTable(approvedItems)}
@@ -1897,10 +2013,13 @@ export default function EmailPage() {
       {/* --- Dismissed (collapsible, collapsed by default) --- */}
       {dismissedItems.length > 0 && (
         <div style={{ marginTop: 'var(--space-md)' }}>
-          <button type="button" style={collapsibleStyle} onClick={() => setDismissedOpen(v => !v)}>
-            {dismissedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
-            Dismissed ({dismissedItems.length})
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
+            <button type="button" style={collapsibleStyle} onClick={() => setDismissedOpen(v => !v)}>
+              {dismissedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+              Dismissed ({dismissedItems.length})
+            </button>
+            {deleteAllBtn(dismissedItems)}
+          </div>
           {dismissedOpen && (
             <div className="card" style={{ marginTop: '0.5em' }}>
               {renderTable(dismissedItems)}

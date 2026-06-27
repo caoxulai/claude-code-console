@@ -13,6 +13,7 @@ import {
   latestThreadView,
   threadSummaryParts,
   fromColumnLabel,
+  sourceFolderLabel,
   mutedLabel,
   sortedMutedKeys,
   polishSource,
@@ -252,6 +253,43 @@ test('fromColumnLabel: empty sender -> "unknown" fallback preserved', () => {
 
 test('fromColumnLabel: empty sender but multi senderList -> "unknown +N" still counts', () => {
   assert.equal(fromColumnLabel({ sender: '', senderList: ['A', 'B'] }), 'unknown +1');
+});
+
+// --- sourceFolderLabel: the per-row source-folder badge label (D-058 §5) --
+// Every item carries a sourceFolder set by the scan worker: the folder display
+// name ("1 GSD", "1 managers", ...) for folder-sourced items and "Inbox" for the
+// root path. The badge renders it VERBATIM. The ONLY decision is the safe default
+// for an OLDER persisted item that predates the field (or a blank value): default
+// to "Inbox" so no row reads blank — but NEVER invent a folder name and NEVER
+// render a raw AAMk... id (the backend always sets a real display name on both
+// paths; the helper only guards the missing/blank case, it does not transform a
+// present value).
+
+test('sourceFolderLabel: a folder item renders its display name verbatim', () => {
+  assert.equal(sourceFolderLabel({ sourceFolder: '1 GSD' }), '1 GSD');
+  assert.equal(sourceFolderLabel({ sourceFolder: '1 managers' }), '1 managers');
+  assert.equal(sourceFolderLabel({ sourceFolder: '2 black falcon' }), '2 black falcon');
+});
+
+test('sourceFolderLabel: an Inbox-root item renders "Inbox" verbatim', () => {
+  assert.equal(sourceFolderLabel({ sourceFolder: 'Inbox' }), 'Inbox');
+});
+
+test('sourceFolderLabel: a missing/blank field defaults to "Inbox" (older item never reads blank)', () => {
+  assert.equal(sourceFolderLabel({}), 'Inbox');
+  assert.equal(sourceFolderLabel(undefined), 'Inbox');
+  assert.equal(sourceFolderLabel({ sourceFolder: '' }), 'Inbox');
+  assert.equal(sourceFolderLabel({ sourceFolder: '   ' }), 'Inbox');
+  assert.equal(sourceFolderLabel({ sourceFolder: null }), 'Inbox');
+});
+
+test('sourceFolderLabel: a non-string value defaults to "Inbox" (never renders [object Object])', () => {
+  assert.equal(sourceFolderLabel({ sourceFolder: 42 }), 'Inbox');
+  assert.equal(sourceFolderLabel({ sourceFolder: { name: '1 GSD' } }), 'Inbox');
+});
+
+test('sourceFolderLabel: a present value is trimmed but otherwise verbatim (no fabrication)', () => {
+  assert.equal(sourceFolderLabel({ sourceFolder: '  1 CRIS OOR  ' }), '1 CRIS OOR');
 });
 
 // --- mutedLabel: resolve a friendly label from a mute key -----------------
