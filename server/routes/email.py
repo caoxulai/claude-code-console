@@ -132,7 +132,19 @@ _CLASSIFY_NEXT_STATUS = {
 # back up from the remaining unread inbox, oldest-first, until the inbox is drained.
 # The actionable set is defined by _count_actionable / _TERMINAL_STATUSES (the SAME
 # predicate as the "N to review" count, D-035) — never a second inline definition.
-EMAIL_ACTIVE_TODO_CAP = 50
+EMAIL_ACTIVE_TODO_CAP = 100
+
+# Inbox SUBFOLDERS to triage in addition to the Inbox ROOT (D-058). These are
+# matched by DISPLAY NAME at scan time and resolved to their CURRENT folder id via
+# email_list_folders -- NEVER hardcode AAMk ids (they change if a folder is
+# recreated/renamed). Read through the aws-outlook-mcp (OWA/EWS) backend via the
+# existing call_read_tool routing, which is OFF the GRASP 500/day quota. A
+# management UI/API for this list is OUT of scope -- edit it here. See D-058.
+EMAIL_SCAN_SUBFOLDERS = (
+    "1 managers", "1 GSD", "1 CRIS OOR", "1 my directs", "1 me in TO",
+    "1 me only", "1 me in CC", "1 leads", "1 DG", "1 AMP 2.0", "0 to do",
+    "1 MX", "2 glenn dev", "2 black falcon",
+)
 
 # Worker tuning constants (mirroring Slack module):
 EMAIL_SCAN_INTERVAL_S = 300        # 5 minutes between scans
@@ -2105,6 +2117,126 @@ def _msg_recipients_str(msg: dict) -> str:
     return _one_line(", ".join(names), 200)
 
 
+def _resolve_scan_subfolders(list_folders_payload) -> list[tuple[str, str]]:
+    """Resolve EMAIL_SCAN_SUBFOLDERS display names -> current folder ids (D-058).
+
+    PURE/testable: takes an ``email_list_folders`` payload
+    ``{content:{folders:[{name,id,unreadCount,children:[...]}]}}``, finds the
+    top-level folder named "Inbox", walks its ``children``, and matches each child's
+    ``name`` against the allowlist. Returns ``[(display_name, folder_id), ...]`` for
+    allowlisted children that have ``unreadCount > 0`` (the cheap optimization --
+    skip folders with no unread to ingest this tick).
+
+    FAIL-LOUD-BUT-CONTINUE (AC-11): an allowlist name with NO matching Inbox child is
+    SKIPPED with a logger.info -- NEVER resolved to a fabricated id. A missing/
+    malformed payload (no Inbox, wrong shape) degrades to [] without raising.
+    """
+    if not isinstance(list_folders_payload, dict):
+        return []
+    content = list_folders_payload.get("content")
+    folders = content.get("folders") if isinstance(content, dict) else None
+    if not isinstance(folders, list):
+        folders = list_folders_payload.get("folders")
+    if not isinstance(folders, list):
+        return []
+
+    inbox = None
+    for f in folders:
+        if isinstance(f, dict) and str(f.get("name", "")).strip().lower() == "inbox":
+            inbox = f
+            break
+    if inbox is None:
+        return []
+
+    children = inbox.get("children")
+    if not isinstance(children, list):
+        children = []
+    # Index the Inbox children by display name (current ids).
+    by_name = {
+        str(c.get("name", "")): c
+        for c in children
+        if isinstance(c, dict) and c.get("name")
+    }
+
+    resolved: list[tuple[str, str]] = []
+    for name in EMAIL_SCAN_SUBFOLDERS:
+        child = by_name.get(name)
+        if child is None:
+            # Fail-loud-but-continue: surface the miss, never fabricate an id.
+            logger.info(
+                "Email scan: allowlisted subfolder %r not found under Inbox "
+                "(skipping this folder this cycle).", name,
+            )
+            continue
+        fid = str(child.get("id", "") or "")
+        if not fid:
+            logger.info(
+                "Email scan: allowlisted subfolder %r resolved to an empty id "
+                "(skipping).", name,
+            )
+            continue
+        # Cheap optimization: nothing unread to ingest this tick.
+        unread = child.get("unreadCount")
+        if isinstance(unread, (int, float)) and not isinstance(unread, bool) and unread <= 0:
+            continue
+        resolved.append((name, fid))
+    return resolved
+
+
+def _owa_conversation_to_payload(owa_emails) -> dict:
+    """Normalize an OWA ``email_read`` message list onto the canonical body shape.
+
+    The aws-outlook-mcp ``email_read`` response is
+    ``{content:{emails:[<message>]}}`` where each <message> uses DIFFERENT field
+    names than the Graph ``get_email`` path: message id is ``itemId`` (NOT id/
+    messageId), To recipients are ``recipients`` (NOT toRecipients), CC is
+    ``ccRecipients``, sender is ``sender``/``from``, received ts is
+    ``dateTimeSent``/``recievedAt`` (sic -- misspelled in the API), read flag is
+    ``isRead``.
+
+    We REMAP onto the {email:{..., messages:[...]}} shape the EXISTING helpers
+    already consume (_email_messages_from_payload / _extract_email_body /
+    _extract_thread_history / _detail_recipients / _recipient_type) so we do NOT
+    fork a parallel item builder. The conversation's FULL message list IS the thread
+    history (AC-4 -- N per-turn cards, never a summary). Crucially we map
+    ``recipients`` -> ``to`` and ``ccRecipients`` -> ``cc`` so _capture_recipients/
+    _recipient_type (which read ``to``/``cc``) classify correctly (AC-12 -- avoids
+    all-"Other" grouping). Returns {} for an empty/wrong-shaped input (never
+    fabricates).
+    """
+    if not isinstance(owa_emails, list):
+        return {}
+    messages: list[dict] = []
+    for m in owa_emails:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("itemId", "") or m.get("id", "") or m.get("messageId", ""))
+        recipients = m.get("recipients")
+        cc = m.get("ccRecipients")
+        received = m.get("recievedAt") or m.get("dateTimeSent") or m.get("received") or ""
+        messages.append({
+            "id": mid,
+            "messageId": mid,
+            "from": m.get("from") or m.get("sender"),
+            "sender": m.get("sender") or m.get("from"),
+            # Map onto to/cc (the keys _detail_recipients / _recipient_type read).
+            "to": recipients if isinstance(recipients, list) else [],
+            "cc": cc if isinstance(cc, list) else [],
+            "subject": m.get("subject", ""),
+            "body": m.get("body", ""),
+            "received": received,
+            "isRead": m.get("isRead"),
+        })
+    if not messages:
+        return {}
+    # The latest message (newest-first by convention) seeds the top-level
+    # email.to/cc so _detail_recipients/_capture_recipients see the recipients of
+    # the message addressed to me; the full list rides under messages[].
+    head = dict(messages[0])
+    head["messages"] = messages
+    return {"email": head}
+
+
 def _email_messages_from_payload(payload) -> list[dict]:
     """Normalize an MCP body response into a list of message dicts.
 
@@ -2664,7 +2796,7 @@ async def _scan_once(app) -> None:
     else:
         try:
             inbox_payload = await call_read_tool("get_emails", {
-                "folder": "inbox", "limit": 25, "unread_only": True,
+                "folder": "inbox", "limit": 100, "unread_only": True,
             })
             raw_items = _unwrap_list(inbox_payload, "emails", "messages", "items", "value")
         except Exception as e:  # noqa: BLE001 -- inbox fetch is best-effort per cycle
@@ -2698,7 +2830,10 @@ async def _scan_once(app) -> None:
     }
 
     # Filter new items (not already in queue, not muted) -- key on the Graph
-    # message_id so the conversationId->messageId re-key drops nothing.
+    # message_id so the conversationId->messageId re-key drops nothing. Track the
+    # ids queued THIS cycle (candidate_ids) so a conversation appearing in BOTH the
+    # Inbox fetch and an allowlisted subfolder is admitted ONCE (dedup, AC-9).
+    candidate_ids: set[str] = set()
     new_items = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -2706,11 +2841,76 @@ async def _scan_once(app) -> None:
         msg_id = str(raw.get("id", "") or raw.get("messageId", ""))
         if not msg_id:
             continue
-        if msg_id in existing_msg_ids:
+        if msg_id in existing_msg_ids or msg_id in candidate_ids:
             continue
         if muted and msg_id in muted:
             continue
+        raw["_sourceFolder"] = "Inbox"
+        candidate_ids.add(msg_id)
         new_items.append(raw)
+
+    # SECOND scan source (D-058): a fixed allowlist of Inbox SUBFOLDERS, read through
+    # the aws-outlook-mcp (OWA/EWS) backend via call_read_tool -- OFF the GRASP quota
+    # (these tools are NOT in _GRAPH_READ_TOOLS, so they route to the legacy session,
+    # never the Graph/manager-outlook session). The cheap LIST calls (email_list_
+    # folders + per-folder email_folders, ~15/tick) ALWAYS run; the expensive per-
+    # conversation email_read body-prefetch runs ONLY for ADMITTED folder candidates
+    # below (headroom-bounded). Discovery + each per-folder read is wrapped in its
+    # OWN try/except that logs a WARNING and CONTINUES -- one bad folder never aborts
+    # the cycle (mirrors the inbox-fetch best-effort above; AC-10). Never fabricate.
+    resolved_folders: list[tuple[str, str]] = []
+    try:
+        folders_payload = await call_read_tool("email_list_folders", {})
+        resolved_folders = _resolve_scan_subfolders(folders_payload)
+    except Exception as e:  # noqa: BLE001 -- folder discovery is best-effort per cycle
+        logger.warning("Email folder discovery failed (continuing without subfolders): %s",
+                       _scrub(str(e)))
+
+    for folder_name, folder_id in resolved_folders:
+        try:
+            folder_payload = await call_read_tool(
+                "email_folders", {"folderId": folder_id, "limit": 100})
+        except Exception as e:  # noqa: BLE001 -- one folder read must NOT abort the cycle
+            logger.warning("Email subfolder read failed for %r (skipping this folder "
+                           "this cycle): %s", folder_name, _scrub(str(e)))
+            continue
+        # email_folders has NO unread_only param: it returns read+unread mixed, with
+        # `items` NOT populated in the listing. Filter client-side to conversations
+        # with unreadCount>0 so already-handled mail never re-floods the queue (AC-3).
+        conversations = _unwrap_list(folder_payload, "emails", "messages", "items", "value")
+        for conv in conversations:
+            if not isinstance(conv, dict):
+                continue
+            unread = conv.get("unreadCount")
+            if not (isinstance(unread, (int, float)) and not isinstance(unread, bool)
+                    and unread > 0):
+                continue
+            conv_id = str(conv.get("conversationId", "") or conv.get("id", ""))
+            if not conv_id:
+                continue
+            if conv_id in existing_msg_ids or conv_id in candidate_ids:
+                continue
+            if muted and conv_id in muted:
+                continue
+            candidate_ids.add(conv_id)
+            # Shape a lightweight raw candidate that flows through the SAME machinery
+            # (_graph_ts_ms FIFO, _skeleton_for): key id/messageId/conversationId on
+            # the conversationId (Graph items alias conversationId==messageId too), so
+            # dedup/skeleton keying stay consistent. Carry the source-folder name and
+            # the conversationId for the per-conversation email_read body-prefetch.
+            new_items.append({
+                "id": conv_id,
+                "messageId": conv_id,
+                "conversationId": conv_id,
+                "subject": conv.get("topic", "") or conv.get("subject", ""),
+                "senders": conv.get("senders") or [],
+                "preview": conv.get("preview", ""),
+                "received": conv.get("lastDeliveryTime", "")
+                            or conv.get("received", ""),
+                "messageCount": conv.get("messageCount") or conv.get("unreadCount") or 1,
+                "_sourceFolder": folder_name,
+                "_owaConversationId": conv_id,
+            })
 
     # Active-to-do cap (replenish-on-clear): bound the actionable queue at
     # EMAIL_ACTIVE_TODO_CAP. Compute the current actionable count from the persisted
@@ -2735,7 +2935,33 @@ async def _scan_once(app) -> None:
     # (_extract_thread_history), so the draft worker needs no further MCP call.
     for raw in admitted:
         msg_id = str(raw.get("id", "") or raw.get("messageId", ""))
-        if msg_id:
+        owa_conv_id = raw.get("_owaConversationId")
+        if owa_conv_id:
+            # FOLDER candidate (D-058): read the conversation via the OWA backend.
+            # markAs SAFETY (AC-6, load-bearing): call email_read WITHOUT any markAs
+            # key. Per docs/meshclaw-email-integration-report.md §3, omitting markAs
+            # issues a pure GetConversationItems fetch with NO SetReadState, so the
+            # message stays UNREAD; markAs:'read' would fire ApplyConversationAction/
+            # SetReadState. NEVER add markAs here (D-058 §5/§7). The conversation's
+            # full message list IS the thread history (AC-4) -- _owa_conversation_to_
+            # payload remaps the OWA field names (itemId/recipients/ccRecipients) onto
+            # the canonical shape the existing extractors consume.
+            try:
+                read_payload = await call_read_tool(
+                    "email_read", {"conversationId": owa_conv_id, "format": "markdown"})
+                owa_msgs = _unwrap_list(read_payload, "emails", "messages", "items")
+                body_payload = _owa_conversation_to_payload(owa_msgs)
+                body_text = _extract_email_body(body_payload)
+                if body_text:
+                    raw["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+                history = _extract_thread_history(body_payload)
+                if history:
+                    raw["threadHistory"] = history
+                _capture_recipients(raw, body_payload)
+            except Exception as e:  # noqa: BLE001 -- body fetch is best-effort
+                logger.warning("Email folder body fetch failed for %s (%s): %s",
+                               owa_conv_id, raw.get("_sourceFolder"), _scrub(str(e)))
+        elif msg_id:
             try:
                 body_payload = await call_read_tool("get_email", {"message_id": msg_id})
                 body_text = _extract_email_body(body_payload)
@@ -2774,7 +3000,25 @@ async def _scan_once(app) -> None:
         msg_id = str(it.get("messageId", "") or it.get("conversationId", ""))
         body_text = ""
         history = None
-        if not skip_graph_reads:
+        # Folder-sourced items (D-058) backfill through the OWA email_read path, NOT
+        # Graph get_email -- so they stay OFF the GRASP quota even on retry and are
+        # NOT skipped while Graph is throttled (skip_graph_reads is a GRAPH concern).
+        # markAs is OMITTED here too (leaves the mail UNREAD; see prefetch comment).
+        source_folder = it.get("sourceFolder")
+        is_folder_item = bool(source_folder) and source_folder != "Inbox"
+        if is_folder_item:
+            try:
+                read_payload = await call_read_tool(
+                    "email_read", {"conversationId": msg_id, "format": "markdown"})
+                owa_msgs = _unwrap_list(read_payload, "emails", "messages", "items")
+                body_payload = _owa_conversation_to_payload(owa_msgs)
+                body_text = _extract_email_body(body_payload)
+                history = _extract_thread_history(body_payload)
+                _capture_recipients(it, body_payload)
+            except Exception as e:  # noqa: BLE001 -- one folder backfill must not abort
+                logger.warning("Email folder body backfill failed for %s (%s): %s",
+                               msg_id, source_folder, _scrub(str(e)))
+        elif not skip_graph_reads:
             try:
                 body_payload = await call_read_tool("get_email", {"message_id": msg_id})
                 body_text = _extract_email_body(body_payload)
@@ -2819,6 +3063,10 @@ async def _scan_once(app) -> None:
     # above, so non-admitted unread are NOT persisted this cycle).
     for raw in admitted:
         skeleton = _skeleton_for(raw)
+        # Source-folder tag (D-058, AC-2/AC-7): the folder display name for folder-
+        # sourced items, "Inbox" for the root path. Set on BOTH paths in lockstep
+        # (raw carries _sourceFolder either way) so an Inbox item is never blank.
+        skeleton["sourceFolder"] = raw.get("_sourceFolder") or "Inbox"
         if raw.get("emailBody"):
             skeleton["emailBody"] = raw["emailBody"]
         # Carry forward the To/CC captured from the get_email detail payload above

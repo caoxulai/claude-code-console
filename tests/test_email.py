@@ -3900,3 +3900,684 @@ async def test_email_approve_body_is_reply_all_with_quoted_thread(client, email_
     assert i_reply < i_old < i_new
     # Per-turn attribution present (not a bare reply).
     assert "From:" in body_html and "Sent:" in body_html
+
+
+# ─── D-058: folder-source pre-flight (scripts/email_validate.py) ──────────────
+#
+# The Email scanner is being extended to triage unread mail from a fixed
+# allowlist of Inbox SUBFOLDERS, read through the aws-outlook-mcp (OWA/EWS)
+# backend (OFF the GRASP quota) via the EXISTING email.call_read_tool routing
+# (email_list_folders / email_folders / email_read). The validation pre-flight
+# gains two LIVE steps:
+#   (1) the LOAD-BEARING markAs proof: email_read WITHOUT any markAs key leaves a
+#       folder message UNREAD (verified by re-reading the read-state at the
+#       destination, never the tool's success string); and
+#   (2) a folder-source smoke proving name->id resolution, the unreadCount>0
+#       filter, and a real body + multi-message thread from email_read.
+#
+# These OFFLINE tests pin the pure helpers + the effect-verified step seams with
+# the live MCP seams stubbed; the LIVE end-to-end run happens only when an
+# operator runs `python3 scripts/email_validate.py`.
+
+
+def test_validate_subfolder_allowlist_matches_spec():
+    """The script's subfolder allowlist must reuse the backend constant when it
+    lands (single source of truth) and otherwise fall back to the D-058 spec set,
+    which must include the canonical allowlisted names ('1 GSD' etc.)."""
+    backend = getattr(email_mod, "EMAIL_SCAN_SUBFOLDERS", None)
+    if backend is not None:
+        assert list(validate_mod.EMAIL_SCAN_SUBFOLDERS) == list(backend), \
+            "validate must reuse the backend subfolder allowlist, not a copy"
+    # Whatever the source, the canonical names from the spec must be present.
+    names = set(validate_mod.EMAIL_SCAN_SUBFOLDERS)
+    for canonical in ("1 GSD", "1 managers", "0 to do"):
+        assert canonical in names, f"allowlist must include {canonical!r}"
+
+
+def test_validate_resolve_subfolders_maps_names_and_skips_unresolved():
+    """resolve_subfolders walks the Inbox children and maps each allowlisted name
+    to its CURRENT id; an allowlist name with no matching child is SKIPPED (fail
+    loud, never fabricated) — never invents an id, never matches by a hardcoded id."""
+    payload = {
+        "success": True,
+        "content": {
+            "folders": [
+                {"name": "Inbox", "id": "INBOX-ID", "children": [
+                    {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 3},
+                    {"name": "1 managers", "id": "AAMk-MGR", "unreadCount": 0},
+                    {"name": "2 CR", "id": "AAMk-CR", "unreadCount": 9},  # NOT allowlisted
+                ]},
+                {"name": "Sent Items", "id": "SENT-ID", "children": []},
+            ],
+        },
+    }
+    allowlist = ["1 GSD", "1 managers", "0 to do"]  # "0 to do" has no child
+    resolved, unresolved = validate_mod.resolve_subfolders(payload, allowlist)
+
+    assert resolved == {"1 GSD": "AAMk-GSD", "1 managers": "AAMk-MGR"}, \
+        "must map allowlisted names to their CURRENT ids from the Inbox children"
+    # The non-allowlisted child is never admitted even though it has unread.
+    assert "2 CR" not in resolved
+    # An allowlist name with no matching child is reported unresolved (skipped),
+    # never fabricated with a guessed id.
+    assert unresolved == ["0 to do"], "an unresolved allowlist name must be surfaced, not faked"
+    assert all(isinstance(v, str) and v.startswith("AAMk") for v in resolved.values())
+
+
+def test_validate_filter_unread_conversations_drops_already_read():
+    """email_folders has NO unread_only param and returns read+unread mixed, so the
+    script MUST filter client-side to conversations with unreadCount>0 (else it
+    floods the queue with already-handled mail). Returns the unread conversations."""
+    payload = {"content": {"emails": [
+        {"conversationId": "C-unread-1", "topic": "live", "unreadCount": 2},
+        {"conversationId": "C-read", "topic": "done", "unreadCount": 0},
+        {"conversationId": "C-unread-2", "topic": "live2", "unreadCount": 1},
+        {"conversationId": "C-missing", "topic": "noflag"},  # absent unreadCount == 0
+    ]}}
+    admitted = validate_mod.filter_unread_conversations(payload)
+    ids = [c.get("conversationId") for c in admitted]
+    assert ids == ["C-unread-1", "C-unread-2"], \
+        "only conversations with unreadCount>0 may be admitted (read mail must NOT leak in)"
+
+
+def test_validate_map_folder_message_uses_owa_field_names():
+    """email_read returns DIFFERENT field names than the Graph get_email path. The
+    mapper must read itemId (NOT id/messageId), recipients (To), ccRecipients (CC),
+    sender/from, and recievedAt (sic) — reusing the Inbox field names would yield a
+    dead row (blank id, empty To/CC)."""
+    message = {
+        "itemId": "AAMk-ITEM-1",
+        "itemChangeKey": "CK1",
+        "sender": {"name": "Glenn Dev", "email": "glenn@example.com"},
+        "from": {"name": "Glenn Dev", "email": "glenn@example.com"},
+        "recievedAt": "2026-06-27T09:00:00Z",   # NOTE: misspelled in the API
+        "dateTimeSent": "2026-06-27T08:59:00Z",
+        "recipients": [{"name": "Me", "email": _MY_EMAIL}],
+        "ccRecipients": [{"name": "Lead", "email": "lead@example.com"}],
+        "subject": "Folder source",
+        "body": "Real folder body text.",
+        "isRead": False,
+    }
+    mapped = validate_mod.map_folder_message(message)
+    assert mapped["messageId"] == "AAMk-ITEM-1", "id must map from itemId, NOT id/messageId"
+    assert mapped["isRead"] is False
+    # To/CC come from recipients/ccRecipients (the OWA names), not toRecipients/etc.
+    to_emails = [e.get("email") for e in mapped["to"]]
+    cc_emails = [e.get("email") for e in mapped["cc"]]
+    assert _MY_EMAIL in to_emails
+    assert "lead@example.com" in cc_emails
+    # recipientType is derivable from the mapped to/cc keys (not "unknown").
+    assert mapped["recipientType"] != "unknown", \
+        "with To/CC populated the type must classify, not fall back to unknown"
+
+
+def test_validate_email_read_keeps_unread_passes_when_state_unchanged():
+    """LOAD-BEARING (AC-6 / mark-read-by-accident): calling email_read WITHOUT any
+    markAs key must leave the message UNREAD. PASS only when the re-read at the
+    destination still shows unread; the read tool's success string is NOT proof."""
+    state = {"isRead": False}
+    read_calls = []
+
+    async def fake_email_read(args):
+        read_calls.append(dict(args))
+        # email_read returns the conversation's messages; reading does NOT flip read.
+        return {"content": {"emails": [
+            {"itemId": "AAMk-ITEM-1", "isRead": state["isRead"], "body": "b"},
+        ]}}
+
+    async def fake_read_state(conv_id):
+        # Re-read the conversation's unread state at the destination.
+        return state["isRead"]
+
+    res = _vrun(validate_mod.email_read_keeps_unread(
+        conversation_id="C-unread-1",
+        email_read=fake_email_read,
+        read_state=fake_read_state,
+    ))
+    assert res.passed is True, res.detail
+    # The email_read call must carry NO markAs key (the only safe wiring).
+    assert read_calls, "email_read must be called"
+    assert all("markAs" not in c for c in read_calls), \
+        "email_read must be called WITHOUT a markAs key (never mark folder mail read)"
+
+
+def test_validate_email_read_keeps_unread_fails_if_it_marks_read():
+    """Anti VALIDATION-THEATER: if email_read marks the message read (the obvious
+    copied default), the re-read shows read and the step FAILS LOUD so the wiring is
+    never trusted."""
+    state = {"isRead": False}
+
+    async def fake_email_read(args):
+        # A wiring that marks read on read — exactly the failure mode we guard.
+        state["isRead"] = True
+        return {"content": {"emails": [{"itemId": "X", "isRead": True, "body": "b"}]}}
+
+    async def fake_read_state(conv_id):
+        return state["isRead"]
+
+    res = _vrun(validate_mod.email_read_keeps_unread(
+        conversation_id="C-unread-1",
+        email_read=fake_email_read,
+        read_state=fake_read_state,
+    ))
+    assert res.passed is False, "if email_read flips the message to read, the step must FAIL"
+    assert "unread" in res.detail.lower()
+
+
+def test_validate_folder_source_smoke_resolves_filters_and_reads_body():
+    """End-to-end (AC-4) with seams stubbed: email_list_folders resolves >=1
+    allowlisted name->id, email_folders' unreadCount>0 filter admits the right
+    conversation, and email_read on that conversationId returns a real body +
+    multi-message thread."""
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1},
+            {"name": "1 managers", "id": "AAMk-MGR", "unreadCount": 0},
+        ]},
+    ]}}
+    folder_emails_payload = {"content": {"emails": [
+        {"conversationId": "C-GSD-1", "topic": "live", "unreadCount": 1},
+        {"conversationId": "C-GSD-read", "topic": "done", "unreadCount": 0},
+    ]}}
+    email_read_payload = {"content": {"emails": [
+        {"itemId": "M1", "sender": {"name": "A", "email": "a@x.com"},
+         "recievedAt": "2026-06-27T08:00:00Z", "subject": "t",
+         "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+         "body": "First message body.", "isRead": False},
+        {"itemId": "M2", "sender": {"name": "B", "email": "b@x.com"},
+         "recievedAt": "2026-06-27T09:00:00Z", "subject": "t",
+         "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+         "body": "Second message body.", "isRead": False},
+    ]}}
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        if name == "email_folders":
+            assert args.get("folderId") == "AAMk-GSD", "must read the resolved folder id"
+            return folder_emails_payload
+        if name == "email_read":
+            assert args.get("conversationId") == "C-GSD-1", "must read the admitted conv"
+            assert "markAs" not in args, "folder email_read must omit markAs (never mark read)"
+            return email_read_payload
+        raise AssertionError(f"unexpected read tool {name}")
+
+    res = _vrun(validate_mod.folder_source_smoke(
+        allowlist=["1 GSD", "1 managers"],
+        call_read=fake_call_read,
+    ))
+    assert res.passed is True, res.detail
+    # The detail should evidence the resolved folder, the admitted conv, and a
+    # multi-message thread (full thread history, not a one-paragraph blurb).
+    assert "1 GSD" in res.detail
+    assert "2" in res.detail  # 2 thread messages
+
+
+def test_validate_folder_smoke_fails_when_no_allowlisted_folder_resolves():
+    """If NONE of the allowlisted names resolve to a folder id, the smoke step must
+    FAIL (fail-loud) rather than silently report success on an empty resolution."""
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "Some Other Folder", "id": "AAMk-OTHER", "unreadCount": 5},
+        ]},
+    ]}}
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        raise AssertionError("must not read a folder when nothing resolved")
+
+    res = _vrun(validate_mod.folder_source_smoke(
+        allowlist=["1 GSD", "1 managers"],
+        call_read=fake_call_read,
+    ))
+    assert res.passed is False, "no allowlisted folder resolving must FAIL the smoke step"
+
+
+# ─── D-058 BACKEND (server/routes/email.py): Inbox-subfolder scan source ──────
+#
+# A second scan source: a fixed allowlist of Inbox SUBFOLDERS read through the
+# aws-outlook-mcp (OWA/EWS) backend (off the GRASP quota) via the EXISTING
+# email.call_read_tool routing (email_list_folders/email_folders/email_read).
+# These pin the backend helpers (_resolve_scan_subfolders, _owa_conversation_to_
+# payload) and the _scan_once integration: sourceFolder tag on BOTH paths, the
+# unreadCount>0 filter, the OWA field-name remap, the combined cap/FIFO, best-effort
+# per-folder reads, and the LOAD-BEARING markAs SAFETY (email_read WITHOUT markAs).
+
+
+def _b58_list_folders_payload(children):
+    """email_list_folders payload with `children` under the top-level Inbox."""
+    return {
+        "success": True,
+        "content": {
+            "message": "ok",
+            "folders": [
+                {"name": "Inbox", "id": "INBOX-ID", "totalCount": 100,
+                 "unreadCount": 5, "children": children},
+                {"name": "Sent Items", "id": "SENT-ID", "totalCount": 9,
+                 "unreadCount": 0, "children": []},
+            ],
+        },
+    }
+
+
+def test_b58_email_scan_subfolders_constant_present():
+    """The allowlist is a module-level constant (editable in one place), by DISPLAY
+    NAME — never a hardcoded AAMk id."""
+    names = email_mod.EMAIL_SCAN_SUBFOLDERS
+    assert "1 GSD" in names and "1 managers" in names and "2 black falcon" in names
+    assert len(names) == 14
+    for n in names:
+        assert not str(n).startswith("AAMk")
+
+
+def test_b58_resolve_scan_subfolders_matches_allowlist_by_name():
+    """AC-2/AC-11: discovery walks Inbox children, matches the allowlist by display
+    name, returns (name, current id); a non-allowlisted child is never resolved."""
+    children = [
+        {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 3, "children": []},
+        {"name": "1 managers", "id": "AAMk-MGR", "unreadCount": 1, "children": []},
+        {"name": "2 CR", "id": "AAMk-CR", "unreadCount": 7, "children": []},
+    ]
+    by_name = dict(email_mod._resolve_scan_subfolders(_b58_list_folders_payload(children)))
+    assert by_name.get("1 GSD") == "AAMk-GSD"
+    assert by_name.get("1 managers") == "AAMk-MGR"
+    assert "2 CR" not in by_name
+
+
+def test_b58_resolve_scan_subfolders_skips_zero_unread():
+    """AC-3 cheap-optimization: an allowlisted child with unreadCount==0 is skipped."""
+    children = [
+        {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 0, "children": []},
+        {"name": "1 leads", "id": "AAMk-LEADS", "unreadCount": 2, "children": []},
+    ]
+    by_name = dict(email_mod._resolve_scan_subfolders(_b58_list_folders_payload(children)))
+    assert "1 GSD" not in by_name
+    assert by_name.get("1 leads") == "AAMk-LEADS"
+
+
+def test_b58_resolve_scan_subfolders_unresolved_name_skipped_not_fabricated(caplog):
+    """AC-11 (anti FABRICATE-ON-MISS): an allowlist name with NO matching child is
+    SKIPPED with an info log — never resolved to a fabricated id."""
+    import logging
+    children = [{"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 4, "children": []}]
+    with caplog.at_level(logging.INFO, logger=email_mod.logger.name):
+        resolved = email_mod._resolve_scan_subfolders(_b58_list_folders_payload(children))
+    assert dict(resolved) == {"1 GSD": "AAMk-GSD"}
+    assert any("1 managers" in r.getMessage() for r in caplog.records), \
+        "an unresolved allowlist name must be logged (fail-loud-but-continue)"
+
+
+def test_b58_resolve_scan_subfolders_no_inbox_returns_empty():
+    """No top-level Inbox / malformed payload degrades to [] (never raises)."""
+    assert email_mod._resolve_scan_subfolders(
+        {"content": {"folders": [{"name": "Archive", "children": []}]}}) == []
+    assert email_mod._resolve_scan_subfolders({}) == []
+    assert email_mod._resolve_scan_subfolders(None) == []
+
+
+def test_b58_owa_conversation_to_payload_remaps_field_names():
+    """AC-4 (anti FOLDER-DEAD-ROW): the OWA email_read message uses DIFFERENT field
+    names (itemId, recipients, ccRecipients, recievedAt[sic], isRead). The normalizer
+    remaps them onto the canonical {to,cc,from,body} shape the existing helpers
+    consume so body/thread/recipientType all populate."""
+    owa_emails = [{
+        "itemId": "AAMk-ITEM-1", "itemChangeKey": "CK1",
+        "sender": {"name": "Jane Folder", "email": "jane@example.com"},
+        "from": {"name": "Jane Folder", "email": "jane@example.com"},
+        "recievedAt": "2026-06-26T09:00:00Z",          # sic
+        "dateTimeSent": "2026-06-26T09:00:00Z",
+        "recipients": [{"name": "Me", "email": _MY_EMAIL},
+                       {"name": "Bob", "email": "bob@example.com"}],
+        "ccRecipients": [{"name": "Carol", "email": "carol@example.com"}],
+        "subject": "Re: Folder thread", "body": "The folder message body.",
+        "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    assert "The folder message body." in email_mod._extract_email_body(payload)
+    to_list = email_mod._detail_recipients(payload, "to")
+    cc_list = email_mod._detail_recipients(payload, "cc")
+    assert _MY_EMAIL in [r.get("email") for r in to_list]
+    assert "bob@example.com" in [r.get("email") for r in to_list]
+    assert [r.get("email") for r in cc_list] == ["carol@example.com"]
+    assert email_mod._recipient_type({"to": to_list, "cc": cc_list}) == "to"
+
+
+def test_b58_owa_conversation_to_payload_full_thread_is_per_turn():
+    """AC-4 (anti SUMMARY-MASQUERADING-AS-TIMELINE): the conversation's full message
+    LIST is the thread history — N per-turn cards, oldest->newest."""
+    owa_emails = [
+        {"itemId": "M2", "sender": {"name": "Bravo", "email": "b@example.com"},
+         "dateTimeSent": "2026-06-26T10:00:00Z", "subject": "Re: T",
+         "body": "Newest reply text.", "isRead": False},
+        {"itemId": "M1", "sender": {"name": "Alpha", "email": "a@example.com"},
+         "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "T",
+         "body": "Oldest message text.", "isRead": True},
+    ]
+    turns = email_mod._extract_thread_history(
+        email_mod._owa_conversation_to_payload(owa_emails))
+    assert len(turns) == 2
+    assert turns[0]["body"] == "Oldest message text."
+    assert turns[1]["body"] == "Newest reply text."
+
+
+class _B58WSNoop:
+    async def broadcast(self, *a, **k):
+        pass
+
+
+def _b58_scan_read_tool(folder_children, conversations_by_id, messages_by_conv,
+                        inbox_emails=None, calls=None):
+    """Fake call_read_tool routing email_list_folders/email_folders/email_read (OWA)
+    + get_emails/get_email (Graph inbox). Records every call for markAs assertions."""
+    inbox_emails = inbox_emails or []
+
+    async def fake_read_tool(name, arguments):
+        if calls is not None:
+            calls.append((name, dict(arguments)))
+        if name == "get_emails":
+            return {"emails": list(inbox_emails), "count": len(inbox_emails),
+                    "folder": "inbox"}
+        if name == "get_email":
+            mid = arguments.get("message_id")
+            for e in inbox_emails:
+                if e.get("id") == mid:
+                    return {"email": dict(e, body=e.get("body", "Inbox body."))}
+            return {}
+        if name == "email_list_folders":
+            return _b58_list_folders_payload(folder_children)
+        if name == "email_folders":
+            fid = arguments.get("folderId")
+            return {"content": {"message": "ok",
+                                "emails": conversations_by_id.get(fid, []),
+                                "totalResults": 0, "offset": 0, "limit": 100}}
+        if name == "email_read":
+            cid = arguments.get("conversationId")
+            return {"content": {"message": "ok",
+                                "emails": messages_by_conv.get(cid, [])}}
+        return {}
+
+    return fake_read_tool
+
+
+async def test_b58_scan_ingests_unread_folder_conversation_tagged_source(email_file, monkeypatch):
+    """DONE-WHEN: an unread email in an allowlisted subfolder ("1 GSD") appears in the
+    queue tagged sourceFolder "1 GSD", with its real body + full thread history; a
+    non-allowlisted folder ("2 CR") is NOT present."""
+    _seed(email_file, [])
+    folder_children = [
+        {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1, "children": []},
+        {"name": "2 CR", "id": "AAMk-CR", "unreadCount": 1, "children": []},
+    ]
+    conversations_by_id = {
+        "AAMk-GSD": [{"conversationId": "CONV-GSD-1", "topic": "Re: GSD review",
+                      "senders": ["Jane Folder"], "lastDeliveryTime": "2026-06-26T09:00:00Z",
+                      "preview": "folder preview", "unreadCount": 1, "messageCount": 2}],
+        "AAMk-CR": [{"conversationId": "CONV-CR-1", "topic": "CR thread", "unreadCount": 1}],
+    }
+    messages_by_conv = {
+        "CONV-GSD-1": [
+            {"itemId": "GSD-MSG-2", "sender": {"name": "Jane", "email": "jane@example.com"},
+             "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Re: GSD review",
+             "body": "Latest GSD reply body.",
+             "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+             "isRead": False},
+            {"itemId": "GSD-MSG-1", "sender": {"name": "Origin", "email": "origin@example.com"},
+             "dateTimeSent": "2026-06-26T08:00:00Z", "subject": "GSD review",
+             "body": "Original GSD message.",
+             "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+             "isRead": True},
+        ],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    by_conv = {it.get("conversationId"): it for it in items}
+    assert "CONV-GSD-1" in by_conv
+    assert "CONV-CR-1" not in by_conv
+    gsd = by_conv["CONV-GSD-1"]
+    assert gsd.get("sourceFolder") == "1 GSD"
+    assert "Latest GSD reply body." in (gsd.get("emailBody") or "")
+    th = gsd.get("threadHistory") or []
+    assert len(th) == 2
+    assert th[0]["body"] == "Original GSD message."
+    assert th[1]["body"] == "Latest GSD reply body."
+    assert gsd.get("recipientType") in ("to-only", "to", "cc", "dl")
+
+
+async def test_b58_scan_filters_read_folder_conversations(email_file, monkeypatch):
+    """AC-3 (anti READ-MAIL-LEAKS-IN): email_folders returns read+unread mixed; the
+    scan filters to unreadCount>0 so already-handled mail never re-floods the queue."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-GSD": [
+            {"conversationId": "CONV-UNREAD", "topic": "Unread", "unreadCount": 1},
+            {"conversationId": "CONV-READ", "topic": "Already read", "unreadCount": 0},
+        ],
+    }
+    messages_by_conv = {
+        "CONV-UNREAD": [{"itemId": "U1", "sender": {"name": "X", "email": "x@example.com"},
+                         "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Unread",
+                         "body": "Unread body.", "isRead": False}],
+    }
+    calls = []
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv, calls=calls))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    convs = {it.get("conversationId") for it in items}
+    assert "CONV-UNREAD" in convs
+    assert "CONV-READ" not in convs
+    read_conv_ids = [a.get("conversationId") for n, a in calls if n == "email_read"]
+    assert "CONV-READ" not in read_conv_ids
+
+
+async def test_b58_scan_folder_email_read_never_marks_read(email_file, monkeypatch):
+    """AC-6 (anti MARK-READ-BY-ACCIDENT, load-bearing): email_read MUST be called
+    WITHOUT any markAs key so the folder mail stays UNREAD after the scan."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1, "children": []}]
+    conversations_by_id = {"AAMk-GSD": [{"conversationId": "CONV-X", "topic": "X",
+                                         "unreadCount": 1}]}
+    messages_by_conv = {
+        "CONV-X": [{"itemId": "X1", "sender": {"name": "X", "email": "x@example.com"},
+                    "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "X",
+                    "body": "Body.", "isRead": False}],
+    }
+    calls = []
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv, calls=calls))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    email_read_calls = [a for n, a in calls if n == "email_read"]
+    assert email_read_calls, "email_read should have been called for the unread conversation"
+    for args in email_read_calls:
+        assert "markAs" not in args, \
+            "email_read must NOT pass markAs (would mark the user's mail read)"
+
+
+async def test_b58_scan_inbox_item_tagged_inbox_source(email_file, monkeypatch):
+    """AC-2/AC-7: the existing Inbox-root path tags items sourceFolder='Inbox' (set on
+    BOTH paths in lockstep so an Inbox item is never blank)."""
+    _seed(email_file, [])
+    inbox_emails = [{"id": "INBOX-1", "subject": "Inbox subject",
+                     "from": {"name": "Root Sender", "email": "root@example.com"},
+                     "received": "2026-06-26T11:00:00Z", "is_read": False, "preview": "p"}]
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool([], {}, {}, inbox_emails=inbox_emails))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    inbox_item = next(it for it in items if it.get("messageId") == "INBOX-1")
+    assert inbox_item.get("sourceFolder") == "Inbox"
+
+
+async def test_b58_scan_combined_cap_fifo_across_sources_unchanged(email_file, monkeypatch):
+    """AC-8 (anti CAP-BYPASS): folder items join the SAME queue under the SINGLE
+    EMAIL_ACTIVE_TODO_CAP, oldest-first across ALL sources. With CAP=2 and 1 inbox +
+    2 folder unread, exactly the 2 OLDEST are admitted, the newest deferred."""
+    monkeypatch.setattr(email_mod, "EMAIL_ACTIVE_TODO_CAP", 2)
+    _seed(email_file, [])
+    inbox_emails = [{"id": "INBOX-NEW", "subject": "Inbox newest",
+                     "from": {"name": "I", "email": "i@example.com"},
+                     "received": "2026-06-26T12:00:00Z", "is_read": False, "preview": "p"}]
+    folder_children = [{"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 2, "children": []}]
+    conversations_by_id = {
+        "AAMk-GSD": [
+            {"conversationId": "CONV-OLD", "topic": "old", "unreadCount": 1,
+             "lastDeliveryTime": "2026-06-26T08:00:00Z"},
+            {"conversationId": "CONV-MID", "topic": "mid", "unreadCount": 1,
+             "lastDeliveryTime": "2026-06-26T10:00:00Z"},
+        ],
+    }
+    messages_by_conv = {
+        "CONV-OLD": [{"itemId": "OLD1", "sender": {"name": "O", "email": "o@example.com"},
+                      "dateTimeSent": "2026-06-26T08:00:00Z", "subject": "old",
+                      "body": "Old body.", "isRead": False}],
+        "CONV-MID": [{"itemId": "MID1", "sender": {"name": "M", "email": "m@example.com"},
+                      "dateTimeSent": "2026-06-26T10:00:00Z", "subject": "mid",
+                      "body": "Mid body.", "isRead": False}],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv, inbox_emails=inbox_emails))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    assert len(items) == 2
+    convs = {it.get("conversationId") for it in items}
+    assert "CONV-OLD" in convs and "CONV-MID" in convs
+    assert "INBOX-NEW" not in convs
+    assert email_mod._count_actionable(items) <= 2
+
+
+async def test_b58_scan_one_bad_folder_does_not_abort_cycle(email_file, monkeypatch):
+    """AC-10 (anti WHOLE-CYCLE-ABORT): a folder read that throws is logged and the
+    scan still completes for the OTHER folders + inbox (best-effort per folder)."""
+    _seed(email_file, [])
+    folder_children = [
+        {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1, "children": []},
+        {"name": "1 leads", "id": "AAMk-BAD", "unreadCount": 1, "children": []},
+    ]
+    conversations_by_id = {"AAMk-GSD": [{"conversationId": "CONV-GOOD", "topic": "good",
+                                         "unreadCount": 1}]}
+    messages_by_conv = {
+        "CONV-GOOD": [{"itemId": "G1", "sender": {"name": "G", "email": "g@example.com"},
+                       "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "good",
+                       "body": "Good body.", "isRead": False}],
+    }
+    base = _b58_scan_read_tool(folder_children, conversations_by_id, messages_by_conv)
+
+    async def flaky_read_tool(name, arguments):
+        if name == "email_folders" and arguments.get("folderId") == "AAMk-BAD":
+            raise RuntimeError("transient OWA failure reading 1 leads")
+        return await base(name, arguments)
+
+    monkeypatch.setattr(email_mod, "call_read_tool", flaky_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})  # must NOT raise
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    convs = {it.get("conversationId") for it in items}
+    assert "CONV-GOOD" in convs
+
+
+async def test_b58_scan_dedups_conversation_in_both_inbox_and_folder(email_file, monkeypatch):
+    """AC-9: a conversation appearing in BOTH the Inbox fetch and an allowlisted
+    subfolder is admitted ONCE (deduped on conversationId/messageId), not twice."""
+    _seed(email_file, [])
+    shared_id = "SHARED-CONV"
+    inbox_emails = [{"id": shared_id, "subject": "Shared",
+                     "from": {"name": "Dup", "email": "dup@example.com"},
+                     "received": "2026-06-26T09:00:00Z", "is_read": False, "preview": "p"}]
+    folder_children = [{"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-GSD": [{"conversationId": shared_id, "topic": "Shared", "unreadCount": 1}],
+    }
+    messages_by_conv = {
+        shared_id: [{"itemId": "S1", "sender": {"name": "Dup", "email": "dup@example.com"},
+                     "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Shared",
+                     "body": "Shared body.", "isRead": False}],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv, inbox_emails=inbox_emails))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    shared = [it for it in items if it.get("conversationId") == shared_id]
+    assert len(shared) == 1, "the shared conversation must be admitted exactly once"
+    # First-seen (the Inbox path) wins the source tag.
+    assert shared[0].get("sourceFolder") == "Inbox"
+
+
+def test_b58_owa_remap_message_id_tracks_itemid_specifically():
+    """AC-13 #3 anti-bogus-green: the per-message id MUST be sourced from `itemId`
+    SPECIFICALLY, not id/messageId. The OWA email_read message has NO id/messageId
+    key — only the misspelled-domain `itemId` names the message — so a remap that
+    (wrongly) read id/messageId would leave the turn's id BLANK.
+
+    Feed a message carrying ONLY itemId with a DISTINCT value and assert the mapped
+    message id equals exactly that itemId (a 'non-empty' assertion would bogus-green
+    regardless of which key was read; the exact-equality + only-itemId-present makes
+    it go RED if the wrong key is read)."""
+    msg = {
+        "itemId": "AAMk-ITEMID-TRACKED-9",
+        "sender": {"name": "Glenn Dev", "email": "glenn@example.com"},
+        "dateTimeSent": "2026-06-26T09:00:00Z",
+        "subject": "OWA only",
+        "body": "Body text.",
+        "isRead": False,
+    }
+    assert "id" not in msg and "messageId" not in msg, \
+        "the fixture must carry ONLY itemId so the remap source is unambiguous"
+
+    payload = email_mod._owa_conversation_to_payload([msg])
+    mapped = email_mod._email_messages_from_payload(payload)
+    assert len(mapped) == 1
+    # Exact equality on the DISTINCT itemId value (not just non-empty).
+    assert mapped[0].get("id") == "AAMk-ITEMID-TRACKED-9", \
+        "message id must be remapped from itemId, not id/messageId"
+    assert mapped[0].get("messageId") == "AAMk-ITEMID-TRACKED-9"
+    # And it is non-blank — a skipped itemId read would yield '' here.
+    assert mapped[0].get("messageId"), "a skipped itemId->id remap would leave the id blank"
+
+
+async def test_b58_folder_item_backfill_uses_owa_email_read_not_graph(email_file, monkeypatch):
+    """A body-less folder-sourced item already in the queue backfills through the OWA
+    email_read path (off the GRASP quota), NEVER Graph get_email, and WITHOUT markAs."""
+    _seed(email_file, [_make_item(
+        "f1", status="needs-review", messageId="AAMk-FOLDER-CONV",
+        conversationId="AAMk-FOLDER-CONV", sourceFolder="1 GSD", emailBody="")])
+    calls = []
+
+    async def fake_read_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        if name == "get_emails":
+            return {"emails": [], "count": 0, "folder": "inbox"}
+        if name == "email_list_folders":
+            return _b58_list_folders_payload([])  # no allowlisted children resolve
+        if name == "email_read":
+            return {"content": {"emails": [
+                {"itemId": "AAMk-FOLDER-CONV", "sender": {"name": "X", "email": "x@example.com"},
+                 "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Re: Project update",
+                 "body": "Recovered folder body.", "isRead": False}]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert "Recovered folder body." in (item.get("emailBody") or "")
+    names = [n for n, _ in calls]
+    assert "email_read" in names
+    assert "get_email" not in names, "folder item must NOT backfill via Graph get_email"
+    for n, a in calls:
+        if n == "email_read":
+            assert "markAs" not in a
