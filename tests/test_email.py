@@ -4587,3 +4587,115 @@ async def test_b58_folder_item_backfill_uses_owa_email_read_not_graph(email_file
     for n, a in calls:
         if n == "email_read":
             assert "markAs" not in a
+
+
+# ─── T1 (Email read-view polish): <img> → 🖼 [image: <filename>] text marker ───
+# _html_to_text must turn a stripped inline <img> into a single tidy text marker
+# (derived from alt, else the src basename, else generic) INSTEAD of silently
+# deleting the tag in the catch-all <[^>]+> strip. The marker is PLAIN TEXT — no
+# <img> element, no cid/remote src — so it flows as prose into both emailBody
+# (_extract_email_body) and every threadHistory turn (_extract_thread_history),
+# the only place the image's identity still survives at strip time. The rule must
+# stay pure, idempotent (the marker has no '<img>', so a 2nd pass is a no-op) and
+# content-preserving (it ADDS a marker; it never drops a word of real prose).
+
+_IMG_MARKER_PREFIX = "\U0001f5bc"  # 🖼  framed-picture glyph
+
+
+def test_html_to_text_img_cid_becomes_filenamed_marker():
+    """SABOTAGE-PROOF: an <img src="cid:image001.gif@host"> with no alt becomes the
+    EXACT marker '🖼 [image: image001.gif]'. Goes RED if the tag is dropped (today's
+    behavior) OR the filename is lost — NOT a 'non-empty'/'contains image' check."""
+    html = '<p>See diagram:</p><img src="cid:image001.gif@01D8B2C3.A1B2C3D4">'
+    out = email_mod._html_to_text(html)
+    assert "\U0001f5bc [image: image001.gif]" in out, repr(out)
+    # The literal cid src must NOT survive into the rendered prose.
+    assert "cid:" not in out
+    assert "<img" not in out.lower()
+
+
+def test_html_to_text_img_https_src_uses_basename():
+    """A remote https src yields the basename only (path + query stripped)."""
+    html = '<img src="https://cdn.example.com/assets/logo.png?v=3">'
+    out = email_mod._html_to_text(html)
+    assert "\U0001f5bc [image: logo.png]" in out, repr(out)
+    assert "https://" not in out
+
+
+def test_html_to_text_img_alt_preferred_over_src():
+    """The alt attribute is preferred over the src basename when present."""
+    html = '<img alt="Q3 Revenue Chart" src="cid:chart99.png@host">'
+    out = email_mod._html_to_text(html)
+    assert "\U0001f5bc [image: Q3 Revenue Chart]" in out, repr(out)
+    # The src basename is NOT used when alt is present.
+    assert "chart99.png" not in out
+
+
+def test_html_to_text_img_no_src_or_alt_is_generic_marker():
+    """An <img> with neither a usable src nor alt yields the generic '🖼 [image]'
+    (no filename, no trailing ': ')."""
+    for html in ('<img>', '<img src="">', '<img src="data:image/png;base64,AAAA">'):
+        out = email_mod._html_to_text(html)
+        assert "\U0001f5bc [image]" in out, repr((html, out))
+        # The generic marker carries NO ': ' filename separator.
+        assert "[image:" not in out, repr((html, out))
+
+
+def test_html_to_text_img_marker_is_idempotent():
+    """f(f(x)) == f(x): the emitted marker contains no '<img>', so a second pass is a
+    no-op (the marker is plain prose to every downstream pass)."""
+    html = '<p>Logo:</p><img alt="Acme logo" src="cid:logo.gif@h"><p>Thanks</p>'
+    once = email_mod._html_to_text(html)
+    twice = email_mod._html_to_text(once)
+    assert once == twice, (repr(once), repr(twice))
+
+
+def test_html_to_text_img_no_word_loss():
+    """No-word-loss: every word of the surrounding prose survives verbatim; the rule
+    only ADDS the marker where the tag-strip previously DELETED the tag."""
+    html = (
+        "<p>Quarterly results are strong.</p>"
+        '<img src="cid:graph.png@host">'
+        "<p>Please review before Friday.</p>"
+    )
+    out = email_mod._html_to_text(html)
+    for word in ("Quarterly", "results", "are", "strong.",
+                 "Please", "review", "before", "Friday."):
+        assert word in out, repr((word, out))
+    # The marker is present alongside the prose (added, not substituted for words).
+    assert "\U0001f5bc [image: graph.png]" in out
+
+
+def test_html_to_text_image_only_body_yields_just_marker(  # AC-8
+):
+    """An image-only body (no prose) yields just the marker line — no broken
+    empty-bold / horizontal-rule artifacts."""
+    html = '<div><img src="cid:image001.gif@host"></div>'
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines == ["\U0001f5bc [image: image001.gif]"], repr(out)
+
+
+def test_html_to_text_no_img_yields_no_marker():  # AC-7 OWA folder limitation
+    """OWA folder limitation: a format=markdown-style body that carries NO <img>
+    tags yields NO image marker (the folder path can't surface filenamed markers
+    because its body has no img tags to convert — documented in email.py)."""
+    body = "Hi team,\n\nHere is the update. See the dashboard for charts.\n\nThanks"
+    out = email_mod._html_to_text(body)
+    assert "\U0001f5bc" not in out
+    assert "[image" not in out
+    # And the plain body is otherwise untouched (no '<' → pass-through).
+    assert out == body
+
+
+def test_html_to_text_img_marker_reaches_thread_and_body_extractors():
+    """The single _html_to_text change flows into BOTH _extract_email_body and the
+    per-turn _extract_thread_history bodies (both call _html_to_text), so the marker
+    appears wherever an img was stripped."""
+    payload = {"email": {
+        "from": {"name": "Jane Doe", "email": "jane@example.com"},
+        "subject": "Diagram",
+        "body": '<p>Architecture:</p><img src="cid:arch001.png@host">',
+    }}
+    body = email_mod._extract_email_body(payload)
+    assert "\U0001f5bc [image: arch001.png]" in body, repr(body)

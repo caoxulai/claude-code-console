@@ -1989,6 +1989,57 @@ def _skeleton_for(raw: dict) -> dict:
     }
 
 
+# Inline-image marker glyph (framed picture). The marker is the ONLY trace of a
+# stripped <img> that survives _html_to_text, rendered downstream as plain prose.
+_IMG_MARKER_GLYPH = "\U0001f5bc"  # 🖼
+_RE_IMG_ALT = re.compile(r"""\balt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+_RE_IMG_SRC = re.compile(r"""\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+
+
+def _img_src_basename(src: str) -> str:
+    """Derive a filename from an <img> src.
+
+    cid:image001.gif@01D8.host -> image001.gif (drop the cid: scheme and @-suffix);
+    https://cdn/assets/logo.png?v=3 -> logo.png (drop path + query). A data: URI or
+    an empty src yields "" (no usable filename -> generic marker upstream).
+    """
+    src = (src or "").strip()
+    if not src or src.lower().startswith("data:"):
+        return ""
+    # cid references: "cid:image001.gif@host" -> "image001.gif@host" -> "image001.gif"
+    if src.lower().startswith("cid:"):
+        src = src[4:]
+        src = src.split("@", 1)[0]
+    # Drop a query string / fragment, then take the last path segment.
+    src = src.split("?", 1)[0].split("#", 1)[0]
+    src = src.rstrip("/")
+    base = src.rsplit("/", 1)[-1]
+    return base.strip()
+
+
+def _img_marker_from_tag(match: "re.Match") -> str:
+    """re.sub replacement: turn one <img ...> tag into a 🖼 [image: <name>] marker.
+
+    Name preference: alt attr, else the src basename, else a generic "🖼 [image]"
+    (no filename, no ': ' separator). Pure + content-additive: it ADDS a marker
+    where the catch-all tag-strip previously DELETED the tag; it never drops prose.
+    The emitted text has no '<img>', so a second _html_to_text pass is a no-op.
+    """
+    tag = match.group(0)
+    alt_m = _RE_IMG_ALT.search(tag)
+    name = ""
+    if alt_m:
+        name = (alt_m.group(1) or alt_m.group(2) or alt_m.group(3) or "").strip()
+    if not name:
+        src_m = _RE_IMG_SRC.search(tag)
+        if src_m:
+            src = src_m.group(1) or src_m.group(2) or src_m.group(3) or ""
+            name = _img_src_basename(src)
+    if name:
+        return f"{_IMG_MARKER_GLYPH} [image: {name}]"
+    return f"{_IMG_MARKER_GLYPH} [image]"
+
+
 def _html_to_text(html: str) -> str:
     """Strip HTML to readable plain text. Handles email HTML from Graph/OWA.
 
@@ -2017,6 +2068,23 @@ def _html_to_text(html: str) -> str:
     # Block-level breaks
     text = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</h[1-6]>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<h[1-6][^>]*>", "\n", text, flags=re.IGNORECASE)
+    # Inline images: replace each <img ...> with a tidy plain-text marker BEFORE the
+    # catch-all tag-strip below (which would otherwise DELETE the tag, losing the
+    # image's identity — this is the only place the alt/src still exists). The marker
+    # is PLAIN TEXT (no <img>, no cid/remote src) so the downstream tag-strip,
+    # entity-decode, and table/list passes treat it as ordinary prose, and it flows
+    # automatically into both _extract_email_body and every _extract_thread_history
+    # turn (both call _html_to_text). Name = alt attr, else the src basename
+    # (cid:image001.gif@host -> image001.gif; https://.../logo.png?v=3 -> logo.png),
+    # else the generic "🖼 [image]". The emitted marker has no '<img>', so a second
+    # _html_to_text pass is a no-op (idempotent).
+    #
+    # DOCUMENTED LIMITATION (AC-7): only an HTML body that actually carries <img>
+    # tags can surface a filenamed marker. The OWA folder ingest path (email_read
+    # format=markdown) returns a body with NO <img> trace, so folder items get no
+    # marker here — there is nothing to convert. That is surfaced as a known
+    # limitation, not silently shipped as Inbox-only behavior.
+    text = re.sub(r"<img\b[^>]*>", _img_marker_from_tag, text, flags=re.IGNORECASE)
     # Strip remaining tags
     text = re.sub(r"<[^>]+>", "", text)
     # Decode common HTML entities
