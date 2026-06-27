@@ -3424,36 +3424,18 @@ async def _draft_worker(app) -> None:
 # operator habit ('0'/'false' are non-empty -> truthy) as ENABLE, silently breaking
 # the default-OFF guarantee. Does NOT gate the persistent-MCP cleanup or any
 # non-email worker.
-_EMAIL_WORKERS_ENV = "CLAUDE_WEB_EMAIL_WORKERS"
-_EMAIL_WORKERS_TRUTHY = {"1", "true", "yes"}
-# Guard so the three start hooks don't triple-log the "disabled" line on startup.
-_EMAIL_WORKERS_DISABLED_LOGGED = False
-
-
-def _email_workers_enabled() -> bool:
-    """True iff CLAUDE_WEB_EMAIL_WORKERS is a truthy token (1/true/yes, any case)."""
-    return os.environ.get(_EMAIL_WORKERS_ENV, "").strip().lower() in _EMAIL_WORKERS_TRUTHY
-
-
-def _email_workers_gate_open() -> bool:
-    """Gate for the start hooks: log ONCE when disabled, then early-return falsey."""
-    if _email_workers_enabled():
-        return True
-    global _EMAIL_WORKERS_DISABLED_LOGGED
-    if not _EMAIL_WORKERS_DISABLED_LOGGED:
-        logger.info(
-            "Email workers disabled (%s unset/falsey) — no scan/classify/draft loops "
-            "will run. Set %s=1 to enable.",
-            _EMAIL_WORKERS_ENV, _EMAIL_WORKERS_ENV,
-        )
-        _EMAIL_WORKERS_DISABLED_LOGGED = True
-    return False
-
-
 async def _start_scan_worker(app) -> None:
-    """on_startup: seed _LAST_SCAN_TS_MS from persisted lastScanAt, then launch."""
-    if not _email_workers_gate_open():
-        return
+    """on_startup: seed _LAST_SCAN_TS_MS from persisted lastScanAt, then launch.
+
+    Like the Slack workers, the email workers always start on app startup; the
+    ONLY runtime control is the store's ``paused`` flag (toggled from the UI via
+    PUT /api/email/config), which every worker loop honors per cycle. The former
+    CLAUDE_WEB_EMAIL_WORKERS startup env gate (added as a post-GRASP-outage kill
+    switch) was retired once the quota-burn cause was fixed structurally: scan
+    reads go through the OWA backend (MMCP_AUTH_BACKEND=owa, off the GRASP quota)
+    and the scan worker reaps the idle Graph session every tick, while classify
+    and draft are MCP-free (claude --print). Pause from the UI to stop the loops.
+    """
     global _LAST_SCAN_TS_MS
     if _LAST_SCAN_TS_MS is None:
         try:
@@ -3481,8 +3463,6 @@ async def _stop_scan_worker(app) -> None:
 
 
 async def _start_classify_worker(app) -> None:
-    if not _email_workers_gate_open():
-        return
     task = app.get("email_classify_task")
     if task is None or task.done():
         app["email_classify_task"] = asyncio.create_task(_classify_worker(app))
@@ -3501,8 +3481,6 @@ async def _stop_classify_worker(app) -> None:
 
 
 async def _start_draft_worker(app) -> None:
-    if not _email_workers_gate_open():
-        return
     task = app.get("email_draft_task")
     if task is None or task.done():
         app["email_draft_task"] = asyncio.create_task(_draft_worker(app))

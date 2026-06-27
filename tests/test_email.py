@@ -2520,14 +2520,15 @@ def _make_actionable(n):
     )
 
 
-def test_active_todo_cap_is_named_constant_fifty():
+def test_active_todo_cap_is_named_constant():
     """The cap is a single named constant reusing the terminal/actionable predicate."""
-    assert email_mod.EMAIL_ACTIVE_TODO_CAP == 50
+    assert email_mod.EMAIL_ACTIVE_TODO_CAP == 100
 
 
 async def test_scan_at_cap_admits_zero_new(email_file, monkeypatch):
-    """(CAP) A store already holding 50 actionable items admits ZERO new to-dos."""
-    _seed(email_file, [_make_actionable(i) for i in range(50)])
+    """(CAP) A store already AT the cap admits ZERO new to-dos."""
+    cap = email_mod.EMAIL_ACTIVE_TODO_CAP
+    _seed(email_file, [_make_actionable(i) for i in range(cap)])
 
     async def fake_read_tool(name, arguments):
         if name == "get_emails":
@@ -2542,15 +2543,16 @@ async def test_scan_at_cap_admits_zero_new(email_file, monkeypatch):
     await email_mod._scan_once({"ws_manager": _NoopWS()})
 
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
-    assert email_mod._count_actionable(saved) == 50
+    assert email_mod._count_actionable(saved) == cap
     # No new MSG-* skeletons were ingested.
     assert not any(str(it.get("messageId", "")).startswith("MSG-") for it in saved)
 
 
 async def test_scan_below_cap_admits_oldest_first_up_to_headroom(email_file, monkeypatch):
-    """(CAP+FIFO) With 42 actionable, a scan admits at most 8 — the OLDEST eligible
-    unread first — and never exceeds 50."""
-    _seed(email_file, [_make_actionable(i) for i in range(42)])
+    """(CAP+FIFO) With headroom 8, a scan admits at most 8 — the OLDEST eligible
+    unread first — and never exceeds the cap."""
+    cap = email_mod.EMAIL_ACTIVE_TODO_CAP
+    _seed(email_file, [_make_actionable(i) for i in range(cap - 8)])  # headroom 8
 
     # 12 eligible unread returned NEWEST-FIRST (as Graph does): MSG-12 .. MSG-1,
     # with MSG-1 the OLDEST. Headroom is 8, so the 8 OLDEST (MSG-1..MSG-8) win.
@@ -2570,7 +2572,7 @@ async def test_scan_below_cap_admits_oldest_first_up_to_headroom(email_file, mon
     await email_mod._scan_once({"ws_manager": _NoopWS()})
 
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
-    assert email_mod._count_actionable(saved) == 50  # 42 + 8, never more
+    assert email_mod._count_actionable(saved) == cap  # (cap-8) + 8, never more
     admitted_ids = sorted(
         str(it.get("messageId")) for it in saved
         if str(it.get("messageId", "")).startswith("MSG-")
@@ -2581,10 +2583,12 @@ async def test_scan_below_cap_admits_oldest_first_up_to_headroom(email_file, mon
 
 
 async def test_scan_never_exceeds_cap_with_many_new(email_file, monkeypatch):
-    """(CAP) Far more eligible unread than headroom never pushes past 50."""
-    _seed(email_file, [_make_actionable(i) for i in range(10)])  # headroom 40
+    """(CAP) Far more eligible unread than headroom never pushes past the cap."""
+    cap = email_mod.EMAIL_ACTIVE_TODO_CAP
+    _seed(email_file, [_make_actionable(i) for i in range(10)])  # headroom cap-10
 
-    raws = [_unread_raw(n, f"2026-{(n % 12) + 1:02d}-01T10:00:00Z") for n in range(100)]
+    raws = [_unread_raw(n, f"2026-{(n % 12) + 1:02d}-01T10:00:00Z")
+            for n in range(cap + 50)]
 
     async def fake_read_tool(name, arguments):
         if name == "get_emails":
@@ -2597,15 +2601,16 @@ async def test_scan_never_exceeds_cap_with_many_new(email_file, monkeypatch):
     await email_mod._scan_once({"ws_manager": _NoopWS()})
 
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
-    assert email_mod._count_actionable(saved) == 50
+    assert email_mod._count_actionable(saved) == cap
 
 
 async def test_deleted_status_does_not_eat_a_capped_slot(email_file, monkeypatch):
     """(CAP+TERMINAL RECONCILE) A 'deleted' item is terminal, so it frees headroom."""
-    items = [_make_actionable(i) for i in range(49)]
+    cap = email_mod.EMAIL_ACTIVE_TODO_CAP
+    items = [_make_actionable(i) for i in range(cap - 1)]  # headroom 1
     items.append(_make_item("gone", messageId="GONE", conversationId="GONE",
                             status="deleted"))
-    _seed(email_file, items)  # 49 actionable + 1 deleted (terminal)
+    _seed(email_file, items)  # (cap-1) actionable + 1 deleted (terminal)
 
     async def fake_read_tool(name, arguments):
         if name == "get_emails":
@@ -2620,11 +2625,11 @@ async def test_deleted_status_does_not_eat_a_capped_slot(email_file, monkeypatch
     await email_mod._scan_once({"ws_manager": _NoopWS()})
 
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
-    # Headroom was 50 - 49 = 1, so exactly ONE new item is admitted (the oldest).
+    # Headroom was cap - (cap-1) = 1, so exactly ONE new item is admitted (the oldest).
     admitted = [it for it in saved if str(it.get("messageId", "")).startswith("MSG-")]
     assert len(admitted) == 1
     assert admitted[0]["messageId"] == "MSG-500"
-    assert email_mod._count_actionable(saved) == 50
+    assert email_mod._count_actionable(saved) == cap
 
 
 # ─── D-055 (2) Terminal-predicate reconciliation ─────────────────────────────
@@ -2641,49 +2646,20 @@ def test_deleted_is_terminal():
     ]) == 1
 
 
-# ─── D-055 (3) Default-OFF worker gate ───────────────────────────────────────
+# ─── Worker startup (Slack-model: always start, controlled only by `paused`) ──
+#
+# The former D-055 CLAUDE_WEB_EMAIL_WORKERS startup env gate was retired so email
+# matches Slack: the three workers always start on app startup, and the ONLY
+# runtime control is the store's `paused` flag (toggled from the UI via PUT
+# /api/email/config), which every worker loop honors per cycle. The env gate was
+# a post-GRASP-outage kill switch; it became unnecessary once scan reads moved to
+# the OWA backend (off the GRASP quota) and the idle Graph session is reaped each
+# tick. The pause-gate behavior of each loop is covered by the worker-loop tests.
 
 
-def test_email_workers_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("CLAUDE_WEB_EMAIL_WORKERS", raising=False)
-    assert email_mod._email_workers_enabled() is False
-
-
-@pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "yes", "True"])
-def test_email_workers_enabled_for_truthy_allowlist(monkeypatch, val):
-    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", val)
-    assert email_mod._email_workers_enabled() is True
-
-
-@pytest.mark.parametrize("val", ["0", "false", "no", "", "off", "disable"])
-def test_email_workers_disabled_for_falsey_strings(monkeypatch, val):
-    """'0'/'false' are TRUTHY strings to bool() — they must NOT enable workers."""
-    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", val)
-    assert email_mod._email_workers_enabled() is False
-
-
-async def test_start_hooks_register_no_task_when_flag_unset(monkeypatch):
-    """All three start hooks early-return (register NO task) when the flag is unset."""
-    monkeypatch.delenv("CLAUDE_WEB_EMAIL_WORKERS", raising=False)
-
-    created = []
-    monkeypatch.setattr(email_mod.asyncio, "create_task",
-                        lambda coro: created.append(coro) or _DummyTask(coro))
-
-    app = {}
-    await email_mod._start_scan_worker(app)
-    await email_mod._start_classify_worker(app)
-    await email_mod._start_draft_worker(app)
-
-    assert created == [], "no email worker coroutine may be scheduled when disabled"
-    assert "email_scan_task" not in app
-    assert "email_classify_task" not in app
-    assert "email_draft_task" not in app
-
-
-async def test_start_hooks_register_task_when_flag_set(monkeypatch):
-    """With CLAUDE_WEB_EMAIL_WORKERS=1 all three hooks register their task (wiring)."""
-    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", "1")
+async def test_start_hooks_register_task_unconditionally(monkeypatch):
+    """All three start hooks register their task (no env gate — Slack model)."""
+    monkeypatch.delenv("CLAUDE_WEB_EMAIL_WORKERS", raising=False)  # must NOT matter now
 
     monkeypatch.setattr(email_mod, "register_worker", lambda *a, **k: None)
     # Avoid the scan hook actually reading the sidecar.
@@ -2709,6 +2685,34 @@ async def test_start_hooks_register_task_when_flag_set(monkeypatch):
     assert "email_draft_task" in app
 
 
+async def test_start_hooks_ignore_legacy_env_flag(monkeypatch):
+    """The retired CLAUDE_WEB_EMAIL_WORKERS env var no longer gates startup.
+
+    Even set to a former-falsey value, the workers still start — the env gate is
+    gone and only `paused` controls them now.
+    """
+    monkeypatch.setenv("CLAUDE_WEB_EMAIL_WORKERS", "0")  # legacy "off" — now ignored
+
+    monkeypatch.setattr(email_mod, "register_worker", lambda *a, **k: None)
+    monkeypatch.setattr(email_mod, "_load", lambda: ({"items": []}, None))
+
+    created = []
+
+    def fake_create_task(coro):
+        created.append(coro)
+        coro.close()
+        return _DummyTask(coro)
+
+    monkeypatch.setattr(email_mod.asyncio, "create_task", fake_create_task)
+
+    app = {}
+    await email_mod._start_scan_worker(app)
+    await email_mod._start_classify_worker(app)
+    await email_mod._start_draft_worker(app)
+
+    assert len(created) == 3, "legacy env flag must not suppress worker startup"
+
+
 class _DummyTask:
     def __init__(self, coro):
         self._coro = coro
@@ -2727,12 +2731,14 @@ async def test_scan_cap_prefetches_admitted_bodies_and_drops_non_admitted(
     pre-fetch (emailBody + threadHistory) AND get persisted; the non-admitted
     overflow is NOT ingested this cycle at all — no body-less ghost rows.
 
-    Seeds 48 actionable (headroom = 2) and returns 5 eligible unread NEWEST-FIRST
-    (MSG-5..MSG-1, MSG-1 oldest). The 2 OLDEST (MSG-1, MSG-2) are admitted: each
-    must carry a body AND a multi-turn threadHistory, AND get_email must have been
-    called for EXACTLY those two ids (the cap gates the body fetch, not just the
-    persist). MSG-3..MSG-5 must be wholly absent (no skeleton, no get_email)."""
-    _seed(email_file, [_make_actionable(i) for i in range(48)])  # headroom 2
+    Seeds (cap - 2) actionable (headroom = 2) and returns 5 eligible unread
+    NEWEST-FIRST (MSG-5..MSG-1, MSG-1 oldest). The 2 OLDEST (MSG-1, MSG-2) are
+    admitted: each must carry a body AND a multi-turn threadHistory, AND get_email
+    must have been called for EXACTLY those two ids (the cap gates the body fetch,
+    not just the persist). MSG-3..MSG-5 must be wholly absent (no skeleton, no
+    get_email)."""
+    cap = email_mod.EMAIL_ACTIVE_TODO_CAP
+    _seed(email_file, [_make_actionable(i) for i in range(cap - 2)])  # headroom 2
 
     # 5 eligible unread, newest-first (day=n so larger n is newer; MSG-1 oldest).
     raws = [_unread_raw(n, f"2026-06-{n:02d}T10:00:00Z") for n in range(5, 0, -1)]
@@ -2769,7 +2775,7 @@ async def test_scan_cap_prefetches_admitted_bodies_and_drops_non_admitted(
 
     # Exactly the 2 OLDEST eligible unread were admitted (MSG-1, MSG-2).
     assert sorted(by_msg) == ["MSG-1", "MSG-2"]
-    assert email_mod._count_actionable(saved) == 50
+    assert email_mod._count_actionable(saved) == cap
 
     # Each admitted item got the expensive body pre-fetch (emailBody + history).
     for mid in ("MSG-1", "MSG-2"):
@@ -2880,7 +2886,7 @@ def test_validate_cap_check_passes_only_on_correct_fifo_admission():
     """assert_scan_cap: PASS only when the post-cycle actionable count respects the
     cap AND the admitted items are the OLDEST eligible unread (FIFO)."""
     cap = validate_mod.ACTIVE_TODO_CAP
-    pre_count = cap - 8  # e.g. 42 when cap is 50
+    pre_count = cap - 8  # e.g. 92 when cap is 100
     eligible_ts = list(range(20, 0, -1))  # 20 (newest) .. 1 (oldest), newest-first
 
     # CORRECT: admit the 8 OLDEST (ts 1..8); post count == cap.
@@ -2923,7 +2929,7 @@ def test_validate_uses_real_active_todo_cap_constant():
         assert validate_mod.ACTIVE_TODO_CAP == backend_cap, \
             "the validation script must reuse the backend cap constant, not a copy"
     else:
-        assert validate_mod.ACTIVE_TODO_CAP == 50
+        assert validate_mod.ACTIVE_TODO_CAP == 100
 
 
 def test_validate_never_references_a_send_tool_name():
