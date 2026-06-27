@@ -1222,7 +1222,7 @@ export default function EmailPage() {
               </button>
               {emailBodyOpen && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em', marginTop: '0.5em' }}>
-                  {view.turns.map((turn, i) => renderTurnCard(turn, i))}
+                  {view.turns.map((turn, i) => renderTurnCard(turn, turn.timestamp || i))}
                 </div>
               )}
             </>
@@ -1467,18 +1467,18 @@ export default function EmailPage() {
               }}
             >
               {diffTokens.map((tok, i) => {
-                if (tok.type === 'same') return <span key={i}>{tok.value}</span>;
+                if (tok.type === 'same') return <span key={tok.type + '-' + i + '-' + tok.value.slice(0, 12)}>{tok.value}</span>;
                 if (tok.type === 'removed') {
                   return (
                     <span
-                      key={i}
+                      key={tok.type + '-' + i + '-' + tok.value.slice(0, 12)}
                       style={{ color: 'var(--muted)', textDecoration: 'line-through', textDecorationColor: 'var(--muted)' }}
                     >
                       {tok.value}
                     </span>
                   );
                 }
-                return <span key={i} style={{ color: 'var(--accent)', fontWeight: 600 }}>{tok.value}</span>;
+                return <span key={tok.type + '-' + i + '-' + tok.value.slice(0, 12)} style={{ color: 'var(--accent)', fontWeight: 600 }}>{tok.value}</span>;
               })}
             </div>
             <div style={{ display: 'flex', gap: '1em', marginTop: '0.4em', fontSize: '0.75em', color: 'var(--muted)' }}>
@@ -1587,7 +1587,7 @@ export default function EmailPage() {
           const rowUpdating = item.status === 'needs-review' && rowHasDraft && item.needsRedraft === true;
           return (
             <Fragment key={item.id}>
-              <tr onClick={() => toggleExpand(item)} style={{ cursor: 'pointer' }}>
+              <tr onClick={() => toggleExpand(item)} tabIndex={0} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(item); } }} style={{ cursor: 'pointer' }}>
                 <td>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', flexWrap: 'wrap' }}>
                     <span style={{ color: 'var(--muted)' }}>
@@ -1965,7 +1965,7 @@ export default function EmailPage() {
           {fyiItems.length > 0 && (
             <div style={{ marginBottom: 'var(--space-md)' }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
-                <button type="button" style={collapsibleStyle} onClick={() => setFyiOpen(v => !v)}>
+                <button type="button" style={collapsibleStyle} aria-expanded={fyiOpen} onClick={() => setFyiOpen(v => !v)}>
                   {fyiOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
                   FYI — no reply needed ({fyiItems.length})
                 </button>
@@ -1996,7 +1996,7 @@ export default function EmailPage() {
       {approvedItems.length > 0 && (
         <div style={{ marginTop: 'var(--space-md)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
-            <button type="button" style={collapsibleStyle} onClick={() => setApprovedOpen(v => !v)}>
+            <button type="button" style={collapsibleStyle} aria-expanded={approvedOpen} onClick={() => setApprovedOpen(v => !v)}>
               {approvedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
               Approved ({approvedItems.length})
             </button>
@@ -2014,7 +2014,7 @@ export default function EmailPage() {
       {dismissedItems.length > 0 && (
         <div style={{ marginTop: 'var(--space-md)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4em' }}>
-            <button type="button" style={collapsibleStyle} onClick={() => setDismissedOpen(v => !v)}>
+            <button type="button" style={collapsibleStyle} aria-expanded={dismissedOpen} onClick={() => setDismissedOpen(v => !v)}>
               {dismissedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
               Dismissed ({dismissedItems.length})
             </button>
@@ -2031,7 +2031,7 @@ export default function EmailPage() {
       {/* --- Deleted (collapsible, collapsed by default) --- */}
       {deletedItems.length > 0 && (
         <div style={{ marginTop: 'var(--space-md)' }}>
-          <button type="button" style={collapsibleStyle} onClick={() => setDeletedOpen(v => !v)}>
+          <button type="button" style={collapsibleStyle} aria-expanded={deletedOpen} onClick={() => setDeletedOpen(v => !v)}>
             {deletedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
             Deleted ({deletedItems.length})
           </button>
@@ -2049,7 +2049,7 @@ export default function EmailPage() {
           and an Unmute button. Empty map renders nothing. */}
       {mutedKeys.length > 0 && (
         <div style={{ marginTop: 'var(--space-md)' }}>
-          <button type="button" style={collapsibleStyle} onClick={() => setMutedOpen(v => !v)}>
+          <button type="button" style={collapsibleStyle} aria-expanded={mutedOpen} onClick={() => setMutedOpen(v => !v)}>
             {mutedOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
             <FiBellOff size={13} /> Muted conversations ({mutedKeys.length})
           </button>
@@ -2100,7 +2100,7 @@ export default function EmailPage() {
       {/* --- Style preferences (collapsible, collapsed by default) --- */}
       {styleLoaded && (
         <div style={{ marginTop: 'var(--space-lg)' }}>
-          <button type="button" style={collapsibleStyle} onClick={() => setStyleOpen(v => !v)}>
+          <button type="button" style={collapsibleStyle} aria-expanded={styleOpen} onClick={() => setStyleOpen(v => !v)}>
             {styleOpen ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
             Style preferences
           </button>
