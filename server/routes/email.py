@@ -2378,11 +2378,22 @@ def _extract_email_body(payload) -> str:
 # stripped by ``_strip_emphasis`` BEFORE the value is flattened into a field.
 _EMPH = r"(?:\*{1,2}|_{1,2})"  # one markdown emphasis run: ** __ * _
 # Optional leading emphasis + ws, label + ':', optional emphasis/ws, then value.
-_RE_FROM_LINE = re.compile(rf"^\s*{_EMPH}?\s*From:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
-_RE_DATE_LINE = re.compile(rf"^\s*{_EMPH}?\s*(?:Date|Sent):\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
-_RE_TO_LINE = re.compile(rf"^\s*{_EMPH}?\s*To:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
-_RE_CC_LINE = re.compile(rf"^\s*{_EMPH}?\s*Cc:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
-_RE_SUBJECT_LINE = re.compile(rf"^\s*{_EMPH}?\s*Subject:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
+# The value group is OPTIONAL ((.*)) so a real OWA body that wraps the value onto
+# the FOLLOWING line (``**From:`` / ``**From: `` alone, value ``**"Shadeck, Gal"``
+# below) still matches the label; the on-next-line value is recovered by
+# ``_header_value`` (D-060 rework). The bare/inline form is unchanged: a non-empty
+# value is still captured in group(1) byte-identically.
+_RE_FROM_LINE = re.compile(rf"^\s*{_EMPH}?\s*From:\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
+_RE_DATE_LINE = re.compile(rf"^\s*{_EMPH}?\s*(?:Date|Sent):\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
+_RE_TO_LINE = re.compile(rf"^\s*{_EMPH}?\s*To:\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
+_RE_CC_LINE = re.compile(rf"^\s*{_EMPH}?\s*Cc:\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
+_RE_SUBJECT_LINE = re.compile(rf"^\s*{_EMPH}?\s*Subject:\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
+# A meeting-invite ``**When:`` (date/time) and ``**Where:`` (location) line.
+# ``When:`` is a date CONFIRMATION for the shape gate and a FALLBACK timestamp (used
+# only when no Date:/Sent: line is present); ``Where:`` is recognized solely so the
+# parser drops it from the body (D-060 rework: real Original-Appointment blocks).
+_RE_WHEN_LINE = re.compile(rf"^\s*{_EMPH}?\s*When:\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
+_RE_WHERE_LINE = re.compile(rf"^\s*{_EMPH}?\s*Where:\s*{_EMPH}?\s*(.*?)\s*$", re.IGNORECASE)
 _RE_GMAIL_WROTE = re.compile(r"^\s*On\s+.+\bwrote:\s*$", re.IGNORECASE)
 # Full-line dashed separator: ``-----Original Message-----`` AND
 # ``-----Original Appointment-----`` (any single-word variant). Stays dash-anchored
@@ -2410,8 +2421,15 @@ def _strip_emphasis(value: str) -> str:
         prev = v
         v = _RE_EMPH_EDGES.sub("", v).strip()
     return v
-# How far below a ``From:`` line we look for the Date:/Subject: confirmation.
-_OUTLOOK_HEADER_LOOKAHEAD = 5
+# Max NON-BLANK lines a single quoted Outlook header block may span (From: through
+# Subject:, blank lines NOT counted). Real OWA blocks interleave blank lines between
+# every label AND wrap long To:/Cc: recipient lists across MANY continuation lines —
+# the largest genuine block observed in the stored corpus is 27 non-blank lines (a
+# big Cc list). 40 comfortably clears that while still bounding a pathological scan
+# (a lone ``**From:`` in prose can't wander hundreds of lines hunting an unrelated
+# Subject:). The real over-match guard is the SHAPE gate (From: + date + Subject: in
+# order, terminating at Subject:); this cap is the belt-and-suspenders (D-060 rework).
+_OUTLOOK_HEADER_MAX_NONBLANK = 40
 # A 'Name <email>' / 'Name email@x' header value -> display name (drop the addr).
 _RE_ADDR_ANGLE = re.compile(r"\s*<[^>]+>\s*$")
 _RE_ADDR_BARE = re.compile(r"\s+\S+@\S+\s*$")
@@ -2425,11 +2443,12 @@ _RE_RECIP_SPLIT_COMMA = re.compile(r"\s*,\s*")
 def _flatten_header_name(value: str) -> str:
     """Flatten ONE header 'Name <email>' / 'Name email@x' value to a display name.
 
-    Drops a trailing ``<addr>`` or bare ``addr@host``; if only an email is present
-    the email is kept (better than ""). Mirrors the name-else-email intent of
-    _flatten_recipient for parsed-header text.
+    Drops a trailing ``<addr>`` or bare ``addr@host`` and any surrounding double
+    quotes (OWA wraps display names as ``"Last, First"``); if only an email is
+    present the email is kept (better than ""). Mirrors the name-else-email intent
+    of _flatten_recipient for parsed-header text.
     """
-    v = (value or "").strip()
+    v = (value or "").strip().strip('"').strip()
     if not v:
         return ""
     stripped = _RE_ADDR_ANGLE.sub("", v).strip()
@@ -2437,28 +2456,191 @@ def _flatten_header_name(value: str) -> str:
         # Was just '<addr>' — unwrap the angle brackets.
         return v.strip("<> ").strip()
     bare = _RE_ADDR_BARE.sub("", stripped).strip()
-    return (bare or stripped).strip()
+    return (bare or stripped).strip().strip('"').strip()
+
+
+# A double-quoted display name (``"Last, First"``), used to split a recipient list
+# whose names carry internal commas. The quotes are the real delimiter, so when any
+# are present we extract the quoted spans rather than naively splitting on ','/';'.
+_RE_QUOTED_NAME = re.compile(r'"([^"]*)"')
 
 
 def _flatten_header_recipients(value: str) -> str:
-    """Flatten a 'To:'/'Cc:' header value (a ';'/','-separated list) to names."""
+    """Flatten a 'To:'/'Cc:' header value (a list of recipients) to display names.
+
+    OWA renders each recipient as a double-quoted ``"Last, First"`` separated by
+    ``,`` or ``;`` — so a naive comma split would shatter ``"Rui, Ricardo"`` into two
+    bogus names. When quoted spans are present we extract THOSE as the names;
+    otherwise (a bare ``Last, First; Last, First`` list) we prefer ``;`` and only
+    fall back to ``,`` when no ``;`` is present (D-060 rework).
+    """
     v = (value or "").strip()
     if not v:
         return ""
-    splitter = _RE_RECIP_SPLIT_SEMI if ";" in v else _RE_RECIP_SPLIT_COMMA
-    names = [n for n in (_flatten_header_name(p) for p in splitter.split(v)) if n]
+    quoted = _RE_QUOTED_NAME.findall(v)
+    if quoted:
+        parts = quoted
+    else:
+        splitter = _RE_RECIP_SPLIT_SEMI if ";" in v else _RE_RECIP_SPLIT_COMMA
+        parts = splitter.split(v)
+    names = [n for n in (_flatten_header_name(p) for p in parts) if n]
     return "; ".join(names)
 
 
+# label -> regex ; built once, used by the block walker. Each regex anchors a
+# DISTINCT label word so the iteration order does not matter (no shadowing).
+_OUTLOOK_HEADER_LABELS = (
+    ("from", _RE_FROM_LINE),
+    ("date", _RE_DATE_LINE),
+    ("when", _RE_WHEN_LINE),
+    ("to", _RE_TO_LINE),
+    ("cc", _RE_CC_LINE),
+    ("subject", _RE_SUBJECT_LINE),
+    ("where", _RE_WHERE_LINE),
+)
+# Labels that carry a single (possibly wrapped-onto-next-line) value.
+_SINGLE_VALUE_LABELS = ("from", "date", "when", "subject", "where")
+
+
+def _match_header_label(line: str):
+    """If ``line`` is a quoted-header LABEL line, return (label, inline_value); else
+    None. ``inline_value`` is the (possibly empty) value captured after the colon —
+    empty means the real value wraps onto the following line(s) (D-060 rework).
+    """
+    for label, rx in _OUTLOOK_HEADER_LABELS:
+        m = rx.match(line)
+        if m:
+            return label, m.group(1)
+    return None
+
+
+def _parse_outlook_header_block(lines: list[str], start: int):
+    """Walk a quoted Outlook header block beginning at the ``From:`` line ``start``.
+
+    Real OWA ``format=markdown`` bodies (1) bold the labels (``**From:``), (2) wrap a
+    value onto the FOLLOWING line(s) when the label line has no inline value, (3)
+    interleave a blank line between every label, and (4) wrap a long ``To:``/``Cc:``
+    list across continuation lines. This walker tolerates all four: it skips blank
+    lines inside the block, attaches a label's value from the next non-blank line(s)
+    when the inline value is empty, and folds recipient continuation lines into the
+    preceding ``To:``/``Cc:`` value.
+
+    Returns ``(fields, body_start)`` where ``fields`` is
+    ``{from,date,when,to,cc,subject,where}`` (raw captured values, emphasis NOT yet
+    stripped) and ``body_start`` is the index of the first body line AFTER the
+    block — but ONLY when the block has the required multi-line SHAPE (``From:`` + a
+    date label [Date/Sent/When] + ``Subject:``). Returns ``None`` when the shape is
+    absent (a lone ``**From:`` in prose, the top FW wrapper with no date, etc.) so
+    the caller never false-splits.
+
+    Header model: in a real OWA quoted block the labels appear in order and
+    ``Subject:`` (sometimes followed by a meeting invite's ``Where:``) is LAST. So
+    BEFORE the subject is seen, any non-label non-blank line is a wrapped value
+    continuation of the current label (date/recipient lists routinely wrap onto two
+    or three lines); the FIRST non-label line AFTER the subject (+ optional Where)
+    is the body. Bounded to _OUTLOOK_HEADER_MAX_NONBLANK non-blank lines as the
+    over-match guard.
+    """
+    if start >= len(lines) or not _RE_FROM_LINE.match(lines[start]):
+        return None
+    fields = {"from": "", "date": "", "when": "", "to": "", "cc": "",
+              "subject": "", "where": ""}
+    cur_label = None  # the label whose value the next continuation line extends
+    subject_seen = False  # Subject: (and any trailing Where:) terminate the block
+    nonblank = 0
+    last_consumed = start - 1
+    j = start
+    while j < len(lines):
+        ln = lines[j]
+        if ln.strip() == "":
+            # Blank lines interleave the labels — never end the block on their own.
+            j += 1
+            continue
+        nonblank += 1
+        if nonblank > _OUTLOOK_HEADER_MAX_NONBLANK:
+            break
+        matched = _match_header_label(ln)
+        if matched:
+            label, value = matched
+            # Subject: is the last addressing header; only a meeting invite's trailing
+            # When:/Where: may follow it. ANY other label after the subject (a new
+            # From:/Date:/Sent:/To:/Cc:/Subject:) is the START of the NEXT quoted
+            # message — terminate THIS block here so its fields are not overwritten by
+            # the next header (and the next From: stays available as its own boundary).
+            if subject_seen and label not in ("when", "where"):
+                break
+            cur_label = label
+            fields[label] = value.strip()
+            if label == "subject":
+                subject_seen = True
+            last_consumed = j
+            j += 1
+            continue
+        # Not a label line. BEFORE the subject it is a wrapped value continuation of
+        # the current label (a value-on-next-line, or a wrapped date/recipient list);
+        # AFTER the subject it is the first body line.
+        if not subject_seen and cur_label is not None:
+            sep = " " if fields[cur_label] else ""
+            fields[cur_label] = (fields[cur_label] + sep + ln.strip()).strip()
+            last_consumed = j
+            j += 1
+            continue
+        break  # first real body line
+    # Date preference: an explicit Date:/Sent: wins; a meeting invite's When: is the
+    # fallback timestamp (and confirms the date-bearing shape on invites).
+    if not fields["date"] and fields["when"]:
+        fields["date"] = fields["when"]
+    have_date = bool(fields["date"] or fields["when"])
+    if not (fields["from"] and have_date and fields["subject"]):
+        return None
+    return fields, last_consumed + 1
+
+
 def _is_outlook_boundary(lines: list[str], i: int) -> bool:
-    """True iff line ``i`` opens an Outlook header BLOCK (From: + Date/Sent: +
-    Subject: within the lookahead window) — the multi-line SHAPE, not a keyword."""
-    if not _RE_FROM_LINE.match(lines[i]):
-        return False
-    window = lines[i + 1 : i + 1 + _OUTLOOK_HEADER_LOOKAHEAD]
-    has_date = any(_RE_DATE_LINE.match(ln) for ln in window)
-    has_subject = any(_RE_SUBJECT_LINE.match(ln) for ln in window)
-    return has_date and has_subject
+    """True iff line ``i`` opens an Outlook header BLOCK (From: + Date/Sent/When: +
+    Subject:) — the multi-line SHAPE, not a keyword. Delegates to the same
+    blank-line-tolerant walker the consumption loop uses, so detection and stripping
+    can't drift (D-060 rework)."""
+    return _parse_outlook_header_block(lines, i) is not None
+
+
+def _strip_leading_fw_wrapper(seg_lines: list[str]) -> list[str]:
+    """Drop an OWA forward-wrapper header at the TOP of the latest-reply segment.
+
+    A forwarded OWA body opens with a bare ``From: <name>`` / ``Subject: FW: ...``
+    (sometimes Sent:/To:/Cc:) wrapper ABOVE the actual reply text — it is the top
+    message's own forward header, not a quoted older turn (no Date: → never a
+    boundary). Left in place it leaks ``From:``/``Subject:`` literals into the latest
+    turn's body. We strip a leading run of header-label lines ONLY when the segment's
+    FIRST non-blank line is itself a header label (so a normal prose reply, or a
+    reply that merely mentions "From:" mid-sentence, is untouched). Returns the
+    segment unchanged when there is no such leading wrapper (no-loss). """
+    # Find the first non-blank line; bail (keep everything) if it is not a label.
+    first = 0
+    while first < len(seg_lines) and seg_lines[first].strip() == "":
+        first += 1
+    if first >= len(seg_lines) or _match_header_label(seg_lines[first]) is None:
+        return seg_lines
+    # Consume the contiguous (blank-tolerant) run of header-label lines + their
+    # wrapped continuations, stopping at the first non-blank non-label/continuation.
+    cur_label = None
+    k = first
+    while k < len(seg_lines):
+        ln = seg_lines[k]
+        if ln.strip() == "":
+            k += 1
+            continue
+        matched = _match_header_label(ln)
+        if matched:
+            cur_label = matched[0]
+            k += 1
+            continue
+        if cur_label in ("to", "cc"):
+            # recipient list continuation line — still part of the wrapper
+            k += 1
+            continue
+        break
+    return seg_lines[k:]
 
 
 def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
@@ -2483,34 +2665,59 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
     if not body:
         return []
     lines = body.split("\n")
-    # Find boundary line indices (oldest segments start at each boundary).
-    boundaries: list[int] = []
+
+    def _next_nonblank(idx: int) -> int:
+        """Index of the next non-blank line at/after ``idx`` (len(lines) if none)."""
+        while idx < len(lines) and lines[idx].strip() == "":
+            idx += 1
+        return idx
+
+    # Find boundaries. Each boundary is (open_index, header_start) where
+    # ``open_index`` is the line that opens the quoted message (a separator line or
+    # the From: line itself) and ``header_start`` is the index of the From: line of
+    # its Outlook header block (== open_index when the block is not separator-led, or
+    # None for a bare Gmail/Original separator with no parseable Outlook block).
+    boundaries: list[tuple[int, "int | None"]] = []
     i = 0
     while i < len(lines):
-        if _is_outlook_boundary(lines, i):
-            boundaries.append(i)
-            i += 1
-        elif _RE_GMAIL_WROTE.match(lines[i]) or _RE_ORIGINAL_SEP.match(lines[i]):
-            boundaries.append(i)
-            i += 1
-        else:
-            i += 1
+        block = _parse_outlook_header_block(lines, i)
+        if block is not None:
+            boundaries.append((i, i))
+            i = block[1]  # jump past the parsed header block
+            continue
+        if _RE_GMAIL_WROTE.match(lines[i]) or _RE_ORIGINAL_SEP.match(lines[i]):
+            # A separator (``-----Original Appointment-----``/Gmail ``wrote:``) is
+            # routinely FOLLOWED by an Outlook header block. Fold the two into ONE
+            # boundary so the block's headers are parsed/stripped, not left in body.
+            nb = _next_nonblank(i + 1)
+            follow = _parse_outlook_header_block(lines, nb)
+            if follow is not None:
+                boundaries.append((i, nb))
+                i = follow[1]
+            else:
+                boundaries.append((i, None))
+                i += 1
+            continue
+        i += 1
     if not boundaries:
         return []  # genuine single fresh email — caller keeps today's behavior
 
     # Segment span = [start, end). The first segment is the latest reply (text
-    # above boundaries[0]); each later segment runs from its boundary to the next.
-    spans = [(0, boundaries[0])]
-    for n, start in enumerate(boundaries):
-        end = boundaries[n + 1] if n + 1 < len(boundaries) else len(lines)
-        spans.append((start, end))
+    # above boundaries[0]); each later segment runs from its open line to the next.
+    open_indices = [b[0] for b in boundaries]
+    spans = [(0, open_indices[0], None)]
+    for n, (open_idx, header_start) in enumerate(boundaries):
+        end = open_indices[n + 1] if n + 1 < len(open_indices) else len(lines)
+        spans.append((open_idx, end, header_start))
 
     turns: list[dict] = []
-    for seg_idx, (start, end) in enumerate(spans):
+    for seg_idx, (start, end, header_start) in enumerate(spans):
         seg = lines[start:end]
         if seg_idx == 0:
-            # Latest reply — fields from top_msg, whole segment is the body.
-            seg_body = "\n".join(seg)
+            # Latest reply — fields from top_msg, whole segment is the body. Strip a
+            # leading OWA forward-wrapper header (From:/Subject: FW:) so it does not
+            # leak into the latest turn's body.
+            seg_body = "\n".join(_strip_leading_fw_wrapper(seg))
             sender = _msg_sender_name(top_msg)
             timestamp = (
                 top_msg.get("received") or top_msg.get("receivedDateTime")
@@ -2519,34 +2726,38 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
             )
             recipients = _msg_recipients_str(top_msg)
         else:
-            # Quoted message — parse the header lines, strip them from the body.
+            # Quoted message. Prefer the structured header block parse (handles
+            # value-on-next-line, blank-interleaving, wrapped recipient lists); fall
+            # back to the bare per-line strip for a separator with no Outlook block.
             sender = timestamp = recipients = ""
-            cc = ""
-            consumed = 0
-            for ln in seg:
-                m_from = _RE_FROM_LINE.match(ln)
-                m_date = _RE_DATE_LINE.match(ln)
-                m_to = _RE_TO_LINE.match(ln)
-                m_cc = _RE_CC_LINE.match(ln)
-                m_subject = _RE_SUBJECT_LINE.match(ln)
-                if m_from:
-                    sender = _flatten_header_name(_strip_emphasis(m_from.group(1)))
-                elif m_date:
-                    timestamp = _strip_emphasis(m_date.group(1))
-                elif m_to:
-                    recipients = _flatten_header_recipients(_strip_emphasis(m_to.group(1)))
-                elif m_cc:
-                    cc = _flatten_header_recipients(_strip_emphasis(m_cc.group(1)))
-                elif m_subject:
-                    pass  # Subject: dropped (not a turn field)
-                elif _RE_ORIGINAL_SEP.match(ln) or _RE_GMAIL_WROTE.match(ln):
-                    pass  # the separator line itself is not body
+            block = (
+                _parse_outlook_header_block(lines, header_start)
+                if header_start is not None else None
+            )
+            if block is not None:
+                fields, body_start = block
+                sender = _flatten_header_name(_strip_emphasis(fields["from"]))
+                timestamp = _strip_emphasis(fields["date"])
+                to_ = _flatten_header_recipients(_strip_emphasis(fields["to"]))
+                cc = _flatten_header_recipients(_strip_emphasis(fields["cc"]))
+                if cc:
+                    recipients = (to_ + "; " + cc) if to_ else cc
                 else:
-                    break  # first non-header line -> body starts here
-                consumed += 1
-            if cc:
-                recipients = (recipients + "; " + cc) if recipients else cc
-            seg_body = "\n".join(seg[consumed:])
+                    recipients = to_
+                # body_start is an absolute line index; the body is everything after
+                # the header block within this segment.
+                seg_body = "\n".join(lines[body_start:end])
+            else:
+                # Bare separator (Gmail/Original-Message) with no Outlook block —
+                # strip the leading separator/blank lines, keep the rest as body.
+                consumed = 0
+                for ln in seg:
+                    if (ln.strip() == "" or _RE_ORIGINAL_SEP.match(ln)
+                            or _RE_GMAIL_WROTE.match(ln)):
+                        consumed += 1
+                    else:
+                        break
+                seg_body = "\n".join(seg[consumed:])
 
         seg_body = _scrub(seg_body)[:_THREAD_TURN_BODY_CAP].strip()
         if not seg_body:

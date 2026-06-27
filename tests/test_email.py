@@ -910,43 +910,65 @@ def test_extract_thread_history_boundary_only_no_reply_text_degrades_to_one_turn
 # --- broaden the standalone Original-<word> separator -------------------------
 
 
-# The REAL 'Enabling pallet tech at existing AWD sites' body shape: Graph returns
-# the whole thread as ONE message. After the OWA email_read format=markdown path,
-# the quoted-message header LABELS arrive MARKDOWN-BOLDED (`**From:` / `**Date: **`
-# / `**To: **` / `**Subject: **`, and a later block uses `**From:** ` /
-# `**Sent:** `), and the older block is separated by `-----Original Appointment-----`
-# (a meeting invite), not `-----Original Message-----`. The body carries NO `<` so
-# _html_to_text passes it through VERBATIM (mirroring the real format=markdown body
-# — the `**` is NOT produced by _html_to_text's tag-strip, it is already in the
-# stored emailBody). On the un-relaxed regexes _RE_FROM_LINE does NOT match
-# `**From:`, so _split_quoted_thread finds 0 boundaries and returns [] (one turn);
-# the relaxed regexes must recover the per-message turns.
+# The REAL 'Enabling pallet tech at existing AWD sites' body shape, re-derived
+# VERBATIM from the stored emailBody (.claude/email_threads.json) — NOT a hand-built
+# string. Graph returns the whole thread as ONE message; after the OWA
+# email_read format=markdown path the body has FOUR features a hand-crafted fixture
+# missed (D-060 rework — the prior fixture used adjacent inline headers and PASSED
+# while the real body still mis-parsed):
+#   1. a bare ``From: <name>`` / ``Subject: FW: ...`` FORWARD WRAPPER at the very top
+#      (the latest reply's own forward header, NO Date: -> not a boundary) that must
+#      be stripped from the latest turn's body;
+#   2. a quoted header whose VALUE wraps onto the FOLLOWING line — ``**From:`` alone,
+#      value ``**"Shadeck, Gal"`` below;
+#   3. a BLANK LINE between every label, and a long ``To:``/``Cc:`` recipient list
+#      wrapped across continuation lines, pushing ``**Subject:`` far past a naive
+#      5-line lookahead;
+#   4. an ``-----Original Appointment-----`` meeting invite whose block ends with
+#      ``**When:``/``**Where:`` trailers AFTER the Subject, and double-quoted
+#      ``"Last, First"`` recipients (the comma is INSIDE the name).
+# The body carries NO `<`, so _html_to_text passes it through verbatim (the `**` is
+# already in the stored body, not produced by the tag-strip). On the prior regexes
+# this split into 0 boundaries (one merged turn); the rework must recover the turns.
 _PALLET_BODY = (
-    "Thanks Ricardo. Adding Gal for the pallet-tech rollout context.\n"
+    "From: Kim, Seong\n"
+    "Subject: FW: Enabling pallet tech at existing AWD sites \n"
     "\n"
-    "Let's align on the site list before the next review.\n"
+    "Team - FYI\n"
     "\n"
-    "Best,\n"
-    "Kim, Seong\n"
+    "**From:\n"
+    "**\"Shadeck, Gal\" \n"
     "\n"
-    "**From:** Kim, Seong lpark@example.com\n"
-    "**Date: **Wednesday, September 17, 2025 at 9:41 AM\n"
-    "**To: **\"Rui, Ricardo\" jdavis@example.com; \"Shadeck, Gal\" gshadeck@amazon.com\n"
-    "**Subject: **RE: Enabling pallet tech at existing AWD sites\n"
+    "**Date: **Wednesday, September 17, 2025 at 4:51 PM\n"
     "\n"
-    "Ricardo, the pallet tech pilot at AWD1 wrapped successfully last week.\n"
-    "We should schedule the rollout to the remaining sites this quarter.\n"
+    "**To: **\"Rui, Ricardo\" , \"Ahsan, Ayaz\" , \"Marquez, Seville\" , \"Neuman, Kyle\" , \"Divekar, Pratik\" , \"Brownlee, Donavan\" , \"Ramakrishnan,\n"
+    " Raghavendra\" , \"Goldschmidt, Jeff\" , \"Kim, Seong\" , \"Lathan, Paul\" , \"Shadeck, Gal\" \n"
+    "\n"
+    "**Cc: **\"Sankaranarayanan, Karthik\" , \"Barki, Jayanth\" , \"Vande Vegte, Danielle\" \n"
+    "\n"
+    "**Subject: **RE: Enabling pallet tech at existing AWD sites \n"
+    "\n"
+    "+ Vipul\n"
+    "\n"
+    "Ricardo and the team, thank you for joining and taking part in the discussion.\n"
     "\n"
     "-----Original Appointment-----\n"
-    # Trailing emphasis on the VALUE (a `**` run AFTER the value) exercises
-    # _strip_emphasis — without it the parsed sender reads 'Shadeck, Gal **'.
-    "**From:** Shadeck, Gal gshadeck@amazon.com **\n"
-    "**Sent:** Tuesday, September 16, 2025 4:00 PM\n"
-    "**To:** Kim, Seong; Rui, Ricardo **\n"
-    "**Subject:** Enabling pallet tech at existing AWD sites\n"
+    "\n"
+    "**From:** Shadeck, Gal  \n"
+    "\n"
+    "**Sent:** Wednesday, September 10, 2025 10:58 AM\n"
+    "\n"
+    "**To:** Shadeck, Gal; Rui, Ricardo; Ahsan, Ayaz\n"
+    "\n"
+    "**Cc:** Sankaranarayanan, Karthik; Barki, Jayanth\n"
+    "\n"
+    "**Subject:** Enabling pallet tech at existing AWD sites \n"
+    "\n"
+    "**When:** Wednesday, September 17, 2025 2:30 PM-3:00 PM (UTC-08:00) Pacific Time (US & Canada).\n"
+    "\n"
+    "**Where:** Chime ID: 9666923742\n"
     "\n"
     "Booking time to walk through the proposal for enabling pallet tech.\n"
-    "Please review the deck beforehand and bring site-level constraints.\n"
 )
 
 
@@ -960,7 +982,7 @@ def _pallet_payload() -> dict:
                 {"name": "Rui, Ricardo", "email": "jdavis@example.com"},
             ],
             "received": "2025-09-17T16:41:00Z",
-            "subject": "RE: Enabling pallet tech at existing AWD sites",
+            "subject": "FW: Enabling pallet tech at existing AWD sites",
             "body": _PALLET_BODY,
         }
     }
@@ -978,30 +1000,42 @@ def test_split_quoted_thread_recovers_bolded_header_chain():
 
 
 def test_extract_thread_history_bolded_headers_yields_three_turns():
-    """AC-1/AC-2/AC-3: ~3 turns (latest reply + quoted RE: + Original Appointment),
-    senders PARSED from the bolded labels (Kim, Seong / Shadeck, Gal), CLEAN values
-    (no `**`/`__`/`*`/`_` emphasis noise stuck to the parsed sender/date/recipients)."""
+    """AC-1/AC-2/AC-3 on the REAL stored body shape: 3 turns (latest reply +
+    quoted RE: + Original Appointment), senders PARSED from the bolded labels even
+    when the From: value wraps onto the NEXT line (``**From:`` / ``**"Shadeck, Gal"``)
+    and the labels are blank-line interleaved, with CLEAN values (no `**`/`__`/`*`/`_`
+    emphasis noise, no stray double-quotes from ``"Last, First"``)."""
     turns = email_mod._extract_thread_history(_pallet_payload())
     assert len(turns) == 3, f"expected a 3-way split, got {len(turns)}"
 
-    # oldest -> newest: [Original Appointment from Gal, quoted RE: from Seong, latest reply]
+    # oldest -> newest: [Original Appointment from Gal, quoted RE: from Gal, latest reply]
     appointment, quoted_re, latest = turns[0], turns[1], turns[2]
 
-    # The Original Appointment block (separator-delimited, **From:** Shadeck, Gal).
+    # The Original Appointment block (separator-delimited, inline `**From:** Gal`).
+    # Sent: wins over the trailing When: as the timestamp.
     assert "Shadeck, Gal" in appointment["sender"]
     assert "Booking time to walk through the proposal" in appointment["body"]
-    assert appointment["timestamp"] == "Tuesday, September 16, 2025 4:00 PM"
+    assert appointment["timestamp"] == "Wednesday, September 10, 2025 10:58 AM"
 
-    # The quoted RE: from Kim, Seong (bolded `**From:` / `**Date: **`).
-    assert "Kim, Seong" in quoted_re["sender"]
-    assert "the pallet tech pilot at AWD1 wrapped successfully" in quoted_re["body"]
-    assert quoted_re["timestamp"] == "Wednesday, September 17, 2025 at 9:41 AM"
+    # The quoted RE: — From: value is on the NEXT line (``**From:`` then
+    # ``**"Shadeck, Gal"``); the wrapped, quoted-name recipient list parses cleanly.
+    assert "Shadeck, Gal" in quoted_re["sender"]
+    assert '"' not in quoted_re["sender"]  # surrounding quotes stripped
+    assert "thank you for joining and taking part in the discussion" in quoted_re["body"]
+    assert quoted_re["timestamp"] == "Wednesday, September 17, 2025 at 4:51 PM"
     assert "Rui, Ricardo" in quoted_re["recipients"]
-    assert "Shadeck, Gal" in quoted_re["recipients"]
+    assert "Goldschmidt, Jeff" in quoted_re["recipients"]
+    # The comma INSIDE a quoted ``"Last, First"`` name is NOT a recipient
+    # separator: every ';'-joined entry is a full Last, First (none is a bare
+    # first-name fragment like "Ricardo" split off from "Rui, Ricardo").
+    recip_entries = [e.strip() for e in quoted_re["recipients"].split(";")]
+    assert "Ricardo" not in recip_entries
+    assert "Rui, Ricardo" in recip_entries
 
-    # The latest reply (sender/recipients/timestamp from top_msg).
+    # The latest reply (sender/recipients/timestamp from top_msg); the bare FW
+    # wrapper (From:/Subject: FW:) above the reply text is stripped, not leaked.
     assert "Kim, Seong" in latest["sender"]
-    assert "Adding Gal for the pallet-tech rollout context." in latest["body"]
+    assert latest["body"].strip() == "Team - FYI"
     assert latest["timestamp"] == "2025-09-17T16:41:00Z"
 
     # AC-3 VALUE-CLEAN: NO emphasis noise on any structured field.
@@ -1013,12 +1047,15 @@ def test_extract_thread_history_bolded_headers_yields_three_turns():
             assert not val.endswith("*"), f"emphasis noise in {field!r}: {val!r}"
             assert not val.startswith("*"), f"emphasis noise in {field!r}: {val!r}"
 
-    # The run-on header blob is gone from EVERY body (labels promoted to fields).
+    # The run-on header blob is gone from EVERY body (labels promoted to fields) —
+    # the flagship DONE-WHEN: no literal header markup left inside any turn body.
     for t in turns:
         assert "From:" not in t["body"]
         assert "Date:" not in t["body"]
         assert "Sent:" not in t["body"]
         assert "Subject:" not in t["body"]
+        assert "When:" not in t["body"]
+        assert "Where:" not in t["body"]
         assert "Original Appointment" not in t["body"]
 
 
@@ -1071,20 +1108,78 @@ def test_split_quoted_thread_lone_bolded_from_in_prose_does_not_false_split():
     assert "revised timeline" in turns[0]["body"]
 
 
+def test_parse_outlook_header_block_value_on_next_line_and_blank_interleave():
+    """D-060 rework core: a quoted header whose From: VALUE is on the FOLLOWING line
+    (``**From:`` then ``**"Wang, Yibo"``) and whose labels are BLANK-LINE interleaved
+    with a wrapped recipient list still parses — From: + Date: + Subject: confirmed,
+    value recovered, body starts AFTER the block."""
+    lines = [
+        "**From:",
+        '**"Wang, Yibo"',
+        "",
+        "**Date: **Tuesday, October 14, 2025 at 7:04 PM",
+        "",
+        "**To: **\"Manea, Daria\" , glenn-leads ,",
+        "  \"Cao, Xulai\"",
+        "",
+        "**Subject: **Re: status",
+        "",
+        "The actual reply text begins here.",
+    ]
+    parsed = email_mod._parse_outlook_header_block(lines, 0)
+    assert parsed is not None, "value-on-next-line + blank-interleaved block must parse"
+    fields, body_start = parsed
+    assert email_mod._flatten_header_name(
+        email_mod._strip_emphasis(fields["from"])
+    ) == "Wang, Yibo"
+    assert fields["date"] == "Tuesday, October 14, 2025 at 7:04 PM"
+    recips = email_mod._flatten_header_recipients(email_mod._strip_emphasis(fields["to"]))
+    assert "Manea, Daria" in recips and "Cao, Xulai" in recips
+    # body_start is the first line after the header block (a trailing blank here);
+    # the body prose follows and NO header markup precedes it.
+    remainder = "\n".join(lines[body_start:])
+    assert remainder.strip() == "The actual reply text begins here."
+
+
+def test_split_quoted_thread_bold_headings_only_does_not_false_split():
+    """Over-match guard: a meeting-summary-style body full of BOLD HEADINGS
+    (``**Key Discussion Points**``, ``**1. Purpose**``) but with NO quoted reply
+    chain (no From:+Date:+Subject: block) stays ONE turn — never fabricated splits."""
+    body = (
+        "### Meeting Summary\n"
+        "\n"
+        "**Hi team, thanks for joining, here is the summary.**\n"
+        "\n"
+        "**Key Discussion Points**\n"
+        "\n"
+        "**1. Purpose and Scope**\n"
+        "- The document is a readiness affirmation report.\n"
+        "\n"
+        "**2. Content Refinements**\n"
+        "- Add service descriptions and key accomplishments.\n"
+    )
+    top_msg = {"from": {"name": "Ma, Ke"}, "received": "2026-06-24T10:00:00Z"}
+    assert email_mod._split_quoted_thread(body, top_msg) == []
+
+
 def test_split_quoted_thread_bolded_no_word_loss():
-    """AC-6: the concatenation of all per-turn bodies contains every non-header word
-    of the original chain, in order — nothing dropped or reordered."""
+    """AC-6: every BODY-prose line of the original chain survives in some turn body —
+    nothing dropped. Header lines (labels, their wrapped value/continuation lines,
+    and the When:/Where: invite trailers) are promoted to fields, so they are the
+    ONLY lines allowed to be absent from the joined bodies."""
     turns = email_mod._extract_thread_history(_pallet_payload())
     joined = "\n".join(t["body"] for t in turns)
-    for line in _PALLET_BODY.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped == "-----Original Appointment-----":
-            continue
-        # Header lines (bolded or bare) are promoted to fields, not kept in any body.
-        label = stripped.lstrip("*_ ").split(":", 1)[0]
-        if label in ("From", "Date", "Sent", "To", "Cc", "Subject"):
-            continue
-        assert stripped in joined, f"lost body line: {stripped!r}"
+    # The actual body prose of the three turns — every one must survive.
+    for prose in (
+        "Team - FYI",
+        "+ Vipul",
+        "thank you for joining and taking part in the discussion",
+        "Booking time to walk through the proposal for enabling pallet tech",
+    ):
+        assert prose in joined, f"lost body prose: {prose!r}"
+    # And no header markup leaked the other way (belt-and-suspenders for AC-6).
+    for marker in ("**From:", "**Subject:", "**When:", "**Where:", "Original Appointment"):
+        assert marker not in joined, f"header markup leaked into body: {marker!r}"
 
 
 def test_original_separator_matches_appointment_and_message_not_prose():
