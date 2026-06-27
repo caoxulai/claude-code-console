@@ -17,11 +17,15 @@ A sidebar-navigated single-page app backed by a small aiohttp server. Each page 
 | **Sessions** | All Claude Code sessions across projects — browse, view transcripts, rename, resume, or delete |
 | **Usage** | Token/cost analytics across all transcripts — totals, daily trend, a GitHub-style activity heatmap with week drill-down, and breakdowns by model, project, and agent (all day boundaries in Pacific time) |
 | **Chat** | Send a prompt to `claude` and stream the response (SSE), with per-request working-directory selection |
+| **Slack** | Triage queue for unread Slack messages — auto-classifies and drafts replies, lets you edit/approve, and posts the approved reply (background scan/classify/draft workers) |
+| **Email** | Triage queue for unread Outlook email — auto-classifies and drafts reply-all responses you can edit/approve; approving saves an Outlook **draft** (never sends), with the same background workers as Slack |
 | **Memory** | Browse and edit `~/.claude` memory files (typed: feedback / user / project / reference) with rendered markdown |
+| **Agents** | Browse global and per-project role agents (`.claude/agents/*.md`) and their accumulated context |
 | **Skills** | List installed skills and read their `SKILL.md` content |
 | **MCP Servers** | View configured MCP servers |
 | **Hooks** | Inspect configured Claude Code hooks |
 | **Cron Jobs** | View scheduled jobs |
+| **Workers** | Live status of background workers (scan/classify/draft, session reapers) — running / stopped / errored, with last-run times |
 | **Tasks** | Track tasks |
 | **Plugins** | View installed plugins |
 | **Settings** | Inspect Claude Code settings |
