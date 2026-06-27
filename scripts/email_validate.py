@@ -26,12 +26,23 @@ Steps:
       confirm it LANDS in Drafts, then clean it up.
   (f) SOFT-DELETE: the (e) cleanup IS the proof -- ``delete_email(permanent=false)``
       on the throwaway draft leaves Drafts and lands in Deleted Items.
+  (g) FOLDER-SOURCE SMOKE (D-058): ``email_list_folders`` resolves >= 1 allowlisted
+      Inbox-subfolder name->current id, ``email_folders`` returns conversations and
+      the unreadCount>0 filter admits the right ones, and ``email_read`` on an
+      admitted conversationId returns a real body + a multi-message thread -- ALL
+      via the OWA backend through ``email.call_read_tool`` (off the GRASP quota).
+  (h) EMAIL_READ KEEPS UNREAD (D-058, LOAD-BEARING): pick a real UNREAD conversation
+      in an allowlisted subfolder, call ``email_read`` WITHOUT any markAs key exactly
+      as the scanner will, then RE-READ the conversation's read state and assert it
+      is STILL UNREAD. The re-read is the proof (not the tool's success string); if
+      it marked the mail read the step FAILS LOUD so the wiring is never trusted.
 
 It is IDEMPOTENT: every artifact it creates (a throwaway draft, a flipped
-read-state) is cleaned up / restored by the end of the run. It uses ONLY read
-tools (via ``email.call_read_tool``) and the gated write seams
-(``email._call_graph_write_tool_oneshot`` for mark_email_read / delete_email and
-``email._call_owa_write_tool`` for email_draft). It NEVER sends / replies /
+read-state) is cleaned up / restored by the end of the run; the folder-source
+steps READ ONLY and never mutate folder mail (email_read is called with NO markAs
+key). It uses ONLY read tools (via ``email.call_read_tool``) and the gated write
+seams (``email._call_graph_write_tool_oneshot`` for mark_email_read / delete_email
+and ``email._call_owa_write_tool`` for email_draft). It NEVER sends / replies /
 forwards and NEVER destructively touches real user mail (no leo11, no real inbox
 message) -- only the throwaway artifacts it creates or reversible flips it
 restores.
@@ -58,13 +69,24 @@ from server.routes import email  # noqa: E402
 # when it exists (D-055 clause 1 / D-035 lockstep) so this pre-flight can never
 # drift from the cap the scanner actually enforces. Fall back to the spec value
 # of 50 only when T1's constant has not yet landed.
-ACTIVE_TODO_CAP = getattr(email, "EMAIL_ACTIVE_TODO_CAP", 50)
+ACTIVE_TODO_CAP = getattr(email, "EMAIL_ACTIVE_TODO_CAP", 100)
 
 # A safe self-address used for the throwaway draft (never sent).
 SELF_ADDRESS = getattr(email, "_MY_EMAIL", "user@example.com")
 
 # Subject prefix for the throwaway draft so it is unmistakably this job's artifact.
 _THROWAWAY_SUBJECT_PREFIX = "[email_validate throwaway]"
+
+# The fixed allowlist of Inbox SUBFOLDERS the scanner triages (D-058). Reuse the
+# backend constant when it lands (single source of truth) so this pre-flight can
+# never drift from the folders the scanner actually reads; otherwise fall back to
+# the D-058 spec set. The Inbox ROOT is handled by the existing scan path and is
+# NOT in this subfolder list.
+EMAIL_SCAN_SUBFOLDERS = tuple(getattr(email, "EMAIL_SCAN_SUBFOLDERS", (
+    "1 managers", "1 GSD", "1 CRIS OOR", "1 my directs", "1 me in TO",
+    "1 me only", "1 me in CC", "1 leads", "1 DG", "1 AMP 2.0", "0 to do",
+    "1 MX", "2 glenn dev", "2 black falcon",
+)))
 
 
 class QuotaStop(Exception):
@@ -185,6 +207,225 @@ def assert_scan_cap(*, pre_actionable: int, post_actionable: int,
         "scan-cap", True,
         f"pre={pre_actionable} admitted={len(admitted_ts)} post={post_actionable} "
         f"(cap {cap}, oldest-first)",
+    )
+
+
+# ─── Folder-source pure helpers (D-058, offline-checkable) ────────────────────
+
+
+def resolve_subfolders(folders_payload, allowlist) -> tuple[dict, list]:
+    """Resolve each allowlisted Inbox-child folder NAME to its CURRENT id.
+
+    Walks the ``email_list_folders`` payload to the top-level ``Inbox`` folder and
+    matches each of its ``children`` by display name against ``allowlist``. Returns
+    ``(resolved, unresolved)`` where ``resolved`` is ``{name: id}`` (current AAMk…
+    Graph id, NEVER a hardcoded one) and ``unresolved`` lists the allowlist names
+    that had no matching child. An unresolved name is SKIPPED (fail-loud-but-
+    continue) — never fabricated with a guessed id.
+    """
+    payload = folders_payload or {}
+    content = payload.get("content") if isinstance(payload, dict) else None
+    folders = (content or {}).get("folders") if isinstance(content, dict) else None
+    if not isinstance(folders, list):
+        folders = payload.get("folders") if isinstance(payload, dict) else None
+    folders = folders if isinstance(folders, list) else []
+
+    inbox = next(
+        (f for f in folders
+         if isinstance(f, dict) and str(f.get("name", "")).strip().lower() == "inbox"),
+        None,
+    )
+    children = (inbox or {}).get("children") if isinstance(inbox, dict) else []
+    children = children if isinstance(children, list) else []
+
+    by_name = {
+        str(c.get("name", "")).strip(): str(c.get("id", "")).strip()
+        for c in children
+        if isinstance(c, dict) and c.get("id")
+    }
+
+    resolved: dict = {}
+    unresolved: list = []
+    for name in allowlist:
+        fid = by_name.get(name)
+        if fid:
+            resolved[name] = fid
+        else:
+            unresolved.append(name)
+    return resolved, unresolved
+
+
+def filter_unread_conversations(folder_payload) -> list:
+    """Return the ``email_folders`` conversations with ``unreadCount`` > 0.
+
+    ``email_folders`` has NO unread_only param and returns read+unread mixed, so
+    the caller MUST filter client-side or it floods the queue with already-handled
+    mail. A missing/zero unreadCount is treated as read (excluded).
+    """
+    payload = folder_payload or {}
+    content = payload.get("content") if isinstance(payload, dict) else None
+    convs = (content or {}).get("emails") if isinstance(content, dict) else None
+    if not isinstance(convs, list):
+        convs = payload.get("emails") if isinstance(payload, dict) else None
+    convs = convs if isinstance(convs, list) else []
+    out = []
+    for c in convs:
+        if not isinstance(c, dict):
+            continue
+        try:
+            if int(c.get("unreadCount") or 0) > 0:
+                out.append(c)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def map_folder_message(message) -> dict:
+    """Map ONE ``email_read`` message (OWA field names) to the scanner's item keys.
+
+    The OWA ``email_read`` path uses DIFFERENT field names than the Graph
+    ``get_email`` path: message id ← ``itemId`` (NOT id/messageId); To ←
+    ``recipients``; CC ← ``ccRecipients``; sender ← ``sender``/``from``; received ts
+    ← ``dateTimeSent``/``recievedAt`` (sic); read flag ← ``isRead``. Reusing the
+    Inbox names here is the DEAD-ROW trap (blank id, empty To/CC), so this remap is
+    load-bearing. Recipient type is derived from the mapped to/cc via the backend's
+    own ``_recipient_type`` so it can never drift.
+    """
+    msg = message if isinstance(message, dict) else {}
+    to_list = msg.get("recipients") or []
+    cc_list = msg.get("ccRecipients") or []
+    sender = msg.get("sender") or msg.get("from") or {}
+    return {
+        "messageId": str(msg.get("itemId", "") or ""),
+        "sender": sender,
+        "ts": msg.get("dateTimeSent") or msg.get("recievedAt") or "",
+        "to": list(to_list) if isinstance(to_list, list) else [],
+        "cc": list(cc_list) if isinstance(cc_list, list) else [],
+        "subject": str(msg.get("subject", "") or ""),
+        "body": str(msg.get("body", "") or ""),
+        "isRead": bool(msg.get("isRead", False)),
+        "recipientType": email._recipient_type({"to": to_list, "cc": cc_list}),
+    }
+
+
+async def email_read_keeps_unread(*, conversation_id: str, email_read=None,
+                                  read_state=None) -> StepResult:
+    """LOAD-BEARING (AC-6): prove ``email_read`` WITHOUT a markAs key leaves the
+    folder message UNREAD.
+
+    Calls ``email_read`` EXACTLY as the scanner will — ``{"conversationId": …,
+    "format": "markdown"}`` with NO ``markAs`` key — then RE-READS the unread state
+    at the destination and asserts it is STILL unread. The re-read is the proof, not
+    the tool's success string (mirrors ``mark_read_roundtrip``). The seams default to
+    the live OWA path but are injectable for offline tests.
+    """
+    if email_read is None:
+        async def email_read(args):  # noqa: ANN001
+            return await email.call_read_tool("email_read", args)
+    if read_state is None:
+        async def read_state(conv_id):  # noqa: ANN001
+            # Re-read the conversation and report whether it is FULLY read. A
+            # conversation is "still unread" while ANY message in it is unread, so
+            # this returns True (read) only when EVERY message is read.
+            payload = await email.call_read_tool(
+                "email_read", {"conversationId": conv_id, "format": "markdown"})
+            content = payload.get("content") if isinstance(payload, dict) else None
+            msgs = (content or {}).get("emails") if isinstance(content, dict) else None
+            msgs = [m for m in (msgs or []) if isinstance(m, dict)]
+            if not msgs:
+                return False
+            return all(bool(m.get("isRead")) for m in msgs)
+
+    before = await read_state(conversation_id)
+    if before:
+        return StepResult(
+            "email-read-keeps-unread", False,
+            f"could not prove the markAs-omit safety: conversation {conversation_id} "
+            "is already READ before email_read (need a still-unread conversation)",
+        )
+
+    # Call email_read EXACTLY as the scanner will: NO markAs key.
+    args = {"conversationId": conversation_id, "format": "markdown"}
+    assert "markAs" not in args  # structural: the scanner must never mark folder mail read
+    _raise_if_quota(await email_read(args))
+
+    after = await read_state(conversation_id)
+    if after:
+        return StepResult(
+            "email-read-keeps-unread", False,
+            f"email_read MARKED the message READ (unread->read) for conversation "
+            f"{conversation_id} — the markAs-omit wiring is UNSAFE, do NOT trust it",
+        )
+    return StepResult(
+        "email-read-keeps-unread", True,
+        f"email_read (no markAs) left conversation {conversation_id} UNREAD "
+        "(re-read confirms, not a success string)",
+    )
+
+
+async def folder_source_smoke(*, allowlist=EMAIL_SCAN_SUBFOLDERS, call_read=None) -> StepResult:
+    """Prove the folder-source read path end-to-end (AC-4) via read tools ONLY.
+
+    email_list_folders resolves >=1 allowlisted name->id; email_folders' unreadCount
+    > 0 filter admits the right conversation; email_read on an admitted
+    conversationId returns a real body + a multi-message thread (the full thread
+    history, never a one-message blurb). Uses ONLY ``email.call_read_tool`` (no
+    write tool, no mark-read). NEVER mutates folder mail — email_read is called WITH
+    NO markAs key. The seam is injectable for offline tests.
+    """
+    if call_read is None:
+        async def call_read(name, args):  # noqa: ANN001
+            return await email.call_read_tool(name, args)
+
+    # 1) DISCOVER + RESOLVE folder name -> current id.
+    folders_payload = await call_read("email_list_folders", {})
+    _raise_if_quota(folders_payload)
+    resolved, unresolved = resolve_subfolders(folders_payload, list(allowlist))
+    if not resolved:
+        return StepResult(
+            "folder-source", False,
+            "NO allowlisted Inbox subfolder resolved to an id "
+            f"(unresolved={unresolved}) — cannot validate the folder source",
+        )
+
+    # 2) Find a resolved folder that has an unread conversation to read.
+    for fname, fid in resolved.items():
+        folder_payload = await call_read("email_folders", {"folderId": fid, "limit": 100})
+        _raise_if_quota(folder_payload)
+        unread = filter_unread_conversations(folder_payload)
+        conv = next(
+            (c for c in unread if c.get("conversationId")), None)
+        if conv is None:
+            continue
+
+        conv_id = str(conv.get("conversationId"))
+        # 3) email_read the admitted conversation — NO markAs (never mark read).
+        read_payload = await call_read(
+            "email_read", {"conversationId": conv_id, "format": "markdown"})
+        _raise_if_quota(read_payload)
+        content = read_payload.get("content") if isinstance(read_payload, dict) else None
+        messages = (content or {}).get("emails") if isinstance(content, dict) else None
+        messages = messages if isinstance(messages, list) else []
+        mapped = [map_folder_message(m) for m in messages if isinstance(m, dict)]
+        with_body = [m for m in mapped if m.get("body")]
+        if not with_body:
+            return StepResult(
+                "folder-source", False,
+                f"email_read({conv_id}) in folder {fname!r} returned no message body "
+                "(dead row — the email_read field-name remap or read failed)",
+            )
+        return StepResult(
+            "folder-source", True,
+            f"resolved {len(resolved)} folder(s); folder {fname!r} conversation "
+            f"{conv_id} read back {len(messages)} thread message(s) "
+            f"(first id={with_body[0]['messageId']!r}, unresolved={unresolved})",
+        )
+
+    return StepResult(
+        "folder-source", True,
+        f"resolved {len(resolved)} allowlisted folder(s) "
+        f"(unresolved={unresolved}); none had an unread conversation this tick "
+        "(name->id resolution + unread filter proven, nothing to read)",
     )
 
 
@@ -350,7 +591,7 @@ async def save_draft_roundtrip(*, subject: str, body: str, to: list,
 # ─── Live step wrappers (used by main(); each FAILS LOUD on a quota condition) ──
 
 # Shared state threaded between live steps within one run.
-_LIVE = {"inbox_msg_id": None}
+_LIVE = {"inbox_msg_id": None, "folder_name": None, "folder_conv_id": None}
 
 
 def _raise_if_quota(payload) -> None:
@@ -520,6 +761,55 @@ async def _step_save_draft() -> StepResult:
     )
 
 
+async def _discover_unread_folder_conv() -> tuple[str, str] | None:
+    """Resolve an allowlisted Inbox subfolder and return (folder_name, conv_id) for
+    an UNREAD conversation in it, or None if none is available this tick.
+
+    Stashes the result in _LIVE so the folder-source and email-read-unread steps
+    share ONE resolution (no double-spend). Read tools only; never mutates mail.
+    """
+    if _LIVE.get("folder_conv_id") and _LIVE.get("folder_name"):
+        return _LIVE["folder_name"], _LIVE["folder_conv_id"]
+
+    folders_payload = await email.call_read_tool("email_list_folders", {})
+    _raise_if_quota(folders_payload)
+    resolved, _unresolved = resolve_subfolders(folders_payload, list(EMAIL_SCAN_SUBFOLDERS))
+    for fname, fid in resolved.items():
+        folder_payload = await email.call_read_tool(
+            "email_folders", {"folderId": fid, "limit": 100})
+        _raise_if_quota(folder_payload)
+        conv = next(
+            (c for c in filter_unread_conversations(folder_payload) if c.get("conversationId")),
+            None,
+        )
+        if conv is not None:
+            _LIVE["folder_name"] = fname
+            _LIVE["folder_conv_id"] = str(conv.get("conversationId"))
+            return _LIVE["folder_name"], _LIVE["folder_conv_id"]
+    return None
+
+
+async def _step_folder_source() -> StepResult:
+    """(g) folder-source smoke: name->id resolution + unreadCount>0 filter + a real
+    body/multi-message thread from email_read (AC-4). Read tools ONLY; no markAs."""
+    return await folder_source_smoke()
+
+
+async def _step_email_read_unread() -> StepResult:
+    """(h) LOAD-BEARING markAs proof (AC-6): email_read WITHOUT markAs on a real
+    unread folder conversation leaves it UNREAD (re-read at the destination)."""
+    found = await _discover_unread_folder_conv()
+    if found is None:
+        return StepResult(
+            "email-read-keeps-unread", False,
+            "no UNREAD conversation found in any allowlisted Inbox subfolder this "
+            "tick — cannot safely prove the markAs-omit leaves mail unread (surface "
+            "rather than mutate real mail)",
+        )
+    fname, conv_id = found
+    return await email_read_keeps_unread(conversation_id=conv_id)
+
+
 async def main() -> int:
     """Run all steps, print PASS/FAIL + a summary, return the process exit code."""
     print("email_validate: pre-flight for the always-on email workers (live OWA path).")
@@ -537,6 +827,8 @@ async def main() -> int:
         _step_get,
         _step_mark_read,
         _step_save_draft,
+        _step_folder_source,
+        _step_email_read_unread,
     ]
     # run_steps keys the step name off __name__; give the lambda a name.
     steps[0].__name__ = "_step_scan"
@@ -550,7 +842,8 @@ async def main() -> int:
     print(f"\n{passed}/{len(results)} step(s) passed; "
           f"{'ALL GREEN' if code == 0 else 'FAILED'} (exit {code}).")
     if code != 0:
-        print("email_validate: do NOT enable CLAUDE_WEB_EMAIL_WORKERS until this passes.")
+        print("email_validate: do NOT unpause the email queue (which runs the live "
+              "workers) until this passes.")
     return code
 
 
