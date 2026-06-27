@@ -47,6 +47,68 @@ export function latestThreadView(item) {
   };
 }
 
+// --- previewOf: a one-line, DISPLAY-ONLY truncation of a turn body ----------
+// FEATURE #3. A collapsed older-message card shows a one-line preview so the
+// reader can tell what it is without expanding. The preview is DISPLAY-ONLY: it
+// is NEVER the stored body and NEVER replaces it (the full verbatim body is
+// still rendered when the card expands — anti SUMMARY-MASQUERADING-AS-TIMELINE).
+// It collapses internal whitespace/newlines to single spaces, trims, and caps at
+// a small length with a single-char ellipsis. A missing/blank/non-string body
+// yields '' (never the literal 'undefined'). Pure — no DOM, no fetch.
+const PREVIEW_MAX_LEN = 120;
+
+export function previewOf(text) {
+  if (typeof text !== 'string') return '';
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (collapsed === '') return '';
+  if (collapsed.length <= PREVIEW_MAX_LEN) return collapsed;
+  // Truncate at the cap and append a single-char ellipsis. The visible prefix is
+  // always a prefix of the (whitespace-collapsed) body — no fabrication.
+  return `${collapsed.slice(0, PREVIEW_MAX_LEN).trimEnd()}…`;
+}
+
+// --- threadCardStates: the per-turn render-plan (Original / Latest / N of M) -
+// FEATURE #3 (intuitive multi-reply threading). The reader must instantly grok
+// the conversation shape: which message is the ORIGINAL, which are NEWER
+// replies, and in what order. Reuses latestThreadView/threadTurns and returns
+// ONE entry per turn in oldest→newest order so the timeline is never merged or
+// summarized (anti COLLAPSE-LOSES-WHO-SAID-WHAT). Each entry:
+//   { index, label, isOriginal, isLatest, isExpandedByDefault, preview }
+//   - label: 'Original' for the FIRST (oldest) turn, 'Latest' for the newest,
+//            'Message N of M' (1-based N) for the middle turns. A 1-message
+//            thread is labeled 'Latest' (it IS the newest) — never a broken
+//            'Message 1 of 1'.
+//   - isExpandedByDefault: ONLY the newest turn (it's what the user acts on);
+//            every older turn is collapsed.
+//   - preview: previewOf(turn.body) — a one-line display-only truncation; the
+//            FULL per-turn body stays on view.turns[i].body (rendered verbatim
+//            when the card expands), so the preview never replaces it.
+// An older item with no structured threadHistory falls back through
+// latestThreadView to ZERO cards (the no-history fallbackBody path renders
+// separately) — never crashing, never the literal 'undefined' (AC-16). Pure —
+// no DOM, no fetch.
+export function threadCardStates(item) {
+  const view = latestThreadView(item);
+  const turns = view.turns;
+  const m = turns.length;
+  return turns.map((turn, index) => {
+    const isOriginal = index === 0;
+    const isLatest = index === m - 1;
+    let label;
+    if (isLatest) label = 'Latest';
+    else if (isOriginal) label = 'Original';
+    else label = `Message ${index + 1} of ${m}`;
+    return {
+      index,
+      label,
+      isOriginal,
+      isLatest,
+      isExpandedByDefault: isLatest,
+      preview: previewOf(turn && turn.body),
+    };
+  });
+}
+
 // The user's own address. SINGLE named const, cross-referenced with the backend
 // server/routes/email.py `_MY_EMAIL = "user@example.com"` (the minus-me /
 // always-CC-me default). If one side changes, change the other.
@@ -116,6 +178,20 @@ function _isShortQuestionLine(line) {
   return trimmed.endsWith('?') && trimmed.length <= HEADING_MAX_LEN && !trimmed.includes('\n');
 }
 
+// An "empty-emphasis artifact" line: HTML newsletters converted to markdown
+// leave behind emphasis markers where inline images/gifs were stripped — e.g.
+// "****", "********", or bold wrapping only a non-breaking space ("** **").
+// ReactMarkdown renders these as stray <hr>/empty-<strong> noise. A line is an
+// artifact ONLY when, after removing every '*' '_' and whitespace (incl. the
+// non-breaking space  ), NOTHING is left — so any line carrying real words
+// (even "**Bold text**") is never matched. Dropping the whole line preserves all
+// real content (the artifact had no words to lose).
+function _isEmptyEmphasisArtifact(line) {
+  const trimmed = line.trim();
+  if (trimmed === '') return false; // a real blank line — preserved as a separator
+  return /^[*_\s ]+$/.test(trimmed) && /[*_]/.test(trimmed);
+}
+
 export function autoFormatBody(text) {
   if (typeof text !== 'string' || text === '') return '';
   // Split into blank-line-delimited blocks WITHOUT collapsing the blank lines —
@@ -130,6 +206,13 @@ export function autoFormatBody(text) {
     // the immediately next line is blank OR it is the last line.
     const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
     const followedByBlank = i + 1 >= lines.length || nextLine.trim() === '';
+
+    // Drop empty-emphasis artifact lines outright (e.g. "****", "** **") — they
+    // carry no words, so removing the whole line loses nothing real and clears
+    // the stray <hr>/empty-bold the markdown renderer would otherwise produce.
+    if (_isEmptyEmphasisArtifact(line)) {
+      continue;
+    }
 
     const isHeadingCandidate =
       trimmed.length > 0 &&

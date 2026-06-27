@@ -23,6 +23,8 @@ import {
   autoFormatBody,
   replyAllRecipients,
   seedRecipients,
+  threadCardStates,
+  previewOf,
   MY_EMAIL,
 } from './emailDetail.js';
 
@@ -659,6 +661,37 @@ test('autoFormatBody: empty / non-string input -> "" (never crashes, never "unde
   assert.equal(autoFormatBody(42), '');
 });
 
+test('autoFormatBody: drops empty-emphasis artifact lines left by stripped inline images', () => {
+  // HTML newsletters (e.g. the "new sql genAI editor" mail) convert to markdown
+  // with leftover emphasis markers where inline gifs were stripped: "****",
+  // "********", and bold wrapping only a non-breaking space ("** **"). These
+  // render as stray <hr>/empty-bold noise. They carry NO words, so dropping the
+  // whole artifact-only line preserves all real content.
+  const body = 'Real intro paragraph.\n\n'
+    + '****\n\n'
+    + '** **\n\n'
+    + '********\n\n'
+    + 'Real closing paragraph.';
+  const out = autoFormatBody(body);
+  assert.ok(out.includes('Real intro paragraph.'), 'real content kept');
+  assert.ok(out.includes('Real closing paragraph.'), 'real content kept');
+  assert.ok(!/\*{3,}/.test(out), 'no run of 3+ asterisks (empty-emphasis artifact) survives');
+  assert.ok(!out.includes('** **'), 'bold-around-nbsp artifact is gone');
+});
+
+test('autoFormatBody: NEVER strips emphasis that wraps real text', () => {
+  // Conservative: only artifact lines with NO word characters are dropped. Real
+  // bold/italic must be untouched.
+  const body = '**Important:** the launch is Friday.\n\n'
+    + 'See *the wiki* for details, and **bold inline** stays bold.';
+  assert.equal(autoFormatBody(body), body);
+});
+
+test('autoFormatBody: a line that is bold-wrapping REAL words is kept (not treated as artifact)', () => {
+  const body = '**Natural Language business questions converted to SQL:**';
+  assert.equal(autoFormatBody(body), body);
+});
+
 // --- replyAllRecipients: reply-all default To/CC resolution -----------------
 // FEATURE #3: when the draft editor opens, default To = sender + original To
 // MINUS me; CC = original CC MINUS me, then ALWAYS add me; de-dupe BOTH
@@ -802,6 +835,243 @@ test('seedRecipients: edited persisted lists are still de-duped/validated (no fa
   const r = seedRecipients(item);
   assert.deepEqual(r.to, ['bob@amazon.com']); // de-duped CI, invalid dropped
   assert.deepEqual(r.cc, ['carol@amazon.com']);
+});
+
+// --- previewOf: a one-line, display-only truncation of a turn body ----------
+// FEATURE #3. A collapsed older-message card shows a one-line preview so the
+// reader can tell what it is without expanding. The preview is DISPLAY-ONLY: it
+// is NEVER the stored body and NEVER replaces it (the full verbatim body is
+// still rendered when the card expands — anti SUMMARY-MASQUERADING-AS-TIMELINE).
+// It collapses internal whitespace/newlines to single spaces, trims, and caps at
+// a small length with an ellipsis. Pure — no DOM, no fetch.
+
+test('previewOf: a short single-line body is returned as-is (no ellipsis)', () => {
+  assert.equal(previewOf('Thanks Yibo, will review.'), 'Thanks Yibo, will review.');
+});
+
+test('previewOf: collapses newlines and runs of whitespace into single spaces (one line)', () => {
+  const body = 'First line.\n\nSecond   line\twith\ttabs.\nThird.';
+  const out = previewOf(body);
+  assert.ok(!out.includes('\n'), 'no newline survives — it is one line');
+  assert.ok(!/\s{2,}/.test(out), 'no run of 2+ whitespace survives');
+  assert.equal(out, 'First line. Second line with tabs. Third.');
+});
+
+test('previewOf: a long body is truncated with an ellipsis (display-only, never the full body)', () => {
+  const body = 'word '.repeat(80).trim(); // far longer than the cap
+  const out = previewOf(body);
+  assert.ok(out.length <= 123, 'capped near 120 chars + ellipsis');
+  assert.ok(out.endsWith('…'), 'ends with a single-char ellipsis');
+  assert.notEqual(out, body, 'the preview is NOT the full stored body');
+  assert.ok(body.startsWith(out.replace(/…$/, '').trimEnd()), 'preview is a prefix of the body (no fabrication)');
+});
+
+test('previewOf: empty / whitespace / non-string -> "" (never crashes, never "undefined")', () => {
+  assert.equal(previewOf(''), '');
+  assert.equal(previewOf('   \n\t  '), '');
+  assert.equal(previewOf(null), '');
+  assert.equal(previewOf(undefined), '');
+  assert.equal(previewOf(42), '');
+  assert.notEqual(previewOf(null), 'undefined');
+});
+
+// --- threadCardStates: the per-turn render-plan (Original/Latest/N-of-M) -----
+// FEATURE #3 (intuitive multi-reply threading). The reader must instantly grok
+// the conversation shape: which message is the ORIGINAL, which are NEWER replies,
+// and the order. threadCardStates(item) reuses latestThreadView/threadTurns and
+// returns ONE entry per turn — { index, label, isOriginal, isLatest,
+// isExpandedByDefault, preview } — in oldest→newest order:
+//   - label: 'Original' for the FIRST (oldest) turn, 'Latest' for the newest,
+//            'Message N of M' for the middle turns (1-based N).
+//   - the NEWEST turn is isExpandedByDefault:true (it's what the user acts on);
+//     older turns are collapsed (isExpandedByDefault:false).
+//   - preview: a one-line display-only truncation of that turn's body (the FULL
+//     body is still rendered when expanded — the preview never replaces it).
+// Every turn yields a DISTINCT entry (anti COLLAPSE-LOSES-WHO-SAID-WHAT): a
+// 14-message thread => 14 entries, never merged/summarized. Edge cases: a
+// 1-message thread => a single card (isOriginal && isLatest, expanded, no broken
+// 'N of M'); an older item with no threadHistory => falls back through
+// latestThreadView to ZERO cards, no crash, no literal 'undefined' (AC-16).
+// Pure — no DOM, no fetch.
+
+test('threadCardStates: a 3-message thread -> 3 distinct entries, oldest→newest', () => {
+  const hist = [
+    { sender: 'Alice', timestamp: 1, body: 'kick-off (original)' },
+    { sender: 'Bob', timestamp: 2, body: 'a reply in the middle' },
+    { sender: 'Alice', timestamp: 3, body: 'the freshest reply' },
+  ];
+  const states = threadCardStates({ threadHistory: hist });
+  assert.equal(states.length, 3);
+  assert.deepEqual(states.map(s => s.index), [0, 1, 2]);
+  // labels: Original / Message 2 of 3 / Latest
+  assert.deepEqual(states.map(s => s.label), ['Original', 'Message 2 of 3', 'Latest']);
+});
+
+test('threadCardStates: Original is the first/oldest, Latest is the newest, middle is "N of M"', () => {
+  const hist = [
+    { sender: 'A', timestamp: 1, body: 'one' },
+    { sender: 'B', timestamp: 2, body: 'two' },
+    { sender: 'C', timestamp: 3, body: 'three' },
+    { sender: 'D', timestamp: 4, body: 'four' },
+  ];
+  const states = threadCardStates({ threadHistory: hist });
+  assert.equal(states[0].isOriginal, true);
+  assert.equal(states[0].isLatest, false);
+  assert.equal(states[0].label, 'Original');
+
+  assert.equal(states[3].isLatest, true);
+  assert.equal(states[3].isOriginal, false);
+  assert.equal(states[3].label, 'Latest');
+
+  // the middle turns carry "Message N of M" (1-based N, M = total)
+  assert.equal(states[1].label, 'Message 2 of 4');
+  assert.equal(states[2].label, 'Message 3 of 4');
+  assert.equal(states[1].isOriginal, false);
+  assert.equal(states[1].isLatest, false);
+});
+
+test('threadCardStates: only the NEWEST turn is expanded by default; older turns are collapsed', () => {
+  const hist = [
+    { sender: 'A', timestamp: 1, body: 'oldest' },
+    { sender: 'B', timestamp: 2, body: 'middle' },
+    { sender: 'C', timestamp: 3, body: 'newest' },
+  ];
+  const states = threadCardStates({ threadHistory: hist });
+  assert.deepEqual(states.map(s => s.isExpandedByDefault), [false, false, true]);
+  // exactly one expanded-by-default card (the newest)
+  assert.equal(states.filter(s => s.isExpandedByDefault).length, 1);
+});
+
+test('threadCardStates: each entry carries a one-line preview of ITS OWN turn body (display-only)', () => {
+  const hist = [
+    { sender: 'A', timestamp: 1, body: 'first turn\n\nwith a second paragraph' },
+    { sender: 'B', timestamp: 2, body: 'second turn body' },
+  ];
+  const states = threadCardStates({ threadHistory: hist });
+  assert.equal(states[0].preview, 'first turn with a second paragraph'); // newlines collapsed
+  assert.equal(states[1].preview, 'second turn body');
+  // the preview is DISPLAY-ONLY — the full per-turn body is still on the turn
+  // (latestThreadView keeps each per-turn body verbatim), the preview never
+  // replaces it.
+  assert.ok(!states[0].preview.includes('\n'));
+});
+
+test('threadCardStates: a 1-message thread -> a SINGLE card, Original && Latest, expanded, no "N of M"', () => {
+  const states = threadCardStates({ threadHistory: [{ sender: 'X', timestamp: 9, body: 'the only message' }] });
+  assert.equal(states.length, 1);
+  const only = states[0];
+  assert.equal(only.index, 0);
+  assert.equal(only.isOriginal, true);
+  assert.equal(only.isLatest, true);
+  assert.equal(only.isExpandedByDefault, true);
+  // a single-message thread is labeled 'Latest' (it IS the newest) — never a
+  // broken "Message 1 of 1".
+  assert.equal(only.label, 'Latest');
+  assert.notEqual(only.label, 'Message 1 of 1');
+});
+
+test('threadCardStates: a 14-message thread -> 14 DISTINCT entries (never merged/summarized)', () => {
+  const hist = Array.from({ length: 14 }, (_, i) => ({
+    sender: `S${i}`, timestamp: i + 1, body: `body number ${i + 1}`,
+  }));
+  const states = threadCardStates({ threadHistory: hist });
+  // anti COLLAPSE-LOSES-WHO-SAID-WHAT / AC-11: N turns => N cards, never fewer.
+  assert.equal(states.length, 14);
+  assert.deepEqual(states.map(s => s.index), Array.from({ length: 14 }, (_, i) => i));
+  // newest expanded + 13 collapsed
+  assert.equal(states.filter(s => s.isExpandedByDefault).length, 1);
+  assert.equal(states[13].isExpandedByDefault, true);
+  assert.equal(states.filter(s => !s.isExpandedByDefault).length, 13);
+  // exactly one Original, one Latest, twelve "Message N of 14"
+  assert.equal(states.filter(s => s.isOriginal).length, 1);
+  assert.equal(states.filter(s => s.isLatest).length, 1);
+  assert.equal(states.filter(s => /^Message \d+ of 14$/.test(s.label)).length, 12);
+  assert.equal(states[0].label, 'Original');
+  assert.equal(states[13].label, 'Latest');
+  assert.equal(states[6].label, 'Message 7 of 14');
+  // who-said-what preserved per card (distinct senders/bodies, never merged)
+  assert.equal(states[0].preview, 'body number 1');
+  assert.equal(states[13].preview, 'body number 14');
+});
+
+test('threadCardStates: an older item with NO threadHistory -> [] (AC-16: no crash, no "undefined")', () => {
+  assert.deepEqual(threadCardStates({}), []);
+  assert.deepEqual(threadCardStates({ threadHistory: null }), []);
+  assert.deepEqual(threadCardStates({ threadHistory: 'not an array' }), []);
+  assert.deepEqual(threadCardStates(undefined), []);
+  // an empty thread is also zero cards
+  assert.deepEqual(threadCardStates({ threadHistory: [], emailBody: 'a body' }), []);
+});
+
+test('threadCardStates: previews never contain the literal "undefined" for a missing body', () => {
+  const hist = [
+    { sender: 'A', timestamp: 1 }, // no body
+    { sender: 'B', timestamp: 2, body: 'real body' },
+  ];
+  const states = threadCardStates({ threadHistory: hist });
+  assert.equal(states.length, 2);
+  assert.equal(states[0].preview, ''); // a missing body -> empty preview, NOT 'undefined'
+  assert.notEqual(states[0].preview, 'undefined');
+  assert.equal(states[1].preview, 'real body');
+});
+
+test('threadCardStates: a 2-message thread -> Original + Latest only (no "N of M" between)', () => {
+  const hist = [
+    { sender: 'A', timestamp: 1, body: 'original' },
+    { sender: 'B', timestamp: 2, body: 'reply' },
+  ];
+  const states = threadCardStates({ threadHistory: hist });
+  assert.equal(states.length, 2);
+  assert.deepEqual(states.map(s => s.label), ['Original', 'Latest']);
+  assert.equal(states[0].isExpandedByDefault, false);
+  assert.equal(states[1].isExpandedByDefault, true);
+});
+
+// --- autoFormatBody: an image marker in the body is PROSE — survives verbatim -
+// FEATURE #2 (AC-13). The backend (_html_to_text) produces the image placeholder
+// marker "🖼 [image: <filename>]" at strip time; autoFormatBody must treat it as
+// ordinary prose — it is NOT promoted to a heading, NOT dropped as an
+// empty-emphasis artifact (it carries real word chars), and survives a pass
+// VERBATIM. The transform stays idempotent + no-word-loss with the marker present.
+
+test('autoFormatBody: a 🖼 image marker line survives VERBATIM (treated as prose, not stripped)', () => {
+  const body = 'Here is the dashboard:\n\n🖼 [image: chart001.gif]\n\nLet me know if it looks right.';
+  const out = autoFormatBody(body);
+  assert.ok(out.includes('🖼 [image: chart001.gif]'), 'the image marker is preserved verbatim');
+  // it is NOT promoted to a heading (no "### 🖼 [image: …]")
+  assert.ok(!/^#+\s+🖼/m.test(out), 'the image marker is not turned into a heading');
+});
+
+test('autoFormatBody: a body with an image marker is IDEMPOTENT — f(f(x)) === f(x)', () => {
+  const body = 'Quarterly numbers attached.\n\n'
+    + '🖼 [image: revenue_q3.png]\n\n'
+    + 'And the breakdown:\n\n'
+    + '🖼 [image]\n\n'
+    + 'Thanks.';
+  const once = autoFormatBody(body);
+  const twice = autoFormatBody(once);
+  assert.equal(twice, once, 'second pass must be a no-op with image markers present');
+});
+
+test('autoFormatBody: NO WORD LOSS with image markers — every original word survives one pass (in order)', () => {
+  const body = 'See the attached screenshot.\n\n'
+    + '🖼 [image: screenshot_final.gif]\n\n'
+    + 'It shows the new SQL genAI editor in action.\n\n'
+    + '🖼 [image]\n\n'
+    + 'Reach out with questions.';
+  const out = autoFormatBody(body);
+  // The marker carries real word chars ("image", the filename) — they must all
+  // survive; nothing reordered or dropped.
+  assert.deepEqual(words(out.replace(/[#]/g, '')).filter(Boolean), words(body));
+  assert.ok(out.includes('🖼 [image: screenshot_final.gif]'), 'the filenamed marker survives');
+  assert.ok(out.includes('🖼 [image]'), 'the generic marker survives');
+});
+
+test('autoFormatBody: a generic "🖼 [image]" marker is NOT an empty-emphasis artifact (kept)', () => {
+  // The empty-emphasis artifact stripper only drops lines whose chars are all
+  // * _ and whitespace. The image marker has letters/brackets, so it is kept.
+  const body = '🖼 [image]';
+  assert.equal(autoFormatBody(body), body);
 });
 
 console.log(`\nall green: ${passed} tests passed`);
