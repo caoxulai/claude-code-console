@@ -2364,14 +2364,52 @@ def _extract_email_body(payload) -> str:
 # single stray keyword in prose (AC-9): an Outlook ``From:`` line is only a
 # boundary if a ``Sent:``/``Date:`` AND a ``Subject:`` line follow within a few
 # lines (confirmed in _split_quoted_thread); the Gmail ``On ... wrote:`` and the
-# ``-----Original Message-----`` separator stand alone.
-_RE_FROM_LINE = re.compile(r"^\s*From:\s*(.+?)\s*$", re.IGNORECASE)
-_RE_DATE_LINE = re.compile(r"^\s*(?:Date|Sent):\s*(.+?)\s*$", re.IGNORECASE)
-_RE_TO_LINE = re.compile(r"^\s*To:\s*(.+?)\s*$", re.IGNORECASE)
-_RE_CC_LINE = re.compile(r"^\s*Cc:\s*(.+?)\s*$", re.IGNORECASE)
-_RE_SUBJECT_LINE = re.compile(r"^\s*Subject:\s*(.+?)\s*$", re.IGNORECASE)
+# ``-----Original <word>-----`` separator stand alone.
+#
+# The OWA ``email_read`` ``format=markdown`` path BOLDS the quoted-header LABELS
+# (and sometimes wraps the colon too): the stored body literally contains lines
+# like ``**From:``, ``**From:** Shadeck, Gal``, ``**Date: **Wednesday, ...``,
+# ``__Sent:__ ...``, ``*Subject:* ...``. We therefore tolerate an OPTIONAL leading
+# emphasis run (``**``/``__``/single ``*``/``_``) plus whitespace before the label,
+# and emphasis between the label's colon and the value (D-060). This is a STRICT
+# SUPERSET of the bare form — when NO emphasis is present the value capture is
+# byte-identical to the pre-D-060 pattern (D-053 backward compat). The captured
+# VALUE may still carry trailing emphasis (e.g. ``Shadeck, Gal **``), which is
+# stripped by ``_strip_emphasis`` BEFORE the value is flattened into a field.
+_EMPH = r"(?:\*{1,2}|_{1,2})"  # one markdown emphasis run: ** __ * _
+# Optional leading emphasis + ws, label + ':', optional emphasis/ws, then value.
+_RE_FROM_LINE = re.compile(rf"^\s*{_EMPH}?\s*From:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
+_RE_DATE_LINE = re.compile(rf"^\s*{_EMPH}?\s*(?:Date|Sent):\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
+_RE_TO_LINE = re.compile(rf"^\s*{_EMPH}?\s*To:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
+_RE_CC_LINE = re.compile(rf"^\s*{_EMPH}?\s*Cc:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
+_RE_SUBJECT_LINE = re.compile(rf"^\s*{_EMPH}?\s*Subject:\s*{_EMPH}?\s*(.+?)\s*$", re.IGNORECASE)
 _RE_GMAIL_WROTE = re.compile(r"^\s*On\s+.+\bwrote:\s*$", re.IGNORECASE)
-_RE_ORIGINAL_SEP = re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE)
+# Full-line dashed separator: ``-----Original Message-----`` AND
+# ``-----Original Appointment-----`` (any single-word variant). Stays dash-anchored
+# (a ``\w+`` word, never free prose) so a sentence mentioning "the original
+# message" never false-splits (D-060, AC-7).
+_RE_ORIGINAL_SEP = re.compile(r"^\s*-{2,}\s*Original\s+\w+\s*-{2,}\s*$", re.IGNORECASE)
+# Leading/trailing markdown emphasis runs to peel off a captured header VALUE.
+_RE_EMPH_EDGES = re.compile(r"^(?:\*{1,2}|_{1,2})\s*|\s*(?:\*{1,2}|_{1,2})$")
+
+
+def _strip_emphasis(value: str) -> str:
+    """Peel leading/trailing markdown emphasis runs (``**``/``__``/``*``/``_``) and
+    surrounding whitespace off a captured header value.
+
+    A bolded label line like ``**From:** Shadeck, Gal **`` yields the raw value
+    ``Shadeck, Gal **``; this returns ``Shadeck, Gal`` so the flattened sender is
+    clean, never carrying emphasis noise (D-060 AC-3). A value with NO emphasis is
+    returned unchanged (strict superset / backward compat). Idempotent: re-applying
+    on the cleaned value is a no-op.
+    """
+    v = (value or "").strip()
+    prev = None
+    # Peel one run at a time from each edge until stable (handles ``** value **``).
+    while v != prev:
+        prev = v
+        v = _RE_EMPH_EDGES.sub("", v).strip()
+    return v
 # How far below a ``From:`` line we look for the Date:/Subject: confirmation.
 _OUTLOOK_HEADER_LOOKAHEAD = 5
 # A 'Name <email>' / 'Name email@x' header value -> display name (drop the addr).
@@ -2492,13 +2530,13 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
                 m_cc = _RE_CC_LINE.match(ln)
                 m_subject = _RE_SUBJECT_LINE.match(ln)
                 if m_from:
-                    sender = _flatten_header_name(m_from.group(1))
+                    sender = _flatten_header_name(_strip_emphasis(m_from.group(1)))
                 elif m_date:
-                    timestamp = m_date.group(1).strip()
+                    timestamp = _strip_emphasis(m_date.group(1))
                 elif m_to:
-                    recipients = _flatten_header_recipients(m_to.group(1))
+                    recipients = _flatten_header_recipients(_strip_emphasis(m_to.group(1)))
                 elif m_cc:
-                    cc = _flatten_header_recipients(m_cc.group(1))
+                    cc = _flatten_header_recipients(_strip_emphasis(m_cc.group(1)))
                 elif m_subject:
                     pass  # Subject: dropped (not a turn field)
                 elif _RE_ORIGINAL_SEP.match(ln) or _RE_GMAIL_WROTE.match(ln):
