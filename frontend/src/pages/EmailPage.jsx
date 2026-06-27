@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients, threadCardStates } from './emailDetail';
 
 // --- Constants ---
 
@@ -145,7 +145,14 @@ export default function EmailPage() {
   const scanNoticeRef = useRef(null);
 
   const [expandedId, setExpandedId] = useState(null);
-  const [emailBodyOpen, setEmailBodyOpen] = useState(false);
+  // Per-thread-card open state (FEATURE #3): a Set of the turn INDICES whose
+  // card is currently expanded. The newest turn is expanded by default (seeded
+  // when a row opens); older turns are collapsed and individually expandable.
+  // This is a DISTINCT state from the single `emailBodyOpen` boolean (which is
+  // the legacy "Show full email" toggle, now retired in the Thread-context
+  // section) — per-card toggles must never share one boolean or every card
+  // would open/close together. Reset on row open/close in toggleExpand.
+  const [expandedCards, setExpandedCards] = useState(() => new Set());
   const [editingId, setEditingId] = useState(null);
   const [draftText, setDraftText] = useState('');
   const [busyId, setBusyId] = useState(null);
@@ -411,7 +418,13 @@ export default function EmailPage() {
     if (alreadyRunningReason) {
       setScanNotice(alreadyRunningReason);
       clearRef(scanNoticeRef);
-      scanNoticeRef.current = setTimeout(() => { setScanNotice(null); scanNoticeRef.current = null; }, 4000);
+      scanNoticeRef.current = setTimeout(() => { setScanNotice(null); scanNoticeRef.current = null; }, 6000);
+      // A scan genuinely IS running (the worker tick beat this click) — reflect it
+      // on the button so the user gets a persistent "Scanning..." signal that
+      // results are coming, not just a brief notice they can miss.
+      setScanning(true);
+      clearRef(scanHintRef);
+      scanHintRef.current = setTimeout(() => { setScanning(false); scanHintRef.current = null; }, 30000);
       return;
     }
     if (!startedScan) return;
@@ -468,7 +481,7 @@ export default function EmailPage() {
       setExpandedId(null);
       setEditingId(null);
       setDraftText('');
-      setEmailBodyOpen(false);
+      setExpandedCards(new Set());
       setRecipientsTo([]);
       setRecipientsCc([]);
       setRecipientsDirty(false);
@@ -478,7 +491,14 @@ export default function EmailPage() {
       setExpandedId(item.id);
       setEditingId(null);
       setDraftText(item.draft || '');
-      setEmailBodyOpen(false);
+      // Seed the thread-card open state to the newest message expanded (the one
+      // the user acts on) — every older card starts collapsed. threadCardStates
+      // marks exactly one entry isExpandedByDefault (the newest); reset on each
+      // row open so a freshly-opened row never inherits the prior row's toggles.
+      const defaultOpen = new Set(
+        threadCardStates(item).filter(s => s.isExpandedByDefault).map(s => s.index),
+      );
+      setExpandedCards(defaultOpen);
       setError(null);
       seedRecipientEditor(item);
     }
@@ -1055,6 +1075,14 @@ export default function EmailPage() {
     // never dangerouslySetInnerHTML.
     const view = latestThreadView(item);
 
+    // The per-turn render PLAN (FEATURE #3): one entry per turn carrying the
+    // ordering label (Original / Latest / Message N of M), which card is open by
+    // default (the newest), and a one-line preview for the collapsed state. This
+    // is the SAME turn data as view.turns — a presentation plan, not a new model.
+    const cardStates = threadCardStates(item);
+    // Expand/collapse-all decisions over the current per-card open Set.
+    const allCardsOpen = cardStates.length > 0 && cardStates.every(s => expandedCards.has(s.index));
+
     // Shared card markup for one thread turn (sender + relative timestamp +
     // body) — used for the single latest-message card AND each card in the
     // expanded full timeline so who-said-what is preserved verbatim.
@@ -1065,7 +1093,14 @@ export default function EmailPage() {
     // malformed-markdown throw from blanking the whole detail panel.
     const renderBody = (text) => (
       <ErrorBoundary label="Couldn't render this email body.">
-        <div className="markdown-body" style={{ color: 'var(--text)', lineHeight: 1.5, wordBreak: 'break-word' }}>
+        {/* `email-body` scopes the reading-comfort rules (constrained measure,
+            line-height, list indentation, blockquote rail, bordered table) in
+            App.css to the email read view ONLY — the shared global .markdown-body
+            (chat / skills / memory / transcripts) is left untouched. The 🖼
+            [image: …] placeholder renders as the plain-text line the body already
+            carries (React-escaped via this ReactMarkdown stack) — NEVER an <img>
+            element, NEVER dangerouslySetInnerHTML. */}
+        <div className="markdown-body email-body" style={{ color: 'var(--text)', wordBreak: 'break-word' }}>
           <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
             {text || ''}
           </ReactMarkdown>
@@ -1073,52 +1108,162 @@ export default function EmailPage() {
       </ErrorBoundary>
     );
 
-    const renderTurnCard = (turn, key) => {
+    // Per-participant accent (FEATURE #4): a deterministic hue derived from the
+    // sender string so each participant reads with a consistent color rail +
+    // avatar tint across cards. Stays inside the app's palette by tinting via
+    // hsl on a fixed S/L tuned for dark-mode contrast (never a hardcoded
+    // off-palette color). A blank/unknown sender falls back to the accent token.
+    const participantHue = (sender) => {
+      const s = (sender || '').trim();
+      if (!s) return null;
+      let h = 0;
+      for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) % 360;
+      return h;
+    };
+    const participantColor = (sender) => {
+      const h = participantHue(sender);
+      return h === null ? 'var(--accent)' : `hsl(${h}, 62%, 70%)`;
+    };
+    // Sender initials for the avatar (up to two letters from the first/last
+    // word). Untrusted email text -> derived, then rendered via {…}.
+    const senderInitials = (sender) => {
+      const s = (sender || '').trim();
+      if (!s) return '?';
+      const parts = s.split(/\s+/).filter(Boolean);
+      if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+      return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+    };
+
+    // Render ONE thread turn as an email-client-grade card (FEATURE #3/#4).
+    //   - `turn`  : the {sender, timestamp, body, recipients} turn (verbatim body)
+    //   - `state` : the threadCardStates entry — { index, label, isOriginal,
+    //               isLatest, isExpandedByDefault, preview }; carries the ordering
+    //               label + the one-line preview shown when collapsed.
+    //   - `open`  : whether THIS card is expanded (per-card expandedCards Set
+    //               state, never one shared boolean) — collapsed shows the header
+    //               + preview, expanded shows the verbatim body.
+    //   - `onToggle`: flips this one card's open state.
+    // The collapsed card still surfaces sender + timestamp + ordering label + a
+    // one-line preview so the reader reconstructs who-said-what at a glance (anti
+    // COLLAPSE-LOSES-WHO-SAID-WHAT); expanding shows the FULL per-turn body
+    // (autoFormatBody -> renderBody), so the preview never replaces the body.
+    const renderTurnCard = (turn, key, state, open, onToggle) => {
       // displayTimestamp (emailDetail.js) returns a relative-time string for an
       // epoch/ISO timestamp, the VERBATIM human date for a quoted-header date
       // string that `new Date()` can't parse ("Wednesday, June 24, 2026 at
       // 10:23" — NEVER the broken "--"), and '' when there's nothing to show.
-      // Gating the slot on the resolved string keeps an empty/unusable
-      // timestamp from rendering an empty span. Untrusted email text -> React
-      // {…} interpolation only.
       const tsLabel = displayTimestamp(turn.timestamp);
+      const accent = participantColor(turn.sender);
+      // The ordering badge: Latest gets the accent fill (the message the user
+      // acts on), Original/middle get a quiet neutral chip. A single-card thread
+      // is labeled 'Latest' (threadCardStates) so it reads as the whole email.
+      const isLatestLabel = state && state.isLatest;
+      const badgeStyle = isLatestLabel
+        ? { background: 'var(--accent)', color: '#000', border: '1px solid var(--accent)' }
+        : { background: 'var(--surface2)', color: 'var(--muted)', border: '1px solid var(--border)' };
       return (
       <div
         key={key}
         className="card"
         style={{
-          padding: '0.6em 0.9em',
-          borderLeft: '3px solid var(--accent)',
+          padding: 0,
+          // The threading rail: a per-participant colored left edge ties each
+          // card to its sender and gives the stack a conversation spine.
+          borderLeft: `3px solid ${accent}`,
           fontSize: '0.85em',
+          overflow: 'hidden',
         }}
       >
-        <div style={{ display: 'flex', gap: '0.6em', alignItems: 'baseline', flexWrap: 'wrap' }}>
-          <span style={{ fontWeight: 600, color: 'var(--text)' }}>{turn.sender || 'unknown'}</span>
-          {tsLabel && (
-            <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{tsLabel}</span>
-          )}
+        {/* Card header — always visible, click toggles this one card. role/
+            tabIndex make it keyboard-accessible (Enter/Space). */}
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={open}
+          onClick={onToggle}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); }
+          }}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '0.6em',
+            padding: '0.5em 0.7em', cursor: 'pointer',
+          }}
+        >
+          {/* Sender initials avatar, tinted with the participant accent. */}
+          <span
+            aria-hidden="true"
+            style={{
+              flexShrink: 0,
+              width: '1.8em', height: '1.8em', borderRadius: '50%',
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              background: 'var(--surface2)', color: accent,
+              border: `1px solid ${accent}`,
+              fontSize: '0.78em', fontWeight: 700,
+            }}
+          >
+            {senderInitials(turn.sender)}
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5em', flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 600, color: 'var(--text)', wordBreak: 'break-word' }}>
+                {turn.sender || 'unknown'}
+              </span>
+              {state && (
+                <span
+                  className="badge"
+                  style={{ ...badgeStyle, fontSize: '0.7em', padding: '0.05em 0.5em' }}
+                >
+                  {state.label}
+                </span>
+              )}
+              {tsLabel && (
+                <span style={{ color: 'var(--muted)', fontSize: '0.85em' }}>{tsLabel}</span>
+              )}
+            </div>
+            {/* Collapsed: a one-line preview so the reader knows what this turn
+                is without expanding (display-only — never replaces the body). */}
+            {!open && state && state.preview && (
+              <div style={{
+                color: 'var(--muted)', fontSize: '0.85em', marginTop: '0.1em',
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                {state.preview}
+              </div>
+            )}
+          </div>
+          <span style={{ flexShrink: 0, color: 'var(--muted)', display: 'inline-flex' }}>
+            {open ? <FiChevronDown size={14} /> : <FiChevronRight size={14} />}
+          </span>
         </div>
-        {/* Optional "To:" line — who this turn was sent to. Rendered ONLY when
-            the turn carries a non-empty recipients STRING (the backend joins
-            display names into a human-readable string — see email.py); skipped
-            entirely otherwise so we never show an empty "To:" or a placeholder.
-            All text via React {…} interpolation, never dangerouslySetInnerHTML. */}
-        {typeof turn.recipients === 'string' && turn.recipients.trim() && (
-          <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginTop: '0.15em', wordBreak: 'break-word' }}>
-            To: {turn.recipients}
+
+        {/* Expanded body. */}
+        {open && (
+          <div style={{ padding: '0 0.7em 0.6em', borderTop: '1px solid var(--border)' }}>
+            {/* Optional "To:" line — who this turn was sent to. Rendered ONLY
+                when the turn carries a non-empty recipients STRING (the backend
+                joins display names into a human-readable string — see email.py);
+                skipped otherwise so we never show an empty "To:" or a placeholder.
+                All text via React {…} interpolation, never dangerouslySetInnerHTML. */}
+            {typeof turn.recipients === 'string' && turn.recipients.trim() && (
+              <div style={{ color: 'var(--muted)', fontSize: '0.85em', marginTop: '0.4em', wordBreak: 'break-word' }}>
+                To: {turn.recipients}
+              </div>
+            )}
+            {/* The body is run through autoFormatBody first (FEATURE #1): a pure,
+                conservative, idempotent, content-preserving transform that
+                promotes short question/Title-Case header lines (followed by a
+                blank line) into markdown subheadings, drops empty-emphasis
+                artifacts, and leaves real lists/tables/links/paragraphs +
+                🖼 [image: …] markers intact — making flat newsletter prose
+                scannable WITHOUT an LLM. The single-turn card's body is the FULL
+                item.emailBody (latestThreadView), so the CRIS Flash renders
+                end-to-end, never the 4096 mid-sentence cut. Rendered via
+                ReactMarkdown ({…} escaped), never dangerouslySetInnerHTML. */}
+            <div style={{ marginTop: '0.4em' }}>
+              {renderBody(autoFormatBody(turn.body))}
+            </div>
           </div>
         )}
-        {/* The body is run through autoFormatBody first (FEATURE #1): a pure,
-            conservative, idempotent, content-preserving transform that promotes
-            short question/Title-Case header lines (followed by a blank line) into
-            markdown subheadings and leaves real lists/tables/links/paragraphs
-            intact — making flat newsletter prose scannable WITHOUT an LLM. The
-            single-turn card's body is the FULL item.emailBody (latestThreadView),
-            so the CRIS Flash renders end-to-end, never the 4096 mid-sentence cut.
-            Still rendered via ReactMarkdown ({…} escaped), never dangerouslySetInnerHTML. */}
-        <div style={{ marginTop: '0.3em' }}>
-          {renderBody(autoFormatBody(turn.body))}
-        </div>
       </div>
       );
     };
@@ -1187,16 +1332,61 @@ export default function EmailPage() {
           </div>
         </div>
 
-        {/* --- 2. Thread Context (latest message + expandable full timeline) -
-            The newest turn shows by default; "Show full email (N messages)"
-            expands the full oldest→newest per-turn cards (reusing renderTurnCard
-            so who-said-what is preserved). N is the REAL turn count from
-            latestThreadView. With no structured history we fall back to the full
-            body/snippet. emailBodyOpen drives this section's expand. */}
+        {/* --- 2. Thread Context (newest expanded + individually-expandable
+            older cards) -------------------------------------------------------
+            FEATURE #3: every turn renders as its own card in oldest→newest order
+            (anti COLLAPSE-LOSES-WHO-SAID-WHAT — a 14-message thread is 14 cards,
+            never merged/summarized). The NEWEST card is expanded by default (the
+            message the user acts on); older cards are collapsed to a header +
+            one-line preview and expand on click (per-card `expandedCards` Set,
+            never one shared boolean). Each card carries an ordering
+            label (Original / Latest / Message N of M) so the reader instantly
+            groks which is the original and which are newer replies, and in what
+            order. The expand/collapse-all control flips every card at once. With
+            no structured threadHistory (older items) we fall back to the full
+            concatenated body/snippet in a single card. All text is EXTERNAL
+            email content via React's {…} interpolation, never dangerouslySetInnerHTML. */}
         <div style={sectionStyle}>
-          <div style={labelStyle}>Thread context</div>
-          {view.latest ? (
-            renderTurnCard(view.latest, 'latest')
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5em', flexWrap: 'wrap', marginBottom: '0.3em' }}>
+            <div style={{ ...labelStyle, marginBottom: 0 }}>Thread context</div>
+            {cardStates.length > 1 && (
+              <>
+                <span style={{ color: 'var(--muted)', fontSize: '0.75em' }}>
+                  {cardStates.length} messages · oldest → newest
+                </span>
+                <button
+                  type="button"
+                  aria-expanded={allCardsOpen}
+                  style={{ ...toggleStyle, marginLeft: 'auto' }}
+                  onClick={() => setExpandedCards(
+                    allCardsOpen ? new Set() : new Set(cardStates.map(s => s.index)),
+                  )}
+                >
+                  {allCardsOpen ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
+                  {allCardsOpen ? 'Collapse all' : 'Expand all'}
+                </button>
+              </>
+            )}
+          </div>
+          {cardStates.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em' }}>
+              {cardStates.map((state) => {
+                const turn = view.turns[state.index];
+                const open = expandedCards.has(state.index);
+                return renderTurnCard(
+                  turn,
+                  turn.timestamp || state.index,
+                  state,
+                  open,
+                  () => setExpandedCards((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(state.index)) next.delete(state.index);
+                    else next.add(state.index);
+                    return next;
+                  }),
+                );
+              })}
+            </div>
           ) : (
             <div
               className="card"
@@ -1209,23 +1399,6 @@ export default function EmailPage() {
                 ? renderBody(autoFormatBody(view.fallbackBody))
                 : <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>(no email body available)</span>}
             </div>
-          )}
-          {view.count > 1 && (
-            <>
-              <button
-                type="button"
-                style={{ ...toggleStyle, marginTop: '0.5em' }}
-                onClick={() => setEmailBodyOpen(v => !v)}
-              >
-                {emailBodyOpen ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
-                {emailBodyOpen ? 'Hide full email' : `Show full email (${view.count} messages)`}
-              </button>
-              {emailBodyOpen && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5em', marginTop: '0.5em' }}>
-                  {view.turns.map((turn, i) => renderTurnCard(turn, turn.timestamp || i))}
-                </div>
-              )}
-            </>
           )}
         </div>
 

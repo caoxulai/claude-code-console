@@ -493,6 +493,45 @@ html, body, #root {
   border-radius: var(--radius);
 }
 
+/* Email read-view reading-comfort overrides (scoped to `.email-body`, the class
+   the Email thread/context cards add — the shared global .markdown-body used by
+   chat / skills / memory / transcripts is untouched). Tuned for a comfortable,
+   email-client-grade reading measure on the existing token palette. */
+.markdown-body.email-body {
+  /* A constrained line measure so body prose doesn't run edge-to-edge; ch keeps
+     it tied to the reading rhythm (~70 characters). Falls back gracefully on a
+     narrower panel because max-width never forces a min. */
+  max-width: 70ch;
+  line-height: 1.6;
+}
+.markdown-body.email-body p { line-height: 1.6; margin-bottom: 0.7em; }
+/* Nested/indented lists keep their hierarchy: each level adds indentation, and
+   a sub-list tucks tight under its parent item. The ordinals on an <ol> come
+   from the real "1. 2. 3." markdown the backend emits (decimal list-style) — NOT
+   faked with CSS counters. */
+.markdown-body.email-body ul,
+.markdown-body.email-body ol { padding-left: 1.6em; margin: 0.4em 0 0.7em; }
+.markdown-body.email-body ol { list-style: decimal; }
+.markdown-body.email-body ul { list-style: disc; }
+.markdown-body.email-body li { margin-bottom: 0.3em; line-height: 1.55; }
+.markdown-body.email-body li > ul,
+.markdown-body.email-body li > ol { margin: 0.3em 0 0.3em; }
+/* A visually-distinct quoted/reply block: a left accent rail + a subtle tinted
+   surface so a quoted reply reads apart from the new prose. */
+.markdown-body.email-body blockquote {
+  border-left: 3px solid var(--accent);
+  background: var(--surface2);
+  padding: 0.4em var(--space-md);
+  margin: 0.6em 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  color: var(--muted);
+  font-style: normal;
+}
+/* A real bordered table that fills the measure with comfortable cell padding. */
+.markdown-body.email-body table { width: 100%; margin: 0.7em 0; }
+.markdown-body.email-body th,
+.markdown-body.email-body td { padding: 0.45em 0.7em; }
+
 /* highlight.js github-dark integration */
 .hljs {
   background: var(--bg) !important;
