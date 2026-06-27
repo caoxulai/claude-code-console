@@ -527,10 +527,44 @@ html, body, #root {
   color: var(--muted);
   font-style: normal;
 }
-/* A real bordered table that fills the measure with comfortable cell padding. */
-.markdown-body.email-body table { width: 100%; margin: 0.7em 0; }
+/* A real bordered status/report table (Outlook GWD / MBR / peak-status grids).
+   The backend (email.py _html_to_text) emits a VALID GFM table — any merged
+   single-cell title row is lifted out as a bold `**caption**` <p><strong>
+   sibling rendered right above the table, which reads as the table's heading.
+   remarkGfm emits a BARE <table> with no wrapping container, so the overflow
+   handling lives on the <table> itself: `display:block; overflow-x:auto` lets a
+   wide 4+ column grid scroll WITHIN the email detail panel instead of clipping
+   or pushing past it. border-collapse + a per-cell border gives real gridlines. */
+.markdown-body.email-body table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 0.4em 0 0.9em;
+  font-size: var(--fs-sm);
+}
 .markdown-body.email-body th,
-.markdown-body.email-body td { padding: 0.45em 0.7em; }
+.markdown-body.email-body td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.8em;
+  text-align: left;
+  vertical-align: top;
+}
+/* Emphasized header row: a subtle raised surface + bold readable text. */
+.markdown-body.email-body th {
+  background: var(--surface2);
+  color: var(--text);
+  font-weight: 600;
+}
+/* Row separation via zebra striping for scannable status rows. */
+.markdown-body.email-body tbody tr:nth-child(even) td { background: var(--surface2); }
+.markdown-body.email-body tbody tr:hover td { background: var(--surface); }
+/* The bold caption emitted right above the table reads as its title — keep its
+   spacing tight to the grid below so they read as one unit. */
+.markdown-body.email-body p + table { margin-top: 0.2em; }
 
 /* highlight.js github-dark integration */
 .hljs {
