@@ -2901,6 +2901,68 @@ def test_html_to_text_header_wider_than_modal_is_valid_gfm():  # D-063 root-caus
     assert lines[3] == "| Phone: | 555-0100 |  |"
 
 
+def test_html_to_text_literal_pipe_in_cell_is_escaped():  # D-063 follow-up root-cause
+    """THE h3/s2 LIVE-MISMATCH BUG, isolated: a cell whose TEXT contains a literal
+    '|' (an Outlook 'A | B' status cell) must be backslash-escaped to '\\|' so
+    remark-gfm re-parses the cell as ONE column. Un-escaped, the header re-parsed
+    WIDER than the separator (h3/s2) and remark-gfm refused the table — the exact
+    mismatch the AC-1 live probe still saw after the MAX-width fix."""
+    html = (
+        "<table>"
+        "<tr><th>Status: A | B</th><th>Owner</th></tr>"  # header cell carries '|'
+        "<tr><td>Done</td><td>Alice</td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # The literal pipe is escaped so it stays INSIDE the header cell.
+    assert lines[0] == "| Status: A \\| B | Owner |"
+    assert lines[1] == "| --- | --- |"
+    assert lines[2] == "| Done | Alice |"
+    # The faithful (escape-aware) validator confirms remark-gfm accepts it:
+    # header_cols == separator_cols == data_cols == 2 (no column inflation).
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(html)
+    assert all_valid, detail
+    # No word loss: the original pipe character is preserved (only escaped).
+    assert "A | B" in out.replace("\\|", "|")
+
+
+def test_html_to_text_pipe_in_data_cell_escaped_no_column_inflation():  # D-063 follow-up
+    """A pipe in a DATA cell (a 'p50|p99' metric, a 'Before | After' comparison) is
+    escaped identically, so the data row stays the header's width and remark-gfm
+    renders all comparison columns instead of dropping them + showing literal '---'
+    (the AC-11 newsletter defect)."""
+    html = (
+        "<table>"
+        "<tr><th>Feature</th><th>Before | After</th><th>Impact</th></tr>"
+        "<tr><td>Latency</td><td>200ms | 50ms</td><td>4x faster</td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(html)
+    assert all_valid, detail
+    # Every row (header + data) re-parses to exactly 3 columns — no column dropped.
+    tables = validate_mod.parse_gfm_tables(out)
+    assert tables and tables[0]["header_cols"] == 3
+    assert tables[0]["separator_cols"] == 3
+    assert tables[0]["data_cols"] == [3]
+
+
+def test_html_to_text_pipe_escape_is_idempotent():  # D-063 follow-up idempotency
+    """f(f(x)) == f(x): the escaped '\\|' carries no cell sentinel / no <table>, so a
+    second _html_to_text pass leaves it unchanged — never double-escaped to '\\\\|'."""
+    html = (
+        "<table>"
+        "<tr><th>Key</th><th>Value</th></tr>"
+        "<tr><td>range</td><td>a|b|c</td></tr>"
+        "</table>"
+    )
+    once = email_mod._html_to_text(html)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "\\\\|" not in once  # never double-escaped
+
+
 # ─── D-052: backfill an un-fetchable body from a copy quoted in another thread ──
 # Some Graph message_ids fail get_email persistently (observed: a standalone
 # original whose id 400s every time) while the SAME message is quoted inside a
@@ -5986,6 +6048,26 @@ def test_validate_parse_gfm_tables_extracts_header_separator_and_data_widths():
     assert t["header_cols"] == 3
     assert t["separator_cols"] == 3
     assert t["data_cols"] == [3, 3], "two 3-column data rows"
+
+
+def test_validate_gfm_pipe_cols_counts_escaped_pipe_as_one_column():
+    """The probe parser must mirror remark-gfm: a backslash-escaped '\\|' is a
+    LITERAL pipe INSIDE a cell, NOT a column boundary. A naive str.split('|') would
+    over-count a legitimate 'A \\| B' cell and FALSELY flag a valid table as a
+    header/separator mismatch — so _gfm_pipe_cols splits on UNescaped pipes only."""
+    # A 2-column row whose first cell carries an escaped pipe.
+    cols, parts = validate_mod._gfm_pipe_cols("| Status: A \\| B | Owner |")
+    assert cols == 2, f"escaped pipe must stay inside the cell (got parts {parts!r})"
+    # And a full converter-shaped table with an escaped pipe parses as valid.
+    md = (
+        "| Status: A \\| B | Owner |\n"
+        "| --- | --- |\n"
+        "| Done | Alice |\n"
+    )
+    tables = validate_mod.parse_gfm_tables(md)
+    assert len(tables) == 1
+    t = tables[0]
+    assert t["header_cols"] == 2 and t["separator_cols"] == 2 and t["data_cols"] == [2]
 
 
 def test_validate_parse_gfm_tables_detects_two_separate_tables():

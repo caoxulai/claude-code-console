@@ -333,23 +333,32 @@ def map_folder_message(message) -> dict:
 # run of dashes, e.g. "---", ":--", "--:", ":-:" (GFM alignment markers).
 _GFM_SEP_CELL = re.compile(r"^\s*:?-{1,}:?\s*$")
 
+# A GFM column boundary is an '|' that is NOT backslash-escaped: ``\|`` is a LITERAL
+# pipe INSIDE a cell (it does NOT open a new column). remark-gfm honours this, so to
+# mirror its column count faithfully we must split on UNescaped pipes only — a plain
+# ``str.split('|')`` over-counts a cell that legitimately carries an escaped pipe
+# (an Outlook ``A \| B`` status cell), which would FALSELY flag a valid table as a
+# header/separator mismatch. Split on a '|' not preceded by a backslash.
+_GFM_UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
 
 def _gfm_pipe_cols(line: str):
     """Column count of a pipe row, or None if ``line`` is not a pipe row.
 
-    A GFM row is delimited by '|'. We split on '|' and drop the leading/trailing
-    empty cells produced by the outer pipes (a row is conventionally written with a
-    leading AND trailing pipe, as ``email._html_to_text`` always emits). The count
-    is the number of real cells BETWEEN the outer pipes. Returns None for any line
-    that is not a pipe row (prose, a bold caption, a blank line) so the caller can
-    treat it as a table boundary.
+    A GFM row is delimited by UNescaped '|' (a ``\\|`` is a literal pipe inside a
+    cell, exactly as remark-gfm treats it). We split on unescaped pipes and drop the
+    leading/trailing empty cells produced by the outer pipes (a row is conventionally
+    written with a leading AND trailing pipe, as ``email._html_to_text`` always
+    emits). The count is the number of real cells BETWEEN the outer pipes. Returns
+    None for any line that is not a pipe row (prose, a bold caption, a blank line) so
+    the caller can treat it as a table boundary.
     """
     s = line.strip()
     if not s or "|" not in s:
         return None
-    # Split on '|'; the converter never emits escaped pipes inside a cell, so a
-    # plain split is faithful to its output.
-    parts = s.split("|")
+    # Split on UNescaped '|' only — ``\|`` stays inside its cell (mirrors remark-gfm),
+    # so a cell carrying an escaped pipe is counted as ONE column, not two.
+    parts = _GFM_UNESCAPED_PIPE.split(s)
     # Drop the leading/trailing empty strings created by the outer pipes.
     if parts and parts[0].strip() == "":
         parts = parts[1:]

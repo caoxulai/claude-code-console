@@ -2043,6 +2043,30 @@ def _img_marker_from_tag(match: "re.Match") -> str:
 _RE_TABLE_TAG = re.compile(r"</?table[^>]*>", re.IGNORECASE)
 
 
+def _escape_pipes_in_cell(cell: str) -> str:
+    """Escape any literal ``|`` inside ONE table cell's text as ``\\|`` (GFM rule).
+
+    THE h3/s2 / h2/s1 LIVE-MISMATCH ROOT CAUSE (D-063 follow-up): the converter
+    sizes the separator + pads every row from the cell COUNT it splits on the cell
+    sentinel, so by construction header_cols == separator_cols == data_width. But it
+    emitted each cell's TEXT verbatim — and a cell whose text contains a literal
+    ``|`` (an Outlook status cell like ``A | B``, a path, a "key|value" pair) makes
+    remark-gfm (and the live probe) RE-PARSE that one cell as TWO columns. The
+    header row then re-parses WIDER than the separator (which only ever held
+    ``---``), so header_cols > separator_cols and remark-gfm REFUSES the table,
+    rendering raw ``| a | b |`` as a literal paragraph — the exact h3/s2 (96x),
+    h2/s1 (34x), … mismatches the AC-1 probe still saw after the MAX-width fix.
+
+    The GFM remedy is to backslash-escape every literal pipe inside the cell so it
+    stays INSIDE the cell on re-parse (a column boundary is an UN-escaped ``|``).
+    Applied to EVERY cell (header AND data) identically so the per-row column count
+    is exactly the sentinel-split count again. Pure/deterministic; no word loss (the
+    pipe character is preserved, only escaped). The escaped ``\\|`` carries no cell
+    sentinel and no ``<table>``, so a second _html_to_text pass is a no-op.
+    """
+    return cell.replace("|", "\\|")
+
+
 def _mark_top_level_tables(text: str, sep: str) -> str:
     """Replace only OUTERMOST <table>/</table> boundaries with the table sentinel.
 
@@ -2269,7 +2293,15 @@ def _html_to_text(html: str) -> str:
                 # column N; a row whose cells are ALL empty (an Outlook spacer/layout
                 # row) is the ONLY case dropped — it is not data and must not widen the
                 # grid or emit a blank pipe row.
-                cells = [c.replace("\n", " ").strip() for c in rest.split(_CELL_SEP)]
+                # Escape any literal '|' INSIDE a cell's text (_escape_pipes_in_cell)
+                # so remark-gfm re-parses the cell as ONE column. An un-escaped pipe
+                # in cell text was the live h3/s2 / h2/s1 mismatch: it inflated the
+                # header's re-parsed column count past the separator width, so
+                # remark-gfm refused the table and rendered raw pipe text.
+                cells = [
+                    _escape_pipes_in_cell(c.replace("\n", " ").strip())
+                    for c in rest.split(_CELL_SEP)
+                ]
                 if not any(cells):
                     _flush_table_block()
                     table_block = []
