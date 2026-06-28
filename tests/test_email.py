@@ -3320,6 +3320,39 @@ def test_validate_runner_non_quota_failure_does_not_claim_quota():
     assert "quota" not in blob, "a non-quota failure must not be reported as a quota error"
 
 
+def test_validate_raise_if_quota_ignores_429_inside_successful_html_body():
+    """D-062 regression: with format="html" the email_read body is large raw HTML
+    that routinely embeds an Outlook GUID like ``data-outlook-id="d71e429d-..."``.
+    The bare-429 substring inside a SUCCESSFUL payload must NOT be mistaken for a
+    GRASP 429/quota_exceeded — only a genuine failure (quota_exceeded code or a real
+    HTTP 429 status) may STOP the run. Otherwise every folder-source read trips a
+    false quota stop on real mail (observed live 2026-06-28)."""
+    successful_html_payload = {
+        "success": True,
+        "content": {
+            "message": "Found 11 email(s) in conversation",
+            "emails": [{
+                "itemId": "AAkALgAA",
+                "sender": {"name": "Bhargava, Vipul", "email": "riley@example.com"},
+                "isRead": False,
+                # Real Outlook markup: a GUID whose hex run contains "429" (429d),
+                # exactly the live false-positive trigger.
+                "body": '<html><body><a href="mailto:k@x.com" '
+                        'data-outlook-id="d71e429d-7c57-45a4-b5cd-c6efa152b475">'
+                        '@K</a> see the status table below.</body></html>',
+            }],
+        },
+    }
+    # The script's quota guard must NOT raise on this successful body.
+    validate_mod._raise_if_quota(successful_html_payload)  # must not raise
+
+    # A GENUINE quota body must still STOP (the guard's reason to exist is intact).
+    import pytest as _pytest
+    with _pytest.raises(validate_mod.QuotaStop):
+        validate_mod._raise_if_quota(
+            {"success": False, "error": "quota_exceeded", "status": 429})
+
+
 def test_validate_cap_check_passes_only_on_correct_fifo_admission():
     """assert_scan_cap: PASS only when the post-cycle actionable count respects the
     cap AND the admitted items are the OLDEST eligible unread (FIFO)."""
@@ -4578,6 +4611,84 @@ def test_validate_folder_smoke_fails_when_no_allowlisted_folder_resolves():
     assert res.passed is False, "no allowlisted folder resolving must FAIL the smoke step"
 
 
+# ─── D-062: the live pre-flight email_read reads must request format="html" ───
+#
+# The scanner flips its OWA email_read reads from format="markdown" to
+# format="html" so the RAW HTML body (real <table>/<img>/<b> markup) reaches
+# _html_to_text. The standalone pre-flight must mirror that EXACT wiring or its
+# AC-6 unread re-read exercises a DIVERGENT format than the scanner actually uses
+# — so EVERY email_read the script issues must carry format="html". A regression
+# back to "markdown" at any of these call sites is the load-bearing thing these
+# tests catch.
+
+
+def test_validate_email_read_keeps_unread_requests_html_format():
+    """D-062: email_read_keeps_unread must issue its email_read read (the call the
+    scanner mirrors) with format="html", NOT "markdown" — so the AC-6 unread proof
+    exercises the same format the scanner uses. Also re-reads via the default
+    read_state seam, whose own email_read must request html too."""
+    state = {"isRead": False}
+    read_calls = []
+
+    async def fake_email_read(args):
+        read_calls.append(dict(args))
+        return {"content": {"emails": [
+            {"itemId": "AAMk-ITEM-1", "isRead": state["isRead"], "body": "b"},
+        ]}}
+
+    async def fake_read_state(conv_id):
+        return state["isRead"]
+
+    res = _vrun(validate_mod.email_read_keeps_unread(
+        conversation_id="C-unread-1",
+        email_read=fake_email_read,
+        read_state=fake_read_state,
+    ))
+    assert res.passed is True, res.detail
+    assert read_calls, "email_read must be called"
+    assert all(c.get("format") == "html" for c in read_calls), \
+        "email_read must request format='html' (mirror the scanner), not 'markdown'"
+
+
+def test_validate_folder_source_smoke_reads_html_format():
+    """D-062: the folder-source smoke's email_read must request format="html" so the
+    pre-flight reads the SAME raw-HTML body the scanner now ingests."""
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1},
+        ]},
+    ]}}
+    folder_emails_payload = {"content": {"emails": [
+        {"conversationId": "C-GSD-1", "topic": "live", "unreadCount": 1},
+    ]}}
+    email_read_payload = {"content": {"emails": [
+        {"itemId": "M1", "sender": {"name": "A", "email": "a@x.com"},
+         "recievedAt": "2026-06-27T08:00:00Z", "subject": "t",
+         "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+         "body": "First message body.", "isRead": False},
+    ]}}
+    read_calls = []
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        if name == "email_folders":
+            return folder_emails_payload
+        if name == "email_read":
+            read_calls.append(dict(args))
+            return email_read_payload
+        raise AssertionError(f"unexpected read tool {name}")
+
+    res = _vrun(validate_mod.folder_source_smoke(
+        allowlist=["1 GSD"],
+        call_read=fake_call_read,
+    ))
+    assert res.passed is True, res.detail
+    assert read_calls, "email_read must be called"
+    assert all(c.get("format") == "html" for c in read_calls), \
+        "folder-source email_read must request format='html', not 'markdown'"
+
+
 # ─── D-058 BACKEND (server/routes/email.py): Inbox-subfolder scan source ──────
 #
 # A second scan source: a fixed allowlist of Inbox SUBFOLDERS read through the
@@ -5137,3 +5248,256 @@ def test_html_to_text_img_marker_reaches_thread_and_body_extractors():
     }}
     body = email_mod._extract_email_body(payload)
     assert "\U0001f5bc [image: arch001.png]" in body, repr(body)
+
+
+# ─── D-062: OWA folder ingest fetches format="html" (NOT markdown) at BOTH call ──
+# sites, so the RAW HTML body (real <table>/<img>/<b> markup) reaches _html_to_text
+# and renders identically in spirit to the Inbox/Graph path. The converter is
+# unchanged — only the upstream format arg flips. These fixtures carry REAL HTML
+# (the shape format="html" returns), proving the html→_html_to_text→canonical body
+# pipeline; the existing markdown-shape tests above stay green untouched.
+
+# The verified real shape: a status report whose first row is a merged-title cell
+# over a 4-column body header + data rows (mirrors the live "XBPS Tech Initiatives
+# Weekly Status Report" table that returned format=html len 47630, <table>=3).
+_D062_HTML_TABLE_BODY = (
+    "<p>Here is this week's status:</p>"
+    "<table>"
+    "<tr><th>Initiative</th><th>Status</th><th>Key Update This Week</th>"
+    "<th>Next Milestone</th></tr>"
+    "<tr><td>Pallet Tech</td><td>GREEN</td><td>Pilot launched at AWD1</td>"
+    "<td>Expand to AWD2</td></tr>"
+    "<tr><td>Sortation</td><td>RED</td><td>Vendor slip on hardware</td>"
+    "<td>Re-baseline plan</td></tr>"
+    "</table>"
+)
+
+
+def test_d062_html_table_through_folder_chain_yields_valid_gfm():
+    """END-TO-END html-table (AC-1/AC-10): an OWA email_read-shaped HTML response with
+    a real <table> flows email_read result -> _owa_conversation_to_payload ->
+    _extract_email_body and produces a VALID GFM table whose separator pipe-column
+    count MATCHES the data-row width (4). Proves the html path feeds the converter."""
+    owa_emails = [{
+        "itemId": "HTML-TBL-1",
+        "sender": {"name": "Reporter", "email": "rep@example.com"},
+        "dateTimeSent": "2026-06-27T09:00:00Z",
+        "subject": "XBPS Tech Initiatives Weekly Status Report",
+        "body": _D062_HTML_TABLE_BODY,
+        "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+        "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    body = email_mod._extract_email_body(payload)
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    # The real 4-column header is present, wrapped in pipes.
+    header = "| Initiative | Status | Key Update This Week | Next Milestone |"
+    assert header in lines, repr(body)
+    hidx = lines.index(header)
+    # The separator immediately follows the header and is sized to the 4 data cols.
+    sep = lines[hidx + 1]
+    assert sep == "| --- | --- | --- | --- |", repr(sep)
+    # Separator pipe-column count MATCHES the data-row width (4 cells -> 5 pipes).
+    assert sep.count("|") == header.count("|") == 5
+    # Data rows survive with all cells.
+    assert "| Pallet Tech | GREEN | Pilot launched at AWD1 | Expand to AWD2 |" in lines
+    assert "| Sortation | RED | Vendor slip on hardware | Re-baseline plan |" in lines
+
+
+def test_d062_markdown_equivalent_input_yields_no_table_anti_bogus_green():
+    """ANTI-BOGUS-GREEN (AC-10, the RED sibling): the SAME chain fed a pre-stripped
+    PROSE body (what format=markdown returned — tables already destroyed, NO <table>)
+    yields ZERO GFM pipe rows. Proves the table assertion above depends on the html
+    shape, not on any input passing through the chain."""
+    # This is the markdown-format body shape: structure already stripped to prose.
+    stripped = (
+        "Here is this week's status:\n\n"
+        "Initiative Status Key Update This Week Next Milestone\n"
+        "Pallet Tech GREEN Pilot launched at AWD1 Expand to AWD2\n"
+        "Sortation RED Vendor slip on hardware Re-baseline plan\n"
+    )
+    owa_emails = [{
+        "itemId": "MD-EQUIV-1",
+        "sender": {"name": "Reporter", "email": "rep@example.com"},
+        "dateTimeSent": "2026-06-27T09:00:00Z",
+        "subject": "XBPS Tech Initiatives Weekly Status Report",
+        "body": stripped, "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    body = email_mod._extract_email_body(payload)
+    pipe_rows = [ln for ln in body.splitlines() if ln.strip().startswith("|")]
+    assert pipe_rows == [], f"a pre-stripped body must yield NO GFM table, got {pipe_rows!r}"
+    assert "| --- |" not in body
+
+
+# A quoted/forwarded folder body as RAW HTML: <b>From:</b>/<b>Sent:</b>/<b>Subject:</b>
+# header blocks (the "Enabling pallet tech" pattern). _html_to_text STRIPS the <b> to
+# BARE labels the SHAPE regexes match — NOT literal '**' (that would test the D-060
+# markdown path, the wrong path for this fix; see D-062 anti-wrong-path-green note).
+_D062_HTML_QUOTED_BODY = (
+    "<p>Team - FYI, see below.</p>"
+    "<p><b>From:</b> Shadeck, Gal</p>"
+    "<p><b>Sent:</b> Wednesday, September 17, 2025 4:51 PM</p>"
+    "<p><b>To:</b> Rui, Ricardo; Ahsan, Ayaz</p>"
+    "<p><b>Subject:</b> RE: Enabling pallet tech at existing AWD sites</p>"
+    "<p>Ricardo and the team, thank you for joining the discussion.</p>"
+    "<p><strong>From:</strong> Shadeck, Gal</p>"
+    "<p><strong>Sent:</strong> Wednesday, September 10, 2025 10:58 AM</p>"
+    "<p><strong>To:</strong> Shadeck, Gal; Rui, Ricardo</p>"
+    "<p><strong>Subject:</strong> Enabling pallet tech at existing AWD sites</p>"
+    "<p>Booking time to walk through the proposal for enabling pallet tech.</p>"
+)
+
+
+def test_d062_html_quoted_body_splits_into_multiple_turns():
+    """HTML-THREAD-SPLIT (AC-2, D-062 anti-wrong-path-green): a RAW <b>-bolded quoted
+    header body fed through _owa_conversation_to_payload -> _extract_thread_history
+    yields threadHistory length > 1. _html_to_text strips <b>/<strong> to BARE
+    From:/Sent:/Subject: labels the SHAPE regexes match — proving the html path (not
+    the D-060 literal-** path) feeds the splitter."""
+    owa_emails = [{
+        "itemId": "HTML-QUOTE-1",
+        "sender": {"name": "Kim, Seong", "email": "skim@example.com"},
+        "dateTimeSent": "2026-06-27T16:41:00Z",
+        "subject": "FW: Enabling pallet tech at existing AWD sites",
+        "body": _D062_HTML_QUOTED_BODY,
+        "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+        "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    turns = email_mod._extract_thread_history(payload)
+    assert len(turns) > 1, (
+        f"a <b>-bolded quoted HTML chain must split into >1 turn, got {len(turns)}"
+    )
+    # The <b>/<strong> tags must NOT survive into any turn body (stripped to bare).
+    for t in turns:
+        assert "<b>" not in t["body"] and "<strong>" not in t["body"], repr(t["body"])
+
+
+def test_d062_call_sites_pin_format_html_both_sites():
+    """CALL-SITE GUARD (AC-5): BOTH OWA email_read call sites pass format="html" so a
+    regression back to "markdown" at EITHER site fails loudly. Reads the email.py
+    source and asserts exactly two email_read format args, both 'html', and ZERO
+    'markdown' email_read format args."""
+    import re as _re
+    src = Path(email_mod.__file__).read_text(encoding="utf-8")
+    # Each email_read call passes a conversationId + a format arg on the same call.
+    formats = _re.findall(
+        r'"email_read",\s*\{"conversationId":[^}]*?"format":\s*"([a-z]+)"', src)
+    assert len(formats) == 2, (
+        f"expected exactly 2 OWA email_read call sites, found {len(formats)}: {formats}")
+    assert formats == ["html", "html"], (
+        f"both OWA email_read sites must pass format='html', got {formats}")
+    assert "markdown" not in formats
+
+
+def test_d062_html_body_capped_at_email_body_cap_no_crash():
+    """CAP (AC-7): a >32k HTML-sourced body is clamped to _EMAIL_BODY_CAP on the
+    CONVERTED text (HTML->text->cap, not raw HTML) without crashing. The cap is
+    applied where the scan stores it (raw["emailBody"] = body_text[:_EMAIL_BODY_CAP]),
+    so the converted+capped string is <= the cap and still rendered prose."""
+    cap = email_mod._EMAIL_BODY_CAP
+    # Build an HTML body whose CONVERTED text comfortably exceeds the cap.
+    big = "<p>" + ("alpha bravo charlie delta echo foxtrot " * 3000) + "</p>"
+    owa_emails = [{
+        "itemId": "BIG-1",
+        "sender": {"name": "Verbose", "email": "v@example.com"},
+        "dateTimeSent": "2026-06-27T09:00:00Z", "subject": "Long mail",
+        "body": big, "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    converted = email_mod._extract_email_body(payload)
+    assert len(converted) > cap, "fixture must exceed the cap to exercise clamping"
+    stored = converted[:cap]            # the exact clamp the scan applies
+    assert len(stored) == cap
+    # No leaked HTML tag fragment and not an empty body.
+    assert "<p>" not in stored and stored.strip()
+
+
+async def test_d062_scan_html_table_stored_as_valid_gfm(email_file, monkeypatch):
+    """DONE-WHEN integration: a folder-sourced conversation whose OWA email_read body
+    is HTML with a real <table> is stored with an emailBody containing a VALID GFM
+    table (header + matching separator + data rows). Exercises the real _scan_once
+    folder path via the _b58 fake (which now must request format='html')."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 leads", "id": "AAMk-LEADS", "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-LEADS": [{"conversationId": "CONV-RPT", "topic": "Status Report",
+                        "unreadCount": 1}],
+    }
+    messages_by_conv = {
+        "CONV-RPT": [{"itemId": "RPT-1", "sender": {"name": "Rep", "email": "rep@example.com"},
+                      "dateTimeSent": "2026-06-27T09:00:00Z",
+                      "subject": "XBPS Tech Initiatives Weekly Status Report",
+                      "body": _D062_HTML_TABLE_BODY,
+                      "recipients": [{"name": "Me", "email": _MY_EMAIL}], "ccRecipients": [],
+                      "isRead": False}],
+    }
+    calls = []
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv, calls=calls))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    items = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    rpt = next(it for it in items if it.get("conversationId") == "CONV-RPT")
+    stored = rpt.get("emailBody") or ""
+    assert "| Initiative | Status | Key Update This Week | Next Milestone |" in stored
+    assert "| --- | --- | --- | --- |" in stored
+    assert "| Pallet Tech | GREEN | Pilot launched at AWD1 | Expand to AWD2 |" in stored
+    # The scan read email_read with format='html' (NOT markdown) and no markAs.
+    read_calls = [a for n, a in calls if n == "email_read"]
+    assert read_calls, "email_read should have been called for the unread conversation"
+    for args in read_calls:
+        assert args.get("format") == "html", repr(args)
+        assert "markAs" not in args
+
+
+def test_d062_simple_html_mail_renders_clean_prose():
+    """SIMPLE-MAIL (AC-9): a plain one-message HTML body (no table/img/quote) renders
+    clean readable prose through the folder chain — no stray pipe chars, no leaked tag
+    fragments, no empty body."""
+    owa_emails = [{
+        "itemId": "SIMPLE-1",
+        "sender": {"name": "Alice", "email": "alice@example.com"},
+        "dateTimeSent": "2026-06-27T09:00:00Z", "subject": "Quick note",
+        "body": "<p>Hi team,</p><p>The deploy is done. Thanks!</p>",
+        "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    body = email_mod._extract_email_body(payload)
+    assert "Hi team," in body and "The deploy is done. Thanks!" in body
+    assert "|" not in body                      # no stray pipe table chars
+    assert "<p>" not in body and "</p>" not in body  # no leaked tag fragments
+    assert body.strip()                          # not empty
+
+
+def test_d062_once_only_conversion_idempotency():
+    """ONCE-ONLY/IDEMPOTENCY (AC-8): the HTML body is converted EXACTLY once — no
+    doubled image markers, no leftover '&amp;', no escaped '\\<table\\>', no doubled
+    caption. Proves there is no second strip / double entity-decode / double img pass."""
+    html = (
+        "<p>Q3 chart &amp; notes:</p>"
+        '<img src="cid:chart.png@host">'
+        "<table><tr><td>Org Details</td></tr>"
+        "<tr><th>Team</th><th>Status</th></tr>"
+        "<tr><td>Relay</td><td>GREEN</td></tr></table>"
+    )
+    owa_emails = [{
+        "itemId": "IDEM-1",
+        "sender": {"name": "Bob", "email": "bob@example.com"},
+        "dateTimeSent": "2026-06-27T09:00:00Z", "subject": "Once-only",
+        "body": html, "isRead": False,
+    }]
+    payload = email_mod._owa_conversation_to_payload(owa_emails)
+    body = email_mod._extract_email_body(payload)
+    # Image marker present exactly once, never doubled.
+    assert body.count("\U0001f5bc [image: chart.png]") == 1
+    assert "\U0001f5bc\U0001f5bc" not in body          # no doubled marker glyph
+    # The '&amp;' was decoded exactly once to '&' (not left raw, not double-decoded).
+    assert "&amp;" not in body
+    assert "Q3 chart & notes:" in body
+    # No escaped/leaked table tag text.
+    assert "\\<table\\>" not in body and "<table>" not in body
+    # The merged-title caption appears exactly once (not doubled by a second pass).
+    assert body.count("**Org Details**") == 1

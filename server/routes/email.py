@@ -2079,11 +2079,12 @@ def _html_to_text(html: str) -> str:
     # else the generic "🖼 [image]". The emitted marker has no '<img>', so a second
     # _html_to_text pass is a no-op (idempotent).
     #
-    # DOCUMENTED LIMITATION (AC-7): only an HTML body that actually carries <img>
-    # tags can surface a filenamed marker. The OWA folder ingest path (email_read
-    # format=markdown) returns a body with NO <img> trace, so folder items get no
-    # marker here — there is nothing to convert. That is surfaced as a known
-    # limitation, not silently shipped as Inbox-only behavior.
+    # An HTML body that carries <img> tags surfaces a filenamed marker. BOTH sources
+    # now feed HTML: the Inbox/Graph get_email path AND (since D-062) the OWA folder
+    # email_read path, which fetches format="html" — so folder items now carry <img>
+    # tags and get a marker here too (the prior format="markdown" body had no <img>
+    # trace and could not). The marker is plain prose, so it flows uniformly into
+    # _extract_email_body and every _extract_thread_history turn regardless of source.
     text = re.sub(r"<img\b[^>]*>", _img_marker_from_tag, text, flags=re.IGNORECASE)
     # Strip remaining tags
     text = re.sub(r"<[^>]+>", "", text)
@@ -2308,13 +2309,15 @@ def _resolve_scan_subfolders(list_folders_payload) -> list[tuple[str, str]]:
 def _owa_conversation_to_payload(owa_emails) -> dict:
     """Normalize an OWA ``email_read`` message list onto the canonical body shape.
 
-    The aws-outlook-mcp ``email_read`` response is
+    The aws-outlook-mcp ``email_read`` response (fetched format="html" since D-062 so
+    the body carries real <table>/<img>/<b> markup for _html_to_text) is
     ``{content:{emails:[<message>]}}`` where each <message> uses DIFFERENT field
     names than the Graph ``get_email`` path: message id is ``itemId`` (NOT id/
     messageId), To recipients are ``recipients`` (NOT toRecipients), CC is
     ``ccRecipients``, sender is ``sender``/``from``, received ts is
     ``dateTimeSent``/``recievedAt`` (sic -- misspelled in the API), read flag is
-    ``isRead``.
+    ``isRead``. The ``body`` is passed onto messages[].body UNCHANGED (no pre-strip);
+    _extract_email_body / _extract_thread_history run _html_to_text on it EXACTLY once.
 
     We REMAP onto the {email:{..., messages:[...]}} shape the EXISTING helpers
     already consume (_email_messages_from_payload / _extract_email_body /
@@ -2420,16 +2423,19 @@ def _extract_email_body(payload) -> str:
 # lines (confirmed in _split_quoted_thread); the Gmail ``On ... wrote:`` and the
 # ``-----Original <word>-----`` separator stand alone.
 #
-# The OWA ``email_read`` ``format=markdown`` path BOLDS the quoted-header LABELS
-# (and sometimes wraps the colon too): the stored body literally contains lines
-# like ``**From:``, ``**From:** Shadeck, Gal``, ``**Date: **Wednesday, ...``,
-# ``__Sent:__ ...``, ``*Subject:* ...``. We therefore tolerate an OPTIONAL leading
-# emphasis run (``**``/``__``/single ``*``/``_``) plus whitespace before the label,
-# and emphasis between the label's colon and the value (D-060). This is a STRICT
-# SUPERSET of the bare form — when NO emphasis is present the value capture is
-# byte-identical to the pre-D-060 pattern (D-053 backward compat). The captured
-# VALUE may still carry trailing emphasis (e.g. ``Shadeck, Gal **``), which is
-# stripped by ``_strip_emphasis`` BEFORE the value is flattened into a field.
+# Since D-062 the OWA ``email_read`` path fetches ``format="html"``, so the folder
+# body arrives as raw ``<b>From:</b>``/``<strong>Sent:</strong>`` markup that
+# _html_to_text's tag-strip reduces to BARE labels (``From:``) — exactly like the
+# Inbox/Graph HTML path. So the SHAPE-based boundary regexes match on bare labels on
+# both paths. The D-060 emphasis tolerance below (legacy ``format=markdown`` bolded
+# the labels: ``**From:``, ``**From:** Shadeck, Gal``, ``**Date: **...``, ``__Sent:__
+# ...``, ``*Subject:* ...``) is now a harmless back-compat STRICT-SUPERSET, no longer
+# the folder path's primary boundary. We tolerate an OPTIONAL leading emphasis run
+# (``**``/``__``/single ``*``/``_``) plus whitespace before the label, and emphasis
+# between the label's colon and the value — when NO emphasis is present the value
+# capture is byte-identical to the pre-D-060 pattern (D-053 backward compat). The
+# captured VALUE may still carry trailing emphasis (e.g. ``Shadeck, Gal **``), which
+# is stripped by ``_strip_emphasis`` BEFORE the value is flattened into a field.
 _EMPH = r"(?:\*{1,2}|_{1,2})"  # one markdown emphasis run: ** __ * _
 # Optional leading emphasis + ws, label + ':', optional emphasis/ws, then value.
 # The value group is OPTIONAL ((.*)) so a real OWA body that wraps the value onto
@@ -2571,13 +2577,15 @@ def _match_header_label(line: str):
 def _parse_outlook_header_block(lines: list[str], start: int):
     """Walk a quoted Outlook header block beginning at the ``From:`` line ``start``.
 
-    Real OWA ``format=markdown`` bodies (1) bold the labels (``**From:``), (2) wrap a
-    value onto the FOLLOWING line(s) when the label line has no inline value, (3)
-    interleave a blank line between every label, and (4) wrap a long ``To:``/``Cc:``
-    list across continuation lines. This walker tolerates all four: it skips blank
-    lines inside the block, attaches a label's value from the next non-blank line(s)
-    when the inline value is empty, and folds recipient continuation lines into the
-    preceding ``To:``/``Cc:`` value.
+    Since D-062 the OWA path fetches ``format="html"``, so the folder body's header
+    labels arrive BARE (``<b>From:</b>`` -> ``From:`` after _html_to_text), like the
+    Inbox/Graph path. Legacy/markdown bodies could additionally (1) bold the labels
+    (``**From:``), (2) wrap a value onto the FOLLOWING line(s) when the label line has
+    no inline value, (3) interleave a blank line between every label, and (4) wrap a
+    long ``To:``/``Cc:`` list across continuation lines. This walker tolerates all of
+    them: it skips blank lines inside the block, attaches a label's value from the
+    next non-blank line(s) when the inline value is empty, and folds recipient
+    continuation lines into the preceding ``To:``/``Cc:`` value.
 
     Returns ``(fields, body_start)`` where ``fields`` is
     ``{from,date,when,to,cc,subject,where}`` (raw captured values, emphasis NOT yet
@@ -3319,7 +3327,7 @@ async def _scan_once(app) -> None:
             # the canonical shape the existing extractors consume.
             try:
                 read_payload = await call_read_tool(
-                    "email_read", {"conversationId": owa_conv_id, "format": "markdown"})
+                    "email_read", {"conversationId": owa_conv_id, "format": "html"})
                 owa_msgs = _unwrap_list(read_payload, "emails", "messages", "items")
                 body_payload = _owa_conversation_to_payload(owa_msgs)
                 body_text = _extract_email_body(body_payload)
@@ -3380,7 +3388,7 @@ async def _scan_once(app) -> None:
         if is_folder_item:
             try:
                 read_payload = await call_read_tool(
-                    "email_read", {"conversationId": msg_id, "format": "markdown"})
+                    "email_read", {"conversationId": msg_id, "format": "html"})
                 owa_msgs = _unwrap_list(read_payload, "emails", "messages", "items")
                 body_payload = _owa_conversation_to_payload(owa_msgs)
                 body_text = _extract_email_body(body_payload)
