@@ -314,7 +314,7 @@ async def email_read_keeps_unread(*, conversation_id: str, email_read=None,
     folder message UNREAD.
 
     Calls ``email_read`` EXACTLY as the scanner will — ``{"conversationId": …,
-    "format": "markdown"}`` with NO ``markAs`` key — then RE-READS the unread state
+    "format": "html"}`` with NO ``markAs`` key — then RE-READS the unread state
     at the destination and asserts it is STILL unread. The re-read is the proof, not
     the tool's success string (mirrors ``mark_read_roundtrip``). The seams default to
     the live OWA path but are injectable for offline tests.
@@ -328,7 +328,7 @@ async def email_read_keeps_unread(*, conversation_id: str, email_read=None,
             # conversation is "still unread" while ANY message in it is unread, so
             # this returns True (read) only when EVERY message is read.
             payload = await email.call_read_tool(
-                "email_read", {"conversationId": conv_id, "format": "markdown"})
+                "email_read", {"conversationId": conv_id, "format": "html"})
             content = payload.get("content") if isinstance(payload, dict) else None
             msgs = (content or {}).get("emails") if isinstance(content, dict) else None
             msgs = [m for m in (msgs or []) if isinstance(m, dict)]
@@ -344,8 +344,8 @@ async def email_read_keeps_unread(*, conversation_id: str, email_read=None,
             "is already READ before email_read (need a still-unread conversation)",
         )
 
-    # Call email_read EXACTLY as the scanner will: NO markAs key.
-    args = {"conversationId": conversation_id, "format": "markdown"}
+    # Call email_read EXACTLY as the scanner will: format=html, NO markAs key.
+    args = {"conversationId": conversation_id, "format": "html"}
     assert "markAs" not in args  # structural: the scanner must never mark folder mail read
     _raise_if_quota(await email_read(args))
 
@@ -399,9 +399,9 @@ async def folder_source_smoke(*, allowlist=EMAIL_SCAN_SUBFOLDERS, call_read=None
             continue
 
         conv_id = str(conv.get("conversationId"))
-        # 3) email_read the admitted conversation — NO markAs (never mark read).
+        # 3) email_read the admitted conversation — format=html, NO markAs.
         read_payload = await call_read(
-            "email_read", {"conversationId": conv_id, "format": "markdown"})
+            "email_read", {"conversationId": conv_id, "format": "html"})
         _raise_if_quota(read_payload)
         content = read_payload.get("content") if isinstance(read_payload, dict) else None
         messages = (content or {}).get("emails") if isinstance(content, dict) else None
@@ -595,7 +595,17 @@ _LIVE = {"inbox_msg_id": None, "folder_name": None, "folder_conv_id": None}
 
 
 def _raise_if_quota(payload) -> None:
-    """If a tool payload smells like a GRASP quota error, STOP the run early."""
+    """If a tool payload smells like a GRASP quota error, STOP the run early.
+
+    A SUCCESSFUL tool result is never a quota error, so it is exempt: since D-062
+    flipped the folder reads to ``format="html"`` the bodies are large raw HTML that
+    routinely embed an Outlook GUID like ``data-outlook-id="d71e429d-…"`` — and the
+    backend's bare-``429`` substring matcher would otherwise mistake that GUID for a
+    GRASP 429, falsely stopping the run on perfectly good mail. Only a NON-success
+    payload (or a non-dict error string) is run through the quota detector.
+    """
+    if isinstance(payload, dict) and payload.get("success") is True:
+        return
     if email._is_graph_quota_error(payload):
         raise QuotaStop(str(payload))
 
