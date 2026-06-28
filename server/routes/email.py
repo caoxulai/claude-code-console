@@ -2040,6 +2040,41 @@ def _img_marker_from_tag(match: "re.Match") -> str:
     return f"{_IMG_MARKER_GLYPH} [image]"
 
 
+_RE_TABLE_TAG = re.compile(r"</?table[^>]*>", re.IGNORECASE)
+
+
+def _mark_top_level_tables(text: str, sep: str) -> str:
+    """Replace only OUTERMOST <table>/</table> boundaries with the table sentinel.
+
+    A nested <table> (depth > 1) is DROPPED so it does not split a parent logical
+    row into ragged fragments (D-063 §4); its rows/cells flow on as their own GFM
+    rows in the same block. Adjacent TOP-LEVEL tables still get a boundary sentinel
+    each, so the per-<table> flush (D-061 §2) is unchanged. Pure/deterministic — a
+    single left-to-right depth walk; an unbalanced </table> (depth already 0) is
+    treated as a top-level close so a malformed body never under-counts a boundary.
+    """
+    out = []
+    last = 0
+    depth = 0
+    for m in _RE_TABLE_TAG.finditer(text):
+        out.append(text[last:m.start()])
+        tag = m.group(0)
+        is_open = not tag.lstrip("<").startswith("/")
+        if is_open:
+            # An outermost <table> (depth 0 → 1) marks a boundary; deeper opens drop.
+            if depth == 0:
+                out.append(sep)
+            depth += 1
+        else:
+            depth = max(0, depth - 1)
+            # An outermost </table> (back to depth 0) marks a boundary; deeper drop.
+            if depth == 0:
+                out.append(sep)
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _html_to_text(html: str) -> str:
     """Strip HTML to readable plain text. Handles email HTML from Graph/OWA.
 
@@ -2056,14 +2091,26 @@ def _html_to_text(html: str) -> str:
     _CELL_SEP = "\x01"
     _ROW_SEP = "\x02"
     _TABLE_SEP = "\x03"
-    # Each LOGICAL table (the <table>/</table> element) is a sentinel-delimited block
-    # so the row buffer flushes at every table boundary. Without this, two adjacent
-    # Outlook tables fused into ONE block (one separator, the first table's header
-    # demoted to a caption) and any heading wedged between them was swallowed into the
-    # prior cell. thead/tbody/tfoot/colgroup/col/caption are SUB-divisions WITHIN one
-    # table, so they stay a bare '\n' (intra-table) — splitting on them would tear a
-    # single thead+tbody table into two.
-    text = re.sub(r"</?table[^>]*>", _TABLE_SEP, text, flags=re.IGNORECASE)
+    # Each TOP-LEVEL table (the outermost <table>/</table> element) is a sentinel-
+    # delimited block so the row buffer flushes at every top-level table boundary.
+    # Without this, two adjacent Outlook tables fused into ONE block (one separator,
+    # the first table's header demoted to a caption) and any heading wedged between
+    # them was swallowed into the prior cell. thead/tbody/tfoot/colgroup/col/caption
+    # are SUB-divisions WITHIN one table, so they stay a bare '\n' (intra-table) —
+    # splitting on them would tear a single thead+tbody table into two.
+    #
+    # NESTED-TABLE handling (D-063 §4): an Outlook nested <table> (a table inside a
+    # parent <td>, e.g. a Zoom-invite block embedded in an agenda cell) used to emit
+    # a _TABLE_SEP in the MIDDLE of a parent row, which forced a flush there and TORE
+    # the one logical parent row into ragged half-tables (the parent cell after the
+    # nested table got orphaned as a lone '| Devon |' width-1 row / a stray caption).
+    # We make ONLY the OUTERMOST <table>/</table> boundaries a _TABLE_SEP (depth 0↔1)
+    # and DROP inner ones, so a nested table no longer forces a mid-parent-row flush:
+    # its <tr>/<td> still emit _ROW_SEP/_CELL_SEP and surface as their OWN padded GFM
+    # rows in the same contiguous block (valid GFM), while the top-level flush that
+    # keeps adjacent tables separate (D-061 §2) is unchanged. Deterministic: a single
+    # left-to-right depth walk over the <table>/</table> tokens.
+    text = _mark_top_level_tables(text, _TABLE_SEP)
     text = re.sub(r"</?(?:thead|tbody|tfoot|colgroup|col|caption)[^>]*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<tr[^>]*>", _ROW_SEP, text, flags=re.IGNORECASE)
     text = re.sub(r"</tr>", "", text, flags=re.IGNORECASE)
@@ -2119,17 +2166,25 @@ def _html_to_text(html: str) -> str:
     # LEAD with a merged single-cell TITLE row spanning the table (a colspan over
     # the N-column body). Sizing the separator from that 1-cell first row produced
     # MALFORMED GFM (1-col separator over 4-col data). Instead we BUFFER each
-    # contiguous table block, compute its data width as the MODAL (most-common)
-    # cell count across the block's rows (robust to a stray short/long row), lift a
-    # narrower-than-modal FIRST row OUT as a bold caption line ABOVE the table, size
-    # the separator to the modal width, and PAD any genuinely-short non-title row
-    # with empty trailing cells. No cell text is ever dropped, merged, or reordered.
+    # contiguous table block and lift a narrower-than-the-body FIRST row OUT as a
+    # bold caption line ABOVE the table (never row 1, never dropped).
+    #
+    # WIDTH POLICY (D-063 §1, refines D-061): the grid width is the MAXIMUM cell
+    # count across the (post-title-lift) rows, the separator is emitted at exactly
+    # that width, and EVERY row — header AND data — is padded to it with empty
+    # trailing cells. remark-gfm derives the column count from the HEADER + delimiter
+    # and REQUIRES header_cols == separator_cols; the old MODAL width left a HEADER
+    # wider than the modal mismatched (h3/s2 live) → remark-gfm rejected the table
+    # and rendered raw '| a | b |' as a literal paragraph. MAX-width makes the widest
+    # row define the grid so nothing exceeds the separator. No cell text is ever
+    # dropped, merged, reordered, or truncated (hard no-word-loss).
     #
     # BACKWARD-COMPAT: this fires ONLY for rows that actually contain a cell
     # sentinel (a real <td>/<th>). A non-table row (ordinary prose, or a literal
-    # '|' typed in text) carries no sentinel, so it passes through untouched. A
-    # normal table whose first row already matches the modal width gets NO caption
-    # and the same separator as before — byte-identical output.
+    # '|' typed in text) carries no sentinel, so it passes through untouched. MAX is
+    # a strict SUPERSET of MODAL: a table whose rows already share a width has
+    # max == modal and gains NO padding, so a normal table gets NO caption and the
+    # same separator as before — byte-identical output (the 17 clean reports stay).
     #
     # IDEMPOTENT: the emitted caption is a plain bold-markdown PROSE line (no cell
     # sentinel) and the rows are pipe rows (no <table>/sentinel), so a second
@@ -2140,34 +2195,44 @@ def _html_to_text(html: str) -> str:
 
     def _flush_table_block():
         """Emit the buffered contiguous table block as valid GFM (caption +
-        modal-sized separator + padded short rows), then clear the buffer."""
+        max-sized separator + every row padded to that width), then clear the buffer.
+
+        D-063 §1: the grid width is the MAXIMUM cell count across the block's rows
+        (computed AFTER the leading-title lift). remark-gfm derives the column count
+        from the HEADER row + the delimiter row and REQUIRES header_cols ==
+        separator_cols; the prior MODAL width emitted the separator at the modal but
+        each row at its OWN width, so a HEADER (or any row) WIDER than the modal
+        (h3/s2, h9/s8, h14/s13 live) left header_cols > separator_cols → remark-gfm
+        rejected the table and rendered raw '| a | b |' as a literal paragraph. Sizing
+        to the MAX (the widest row defines the grid) + padding EVERY row to it makes
+        header_cols == separator_cols == every data-row width — zero pipe-junk. This
+        is a strict SUPERSET of the modal policy: a table whose rows already share a
+        width has max == modal and gains no padding, so matched tables stay
+        byte-identical (D-061 §2 / the 17 clean reports preserved)."""
         if not table_block:
             return
-        # Modal (most-common) cell count across the block's rows. Tie-break toward
-        # the LARGER count so a table never under-sizes (we pad short rows, never
-        # widen them past the real grid). Deterministic for a given input.
-        counts = [len(r) for r in table_block]
-        best_count, best_key = counts[0], (counts.count(counts[0]), counts[0])
-        for n in set(counts):
-            key = (counts.count(n), n)  # (frequency, value) — value breaks ties hi
-            if key > best_key:
-                best_count, best_key = n, key
-        data_width = best_count
         rows = list(table_block)
-        # A leading row NARROWER than the data width is a merged/colspan TITLE: lift
-        # it out as a bold caption above the table (never row 1 of the grid).
-        if len(rows) >= 2 and len(rows[0]) < data_width:
-            title = " ".join(rows[0]).strip()
-            if title:
-                out_lines.append("**" + title + "**")
-                out_lines.append("")  # blank line so the caption reads as prose
-            rows = rows[1:]
+        # A leading row NARROWER than every following row is a merged/colspan TITLE
+        # (a colspan over the N-column body): lift it out as a bold caption above the
+        # table (never row 1 of the grid, never dropped). Compute against the MAX of
+        # the REMAINING rows so the title test mirrors the final grid width.
+        if len(rows) >= 2:
+            body_width = max(len(r) for r in rows[1:])
+            if len(rows[0]) < body_width:
+                title = " ".join(rows[0]).strip()
+                if title:
+                    out_lines.append("**" + title + "**")
+                    out_lines.append("")  # blank line so the caption reads as prose
+                rows = rows[1:]
         if not rows:
             return
+        # MAX cell count across the (post-lift) rows — the widest row defines the
+        # grid so nothing exceeds the separator. Deterministic for a given input.
+        data_width = max(len(r) for r in rows)
         for i, cells in enumerate(rows):
-            # PAD a short row with empty trailing cells so it is >= the separator
-            # width — never drop a cell or fuse columns. A genuinely WIDER row keeps
-            # all its cells (valid GFM tolerates extra cells beyond the header).
+            # PAD every row (header row 0 INCLUDED) to the grid width with empty
+            # trailing cells so header/separator/data all share a column count —
+            # never drop, merge, reorder, or truncate a cell (hard no-word-loss).
             padded = list(cells)
             if len(padded) < data_width:
                 padded += [""] * (data_width - len(padded))

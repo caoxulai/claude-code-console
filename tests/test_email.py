@@ -2589,6 +2589,318 @@ def test_html_to_text_real_outlook_report_no_width_mismatch():
             assert ln.count("|") == sep.count("|"), repr(ln)
 
 
+# ─── D-063: FORCE valid GFM for EVERY Outlook table (data, layout/key-value,
+# signature, nested/colspan). ROOT CAUSE: _flush_table_block sized the separator
+# from the MODAL cell count but emitted each row at its OWN width, so a HEADER
+# WIDER than the modal (h3/s2, h9/s8, h14/s13 live) left header_cols != separator_cols
+# — remark-gfm derives the column count from header + delimiter and REQUIRES them
+# equal, so it rejects the table and renders raw '| a | b |' as a literal paragraph.
+# FIX: width = MAX cell count across the block (after the title lift); pad EVERY
+# row (header + data) to that width; separator emitted at exactly that width.
+# These tests build from the VERIFIED real malformed shapes; each (a)/(b)/(c) goes
+# RED on the modal converter via a header/separator mismatch and GREEN after the
+# fix, (d) passes on both (byte-stable anti-regression). ────────────────────────
+
+
+def _is_delim_row(ln: str) -> bool:
+    """A GFM delimiter row is purely '|', '-', and spaces (and has a '-')."""
+    s = ln.strip()
+    return bool(s) and set(s) <= set("|- ") and "-" in s
+
+
+def _gfm_tables(out: str):
+    """Parse emitted output into GFM table blocks for structural validation.
+
+    Returns a list of {'header','sep','rows'} dicts. A new table begins at any
+    pipe row whose NEXT line is a '| --- | ... |' delimiter — so back-to-back
+    tables (Outlook emits adjacent grids with NO blank line between, the D-061
+    per-<table> flush) are split correctly instead of fused into one block.
+    Mirrors the style of the existing
+    `for ln in lines[hidx:]: assert ln.count('|') == sep.count('|')` checks but
+    packaged so each new fixture can assert header_cols == sep_cols == every row.
+    """
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    tables = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("|"):
+            i += 1
+            continue
+        # A header is a pipe row whose next line is a delimiter.
+        if i + 1 < len(lines) and _is_delim_row(lines[i + 1]):
+            header, sep = lines[i], lines[i + 1]
+            i += 2
+            rows = []
+            # Consume data rows until the next header (pipe row followed by a
+            # delimiter) or a non-pipe / delimiter line.
+            while i < len(lines) and lines[i].startswith("|"):
+                if _is_delim_row(lines[i]):
+                    break  # stray delimiter — stop this table
+                if i + 1 < len(lines) and _is_delim_row(lines[i + 1]):
+                    break  # next table's header
+                rows.append(lines[i])
+                i += 1
+            tables.append({"header": header, "sep": sep, "rows": rows})
+        else:
+            # A pipe row with NO delimiter beneath it — literal pipe junk in
+            # remark-gfm. Record it (sep=None) so a test can flag it.
+            tables.append({"header": lines[i], "sep": None, "rows": []})
+            i += 1
+    return tables
+
+
+def _assert_all_tables_valid_gfm(out: str):
+    """Every emitted GFM table must have a delimiter row whose pipe-column count
+    EQUALS the header's AND every data row's — the zero-pipe-junk invariant."""
+    tables = _gfm_tables(out)
+    assert tables, f"expected at least one GFM table, got:\n{out}"
+    for t in tables:
+        assert t["sep"] is not None, (
+            f"pipe-row block has no delimiter row (renders as literal pipe junk):"
+            f"\n{t['header']}"
+        )
+        hcols = t["header"].count("|")
+        scols = t["sep"].count("|")
+        assert hcols == scols, (
+            f"header_cols != separator_cols ({hcols} vs {scols}) — remark-gfm "
+            f"rejects this:\n  {t['header']}\n  {t['sep']}"
+        )
+        for row in t["rows"]:
+            assert row.count("|") == scols, (
+                f"data-row width {row.count('|')} != separator {scols}:\n  {row}"
+            )
+
+
+# (a) 2-col Outlook key/value LAYOUT table (Zoom-invite block): "Meeting URL:"|url,
+# "Meeting ID:"|id, "Passcode:"|code, interleaved with single-cell "Join Zoom
+# Meeting" / "Quick Reference" section header rows. The single-cell rows must pad
+# to a valid 2-col row, NOT become a width-1 separator under a wider header.
+_ZOOM_KV_TABLE_HTML = (
+    "<table>"
+    "<tr><td>Join Zoom Meeting</td></tr>"
+    "<tr><td>Meeting URL:</td><td>https://amazon.zoom.us/j/9988776655</td></tr>"
+    "<tr><td>Meeting ID:</td><td>998 877 6655</td></tr>"
+    "<tr><td>Passcode:</td><td>x7Kp2q</td></tr>"
+    "<tr><td>Quick Reference</td></tr>"
+    "<tr><td>Dial by your location</td></tr>"
+    "<tr><td>Find your local number</td></tr>"
+    "<tr><td>Join by SIP</td></tr>"
+    "<tr><td>One tap mobile:</td><td>+1-253-555-0142,,9988776655#</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_zoom_kv_layout_table_is_valid_gfm():  # D-063 (a)
+    """A 2-col Zoom-invite key/value block renders as a real 2-column GFM table:
+    header_cols == separator_cols == every data-row width, no width-1-under-wider
+    header. The interleaved single-cell 'Join Zoom Meeting'/'Quick Reference'
+    section rows pad to a valid 2-col row (never a width-1 separator)."""
+    out = email_mod._html_to_text(_ZOOM_KV_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # The labeled key/value rows render as real 2-column rows.
+    assert "| Meeting URL: | https://amazon.zoom.us/j/9988776655 |" in lines
+    assert "| Meeting ID: | 998 877 6655 |" in lines
+    assert "| Passcode: | x7Kp2q |" in lines
+    # A mid-block single-cell section row pads to 2 columns (NOT a width-1 sep,
+    # NOT lifted to a caption — only the LEADING merged-title row lifts).
+    assert "| Quick Reference |  |" in lines
+
+
+def test_html_to_text_zoom_kv_layout_no_word_loss():  # D-063 (a) no-word-loss
+    """Every original <td> text survives exactly once — short rows padded, no
+    label/value dropped, merged, or truncated."""
+    out = email_mod._html_to_text(_ZOOM_KV_TABLE_HTML)
+    for cell in (
+        "Join Zoom Meeting", "Meeting URL:", "https://amazon.zoom.us/j/9988776655",
+        "Meeting ID:", "998 877 6655", "Passcode:", "x7Kp2q",
+        "Quick Reference", "Dial by your location", "Find your local number",
+        "Join by SIP", "One tap mobile:", "+1-253-555-0142,,9988776655#",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_zoom_kv_layout_is_idempotent():  # D-063 (a) idempotency
+    """f(f(x)) == f(x): a second pass over pipe rows + a '**...**' caption is a
+    no-op — no double-wrap, no second separator, no doubled '****', no re-padding."""
+    once = email_mod._html_to_text(_ZOOM_KV_TABLE_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+
+
+# (b) signature-in-a-table: ragged 1-and-2-cell rows (the "Re: XBPS SOX Risk"
+# Peter-Ashton sig: name / title / Email:|addr / Phone:|num). Must render as valid
+# GFM with no literal-pipe paragraph and no name/title/contact line dropped.
+_SIG_TABLE_HTML = (
+    "<table>"
+    "<tr><td>Peter Ashton</td></tr>"
+    "<tr><td>Senior Risk Manager, XBPS SOX Risk &amp; Controls</td></tr>"
+    "<tr><td>Amazon.com Services LLC</td></tr>"
+    "<tr><td>2021 7th Ave, Seattle, WA</td></tr>"
+    "<tr><td>Email:</td><td>casey@example.com</td></tr>"
+    "<tr><td>Phone:</td><td>+1-206-555-0177</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_signature_table_is_valid_gfm():  # D-063 (b)
+    """A signature wrapped in a single <table> with ragged 1-and-2-cell rows
+    renders as valid GFM — no literal-pipe paragraph (header_cols == sep_cols ==
+    every data-row width)."""
+    out = email_mod._html_to_text(_SIG_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    # Name, title, address, and BOTH contact lines survive (none dropped).
+    for txt in (
+        "Peter Ashton",
+        "Senior Risk Manager, XBPS SOX Risk & Controls",
+        "Amazon.com Services LLC", "2021 7th Ave, Seattle, WA",
+        "Email:", "casey@example.com", "Phone:", "+1-206-555-0177",
+    ):
+        assert txt in out, f"signature line dropped: {txt!r}"
+
+
+def test_html_to_text_signature_table_no_word_loss():  # D-063 (b) no-word-loss
+    """Union of emitted cell texts == union of original <td> texts, each once."""
+    out = email_mod._html_to_text(_SIG_TABLE_HTML)
+    for cell in (
+        "Peter Ashton",
+        "Senior Risk Manager, XBPS SOX Risk & Controls",
+        "Amazon.com Services LLC", "2021 7th Ave, Seattle, WA",
+        "Email:", "casey@example.com", "Phone:", "+1-206-555-0177",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_signature_table_is_idempotent():  # D-063 (b) idempotency
+    once = email_mod._html_to_text(_SIG_TABLE_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+
+
+# (c) nested / colspan table (the "Re: Global by Default Offsite" agenda + nested
+# Zoom block): the top-level agenda grid plus a nested <table> inside a parent
+# cell plus a colspan'd single-cell row. EVERY emitted table must be valid GFM —
+# a nested <table> must NOT tear a parent logical row into ragged half-tables, and
+# a colspan single-cell row becomes a valid padded row, not a width-1 separator.
+_NESTED_OFFSITE_TABLE_HTML = (
+    "<table>"
+    "<tr><th>Time</th><th>Agenda Item</th><th>Owner</th></tr>"
+    "<tr><td>09:00</td><td>Welcome &amp; goals</td><td>Maria</td></tr>"
+    "<tr><td>09:30</td>"
+    "<td>Logistics"
+    "<table>"
+    "<tr><td>Meeting URL:</td><td>https://amazon.zoom.us/j/55512345</td></tr>"
+    "<tr><td>Meeting ID:</td><td>555 123 45</td></tr>"
+    "<tr><td>Passcode:</td><td>offsite2026</td></tr>"
+    "</table>"
+    "</td>"
+    "<td>Devon</td></tr>"
+    "<tr><td>Lunch break (everyone)</td></tr>"  # colspan single-cell row
+    "<tr><td>13:00</td><td>Breakouts</td><td>All</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_nested_offsite_table_all_tables_valid_gfm():  # D-063 (c)
+    """The nested/colspan offsite email: every emitted GFM table is valid (header_cols
+    == sep_cols == every data-row width). The nested Zoom <table> does NOT tear the
+    parent agenda row into a lone '| Devon |' half-table, and the colspan'd
+    'Lunch break' single-cell row becomes a valid padded row, not a width-1 sep."""
+    out = email_mod._html_to_text(_NESTED_OFFSITE_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # The colspan single-cell agenda row is a valid padded row in the 3-col grid,
+    # never a lone '| Lunch break (everyone) |' width-1 row under a 3-col header.
+    assert "| Lunch break (everyone) |" not in lines
+    # No stray lone-pipe row tears the 'Devon' owner off into a width-1 half-table.
+    assert "| Devon |" not in lines
+
+
+def test_html_to_text_nested_offsite_table_no_word_loss():  # D-063 (c) no-word-loss
+    """No cell text from the agenda grid OR the nested Zoom block is lost."""
+    out = email_mod._html_to_text(_NESTED_OFFSITE_TABLE_HTML)
+    for cell in (
+        "Time", "Agenda Item", "Owner",
+        "09:00", "Welcome & goals", "Maria",
+        "09:30", "Devon",
+        "Meeting URL:", "https://amazon.zoom.us/j/55512345",
+        "Meeting ID:", "555 123 45", "Passcode:", "offsite2026",
+        "Lunch break (everyone)",
+        "13:00", "Breakouts", "All",
+    ):
+        assert cell in out, f"cell text lost: {cell!r}"
+
+
+def test_html_to_text_nested_offsite_table_is_idempotent():  # D-063 (c) idempotency
+    once = email_mod._html_to_text(_NESTED_OFFSITE_TABLE_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+
+
+# (d) ANTI-REGRESSION: a currently-CLEAN multi-table report (the "XBPS Tech
+# Initiatives Weekly Status Report" 5col / 5col / 3col shape). MAX-width is a strict
+# superset of MODAL — a table whose rows already share a width gains no padding, so
+# this output is BYTE-STABLE and still valid on BOTH the pre- and post-fix converter.
+_CLEAN_MULTI_TABLE_HTML = (
+    "<table>"
+    "<tr><th>Initiative</th><th>Status</th><th>Owner</th><th>ETA</th><th>Notes</th></tr>"
+    "<tr><td>Pallet Tech</td><td>GREEN</td><td>Gal</td><td>Fri</td><td>On track</td></tr>"
+    "<tr><td>Sortation</td><td>RED</td><td>Ayaz</td><td>Mon</td><td>Vendor slip</td></tr>"
+    "</table>"
+    "<table>"
+    "<tr><th>Risk</th><th>Sev</th><th>Owner</th><th>Mitigation</th><th>Due</th></tr>"
+    "<tr><td>Capacity</td><td>High</td><td>Tobias</td><td>Add EU lane</td><td>Q3</td></tr>"
+    "</table>"
+    "<table>"
+    "<tr><th>Suite</th><th>Pass</th><th>Fail</th></tr>"
+    "<tr><td>e2e</td><td>98%</td><td>2%</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_clean_multi_table_byte_stable_and_valid():  # D-063 (d)
+    """The clean 5col/5col/3col report stays BYTE-IDENTICAL to the modal converter
+    (max == modal when rows already share a width → no new padding) and is valid
+    GFM. Passes on BOTH pre- and post-fix converters."""
+    out = email_mod._html_to_text(_CLEAN_MULTI_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    assert out == (
+        "| Initiative | Status | Owner | ETA | Notes |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Pallet Tech | GREEN | Gal | Fri | On track |\n"
+        "| Sortation | RED | Ayaz | Mon | Vendor slip |\n"
+        "| Risk | Sev | Owner | Mitigation | Due |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Capacity | High | Tobias | Add EU lane | Q3 |\n"
+        "| Suite | Pass | Fail |\n"
+        "| --- | --- | --- |\n"
+        "| e2e | 98% | 2% |"
+    )
+
+
+def test_html_to_text_header_wider_than_modal_is_valid_gfm():  # D-063 root-cause
+    """THE GFM BUG, isolated: a header row WIDER than the modal (h3/s2 live) must
+    NOT leave header_cols != separator_cols. MAX-width makes the separator match the
+    widest row (the header), and the narrower data rows pad to it."""
+    html = (
+        "<table>"
+        "<tr><th>Name</th><th>Title</th><th>Dept</th></tr>"   # 3-col header (widest)
+        "<tr><td>Email:</td><td>x@amazon.com</td></tr>"       # 2-col data
+        "<tr><td>Phone:</td><td>555-0100</td></tr>"           # 2-col data
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    _assert_all_tables_valid_gfm(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "| Name | Title | Dept |"
+    assert lines[1] == "| --- | --- | --- |"        # sized to the WIDEST row (3)
+    assert lines[2] == "| Email: | x@amazon.com |  |"  # padded to 3
+    assert lines[3] == "| Phone: | 555-0100 |  |"
+
+
 # ─── D-052: backfill an un-fetchable body from a copy quoted in another thread ──
 # Some Graph message_ids fail get_email persistently (observed: a standalone
 # original whose id 400s every time) while the SAME message is quoted inside a
