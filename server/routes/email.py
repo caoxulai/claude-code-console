@@ -1661,7 +1661,7 @@ def _unwrap_list(payload, *keys) -> list:
     return []
 
 
-_MY_EMAIL = "user@example.com"
+_MY_EMAIL = os.environ.get("CLAUDE_WEB_MY_EMAIL", "").strip().lower()
 
 
 def _detail_recipients(payload, key: str) -> list:
@@ -1734,6 +1734,8 @@ def _recipient_type(raw: dict) -> str:
 
     def _contains_me(lst):
         """True only if MY personal email is literally in the list."""
+        if not _MY_EMAIL:
+            return False
         for entry in lst:
             if isinstance(entry, dict):
                 email = str(entry.get("email", "") or "").lower()
@@ -1815,6 +1817,20 @@ def _reply_all_recipients(item: dict) -> tuple[list[str], list[str]]:
 
     orig_to = item.get("toRecipients") or []
     orig_cc = item.get("ccRecipients") or []
+
+    # When _MY_EMAIL is empty (env var not set), skip me-filtering entirely —
+    # return all original recipients unchanged, append nothing to CC.
+    if not me:
+        to_addrs = ([sender] if sender else []) + [
+            a for a in (_recipient_email(e) for e in orig_to) if a
+        ]
+        to = _dedupe_emails_ci([a for a in to_addrs if _valid_email(a)])
+        cc = _dedupe_emails_ci([
+            a for a in (_recipient_email(e) for e in orig_cc) if a and _valid_email(a)
+        ])
+        if not to and _valid_email(sender):
+            to = [sender]
+        return to, cc
 
     # Validate + drop my own address; dedupe CI. Mirrors the frontend
     # replyAllRecipients (which validates via _dedupeByEmailCI) so a malformed
@@ -2290,7 +2306,7 @@ def _html_to_text(html: str) -> str:
     # Decode common HTML entities
     text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     text = text.replace("&nbsp;", " ").replace("&quot;", '"')
-    # Strip angle brackets around email addresses (e.g. <user@amazon.com> → user@amazon.com)
+    # Strip angle brackets around email addresses (e.g. <user@corp.example.com> → user@corp.example.com)
     # so ReactMarkdown doesn't treat them as HTML tags and silently drop following content.
     text = re.sub(r"<([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})>",
                   r"\1", text)

@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-PROJ="$HOME/workspace/projects/claude-web"
+PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 SLACK_FILE="$PROJ/.claude/slack_threads.json"
 
 # Read-only Slack MCP tools — same as _SLACK_READ_TOOLS in server/routes/slack.py.

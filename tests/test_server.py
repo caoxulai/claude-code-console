@@ -2887,10 +2887,10 @@ async def test_stop_all_continues_when_one_stop_raises():
 # Memory routes (/api/memory/files)
 #
 # The memory route reads/writes ~/.claude/projects/<home-slug>/memory. The
-# directory used to be a hardcoded personal slug (-local-home-xulaicao), which
-# made the page silently empty for any other user. It now derives the slug from
-# the resolved home path at call time. These tests point MEMORY_DIR at a
-# tmp-backed dir and exercise the CRUD + etag-conflict paths.
+# directory used to be a hardcoded personal slug, which made the page silently
+# empty for any other user. It now derives the slug from the resolved home path
+# at call time. These tests point MEMORY_DIR at a tmp-backed dir and exercise
+# the CRUD + etag-conflict paths.
 # --------------------------------------------------------------------------- #
 import server.routes.memory as memory_mod  # noqa: E402
 
@@ -3005,7 +3005,7 @@ async def test_memory_path_traversal_rejected(client, memory_dir):
 def test_home_memory_dir_uses_resolved_home_slug(monkeypatch, tmp_path):
     """Regression guard: the memory dir slug is derived from the RESOLVED home
     path, not a hardcoded personal slug. On a machine where $HOME differs, the
-    computed dir must follow $HOME rather than '-local-home-xulaicao'.
+    computed dir must follow $HOME rather than the original developer's path.
     """
     fake_home = tmp_path / "home" / "alice"
     fake_home.mkdir(parents=True)
@@ -3013,7 +3013,7 @@ def test_home_memory_dir_uses_resolved_home_slug(monkeypatch, tmp_path):
     got = memory_mod._home_memory_dir()
     expected_slug = "-" + str(fake_home.resolve()).lstrip("/").replace("/", "-")
     assert got == fake_home / ".claude" / "projects" / expected_slug / "memory"
-    assert "local-home-xulaicao" not in str(got)
+    assert "home-alice" in str(got), "slug must derive from the fake home, not a stale default"
 
 
 # --------------------------------------------------------------------------- #
@@ -8639,7 +8639,7 @@ async def test_slack_group_dm_item_round_trips(client, slack_file):
     with channelType 'group_dm' intact — the backend never rewrites or rejects it."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "gdm1", "sender": "manhalr", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "id": "gdm1", "sender": "alice", "channel": "mpdm-alice--testuser--bob-1",
         "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
         "snippet": "hey team, quick sync?", "threadContext": "",
         "draft": "sure, let me check my calendar", "generatedDraft": "sure, let me check my calendar",
@@ -8652,8 +8652,8 @@ async def test_slack_group_dm_item_round_trips(client, slack_file):
     item = body["items"][0]
     assert item["channelType"] == "group_dm"
     assert item["channelId"] == "C0BC0TT5Z2L"
-    assert item["channel"] == "mpdm-manhalr--xulaicao--emake-1"
-    assert item["sender"] == "manhalr"
+    assert item["channel"] == "mpdm-alice--testuser--bob-1"
+    assert item["sender"] == "alice"
     assert item["status"] == "needs-review"
 
 
@@ -8662,7 +8662,7 @@ async def test_slack_group_dm_approve_routes_via_channel_id(client, slack_file, 
     routing logic as DMs. channelId is the routable key regardless of channelType."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "gdm1", "sender": "manhalr", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "id": "gdm1", "sender": "alice", "channel": "mpdm-alice--testuser--bob-1",
         "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
         "snippet": "hey team", "threadContext": "",
         "draft": "on it", "generatedDraft": "on it",
@@ -8689,7 +8689,7 @@ async def test_slack_group_dm_dismiss_and_undismiss(client, slack_file):
     to 'dismissed', undismiss restores to 'needs-review' (draft == generatedDraft)."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "gdm1", "sender": "emake", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "id": "gdm1", "sender": "bob", "channel": "mpdm-alice--testuser--bob-1",
         "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
         "snippet": "thoughts?", "threadContext": "",
         "draft": "let me think about it", "generatedDraft": "let me think about it",
@@ -8722,7 +8722,7 @@ async def test_slack_channeltype_group_dm_accepted_by_save_draft(client, slack_f
     succeeds with 200 — no validation blocks 'group_dm' as a channelType value."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "gdm1", "sender": "manhalr", "channel": "mpdm-manhalr--xulaicao--emake-1",
+        "id": "gdm1", "sender": "alice", "channel": "mpdm-alice--testuser--bob-1",
         "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
         "snippet": "can you review this PR?", "threadContext": "",
         "draft": "auto draft", "generatedDraft": "auto draft",

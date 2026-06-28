@@ -130,7 +130,7 @@ function wordDiff(before, after) {
 // NOT fabricate a display name that could misrepresent the source — absent a
 // real name we keep the verbatim slug (with a leading '#') and just append the
 // poster. The slug-with-'#' form is the safest non-fabricating choice.
-function sourceLabel(item) {
+function sourceLabel(item, localPart) {
   if (item.channelType === 'dm') return 'DM';
   // Explicit group_dm channelType (from list_dms isGroup=true). Handles both
   // mpdm- slugs and any future non-mpdm group DM naming.
@@ -138,7 +138,7 @@ function sourceLabel(item) {
     const ch = item.channel || '';
     if (ch.startsWith('mpdm-')) {
       const members = ch.replace(/^mpdm-/, '').replace(/-\d+$/, '')
-        .split('--').filter(n => n !== 'xulaicao');
+        .split('--').filter(n => localPart && n !== localPart);
       return `Group · ${members.length ? members.join(', ') : 'group'}`;
     }
     return 'Group DM';
@@ -148,7 +148,7 @@ function sourceLabel(item) {
   const ch = item.channel || '';
   if (ch.startsWith('mpdm-')) {
     const members = ch.replace(/^mpdm-/, '').replace(/-\d+$/, '')
-      .split('--').filter(n => n !== 'xulaicao');
+      .split('--').filter(n => localPart && n !== localPart);
     return `Group · ${members.length ? members.join(', ') : 'group'}`;
   }
   if (ch) {
@@ -235,6 +235,10 @@ export default function SlackPage() {
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [notAvailable, setNotAvailable] = useState(false);
+  // The local-part of the user's email (from /api/config), used to filter the
+  // user's own name out of mpdm- group DM slugs. When blank (env unset), the
+  // filter is inert — no member removed (the `localPart &&` guard).
+  const [localPart, setLocalPart] = useState('');
   // When a Slack SCAN last completed (epoch millis), as reported by the backend
   // in GET /api/slack/queue's `lastScanAt` field. This is the freshness signal
   // the "Updated Xs/Xm ago" header label renders from — NOT when the page last
@@ -400,7 +404,15 @@ export default function SlackPage() {
     }
   };
 
-  useEffect(() => { refresh(); fetchHealth(); refreshMuted(); }, []);
+  useEffect(() => {
+    refresh(); fetchHealth(); refreshMuted();
+    // Fetch the user's email local-part for self-filtering in group DM labels.
+    fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => {
+      if (cfg && typeof cfg.myEmail === 'string' && cfg.myEmail.includes('@')) {
+        setLocalPart(cfg.myEmail.split('@')[0].toLowerCase());
+      }
+    }).catch(() => {});
+  }, []);
 
   // Rehydrate pending-send state from the module-level store on mount. When the
   // user switches tabs and returns, the component remounts fresh — this seeds
@@ -1619,7 +1631,7 @@ export default function SlackPage() {
                     <span style={{ color: 'var(--muted)' }}>
                       {open ? <FiChevronDown size={13} /> : <FiChevronRight size={13} />}
                     </span>
-                    <span style={{ color: 'var(--muted)' }}>{sourceLabel(item)}</span>
+                    <span style={{ color: 'var(--muted)' }}>{sourceLabel(item, localPart)}</span>
                   </span>
                 </td>
                 <td>{item.sender || 'unknown'}</td>
@@ -1728,7 +1740,7 @@ export default function SlackPage() {
     const channelId = String(key).split('_')[0];
     const match = items.find(it => it.channelId === channelId);
     if (match) {
-      const src = sourceLabel(match);
+      const src = sourceLabel(match, localPart);
       if (src === 'DM' && match.sender) return `DM · ${match.sender}`;
       return src;
     }

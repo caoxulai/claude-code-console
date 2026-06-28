@@ -217,8 +217,8 @@ def _project_label(dirname: str) -> str:
     """Convert project dir name back to a real filesystem path.
 
     Claude Code encodes cwds by replacing / with - and prepending -.
-    e.g. "$HOME/workspace/projects/oncall-kpi"
-      → "-local-home-xulaicao-workspace-projects-oncall-kpi"
+    e.g. "/home/user/workspace/projects/my-project"
+      → "-home-user-workspace-projects-my-project"
 
     The trick: we can't just replace all - with / because directory names
     contain hyphens. Instead, greedily match path segments against the real
@@ -571,8 +571,8 @@ def _project_path_to_claude_slug(project_path: str) -> str:
     """Convert a real project path to the Claude session directory slug.
 
     Claude Code encodes cwds by replacing / with - and prepending -.
-    e.g. "$HOME/workspace/projects/oncall-kpi"
-      -> "-local-home-xulaicao-workspace-projects-oncall-kpi"
+    e.g. "/home/user/workspace/projects/my-project"
+      -> "-home-user-workspace-projects-my-project"
     """
     return "-" + project_path.lstrip("/").replace("/", "-")
 
@@ -580,7 +580,7 @@ def _project_path_to_claude_slug(project_path: str) -> str:
 async def get_config(request: web.Request) -> web.Response:
     """Expose environment paths so the frontend doesn't hardcode them.
 
-    The UI previously baked in '/home/xulaicao' and '-local-home-xulaicao'
+    The UI previously baked in '/home/user' and '-local-home-user'
     slugs, which only worked on the original author's machine. This endpoint
     surfaces the resolved home dir, its session-dir slug, the default chat cwd,
     and the workspace projects (name + real path + slug) so the Chat, Sessions,
@@ -601,11 +601,14 @@ async def get_config(request: web.Request) -> web.Response:
                 "slug": _project_path_to_claude_slug(str(d)),
             })
 
+    my_email = os.environ.get("CLAUDE_WEB_MY_EMAIL", "")
+
     return web.json_response({
         "home": str(home),
         "homeSlug": home_slug,
         "defaultCwd": default_cwd,
         "workspaceDir": str(WORKSPACE_DIR),
+        "myEmail": my_email,
         "projects": projects,
     })
 

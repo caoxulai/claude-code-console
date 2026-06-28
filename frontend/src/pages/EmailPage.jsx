@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients, threadCardStates } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients, threadCardStates, setMyEmail } from './emailDetail';
 
 // --- Constants ---
 
@@ -334,7 +334,13 @@ export default function EmailPage() {
     }
   };
 
-  useEffect(() => { refresh(); fetchHealth(); fetchStyle(); refreshMuted(); }, []);
+  useEffect(() => {
+    refresh(); fetchHealth(); fetchStyle(); refreshMuted();
+    // Fetch the user's email for reply-all minus-me filtering (runtime config).
+    fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => {
+      if (cfg && typeof cfg.myEmail === 'string') setMyEmail(cfg.myEmail);
+    }).catch(() => {});
+  }, []);
 
   useLiveUpdates(['email_changed'], () => {
     clearRef(scanHintRef);

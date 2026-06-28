@@ -67,6 +67,10 @@ def _reset_email_primitives():
     primitive from one test's loop would be reused in the next, raising
     'RuntimeError: ... is bound to a different event loop'.
     """
+    # Ensure _MY_EMAIL has a test value (env var may not be set in CI/test)
+    _orig_my_email = email_mod._MY_EMAIL
+    if not email_mod._MY_EMAIL:
+        email_mod._MY_EMAIL = "testuser@example.com"
     # Reset email module primitives
     for attr in ("_scan_in_progress_lock", "_scan_wake_event"):
         if hasattr(email_mod, attr):
@@ -79,6 +83,7 @@ def _reset_email_primitives():
     except (ImportError, AttributeError):
         pass
     yield
+    email_mod._MY_EMAIL = _orig_my_email
     for attr in ("_scan_in_progress_lock", "_scan_wake_event"):
         if hasattr(email_mod, attr):
             setattr(email_mod, attr, None)
@@ -266,7 +271,7 @@ async def test_email_approve_marks_read_but_mute_does_not(client, email_file, mo
         return {"success": True, "draftId": "D1"}
     monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
     _seed(email_file, [
-        _make_item("i1", messageId="AAMkA", conversationId="AAMkA", senderEmail="x@amazon.com"),
+        _make_item("i1", messageId="AAMkA", conversationId="AAMkA", senderEmail="x@example.com"),
         _make_item("i2", messageId="AAMkB", conversationId="AAMkB"),
     ])
 
@@ -744,11 +749,11 @@ _MAWS_BODY = (
     "Regrads,\n"
     "Han, Bingfeng\n"
     "\n"
-    "From: Wang, Yibo mei@example.com\n"
+    "From: Wang, Yibo yibo@example.com\n"
     "Date: Wednesday, June 24, 2026 at 10:23\n"
-    "To: Agarwal, Ankit sjones@example.com; Lakshmanan, Geetika priya@example.com; "
-    "Seah, Yi Ling jkim@example.com\n"
-    "Cc: Han, Bingfeng asmith@example.com; agl-pe agl-pe@amazon.com\n"
+    "To: Agarwal, Ankit ankit@example.com; Lakshmanan, Geetika geetika@example.com; "
+    "Seah, Yi Ling seah@example.com\n"
+    "Cc: Han, Bingfeng bfhan@example.com; agl-pe agl-pe@example.com\n"
     "Subject: [Action needed] MAWS CN deprecation\n"
     "\n"
     "GL L7 SDMs,\n"
@@ -762,9 +767,9 @@ def _maws_payload() -> dict:
     """Graph get_email shape: a SINGLE message, the whole chain inline in body."""
     return {
         "email": {
-            "from": {"name": "Han, Bingfeng", "email": "asmith@example.com"},
+            "from": {"name": "Han, Bingfeng", "email": "bfhan@example.com"},
             "toRecipients": [
-                {"name": "Wang, Yibo", "email": "mei@example.com"},
+                {"name": "Wang, Yibo", "email": "yibo@example.com"},
             ],
             "received": "2026-06-24T14:00:00Z",
             "subject": "[Action needed] MAWS CN deprecation",
@@ -788,7 +793,7 @@ def test_extract_thread_history_splits_inline_quoted_chain():
 
     # Oldest = the quoted original from Wang, Yibo (sender PARSED from From:).
     assert "Wang, Yibo" in oldest["sender"]
-    assert "mei@example.com" not in oldest["sender"]  # flattened to a name
+    assert "yibo@example.com" not in oldest["sender"]  # flattened to a name
     # His two asks survived (no message content lost).
     assert "SDO is moving to deprecate MAWS" in oldest["body"]
     assert "confirm the migration plan" in oldest["body"]
@@ -822,7 +827,7 @@ def test_extract_thread_history_single_fresh_email_is_one_turn():
     byte-identical to the pre-split whole-body behavior (backward compat)."""
     payload = {
         "email": {
-            "from": {"name": "Jane Doe", "email": "jane@amazon.com"},
+            "from": {"name": "Jane Doe", "email": "jane@example.com"},
             "received": "2026-06-24T10:00:00Z",
             "subject": "Lunch?",
             "body": "Hey team,\n\nWant to grab lunch at noon? Let me know.\n\nJane",
@@ -840,7 +845,7 @@ def test_extract_thread_history_prose_from_keyword_does_not_false_split():
     the multi-line header SHAPE is required, not a single keyword."""
     payload = {
         "email": {
-            "from": {"name": "Bob", "email": "bob@amazon.com"},
+            "from": {"name": "Bob", "email": "bob@example.com"},
             "received": "2026-06-24T10:00:00Z",
             "body": (
                 "Here is the update you asked for.\n"
@@ -881,13 +886,13 @@ def test_extract_thread_history_boundary_only_no_reply_text_degrades_to_one_turn
     quoted text is preserved (no message content silently lost)."""
     payload = {
         "email": {
-            "from": {"name": "Han, Bingfeng", "email": "asmith@example.com"},
+            "from": {"name": "Han, Bingfeng", "email": "bfhan@example.com"},
             "received": "2026-06-24T14:00:00Z",
             "subject": "Fwd: [Action needed] MAWS CN deprecation",
             "body": (
-                "From: Wang, Yibo mei@example.com\n"
+                "From: Wang, Yibo yibo@example.com\n"
                 "Date: Wednesday, June 24, 2026 at 10:23\n"
-                "To: Agarwal, Ankit sjones@example.com\n"
+                "To: Agarwal, Ankit ankit@example.com\n"
                 "Subject: [Action needed] MAWS CN deprecation\n"
                 "\n"
                 "GL L7 SDMs,\n"
@@ -977,9 +982,9 @@ def _pallet_payload() -> dict:
     with MARKDOWN-BOLDED quoted-header labels + an Original Appointment separator."""
     return {
         "email": {
-            "from": {"name": "Kim, Seong", "email": "lpark@example.com"},
+            "from": {"name": "Kim, Seong", "email": "skim@example.com"},
             "toRecipients": [
-                {"name": "Rui, Ricardo", "email": "jdavis@example.com"},
+                {"name": "Rui, Ricardo", "email": "rrui@example.com"},
             ],
             "received": "2025-09-17T16:41:00Z",
             "subject": "FW: Enabling pallet tech at existing AWD sites",
@@ -1067,7 +1072,7 @@ def test_split_quoted_thread_bare_headers_backward_compat():
     assert len(turns) == 2, f"bare-header chain must still split into 2, got {len(turns)}"
     oldest, newest = turns[0], turns[1]
     assert "Wang, Yibo" in oldest["sender"]
-    assert "mei@example.com" not in oldest["sender"]
+    assert "yibo@example.com" not in oldest["sender"]
     assert oldest["timestamp"] == "Wednesday, June 24, 2026 at 10:23"
     assert "Agarwal, Ankit" in oldest["recipients"]
     assert "SDO is moving to deprecate MAWS" in oldest["body"]
@@ -1090,14 +1095,14 @@ def test_split_quoted_thread_lone_bolded_from_in_prose_does_not_false_split():
         "Thanks!\n"
     )
     top_msg = {
-        "from": {"name": "Bob", "email": "bob@amazon.com"},
+        "from": {"name": "Bob", "email": "bob@example.com"},
         "received": "2026-06-24T10:00:00Z",
     }
     assert email_mod._split_quoted_thread(body, top_msg) == []
 
     payload = {
         "email": {
-            "from": {"name": "Bob", "email": "bob@amazon.com"},
+            "from": {"name": "Bob", "email": "bob@example.com"},
             "received": "2026-06-24T10:00:00Z",
             "subject": "Heads up",
             "body": body,
@@ -1211,7 +1216,7 @@ def test_extract_email_body_flattens_sender_dict():
     Regression for the Thread Context display showing the raw dict.
     """
     payload = {"content": {"emails": [{
-        "sender": {"name": "Tangudu, Punith", "email": "mtaylor@example.com"},
+        "sender": {"name": "Tangudu, Punith", "email": "punitt@example.com"},
         "subject": "Travel Reminder",
         "body": "Hi all, gentle reminder.",
     }]}}
@@ -1744,7 +1749,7 @@ def test_extract_email_body_handles_graph_shape():
     payload = {"email": {
         "id": "AAMk1",
         "subject": "Travel Reminder",
-        "from": {"name": "Tangudu, Punith", "email": "mtaylor@example.com"},
+        "from": {"name": "Tangudu, Punith", "email": "punitt@example.com"},
         "body": "Hi all, gentle reminder.",
     }}
     out = email_mod._extract_email_body(payload)
@@ -2738,7 +2743,7 @@ _SIG_TABLE_HTML = (
     "<tr><td>Senior Risk Manager, XBPS SOX Risk &amp; Controls</td></tr>"
     "<tr><td>Amazon.com Services LLC</td></tr>"
     "<tr><td>2021 7th Ave, Seattle, WA</td></tr>"
-    "<tr><td>Email:</td><td>casey@example.com</td></tr>"
+    "<tr><td>Email:</td><td>pashton@example.com</td></tr>"
     "<tr><td>Phone:</td><td>+1-206-555-0177</td></tr>"
     "</table>"
 )
@@ -2755,7 +2760,7 @@ def test_html_to_text_signature_table_is_valid_gfm():  # D-063 (b)
         "Peter Ashton",
         "Senior Risk Manager, XBPS SOX Risk & Controls",
         "Amazon.com Services LLC", "2021 7th Ave, Seattle, WA",
-        "Email:", "casey@example.com", "Phone:", "+1-206-555-0177",
+        "Email:", "pashton@example.com", "Phone:", "+1-206-555-0177",
     ):
         assert txt in out, f"signature line dropped: {txt!r}"
 
@@ -2767,7 +2772,7 @@ def test_html_to_text_signature_table_no_word_loss():  # D-063 (b) no-word-loss
         "Peter Ashton",
         "Senior Risk Manager, XBPS SOX Risk & Controls",
         "Amazon.com Services LLC", "2021 7th Ave, Seattle, WA",
-        "Email:", "casey@example.com", "Phone:", "+1-206-555-0177",
+        "Email:", "pashton@example.com", "Phone:", "+1-206-555-0177",
     ):
         assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
 
@@ -2888,7 +2893,7 @@ def test_html_to_text_header_wider_than_modal_is_valid_gfm():  # D-063 root-caus
     html = (
         "<table>"
         "<tr><th>Name</th><th>Title</th><th>Dept</th></tr>"   # 3-col header (widest)
-        "<tr><td>Email:</td><td>x@amazon.com</td></tr>"       # 2-col data
+        "<tr><td>Email:</td><td>x@example.com</td></tr>"       # 2-col data
         "<tr><td>Phone:</td><td>555-0100</td></tr>"           # 2-col data
         "</table>"
     )
@@ -2897,7 +2902,7 @@ def test_html_to_text_header_wider_than_modal_is_valid_gfm():  # D-063 root-caus
     lines = [ln for ln in out.splitlines() if ln.strip()]
     assert lines[0] == "| Name | Title | Dept |"
     assert lines[1] == "| --- | --- | --- |"        # sized to the WIDEST row (3)
-    assert lines[2] == "| Email: | x@amazon.com |  |"  # padded to 3
+    assert lines[2] == "| Email: | x@example.com |  |"  # padded to 3
     assert lines[3] == "| Phone: | 555-0100 |  |"
 
 
@@ -3837,7 +3842,7 @@ def test_validate_raise_if_quota_ignores_429_inside_successful_html_body():
             "message": "Found 11 email(s) in conversation",
             "emails": [{
                 "itemId": "AAkALgAA",
-                "sender": {"name": "Bhargava, Vipul", "email": "riley@example.com"},
+                "sender": {"name": "Bhargava, Vipul", "email": "vipulb@example.com"},
                 "isRead": False,
                 # Real Outlook markup: a GUID whose hex run contains "429" (429d),
                 # exactly the live false-positive trigger.
@@ -3992,7 +3997,7 @@ def test_validate_save_draft_confirms_landing_and_cleans_up():
     res = _vrun(validate_mod.save_draft_roundtrip(
         subject="[email_validate throwaway] preflight",
         body="throwaway",
-        to=["user@example.com"],
+        to=["testuser@example.com"],
         owa_write=fake_owa_write,
         get_emails=fake_get_emails,
         write_tool=fake_write_tool,
@@ -4017,7 +4022,7 @@ def test_validate_save_draft_fails_if_draft_never_lands():
     res = _vrun(validate_mod.save_draft_roundtrip(
         subject="[email_validate throwaway] preflight",
         body="throwaway",
-        to=["user@example.com"],
+        to=["testuser@example.com"],
         owa_write=fake_owa_write,
         get_emails=fake_get_emails,
         write_tool=fake_write_tool,
@@ -4065,7 +4070,7 @@ def test_validate_save_draft_deletes_by_stored_itemid_not_create_id():
     res = _vrun(validate_mod.save_draft_roundtrip(
         subject=subject,
         body="throwaway",
-        to=["user@example.com"],
+        to=["testuser@example.com"],
         owa_write=fake_owa_write,
         get_emails=fake_get_emails,
         write_tool=fake_write_tool,
@@ -4106,7 +4111,7 @@ def test_validate_save_draft_detects_residue_when_real_draft_remains():
     res = _vrun(validate_mod.save_draft_roundtrip(
         subject=subject,
         body="throwaway",
-        to=["user@example.com"],
+        to=["testuser@example.com"],
         owa_write=fake_owa_write,
         get_emails=fake_get_emails,
         write_tool=fake_write_tool,
@@ -4134,9 +4139,9 @@ def test_validate_save_draft_detects_residue_when_real_draft_remains():
 #       threadHistory turn body.
 
 
-# The user's own address — read from the backend's single source of truth so the
-# tests can never drift from the constant the reply-all/minus-me logic uses.
-_MY_EMAIL = email_mod._MY_EMAIL
+# The user's own address — must match the test value set by the autouse fixture
+# when CLAUDE_WEB_MY_EMAIL env var is unset (the CI/test default).
+_MY_EMAIL = email_mod._MY_EMAIL or "testuser@example.com"
 
 
 # --- (a) FYI does NOT auto-draft; needs-reply/actionable still do ------------

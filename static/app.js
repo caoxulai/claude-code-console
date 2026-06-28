@@ -145,7 +145,7 @@ resetBtn.addEventListener("click", () => {
 
 // Long-press header cwd label to set a project cwd (small power-user affordance).
 cwdLabel.addEventListener("click", () => {
-  const next = prompt("set cwd (must resolve under $HOME or $HOME/workspace; blank = default):", cwd);
+  const next = prompt("set cwd (must resolve under $HOME; blank = default):", cwd);
   if (next === null) return;
   cwd = next.trim();
   if (cwd) localStorage.setItem(STORAGE_KEY_CWD, cwd);

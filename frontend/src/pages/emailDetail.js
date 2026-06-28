@@ -109,10 +109,20 @@ export function threadCardStates(item) {
   });
 }
 
-// The user's own address. SINGLE named const, cross-referenced with the backend
-// server/routes/email.py `_MY_EMAIL = "user@example.com"` (the minus-me /
-// always-CC-me default). If one side changes, change the other.
-export const MY_EMAIL = 'user@example.com';
+// The user's own email address, fetched at runtime from GET /api/config
+// (server reads CLAUDE_WEB_MY_EMAIL env var). The page component calls
+// setMyEmail() after its config fetch; the helpers below read via getMyEmail().
+// When blank (env not set), helpers that filter "minus me" become inert (no
+// address removed), which is the safe default.
+let _myEmail = '';
+
+export function setMyEmail(val) {
+  _myEmail = (typeof val === 'string' ? val : '').trim().toLowerCase();
+}
+
+export function getMyEmail() {
+  return _myEmail;
+}
 
 // --- autoFormatBody: conservative, idempotent, content-preserving formatter --
 // FEATURE #1 (light auto-formatting, NO LLM). Make flat newsletter prose
@@ -238,9 +248,9 @@ export function autoFormatBody(text) {
 // FEATURE #3 (UI default). When the draft editor opens, compute the reply-all
 // recipients from the item the backend captured:
 //   To = original sender (item.senderEmail) + the original `to` recipients,
-//        with the user's own address (MY_EMAIL) removed (never reply to self).
-//   CC = the original `cc` recipients with MY_EMAIL removed, then ALWAYS add
-//        MY_EMAIL (always-CC-me, even when the original CC was empty).
+//        with the user's own address (getMyEmail()) removed (never reply to self).
+//   CC = the original `cc` recipients with getMyEmail() removed, then ALWAYS add
+//        getMyEmail() (always-CC-me, even when the original CC was empty).
 // Both lists are de-duped case-insensitively by email. If the item carries no
 // captured to/cc (an older item, or the data was absent) it degrades to
 // To=[sender], CC=[me] — NEVER fabricating another address. Recipient entries
@@ -274,21 +284,23 @@ function _dedupeByEmailCI(emails) {
 
 export function replyAllRecipients(item) {
   const it = item || {};
-  const myKey = MY_EMAIL.toLowerCase();
+  const me = getMyEmail();
+  const myKey = me.toLowerCase();
   const sender = String(it.senderEmail || '').trim();
   const origTo = Array.isArray(it.toRecipients) ? it.toRecipients : [];
   const origCc = Array.isArray(it.ccRecipients) ? it.ccRecipients : [];
 
   // To = sender + original To, minus me. De-dupe CI so a sender who is also in
-  // the original To list isn't doubled.
+  // the original To list isn't doubled. When me is blank (env unset), the filter
+  // is inert — no address removed.
   const toRaw = [sender, ...origTo.map(_emailOf)].filter(
-    addr => addr && addr.toLowerCase() !== myKey,
+    addr => addr && myKey && addr.toLowerCase() !== myKey,
   );
   const to = _dedupeByEmailCI(toRaw);
 
-  // CC = original CC minus me, then always add me last.
-  const ccRaw = origCc.map(_emailOf).filter(addr => addr && addr.toLowerCase() !== myKey);
-  const cc = _dedupeByEmailCI([...ccRaw, MY_EMAIL]);
+  // CC = original CC minus me, then always add me last (only if me is known).
+  const ccRaw = origCc.map(_emailOf).filter(addr => addr && myKey && addr.toLowerCase() !== myKey);
+  const cc = _dedupeByEmailCI([...ccRaw, ...(me ? [me] : [])]);
 
   return { to, cc };
 }

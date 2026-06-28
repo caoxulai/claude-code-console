@@ -25,8 +25,13 @@ import {
   seedRecipients,
   threadCardStates,
   previewOf,
-  MY_EMAIL,
+  setMyEmail,
+  getMyEmail,
 } from './emailDetail.js';
+
+// Set the test email so replyAllRecipients/seedRecipients tests have a known
+// value. This mirrors what the page component does at runtime after /api/config.
+setMyEmail('testuser@example.com');
 
 let passed = 0;
 function test(name, fn) {
@@ -696,30 +701,30 @@ test('autoFormatBody: a line that is bold-wrapping REAL words is kept (not treat
 // FEATURE #3: when the draft editor opens, default To = sender + original To
 // MINUS me; CC = original CC MINUS me, then ALWAYS add me; de-dupe BOTH
 // case-insensitively by email. No captured to/cc => To=[sender], CC=[me] only
-// (never fabricate). MY_EMAIL is the single named const (cross-ref backend
-// email.py _MY_EMAIL = "user@example.com").
+// (never fabricate). getMyEmail() returns the runtime value set via setMyEmail().
 
-test('MY_EMAIL matches the backend _MY_EMAIL constant', () => {
-  assert.equal(MY_EMAIL, 'user@example.com');
+test('setMyEmail/getMyEmail: stores and returns the lowercased email', () => {
+  setMyEmail('TestUser@Example.com');
+  assert.equal(getMyEmail(), 'testuser@example.com');
 });
 
 test('replyAllRecipients: full reply-all — To=sender+origTo-me, CC=origCc-me+me, de-duped (all four clauses)', () => {
   const item = {
     senderEmail: 'alice@amazon.com',
     toRecipients: [
-      { name: 'Me', email: 'user@example.com' }, // me must be stripped from To
+      { name: 'Me', email: 'testuser@example.com' }, // me must be stripped from To
       { name: 'Bob', email: 'bob@amazon.com' },
     ],
     ccRecipients: [
       { name: 'Carol', email: 'carol@amazon.com' },
-      { name: 'Me', email: 'XULAICAO@amazon.com' }, // me (different case) stripped from CC
+      { name: 'Me', email: 'TESTUSER@example.com' }, // me (different case) stripped from CC
     ],
   };
   const r = replyAllRecipients(item);
   // To = sender + (original To minus me)
   assert.deepEqual(r.to, ['alice@amazon.com', 'bob@amazon.com']);
   // CC = (original CC minus me) + me (always)
-  assert.deepEqual(r.cc, ['carol@amazon.com', 'user@example.com']);
+  assert.deepEqual(r.cc, ['carol@amazon.com', 'testuser@example.com']);
 });
 
 test('replyAllRecipients: de-dupes case-insensitively (sender also appearing in To is not doubled)', () => {
@@ -736,31 +741,31 @@ test('replyAllRecipients: de-dupes case-insensitively (sender also appearing in 
   assert.equal(r.to.filter(e => e.toLowerCase() === 'alice@amazon.com').length, 1);
   assert.ok(r.to.includes('bob@amazon.com'));
   // CC degrades to just me
-  assert.deepEqual(r.cc, ['user@example.com']);
+  assert.deepEqual(r.cc, ['testuser@example.com']);
 });
 
 test('replyAllRecipients: always adds me to CC even when original CC is empty', () => {
   const item = { senderEmail: 'alice@amazon.com', toRecipients: [], ccRecipients: [] };
   const r = replyAllRecipients(item);
-  assert.deepEqual(r.cc, ['user@example.com']);
+  assert.deepEqual(r.cc, ['testuser@example.com']);
 });
 
 test('replyAllRecipients: DEGRADE — no captured to/cc => To=[sender], CC=[me] (never fabricated)', () => {
   const item = { senderEmail: 'dana@amazon.com' }; // older item, no toRecipients/ccRecipients
   const r = replyAllRecipients(item);
   assert.deepEqual(r.to, ['dana@amazon.com']);
-  assert.deepEqual(r.cc, ['user@example.com']);
+  assert.deepEqual(r.cc, ['testuser@example.com']);
 });
 
 test('replyAllRecipients: only me in original To/CC => To=[sender], CC=[me] (no self-reply)', () => {
   const item = {
     senderEmail: 'eve@amazon.com',
-    toRecipients: [{ name: 'Me', email: 'user@example.com' }],
-    ccRecipients: [{ name: 'Me', email: 'user@example.com' }],
+    toRecipients: [{ name: 'Me', email: 'testuser@example.com' }],
+    ccRecipients: [{ name: 'Me', email: 'testuser@example.com' }],
   };
   const r = replyAllRecipients(item);
   assert.deepEqual(r.to, ['eve@amazon.com']); // me stripped from To, never reply to self
-  assert.deepEqual(r.cc, ['user@example.com']); // me re-added (always-CC-me)
+  assert.deepEqual(r.cc, ['testuser@example.com']); // me re-added (always-CC-me)
 });
 
 test('replyAllRecipients: tolerates string-email entries and skips blank/invalid ones (no fabrication)', () => {
@@ -775,12 +780,12 @@ test('replyAllRecipients: tolerates string-email entries and skips blank/invalid
   assert.ok(!r.to.includes('')); // blank dropped
   assert.ok(!r.to.includes('not-an-email')); // invalid shape dropped, never fabricated
   assert.ok(r.cc.includes('heidi@amazon.com'));
-  assert.ok(r.cc.includes('user@example.com'));
+  assert.ok(r.cc.includes('testuser@example.com'));
 });
 
 test('replyAllRecipients: empty/missing sender still degrades safely (To may be empty, CC=[me])', () => {
   const r = replyAllRecipients({});
-  assert.deepEqual(r.cc, ['user@example.com']);
+  assert.deepEqual(r.cc, ['testuser@example.com']);
   assert.ok(Array.isArray(r.to));
 });
 
@@ -808,14 +813,14 @@ test('seedRecipients: NOT edited -> computes the reply-all default from captured
   const item = {
     senderEmail: 'alice@amazon.com',
     toRecipients: [
-      { name: 'Me', email: 'user@example.com' },
+      { name: 'Me', email: 'testuser@example.com' },
       { name: 'Bob', email: 'bob@amazon.com' },
     ],
     ccRecipients: [{ name: 'Carol', email: 'carol@amazon.com' }],
   };
   const r = seedRecipients(item);
   assert.deepEqual(r.to, ['alice@amazon.com', 'bob@amazon.com']); // sender added, me stripped
-  assert.deepEqual(r.cc, ['carol@amazon.com', 'user@example.com']); // me always added
+  assert.deepEqual(r.cc, ['carol@amazon.com', 'testuser@example.com']); // me always added
 });
 
 test('seedRecipients: edited but To cleared -> To stays empty (the persisted edit is authoritative)', () => {

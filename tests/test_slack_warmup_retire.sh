@@ -67,8 +67,8 @@ $PIPELINE_LINE_CMD
 # === claude-web slack-warmup (managed) ===
 # claude-web Slack warm-up — keep the tmux host (idle Claude REPL) alive.
 CRON_TZ=America/Los_Angeles
-@reboot bash scripts/slack-warmup-session.sh ensure >> $HOME/workspace/projects/claude-web/.claude/slack-warmup-cron.log 2>&1
-41 * * * * cd $HOME/workspace/projects/claude-web && bash scripts/slack-warmup-session.sh ensure >> $HOME/workspace/projects/claude-web/.claude/slack-warmup-cron.log 2>&1
+@reboot bash scripts/slack-warmup-session.sh ensure >> /home/testuser/projects/claude-web/.claude/slack-warmup-cron.log 2>&1
+41 * * * * cd /home/testuser/projects/claude-web && bash scripts/slack-warmup-session.sh ensure >> /home/testuser/projects/claude-web/.claude/slack-warmup-cron.log 2>&1
 FIXEOF
 
 # ============================================================================

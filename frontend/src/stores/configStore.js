@@ -2,7 +2,7 @@ import { create } from 'zustand';
 
 // Server-provided environment config (home dir, default cwd, workspace
 // projects). Fetched once from /api/config and cached so pages don't hardcode
-// personal paths like '/home/xulaicao' or '-local-home-xulaicao'.
+// personal paths like '/home/<user>' or '-local-home-<user>'.
 export const useConfigStore = create((set, get) => ({
   config: null,
   loading: false,

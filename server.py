@@ -25,7 +25,7 @@ COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 # Per the plan: only allow cwds under these roots.
 ALLOWED_CWD_ROOTS = [
     Path.home(),
-    Path("$HOME/workspace"),
+    Path.home() / "workspace",
 ]
 
 
@@ -170,7 +170,8 @@ async def index_handler(_request: web.Request) -> web.StreamResponse:
 
 # --- Sessions API ---
 
-SESSIONS_DIR = Path.home() / ".claude" / "projects" / "-local-home-xulaicao"
+_HOME_SLUG = "-" + str(Path.home().resolve()).lstrip("/").replace("/", "-")
+SESSIONS_DIR = Path.home() / ".claude" / "projects" / _HOME_SLUG
 
 
 async def sessions_handler(_request: web.Request) -> web.StreamResponse:
@@ -205,14 +206,14 @@ async def sessions_handler(_request: web.Request) -> web.StreamResponse:
 
 # --- Cron Jobs API ---
 
-SCHEDULED_TASKS_PATH = Path.home() / ".claude" / "projects" / "-local-home-xulaicao" / ".." / ".." / "scheduled_tasks.json"
+SCHEDULED_TASKS_PATH = Path.home() / ".claude" / "scheduled_tasks.json"
 
 
 def _load_crons() -> list[dict]:
     # Try multiple known paths
     paths = [
         Path.home() / ".claude" / "scheduled_tasks.json",
-        Path("$HOME/.claude/scheduled_tasks.json"),
+        SCHEDULED_TASKS_PATH,
     ]
     for p in paths:
         if p.exists():

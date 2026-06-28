@@ -163,6 +163,14 @@ def _resolve_slack_path() -> Path:
 # overridable (tests monkeypatch it).
 SLACK_PATH = _resolve_slack_path()
 
+# The owner's Slack username — used for self-exclusion (skip DMs where *I* sent
+# the last message) and style-sample filtering. Derived from CLAUDE_WEB_MY_EMAIL
+# (strip the @domain) with an explicit CLAUDE_WEB_MY_USERNAME override.
+_MY_USERNAME: str = (
+    os.environ.get("CLAUDE_WEB_MY_USERNAME", "").strip().lower()
+    or os.environ.get("CLAUDE_WEB_MY_EMAIL", "").split("@")[0].strip().lower()
+)
+
 
 def _style_path() -> Path:
     """Human-readable learned-style store, sibling to the sidecar."""
@@ -486,7 +494,7 @@ _BOT_SENDERS = frozenset({
     "private sdm channel welcome",
     "opus apps approval process",
     "asana",
-    "meshclaw-xulaicao",
+    *([f"meshclaw-{_MY_USERNAME}"] if _MY_USERNAME else []),
 })
 
 # Module-level tracker for the worker's last successful scan (epoch ms). None
@@ -1851,7 +1859,7 @@ def build_draft_prompt(item: dict) -> str:
     # tell the model to reply in English. CJK Unified Ideographs range check.
     convo_text = (snippet or "") + " " + " ".join(
         str(m.get("text", "")) for m in (item.get("history3d") or [])
-        if isinstance(m, dict) and m.get("author", "") != "xulaicao"
+        if isinstance(m, dict) and m.get("author", "").lower() != _MY_USERNAME
     )
     convo_has_chinese = any("一" <= ch <= "鿿" for ch in convo_text)
 
@@ -3137,13 +3145,13 @@ async def _scan_once(app) -> None:
             if not msgs:
                 continue
             last_msg = msgs[0] if isinstance(msgs, list) else {}
-            # user field may be a string ("xulaicao") or an enriched dict ({name: ...})
+            # user field may be a string (username) or an enriched dict ({name: ...})
             raw_user = last_msg.get("user") or last_msg.get("sender") or ""
             if isinstance(raw_user, dict):
                 last_author = raw_user.get("name") or raw_user.get("id") or ""
             else:
                 last_author = str(raw_user)
-            if last_author.lower() == "xulaicao":
+            if _MY_USERNAME and last_author.lower() == _MY_USERNAME:
                 continue
             dc["sender"] = _scrub(last_author)[:_SNIPPET_CAP] or dc["sender"]
             dc["snippet"] = _scrub(
@@ -3158,7 +3166,7 @@ async def _scan_once(app) -> None:
     candidates = [c for c in candidates if not _is_bot_sender(c.get("sender", ""))]
 
     # Filter out conversations where we are the last sender — nothing to reply to.
-    candidates = [c for c in candidates if c.get("sender", "").lower() != "xulaicao"]
+    candidates = [c for c in candidates if not _MY_USERNAME or c.get("sender", "").lower() != _MY_USERNAME]
 
     data, current_etag = _load()
 
