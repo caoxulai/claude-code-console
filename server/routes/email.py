@@ -2055,7 +2055,16 @@ def _html_to_text(html: str) -> str:
     # with sentinel characters, strip all other tags, then replace sentinels.
     _CELL_SEP = "\x01"
     _ROW_SEP = "\x02"
-    text = re.sub(r"</?(?:table|thead|tbody|tfoot|colgroup|col|caption)[^>]*>", "\n", text, flags=re.IGNORECASE)
+    _TABLE_SEP = "\x03"
+    # Each LOGICAL table (the <table>/</table> element) is a sentinel-delimited block
+    # so the row buffer flushes at every table boundary. Without this, two adjacent
+    # Outlook tables fused into ONE block (one separator, the first table's header
+    # demoted to a caption) and any heading wedged between them was swallowed into the
+    # prior cell. thead/tbody/tfoot/colgroup/col/caption are SUB-divisions WITHIN one
+    # table, so they stay a bare '\n' (intra-table) — splitting on them would tear a
+    # single thead+tbody table into two.
+    text = re.sub(r"</?table[^>]*>", _TABLE_SEP, text, flags=re.IGNORECASE)
+    text = re.sub(r"</?(?:thead|tbody|tfoot|colgroup|col|caption)[^>]*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<tr[^>]*>", _ROW_SEP, text, flags=re.IGNORECASE)
     text = re.sub(r"</tr>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<t[hd][^>]*>", _CELL_SEP, text, flags=re.IGNORECASE)
@@ -2166,28 +2175,50 @@ def _html_to_text(html: str) -> str:
             if i == 0:
                 out_lines.append("| " + " | ".join(["---"] * data_width) + " |")
 
-    for line in lines:
-        if _CELL_SEP in line:
-            # Any text BEFORE the first cell sentinel is prose (a real cell always
-            # opens with _CELL_SEP), so flush any open block, emit the prose on its
-            # own line, and start fresh — it must not be folded into the first cell.
-            prefix, _, rest = line.partition(_CELL_SEP)
-            prefix = prefix.strip()
-            if prefix:
+    for raw_line in lines:
+        # A logical <table>/</table> boundary (the _TABLE_SEP sentinel) ends the
+        # current table block: split the row on it so two adjacent Outlook tables —
+        # and any heading wedged between them — never fuse into one block. Each
+        # segment is processed independently; the boundary itself forces a flush so
+        # the next table starts its OWN header + separator.
+        segments = raw_line.split(_TABLE_SEP)
+        for seg_idx, line in enumerate(segments):
+            if seg_idx > 0:
+                # Crossed a <table>/</table> boundary — end the prior table here.
                 _flush_table_block()
                 table_block = []
-                out_lines.append(prefix)
-            cells = [c.replace("\n", " ").strip() for c in rest.split(_CELL_SEP)]
-            cells = [c for c in cells if c]
-            if not cells:
+            if _CELL_SEP in line:
+                # Any text BEFORE the first cell sentinel is prose (a real cell always
+                # opens with _CELL_SEP), so flush any open block, emit the prose on its
+                # own line, and start fresh — it must not be folded into the first cell.
+                prefix, _, rest = line.partition(_CELL_SEP)
+                prefix = prefix.strip()
+                if prefix:
+                    _flush_table_block()
+                    table_block = []
+                    out_lines.append(prefix)
+                # Split into cells POSITIONALLY. The old code dropped every empty cell
+                # (`[c for c in cells if c]`), which shifted later cells LEFT and broke
+                # column alignment (the live 3-col-header-over-1-col-separator and
+                # 14-vs-13 mismatch). We KEEP empty cells in place so cell N stays in
+                # column N; a row whose cells are ALL empty (an Outlook spacer/layout
+                # row) is the ONLY case dropped — it is not data and must not widen the
+                # grid or emit a blank pipe row.
+                cells = [c.replace("\n", " ").strip() for c in rest.split(_CELL_SEP)]
+                if not any(cells):
+                    _flush_table_block()
+                    table_block = []
+                    continue
+                table_block.append(cells)
+            else:
+                # Plain prose (or a heading lifted out from between two tables). Flush
+                # the open block and emit the text on its own line. An empty segment
+                # (a bare table boundary with nothing else) just flushes — it adds no
+                # blank line of its own.
                 _flush_table_block()
                 table_block = []
-                continue
-            table_block.append(cells)
-        else:
-            _flush_table_block()
-            table_block = []
-            out_lines.append(line)
+                if line.strip():
+                    out_lines.append(line)
     _flush_table_block()
     table_block = []
     text = "\n".join(out_lines)

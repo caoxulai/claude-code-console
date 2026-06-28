@@ -2459,6 +2459,136 @@ def test_html_to_text_normal_table_byte_identical_backward_compat():
     )
 
 
+# ─── D-062 follow-up: the format=html flip EXPOSED two pre-existing _html_to_text
+# table bugs on REAL Outlook bodies (QA UAT, ~1/3 of live reports malformed):
+#   (A) EMPTY-CELL COLLAPSE — `cells = [c for c in cells if c]` dropped empty cells
+#       POSITIONALLY, shifting later cells left → a 3-col header over a 1-col '| --- |'
+#       and a 14-vs-13 column-count mismatch = malformed GFM the user reads as garbage.
+#   (B) ADJACENT-TABLE MERGE — `</table>`/`<table>` both became a bare '\n', erasing the
+#       logical-table boundary, so two visually-adjacent Outlook tables fused into one
+#       block (one separator, first table's real header demoted to a caption) and an
+#       inter-table heading ('Automation Test Results:') was swallowed into the prior cell.
+# The fix preserves empty cells positionally and emits ONE separator per logical
+# <table>. These tests FAIL on the pre-fix converter and PASS after. ────────────
+
+
+def test_html_to_text_empty_cell_preserved_positionally_not_collapsed():
+    """ROOT CAUSE A: an empty MIDDLE cell must keep its column position (emit an empty
+    '|  |' slot), NOT be dropped — otherwise later cells shift left and the row's
+    width no longer matches the header/separator (the live 14-vs-13 mismatch)."""
+    html = (
+        "<table>"
+        "<tr><th>Initiative</th><th>Status</th><th>Owner</th><th>ETA</th></tr>"
+        # A real Outlook data row with an EMPTY 'Status' cell (cell 2 blank).
+        "<tr><td>Pallet Tech</td><td></td><td>Gal</td><td>Fri</td></tr>"
+        "<tr><td>Sortation</td><td>RED</td><td>Ayaz</td><td>Mon</td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    header = "| Initiative | Status | Owner | ETA |"
+    assert lines[0] == header
+    assert lines[1] == "| --- | --- | --- | --- |"
+    # The empty 'Status' cell keeps its slot: Gal stays in column 3, ETA in column 4.
+    assert lines[2] == "| Pallet Tech |  | Gal | Fri |"
+    # Every data row has the SAME pipe count as the header (no left-shift mismatch).
+    for ln in lines[2:]:
+        assert ln.count("|") == header.count("|"), repr(ln)
+
+
+def test_html_to_text_all_empty_cell_row_is_not_a_table_row():
+    """A row whose cells are ALL empty (an Outlook spacer/layout row) is NOT data:
+    it must not emit a pipe row and must not widen the grid. (Preserves the ONLY
+    legitimate effect of the old drop-empties filter — skip a fully-blank row.)"""
+    html = (
+        "<table>"
+        "<tr><th>Metric</th><th>Value</th></tr>"
+        "<tr><td></td><td></td></tr>"            # all-empty spacer row
+        "<tr><td>Revenue</td><td>10</td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "| Metric | Value |"
+    assert lines[1] == "| --- | --- |"
+    assert lines[2] == "| Revenue | 10 |"
+    # No all-empty pipe row leaked through.
+    assert "|  |  |" not in out
+
+
+def test_html_to_text_adjacent_tables_get_separate_separators():
+    """ROOT CAUSE B: two visually-adjacent Outlook tables of DIFFERENT widths must
+    each render as their own valid GFM table (own header + own separator), NOT fuse
+    into one block where the first table's header is demoted to a caption."""
+    html = (
+        "<table><tr><th>A</th><th>B</th></tr>"
+        "<tr><td>1</td><td>2</td></tr></table>"
+        "<table><tr><th>C</th><th>D</th><th>E</th></tr>"
+        "<tr><td>3</td><td>4</td><td>5</td></tr></table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # First table: 2-col header + 2-col separator, NOT demoted to a caption.
+    assert lines[0] == "| A | B |"
+    assert lines[1] == "| --- | --- |"
+    assert lines[2] == "| 1 | 2 |"
+    # Second table: its OWN 3-col header + 3-col separator.
+    assert lines[3] == "| C | D | E |"
+    assert lines[4] == "| --- | --- | --- |"
+    assert lines[5] == "| 3 | 4 | 5 |"
+    # Exactly TWO separators (one per logical table), of the right widths.
+    seps = [ln for ln in lines if set(ln) <= set("|- ") and "-" in ln]
+    assert seps == ["| --- | --- |", "| --- | --- | --- |"]
+
+
+def test_html_to_text_inter_table_heading_survives_between_two_tables():
+    """ROOT CAUSE B (heading drop): a heading BETWEEN two tables ('Automation Test
+    Results:') must stay on its own prose line — never fused into the prior table's
+    last cell, and both tables keep their own separator."""
+    html = (
+        "<table><tr><th>Build</th><th>Status</th></tr>"
+        "<tr><td>main</td><td>GREEN</td></tr></table>"
+        "<p>Automation Test Results:</p>"
+        "<table><tr><th>Suite</th><th>Pass</th></tr>"
+        "<tr><td>e2e</td><td>98%</td></tr></table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # The heading is its own prose line, NOT glued onto '| main | GREEN |'.
+    assert "Automation Test Results:" in lines
+    assert "| main | GREEN Automation Test Results: |" not in out
+    assert "| main | GREEN |" in lines
+    # The second table still gets its own separator.
+    assert out.count("| --- | --- |") == 2
+
+
+def test_html_to_text_real_outlook_report_no_width_mismatch():
+    """END-TO-END regression for the QA UAT failure: a real-shaped status report
+    (merged title + a 4-col grid carrying empty cells) yields a separator whose
+    pipe-column count MATCHES every data row — no 3-over-1 / 14-vs-13 mismatch."""
+    html = (
+        "<table>"
+        "<tr><td>XBPS Tech Initiatives Weekly Status Report</td></tr>"   # merged title
+        "<tr><th>Initiative</th><th>Status</th><th>Key Update This Week</th>"
+        "<th>Next Milestone</th></tr>"
+        "<tr><td>Pallet Tech</td><td>GREEN</td><td></td><td>Expand to AWD2</td></tr>"
+        "<tr><td>Sortation</td><td></td><td>Vendor slip</td><td></td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "**XBPS Tech Initiatives Weekly Status Report**"
+    header = "| Initiative | Status | Key Update This Week | Next Milestone |"
+    assert header in lines
+    hidx = lines.index(header)
+    sep = lines[hidx + 1]
+    assert sep == "| --- | --- | --- | --- |"
+    # Every pipe row in the table has the SAME column count as the separator.
+    for ln in lines[hidx:]:
+        if ln.startswith("|"):
+            assert ln.count("|") == sep.count("|"), repr(ln)
+
+
 # ─── D-052: backfill an un-fetchable body from a copy quoted in another thread ──
 # Some Graph message_ids fail get_email persistently (observed: a standalone
 # original whose id 400s every time) while the SAME message is quoted inside a
