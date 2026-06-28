@@ -2420,6 +2420,23 @@ def _html_to_text(html: str) -> str:
             out_lines.append("| " + " | ".join(padded) + " |")
             if i == 0:
                 out_lines.append("| " + " | ".join(["---"] * data_width) + " |")
+        # THE ADJACENT-BLOCK FUSION DEFECT (D-063 AC-1 live tail): when this full
+        # table is IMMEDIATELY followed by ANOTHER table block (two stacked Outlook
+        # tables of DIFFERENT widths, or a width-1 flowchart connector table after a
+        # 2-col header) with NO blank line between them, remark-gfm reads the next
+        # block's rows as MORE data rows of THIS table — fixing the column count from
+        # THIS header — so a width-3 (or width-1) follow-on row mismatches this width-2
+        # separator and remark-gfm refuses the fused table, rendering raw pipe text.
+        # That is exactly the 'data-row width 3 != separator 2' (Hydra-Kirin ragged
+        # nested layout) and 'data-row width 1 != separator 2' (MAP Automation ▼/EPR
+        # connector) live mismatches. A GFM table ENDS at a blank line, so we terminate
+        # the block with one trailing blank line — the SAME guard the caption /
+        # degenerate-single-cell paths already use. The trailing-blank run is collapsed
+        # by the later `\n{3,}` squeeze, so a table with prose after it is unchanged
+        # byte-for-byte (a single blank line was already there); only the
+        # table-immediately-after-table case gains the separating blank line. Idempotent
+        # (a blank line carries no sentinel) and loss-free (adds whitespace only).
+        out_lines.append("")
 
     for raw_line in lines:
         # A logical <table>/</table> boundary (the _TABLE_SEP sentinel) ends the

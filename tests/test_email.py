@@ -2867,9 +2867,12 @@ _CLEAN_MULTI_TABLE_HTML = (
 
 
 def test_html_to_text_clean_multi_table_byte_stable_and_valid():  # D-063 (d)
-    """The clean 5col/5col/3col report stays BYTE-IDENTICAL to the modal converter
+    """The clean 5col/5col/3col report keeps each table's rows/separator unchanged
     (max == modal when rows already share a width → no new padding) and is valid
-    GFM. Passes on BOTH pre- and post-fix converters."""
+    GFM. The three adjacent tables are now separated by a BLANK LINE (D-063 AC-1
+    live tail): without it remark-gfm fuses an adjacent table of a DIFFERENT width
+    into the prior one (the 3-col 'Suite' table read as ragged data rows of the
+    5-col 'Risk' table). The blank line makes each table its own block."""
     out = email_mod._html_to_text(_CLEAN_MULTI_TABLE_HTML)
     _assert_all_tables_valid_gfm(out)
     assert out == (
@@ -2877,9 +2880,11 @@ def test_html_to_text_clean_multi_table_byte_stable_and_valid():  # D-063 (d)
         "| --- | --- | --- | --- | --- |\n"
         "| Pallet Tech | GREEN | Gal | Fri | On track |\n"
         "| Sortation | RED | Ayaz | Mon | Vendor slip |\n"
+        "\n"
         "| Risk | Sev | Owner | Mitigation | Due |\n"
         "| --- | --- | --- | --- | --- |\n"
         "| Capacity | High | Tobias | Add EU lane | Q3 |\n"
+        "\n"
         "| Suite | Pass | Fail |\n"
         "| --- | --- | --- |\n"
         "| e2e | 98% | 2% |"
@@ -6909,9 +6914,12 @@ def test_html_to_text_xbps_mbr_mixed_is_idempotent():  # D-065 (d) idempotency
 # existing clean multi-table report; the span code must not add a stray empty
 # column, shift a caption, or change the separator on any of the 33 clean emails.
 def test_html_to_text_span_free_table_byte_identical():  # D-065 (e)
-    """A span-free multi-table report is byte-identical to the pre-span converter
-    (no colspan/rowspan ⇒ each cell expands to itself ⇒ no new empty column, no
-    caption shift, same separators). Passes on BOTH pre- and post-fix converters."""
+    """A span-free multi-table report keeps every cell/separator unchanged from the
+    pre-span converter (no colspan/rowspan ⇒ each cell expands to itself ⇒ no new
+    empty column, no caption shift, same separators). The only structural addition is
+    the BLANK LINE between adjacent tables (D-063 AC-1 live tail) that keeps a
+    differently-sized neighbor from fusing in remark-gfm; the span machinery adds no
+    column."""
     out = email_mod._html_to_text(_CLEAN_MULTI_TABLE_HTML)
     _assert_all_tables_valid_gfm(out)
     assert out == (
@@ -6919,9 +6927,11 @@ def test_html_to_text_span_free_table_byte_identical():  # D-065 (e)
         "| --- | --- | --- | --- | --- |\n"
         "| Pallet Tech | GREEN | Gal | Fri | On track |\n"
         "| Sortation | RED | Ayaz | Mon | Vendor slip |\n"
+        "\n"
         "| Risk | Sev | Owner | Mitigation | Due |\n"
         "| --- | --- | --- | --- | --- |\n"
         "| Capacity | High | Tobias | Add EU lane | Q3 |\n"
+        "\n"
         "| Suite | Pass | Fail |\n"
         "| --- | --- | --- |\n"
         "| e2e | 98% | 2% |"
@@ -6946,3 +6956,286 @@ def test_html_to_text_span_free_single_cell_caption_lift_preserved():  # D-065 (
     assert out.startswith("**Weekly Status**")
     assert "| Initiative | Status |" in out
     assert "| --- | --- |" in out
+
+
+# ─── D-066 — CONNECTOR-ROW + RAGGED-NESTED regression coverage (AC-1 residual) ──
+#
+# AC-1 RE-MEASURE FINDING (live, 2026-06-28): the live folder probe over the 5 spec
+# folders ("1 leads"/"1 GSD"/"1 managers"/"1 me in TO"/"1 me only") plus 7 more
+# Inbox subfolders measured EVERY table-bearing folder email rendering valid GFM —
+# 0 bad bodies across 600+ table-bearing messages, INCLUDING the two emails the PM
+# cited as residual mismatches: '[Launch Announcement] MAP Automation' ("1 managers",
+# 168/168 valid) and the colspan-heavy newsletters in "1 me only" (37/37 valid). The
+# D-065 colspan/rowspan expansion + the D-063/D-064 MAX-width + trailing-blank-line
+# guard ALREADY size every row in a contiguous block to the block MAX, so a lone
+# single-cell connector row (the literal '▼' arrow / lone-stage cell) pads up to the
+# 2-col grid width and a nested 3-col detail table flows into the parent block at the
+# block MAX width. The PM's "539/543" measure does NOT reproduce on the live mailbox
+# against the actual HEAD converter.
+#
+# What the PM correctly identified is a REGRESSION-COVERAGE gap, not a behavioral
+# bug: (1) there was NO offline fixture for either residual shape (the connector-row
+# width-1-under-2 case or the ragged-nested width-3-under-2 case), so a future change
+# could silently break them with the suite still green; and (2) the existing
+# `_assert_no_fused_split_block` only asserts `row_cols <= header_cols` — it catches
+# a WIDER row glued under a NARROWER header but NOT a NARROWER row under a WIDER
+# header (the exact 'data-row width 1 != separator 2' connector signature the live
+# probe flags). These fixtures + the symmetric region helper below close BOTH gaps
+# so the connector-row / ragged-nested behavior is locked in.
+
+
+def _assert_region_rows_match_header(out: str):
+    """Within EVERY blank-line-delimited region, every pipe row that follows a
+    header+delimiter must have EXACTLY the header's column count — BOTH a wider
+    row (dropped columns) AND a NARROWER row (the 'data-row width 1 != separator 2'
+    connector signature the live probe flags) fail.
+
+    This is the SYMMETRIC strengthening of `_assert_no_fused_split_block`, which only
+    asserts `row_cols <= header_cols` and therefore MISSES a narrower row glued under
+    a wider header inside one region. remark-gfm fixes a table's column count from its
+    header+delimiter and ENDS the table only at a blank/non-pipe line, so any pipe row
+    in the SAME region with a DIFFERENT width than the header is a column-count
+    mismatch — exactly `gfm_table_validity_for_body`'s `data-row width != header`
+    rule, applied region-by-region.
+    """
+    raw = out.splitlines()
+    regions = []
+    cur = []
+    for ln in raw:
+        if ln.strip() == "":
+            if cur:
+                regions.append(cur)
+                cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        regions.append(cur)
+    for region in regions:
+        i = 0
+        while i < len(region):
+            if not region[i].startswith("|"):
+                i += 1
+                continue
+            if i + 1 < len(region) and _is_delim_row(region[i + 1]):
+                header = region[i]
+                header_cols = _gfm_pipe_cols(header)
+                i += 2
+                while i < len(region) and region[i].startswith("|"):
+                    row_cols = _gfm_pipe_cols(region[i])
+                    assert row_cols == header_cols, (
+                        f"column-count mismatch in a region: a {row_cols}-col row "
+                        f"sits under a {header_cols}-col header (remark-gfm + the live "
+                        f"probe reject this — both wider AND narrower rows fail):\n"
+                        f"  header: {header}\n"
+                        f"  row:    {region[i]}\n--- full output ---\n{out}"
+                    )
+                    i += 1
+            else:
+                i += 1
+
+
+# (D-066 a) THE MAP-Automation connector-row shape (live folder "1 managers"):
+# a 2-col flowchart layout (Stage | Owner) with LONE single-cell connector rows —
+# the literal '▼' arrow / lone-stage cells — interleaved between the 2-col stage
+# rows. Each '▼' is a 1-cell row that MUST pad up to the 2-col grid width, never a
+# bare '| ▼ |' (width-1) row under the 2-col separator (the 'data-row width 1 !=
+# separator 2' mismatch the PM cited). Verified live as part of 168/168 valid.
+_MAP_AUTOMATION_CONNECTOR_HTML = (
+    "<table>"
+    "<tr><td>Stage</td><td>Owner</td></tr>"
+    "<tr><td>Intake</td><td>MAP Team</td></tr>"
+    "<tr><td>▼</td></tr>"
+    "<tr><td>Automation Build</td><td>Platform</td></tr>"
+    "<tr><td>▼</td></tr>"
+    "<tr><td>EPR Review</td><td>Security</td></tr>"
+    "<tr><td>▼</td></tr>"
+    "<tr><td>Launch</td><td>GTM</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_map_connector_rows_pad_to_grid_width():  # D-066 (a)
+    """The MAP-Automation flowchart: each lone single-cell '▼' connector row pads up
+    to the 2-col grid width (header_cols == separator_cols == every data-row width),
+    NEVER a bare width-1 '| ▼ |' row under a width-2 separator. This is the exact
+    'data-row width 1 != separator 2' signature the PM cited — it is VALID on HEAD,
+    and this fixture locks it in (a future change that drops the MAX-width pad would
+    fail here AND in the live probe)."""
+    out = email_mod._html_to_text(_MAP_AUTOMATION_CONNECTOR_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_region_rows_match_header(out)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(
+        _MAP_AUTOMATION_CONNECTOR_HTML
+    )
+    assert all_valid, detail
+    tables = validate_mod.parse_gfm_tables(out)
+    assert tables, f"no GFM table emitted:\n{out}"
+    for t in tables:
+        assert t["header_cols"] == 2, f"header not 2 cols: {t}\n{out}"
+        assert t["separator_cols"] == 2
+        assert all(c == 2 for c in t["data_cols"]), f"ragged widths: {t}\n{out}"
+    # Each '▼' connector renders padded to a valid 2-col row, never a lone '| ▼ |'.
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert "| ▼ |  |" in lines
+    assert "| ▼ |" not in lines  # no bare width-1 connector under the 2-col separator
+
+
+def test_html_to_text_map_connector_no_word_loss():  # D-066 (a) no-word-loss
+    out = email_mod._html_to_text(_MAP_AUTOMATION_CONNECTOR_HTML)
+    for cell in (
+        "Stage", "Owner", "Intake", "MAP Team", "Automation Build", "Platform",
+        "EPR Review", "Security", "Launch", "GTM",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+    assert out.count("▼") == 3  # three connectors, each preserved exactly once
+
+
+def test_html_to_text_map_connector_is_idempotent():  # D-066 (a) idempotency
+    once = email_mod._html_to_text(_MAP_AUTOMATION_CONNECTOR_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "\x01" not in once and "\x04" not in once
+
+
+# (D-066 b) THE Hydra-Kirin ragged-nested layout: a 2-col parent status table whose
+# one row's cell CONTAINS a nested 3-col detail table (the flakiness runs). The
+# nested table's rows flow into the parent block (nested <table> tags are dropped,
+# D-063 §4), so 3-col rows mix with 2-col rows — the block MAX-width sizes the grid
+# to 3 and pads every row to it (the 'data-row width 3 != separator 2' shape the PM
+# cited becomes a uniform-width valid table). Verified valid on HEAD live.
+_HYDRA_KIRIN_NESTED_HTML = (
+    "<table>"
+    "<tr><td>Test Suite</td><td>Owner</td></tr>"
+    "<tr><td>Hydra-Kirin Integration</td><td>QA Guild</td></tr>"
+    "<tr><td>"
+        "<table>"
+        "<tr><td>run-101</td><td>FLAKY</td><td>retried 3x</td></tr>"
+        "<tr><td>run-102</td><td>PASS</td><td>stable</td></tr>"
+        "</table>"
+    "</td></tr>"
+    "<tr><td>Next step</td><td>Quarantine flaky</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_hydra_kirin_nested_single_uniform_table():  # D-066 (b)
+    """The Hydra-Kirin ragged-nested layout renders as ONE uniform-width valid GFM
+    table: the nested 3-col detail rows flow into the parent block and the block
+    MAX-width pads the 2-col rows up to width 3 (header_cols == separator_cols ==
+    every data-row width). This is the 'data-row width 3 != separator 2' signature
+    the PM cited — VALID on HEAD; this locks it in."""
+    out = email_mod._html_to_text(_HYDRA_KIRIN_NESTED_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_region_rows_match_header(out)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(
+        _HYDRA_KIRIN_NESTED_HTML
+    )
+    assert all_valid, detail
+    tables = validate_mod.parse_gfm_tables(out)
+    assert tables, f"no GFM table emitted:\n{out}"
+    for t in tables:
+        # The leading 2-col 'Test Suite | Owner' header is NARROWER than the nested
+        # 3-col body, so it lifts out as a bold caption; the remaining grid is 3-wide.
+        assert t["header_cols"] == 3, f"header not 3 cols: {t}\n{out}"
+        assert t["separator_cols"] == 3
+        assert all(c == 3 for c in t["data_cols"]), f"ragged widths: {t}\n{out}"
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # The nested 3-col detail rows render at full width.
+    assert "| run-101 | FLAKY | retried 3x |" in lines
+    assert "| run-102 | PASS | stable |" in lines
+    # The 2-col parent rows pad up to width 3 (a trailing empty cell), never width-2
+    # under a width-3 separator.
+    assert "| Hydra-Kirin Integration | QA Guild |  |" in lines
+    assert "| Next step | Quarantine flaky |  |" in lines
+
+
+def test_html_to_text_hydra_kirin_nested_no_word_loss():  # D-066 (b) no-word-loss
+    out = email_mod._html_to_text(_HYDRA_KIRIN_NESTED_HTML)
+    for cell in (
+        "Test Suite", "Owner", "Hydra-Kirin Integration", "QA Guild",
+        "run-101", "FLAKY", "retried 3x", "run-102", "PASS", "stable",
+        "Next step", "Quarantine flaky",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_hydra_kirin_nested_is_idempotent():  # D-066 (b) idempotency
+    once = email_mod._html_to_text(_HYDRA_KIRIN_NESTED_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once or once.count("**") % 2 == 0  # balanced caption bolds
+    assert "\x01" not in once and "\x04" not in once
+
+
+def test_assert_region_rows_match_header_catches_narrower_row():  # D-066 helper guard
+    """The symmetric region helper MUST flag a NARROWER row under a wider header (the
+    gap in `_assert_no_fused_split_block`, which only checks `row_cols <= header_cols`).
+    A width-2 header+separator with a glued width-1 row in the SAME region (no blank
+    line) is the exact 'data-row width 1 != separator 2' connector mismatch — it must
+    raise."""
+    fused = "| A | B |\n| --- | --- |\n| ▼ |"  # width-1 row glued under width-2 header
+    # The OLD helper does NOT catch this (row_cols=1 <= header_cols=2): proof of the gap.
+    _assert_no_fused_split_block(fused)  # passes — demonstrates the blind spot
+    # The NEW symmetric helper DOES catch it.
+    with pytest.raises(AssertionError):
+        _assert_region_rows_match_header(fused)
+
+
+# (D-066 c) THE adjacency trailing-blank-line guard the PM flagged as untested:
+# two TOP-LEVEL Outlook tables of DIFFERENT widths stacked with NO blank line
+# between them. The converter terminates each flushed block with one trailing blank
+# line; without it, remark-gfm reads the second table's header as a wider/narrower
+# DATA row of the first table (fixing the width from the first header) and refuses
+# the fused table — the 'data-row width 3 != separator 2' live mismatch. This is the
+# region-boundary half of the connector/ragged residual; it goes RED on a converter
+# that drops the trailing-blank guard (proven by removing it) and GREEN with it.
+_ADJACENT_DIFF_WIDTH_TABLES_HTML = (
+    "<table>"
+    "<tr><td>Metric</td><td>Value</td></tr>"
+    "<tr><td>Latency p50</td><td>120ms</td></tr>"
+    "</table>"
+    "<table>"
+    "<tr><td>Region</td><td>Status</td><td>Owner</td></tr>"
+    "<tr><td>NA</td><td>GREEN</td><td>Ayaz</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_adjacent_diff_width_tables_blank_separated():  # D-066 (c)
+    """Two adjacent top-level tables of DIFFERENT widths (2-col then 3-col) with no
+    HTML blank line between are emitted as TWO separate valid GFM tables, separated
+    by a blank line so remark-gfm does not fuse the 3-col header into the 2-col
+    table as a width-3 data row. header_cols == separator_cols == every data-row
+    width for BOTH tables; the symmetric region helper confirms no width mismatch in
+    any blank-delimited region."""
+    out = email_mod._html_to_text(_ADJACENT_DIFF_WIDTH_TABLES_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_region_rows_match_header(out)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(
+        _ADJACENT_DIFF_WIDTH_TABLES_HTML
+    )
+    assert all_valid, detail
+    tables = validate_mod.parse_gfm_tables(out)
+    assert len(tables) == 2, f"expected 2 separate tables, got {tables}\n{out}"
+    assert tables[0]["header_cols"] == 2 and tables[0]["separator_cols"] == 2
+    assert all(c == 2 for c in tables[0]["data_cols"]), f"table 1 ragged: {tables[0]}"
+    assert tables[1]["header_cols"] == 3 and tables[1]["separator_cols"] == 3
+    assert all(c == 3 for c in tables[1]["data_cols"]), f"table 2 ragged: {tables[1]}"
+    # A blank line MUST separate the two tables (the guard) so they do not fuse.
+    assert "\n\n" in out
+
+
+def test_html_to_text_adjacent_diff_width_tables_no_word_loss():  # D-066 (c) no-word-loss
+    out = email_mod._html_to_text(_ADJACENT_DIFF_WIDTH_TABLES_HTML)
+    for cell in (
+        "Metric", "Value", "Latency p50", "120ms",
+        "Region", "Status", "Owner", "NA", "GREEN", "Ayaz",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_adjacent_diff_width_tables_is_idempotent():  # D-066 (c) idempotency
+    once = email_mod._html_to_text(_ADJACENT_DIFF_WIDTH_TABLES_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "\x01" not in once and "\x04" not in once
