@@ -6350,3 +6350,594 @@ def test_validate_gfm_table_probe_email_read_carries_no_markas():
     _vrun(validate_mod.gfm_table_probe(allowlist=["1 GSD"], call_read=fake_call_read))
     assert seen and all("markAs" not in c for c in seen), \
         "every probe email_read must omit markAs (never mark folder mail read)"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-064 — THE SPLIT-BLOCK DEFECT (the AC-1/AC-2/AC-4 PM miss).
+#
+# Root cause (live-confirmed): _html_to_text FLUSHED a contiguous table block on
+# an all-empty Outlook SPACER row (`if not any(cells): _flush_table_block()`) and
+# emitted NO blank line between consecutive flushed blocks. So a real newsletter
+# body — a single-cell SECTION-TITLE row, an all-empty spacer row, then a
+# multi-column data grid — became a 1-col header+separator IMMEDIATELY followed by
+# the wider grid with no blank line. remark-gfm fixes a table's column count from
+# its HEADER+delimiter, so it parses the two blocks as ONE table with a 1-col
+# header (shape [1, N, N, …]) and DROPS every data column past column 1 — the
+# literal-pipe-junk / column-loss the AC-1 probe still saw (h3/s2 96x, h2/s1 34x).
+#
+# The D-063 offline fixtures were BOGUS-GREEN: they are uniform single-level tables
+# with NO spacer-row interleaving, so they never triggered the flush. These
+# fixtures carry the REAL spacer interleaving and FAIL on the pre-fix converter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _assert_no_fused_split_block(out: str):
+    """Catch the split-block fusion signature exactly as remark-gfm parses it.
+
+    remark-gfm fixes a table's column count from its HEADER+delimiter and groups
+    EVERY following pipe row (regardless of cell count) into that table until a
+    BLANK LINE (or a non-pipe line) ends it — a mid-block delimiter does NOT start
+    a new table, it becomes a data row. So a 1-col section-title header glued (no
+    blank line) to a wider grid yields shape [1, N, N, …]: remark-gfm DROPS every
+    column past the header width. This check mirrors that grouping: within each
+    blank-line-/prose-delimited region, the first pipe-row+delimiter is the header
+    and NO subsequent pipe row may be WIDER than it (= dropped columns).
+
+    This is STRONGER than _assert_all_tables_valid_gfm, which only checks that the
+    converter's OWN emitted widths agree per-block — the fusion bug is internally
+    self-consistent per emitted block (the 1-col title block looks "valid"), so only
+    a region-walk that respects remark-gfm's blank-line table boundaries catches it.
+    """
+    # Split into blank-line-delimited regions (remark-gfm table boundary). A line is
+    # "blank" when it has no visible content.
+    raw = out.splitlines()
+    regions = []
+    cur = []
+    for ln in raw:
+        if ln.strip() == "":
+            if cur:
+                regions.append(cur)
+                cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        regions.append(cur)
+    for region in regions:
+        i = 0
+        while i < len(region):
+            if not region[i].startswith("|"):
+                i += 1
+                continue
+            if i + 1 < len(region) and _is_delim_row(region[i + 1]):
+                header = region[i]
+                header_cols = _gfm_pipe_cols(header)
+                i += 2
+                # Every following pipe row in THIS region belongs to the table
+                # (remark-gfm does not start a new table without a blank line).
+                while i < len(region) and region[i].startswith("|"):
+                    if _is_delim_row(region[i]):
+                        # A mid-table delimiter row: remark-gfm treats it as a DATA
+                        # row whose width is its pipe-column count.
+                        row_cols = _gfm_pipe_cols(region[i])
+                    else:
+                        row_cols = _gfm_pipe_cols(region[i])
+                    assert row_cols <= header_cols, (
+                        f"split-block fusion: a {row_cols}-col row sits under a "
+                        f"{header_cols}-col header — remark-gfm fixes width from the "
+                        f"header and DROPS the extra columns:\n"
+                        f"  header: {header}\n"
+                        f"  row:    {region[i]}\n--- full output ---\n{out}"
+                    )
+                    i += 1
+            else:
+                i += 1
+
+
+def _gfm_pipe_cols(ln: str) -> int:
+    """Column count of a GFM pipe row = number of cells between the outer pipes.
+    A leading+trailing '|' wrapping N cells has N+1 pipes → N columns."""
+    return ln.count("|") - 1
+
+
+# (D-064 a) THE REAL newsletter shape behind AC-1: a single-cell SECTION TITLE,
+# an all-empty Outlook SPACER row, then the multi-column data grid. On the pre-fix
+# converter the spacer FLUSHES the block, so the title becomes a 1-col table glued
+# to the wider grid and remark-gfm drops the data columns. Must render as ONE
+# valid table where the title pads to the grid width.
+_NEWSLETTER_SPACER_TABLE_HTML = (
+    "<table>"
+    "<tr><td>This Week At A Glance</td></tr>"        # single-cell section title
+    "<tr><td></td><td></td><td></td></tr>"           # all-empty spacer row
+    "<tr><th>Initiative</th><th>Status</th><th>Owner</th></tr>"
+    "<tr><td>Pallet Tech</td><td>GREEN</td><td>Gal</td></tr>"
+    "<tr><td>Sortation</td><td>RED</td><td>Ayaz</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_newsletter_spacer_no_split_block():  # D-064 (a) AC-1
+    """A section-title row + an all-empty spacer + a wider grid must NOT split into
+    a 1-col title table glued to the grid (remark-gfm drops the data columns).
+    The spacer is dropped; the grid stays ONE valid MAX-width table (the leading
+    merged-title row lifts to a bold caption above it, D-061 §1 preserved)."""
+    out = email_mod._html_to_text(_NEWSLETTER_SPACER_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    # The data columns survive (Status/Owner not dropped by a 1-col fusion).
+    assert "GREEN" in out and "Gal" in out and "RED" in out and "Ayaz" in out
+    # Exactly ONE separator for the single grid (no spacer-driven second block).
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    seps = [ln for ln in lines if _is_delim_row(ln)]
+    assert seps == ["| --- | --- | --- |"], f"expected one 3-col separator, got {seps}\n{out}"
+
+
+def test_html_to_text_newsletter_spacer_no_word_loss():  # D-064 (a) no-word-loss
+    out = email_mod._html_to_text(_NEWSLETTER_SPACER_TABLE_HTML)
+    for cell in (
+        "This Week At A Glance", "Initiative", "Status", "Owner",
+        "Pallet Tech", "GREEN", "Gal", "Sortation", "RED", "Ayaz",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_newsletter_spacer_is_idempotent():  # D-064 (a) idempotency
+    once = email_mod._html_to_text(_NEWSLETTER_SPACER_TABLE_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+
+
+# (D-064 b) AC-2 REAL Zoom-invite: the same key/value block but with an all-empty
+# spacer row and an nbsp-only spacer interleaved (as Outlook actually emits them).
+# Must render as a single valid 2-col table — labeled URL/ID/passcode rows — not a
+# 1-col fusion that drops the values.
+_ZOOM_KV_SPACER_TABLE_HTML = (
+    "<table>"
+    "<tr><td>Join Zoom Meeting</td></tr>"            # single-cell section title
+    "<tr><td></td><td></td></tr>"                    # all-empty spacer row
+    "<tr><td>Meeting URL:</td><td>https://amazon.zoom.us/j/9988776655</td></tr>"
+    "<tr><td>Meeting ID:</td><td>998 877 6655</td></tr>"
+    "<tr><td>Passcode:</td><td>x7Kp2q</td></tr>"
+    "<tr><td>&nbsp;</td></tr>"                        # nbsp-only spacer row
+    "<tr><td>Quick Reference</td></tr>"
+    "<tr><td>One tap mobile:</td><td>+1-253-555-0142,,9988776655#</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_zoom_kv_spacer_renders_labeled_2col():  # D-064 (b) AC-2
+    """The REAL Zoom block (spacer-interleaved) renders the labeled URL/ID/passcode
+    rows as real 2-col rows in a SINGLE valid table — not a 1-col fusion that drops
+    the value column."""
+    out = email_mod._html_to_text(_ZOOM_KV_SPACER_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert "| Meeting URL: | https://amazon.zoom.us/j/9988776655 |" in lines
+    assert "| Meeting ID: | 998 877 6655 |" in lines
+    assert "| Passcode: | x7Kp2q |" in lines
+    # The value column must survive (not dropped by a 1-col header fusion).
+    assert "https://amazon.zoom.us/j/9988776655" in out
+
+
+def test_html_to_text_zoom_kv_spacer_no_word_loss():  # D-064 (b) no-word-loss
+    out = email_mod._html_to_text(_ZOOM_KV_SPACER_TABLE_HTML)
+    for cell in (
+        "Join Zoom Meeting", "Meeting URL:", "https://amazon.zoom.us/j/9988776655",
+        "Meeting ID:", "998 877 6655", "Passcode:", "x7Kp2q",
+        "Quick Reference", "One tap mobile:", "+1-253-555-0142,,9988776655#",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_zoom_kv_spacer_is_idempotent():  # D-064 (b) idempotency
+    once = email_mod._html_to_text(_ZOOM_KV_SPACER_TABLE_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+
+
+# (D-064 c) AC-4 REAL offsite: the nested/colspan agenda WITH an empty spacer row
+# interleaved before the colspan single-cell row (the deeper real shape the PM
+# flagged). Every table must be valid and no spacer-driven 1-col fusion.
+_NESTED_OFFSITE_SPACER_HTML = (
+    "<table>"
+    "<tr><th>Time</th><th>Agenda Item</th><th>Owner</th></tr>"
+    "<tr><td>09:00</td><td>Welcome &amp; goals</td><td>Maria</td></tr>"
+    "<tr><td>09:30</td>"
+    "<td>Logistics"
+    "<table>"
+    "<tr><td>Meeting URL:</td><td>https://amazon.zoom.us/j/55512345</td></tr>"
+    "<tr><td></td><td></td></tr>"                    # spacer INSIDE the nested table
+    "<tr><td>Meeting ID:</td><td>555 123 45</td></tr>"
+    "<tr><td>Passcode:</td><td>offsite2026</td></tr>"
+    "</table>"
+    "</td>"
+    "<td>Devon</td></tr>"
+    "<tr><td></td><td></td><td></td></tr>"           # all-empty spacer row
+    "<tr><td>Lunch break (everyone)</td></tr>"       # colspan single-cell row
+    "<tr><td>13:00</td><td>Breakouts</td><td>All</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_nested_offsite_spacer_all_valid():  # D-064 (c) AC-4
+    """The REAL offsite invite (nested Zoom block + spacer rows + colspan row):
+    every emitted GFM table is valid AND no spacer-driven 1-col split-block
+    fusion. The colspan 'Lunch break' row pads into the agenda grid, and a spacer
+    row INSIDE the nested Zoom block must NOT flush mid-parent-row — which (pre-fix)
+    lifted 'Meeting ID: 555 123 45' into a bold caption and fused 'Devon' onto the
+    'Passcode:' row, corrupting the agenda."""
+    out = email_mod._html_to_text(_NESTED_OFFSITE_SPACER_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    # A nested-block spacer must NOT flush mid-parent-row. Pre-fix the spacer inside
+    # the nested Zoom block FLUSHED the open block, demoting 'Meeting ID: 555 123 45'
+    # into a bold caption (two cells mangled into one prose blob) and starting a new
+    # ragged block. After the fix the nested rows stay padded rows in the parent grid.
+    assert "**Meeting ID:" not in out, f"nested Zoom row mangled into a caption:\n{out}"
+    assert "Meeting ID: 555 123 45" not in out, \
+        f"two nested cells fused into one prose blob:\n{out}"
+    # The nested Zoom key/value rows survive as labeled rows (value column kept).
+    assert "555 123 45" in out and "offsite2026" in out
+    # 'Devon' survives (no word loss); the 2D nested→1D flatten may place it in a
+    # padded row, but it must NOT be orphaned into a width-1 half-table.
+    assert "Devon" in out
+    assert "| Devon |" not in [ln for ln in out.splitlines()], \
+        f"'Devon' orphaned into a width-1 half-table:\n{out}"
+
+
+def test_html_to_text_nested_offsite_spacer_no_word_loss():  # D-064 (c) no-word-loss
+    out = email_mod._html_to_text(_NESTED_OFFSITE_SPACER_HTML)
+    for cell in (
+        "Time", "Agenda Item", "Owner", "09:00", "Welcome & goals", "Maria",
+        "09:30", "Devon", "Meeting URL:", "https://amazon.zoom.us/j/55512345",
+        "Meeting ID:", "555 123 45", "Passcode:", "offsite2026",
+        "Lunch break (everyone)", "13:00", "Breakouts", "All",
+    ):
+        assert cell in out, f"cell text lost: {cell!r}"
+
+
+def test_html_to_text_nested_offsite_spacer_is_idempotent():  # D-064 (c) idempotency
+    once = email_mod._html_to_text(_NESTED_OFFSITE_SPACER_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+
+
+# (D-064 d) ADJACENCY without a blank line: a single-cell section-title-only table
+# directly followed by a wider grid (two TOP-LEVEL tables). remark-gfm fuses two
+# pipe blocks with NO blank line between them into one table (1-col header → drops
+# the grid's columns). The fix emits a blank line between consecutive flushed
+# blocks so they stay TWO independent valid tables.
+_ADJACENT_TITLE_THEN_GRID_HTML = (
+    "<table><tr><td>Weekly Status</td></tr></table>"
+    "<table>"
+    "<tr><th>Initiative</th><th>Status</th><th>Owner</th></tr>"
+    "<tr><td>Pallet Tech</td><td>GREEN</td><td>Gal</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_adjacent_title_then_grid_blank_line_separated():  # D-064 (d)
+    """A 1-col section-title table directly adjacent to a 3-col grid must be
+    separated by a blank line so remark-gfm does NOT fuse them into a 1-col table
+    (which drops Status/Owner). After the fix the two blocks are blank-line
+    separated and each parses as its own valid table."""
+    out = email_mod._html_to_text(_ADJACENT_TITLE_THEN_GRID_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    assert "GREEN" in out and "Gal" in out
+    # The two pipe blocks are separated by a blank line in the raw output.
+    assert "\n\n" in out, f"expected a blank line between the two blocks:\n{out!r}"
+
+
+def test_html_to_text_all_empty_spacer_mid_grid_no_stray_separator():  # D-064 regression
+    """The original mid-grid spacer case (same-width grid) must NOT emit a trailing
+    stray separator from a spacer-driven flush — the spacer is dropped and the grid
+    stays ONE table with exactly one separator."""
+    html = (
+        "<table>"
+        "<tr><th>Metric</th><th>Value</th></tr>"
+        "<tr><td></td><td></td></tr>"                # all-empty spacer row
+        "<tr><td>Revenue</td><td>10</td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    seps = [ln for ln in lines if _is_delim_row(ln)]
+    assert seps == ["| --- | --- |"], f"expected exactly one separator, got {seps}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-065 — COLSPAN / ROWSPAN expansion (the LAST 9 malformed Outlook tables).
+#
+# ROOT CAUSE (verified live 2026-06-28): the cell substitution
+# `re.sub(r"<t[hd][^>]*>", _CELL_SEP, ...)` DISCARDED the colspan/rowspan
+# attributes, so a `<td colspan=3>` became ONE grid cell (narrower than the
+# N-col body → mis-lifted as a caption OR a header_cols<data mismatch), and a
+# `<td rowspan=2>` left the row below SHORT by one cell AND shifted its data into
+# the wrong column. D-063's MAX-width pad-all pass could not reconcile widths or
+# alignment because the spans never reached _flush_table_block.
+#
+# These fixtures are built from the VERIFIED real malformed shapes and each goes
+# RED on the span-DROPPING converter (a colspan'd header lifts to a caption / a
+# rowspan row shifts left → width-or-alignment mismatch) and GREEN after the
+# span-expansion fix. The anti-regression span-free fixture passes on BOTH.
+#
+# USER DECISIONS (do NOT re-litigate):
+#   - colspan=N → text in the FIRST of N columns, N-1 trailing EMPTY cells
+#     (NEVER duplicate the text across the span — `Q3 | Q3 | Q3` is forbidden).
+#   - rowspan=N → text on the cell's FIRST row; the continuation rows get an
+#     EMPTY cell HELD in that SAME column index (positional — the row below must
+#     NOT shift left).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# (D-065 a) colspan=3 header over a 3-col body. Pre-fix the 1-cell header is
+# NARROWER than the body → it is mis-lifted OUT as a bold `**Q3 Results**` caption
+# (the columnar header identity is destroyed). After the fix it expands to a real
+# 3-col header row `| Q3 Results |  |  |` (text-in-first + 2 empties).
+_COLSPAN_HEADER_HTML = (
+    "<table>"
+    "<tr><td colspan=\"3\">Q3 Results</td></tr>"
+    "<tr><td>North</td><td>South</td><td>East</td></tr>"
+    "<tr><td>120</td><td>98</td><td>143</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_colspan_header_expands_to_first_plus_empties():  # D-065 (a)
+    """A `<td colspan=3>` header over a 3-col body expands to text-in-FIRST + 2
+    EMPTY cells (`| Q3 Results |  |  |`), NOT a lifted bold caption and NOT a
+    duplicated `| Q3 Results | Q3 Results | Q3 Results |`. The table is valid GFM
+    (header_cols == separator_cols == every data-row width == 3)."""
+    out = email_mod._html_to_text(_COLSPAN_HEADER_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # The colspan header is a REAL 3-col header row, text in the first cell only.
+    assert lines[0] == "| Q3 Results |  |  |"
+    assert lines[1] == "| --- | --- | --- |"
+    assert lines[2] == "| North | South | East |"
+    assert lines[3] == "| 120 | 98 | 143 |"
+    # It is NOT lifted to a bold caption (the columnar header identity survives).
+    assert "**Q3 Results**" not in out
+    # It is NOT duplicated across the span (no added words).
+    assert "Q3 Results | Q3 Results" not in out
+
+
+def test_html_to_text_colspan_header_no_word_loss():  # D-065 (a) no-word-loss
+    """Every original <td> text survives EXACTLY ONCE — colspan expansion adds
+    only EMPTY cells, never duplicates or drops the text."""
+    out = email_mod._html_to_text(_COLSPAN_HEADER_HTML)
+    for cell in ("Q3 Results", "North", "South", "East", "120", "98", "143"):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_colspan_header_is_idempotent():  # D-065 (a) idempotency
+    once = email_mod._html_to_text(_COLSPAN_HEADER_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+    assert "\x01" not in once and "\x04" not in once  # no sentinel/span markers leak
+
+
+# (D-065 b) rowspan=2 row-label. Pre-fix the second row is SHORT by one cell and
+# its data lands in column 0 (`| y |  |` — y under the EU label, WRONG). After the
+# fix EU's column 0 is HELD with an empty cell on the continuation row and `y`
+# stays in column 1 (`|  | y |` — POSITIONAL alignment preserved).
+_ROWSPAN_LABEL_HTML = (
+    "<table>"
+    "<tr><th>Region</th><th>Metric</th></tr>"
+    "<tr><td rowspan=\"2\">EU</td><td>Revenue 10</td></tr>"
+    "<tr><td>Cost 4</td></tr>"
+    "<tr><td>NA</td><td>Revenue 20</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_rowspan_holds_column_positionally():  # D-065 (b)
+    """A `<td rowspan=2>EU</td>` reserves its COLUMN on the continuation row with an
+    EMPTY cell at the SAME column index — the row below must NOT shift left. EU's
+    metric and the continuation metric stay in column 1 (Metric)."""
+    out = email_mod._html_to_text(_ROWSPAN_LABEL_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "| Region | Metric |"
+    assert lines[1] == "| --- | --- |"
+    # EU on its first row; its metric in column 1 (Metric).
+    assert lines[2] == "| EU | Revenue 10 |"
+    # Continuation row: EU's column 0 HELD empty, 'Cost 4' in column 1 (NOT col 0).
+    assert lines[3] == "|  | Cost 4 |"
+    # The next independent region row is back to normal.
+    assert lines[4] == "| NA | Revenue 20 |"
+
+
+def test_html_to_text_rowspan_no_word_loss():  # D-065 (b) no-word-loss
+    """Every original <td>/<th> text survives EXACTLY ONCE — rowspan expansion adds
+    only an EMPTY held cell, never duplicates the 'EU' label down its rows."""
+    out = email_mod._html_to_text(_ROWSPAN_LABEL_HTML)
+    for cell in ("Region", "Metric", "EU", "Revenue 10", "Cost 4", "NA", "Revenue 20"):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_rowspan_is_idempotent():  # D-065 (b) idempotency
+    once = email_mod._html_to_text(_ROWSPAN_LABEL_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "\x01" not in once and "\x04" not in once
+
+
+# (D-065 c) THE "Permission Health Summary" h1/s1/d[3] header-narrower case. The
+# VERIFIED root cause (traced, not assumed): the leading SECTION header is a
+# colspan'd cell counted as 1, so it sits as a width-1 row over a 3-col body —
+# remark-gfm renders the literal pipe junk. Family-1 colspan expansion widens the
+# colspan'd header to 3 cells so the WHOLE block is one uniform-width valid table.
+# A colspan-heavy newsletter layout grid (the real "1 me only" shape): a banner
+# colspan header, a 3-col body, and a colspan footer.
+_PERMISSION_HEALTH_SUMMARY_HTML = (
+    "<table>"
+    "<tr><td colspan=\"3\">Your Permission Health Summary</td></tr>"
+    "<tr><th>Resource</th><th>Access</th><th>Expires</th></tr>"
+    "<tr><td>prod-s3-bucket</td><td>ReadOnly</td><td>30 days</td></tr>"
+    "<tr><td>billing-dashboard</td><td>Admin</td><td>7 days</td></tr>"
+    "<tr><td colspan=\"3\">Review your access at the IAM console.</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_permission_health_summary_single_uniform_table():  # D-065 (c)
+    """The h1/s1/d[3] header-narrower newsletter renders as a SINGLE uniform-width
+    valid table (3 cols throughout), not literal pipe junk. The colspan banner +
+    colspan footer expand to text-in-first + 2 empties; the 3-col body is intact."""
+    out = email_mod._html_to_text(_PERMISSION_HEALTH_SUMMARY_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    # Cross-check with the faithful (unescaped-pipe) probe: every table 3 cols.
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(
+        _PERMISSION_HEALTH_SUMMARY_HTML
+    )
+    assert all_valid, detail
+    tables = validate_mod.parse_gfm_tables(out)
+    assert tables, f"no GFM table emitted:\n{out}"
+    for t in tables:
+        assert t["header_cols"] == 3, f"header not 3 cols: {t}\n{out}"
+        assert t["separator_cols"] == 3
+        assert all(c == 3 for c in t["data_cols"]), f"ragged data widths: {t}\n{out}"
+    # The colspan banner is a real first-cell-only header row, not a lifted caption.
+    assert "| Your Permission Health Summary |  |  |" in out
+    assert "**Your Permission Health Summary**" not in out
+    # The colspan footer expands to first-cell + 2 empties too.
+    assert "| Review your access at the IAM console. |  |  |" in out
+
+
+def test_html_to_text_permission_health_summary_no_word_loss():  # D-065 (c) no-word-loss
+    out = email_mod._html_to_text(_PERMISSION_HEALTH_SUMMARY_HTML)
+    for cell in (
+        "Your Permission Health Summary", "Resource", "Access", "Expires",
+        "prod-s3-bucket", "ReadOnly", "30 days", "billing-dashboard", "Admin",
+        "7 days", "Review your access at the IAM console.",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_permission_health_summary_is_idempotent():  # D-065 (c) idempotency
+    once = email_mod._html_to_text(_PERMISSION_HEALTH_SUMMARY_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+    assert "\x01" not in once and "\x04" not in once
+
+
+# (D-065 d) THE "Re: XBPS Tech MBR [Recurring calendar invite]" mixed shape:
+# <table>=6, colspan=22, rowspan=1 (live-probed). A calendar-invite layout grid:
+# a wide colspan banner spanning the body, a rowspan row-label, mixed colspan data
+# cells. EVERY emitted table must be valid GFM. Pre-fix the colspans collapse to
+# 1 cell (h1/s1/d[2] etc.) and the table is literal pipe junk.
+_XBPS_MBR_MIXED_HTML = (
+    "<table>"
+    "<tr><td colspan=\"4\">XBPS Tech MBR — Recurring</td></tr>"
+    "<tr><th>Workstream</th><th>Owner</th><th>Status</th><th>Notes</th></tr>"
+    "<tr><td rowspan=\"2\">Sortation</td><td>Ayaz</td><td>GREEN</td><td>On track</td></tr>"
+    "<tr><td>Gal</td><td colspan=\"2\">Vendor slip resolved this week</td></tr>"
+    "<tr><td>Pallet</td><td>Tobias</td><td>RED</td><td>Capacity risk</td></tr>"
+    "<tr><td colspan=\"4\">Next review: first Monday of the month.</td></tr>"
+    "</table>"
+)
+
+
+def test_html_to_text_xbps_mbr_mixed_all_tables_valid():  # D-065 (d)
+    """The XBPS MBR colspan+rowspan mixed shape: EVERY emitted GFM table is valid
+    (header_cols == separator_cols == every data-row width). The colspan banner +
+    footer expand to first-cell + empties; the rowspan 'Sortation' label holds its
+    column on the continuation row; the mid-row colspan=2 cell expands to
+    first-cell + 1 empty (the row stays 4 wide)."""
+    out = email_mod._html_to_text(_XBPS_MBR_MIXED_HTML)
+    _assert_all_tables_valid_gfm(out)
+    _assert_no_fused_split_block(out)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(
+        _XBPS_MBR_MIXED_HTML
+    )
+    assert all_valid, detail
+    tables = validate_mod.parse_gfm_tables(out)
+    assert tables, f"no GFM table emitted:\n{out}"
+    for t in tables:
+        assert t["header_cols"] == 4, f"header not 4 cols: {t}\n{out}"
+        assert t["separator_cols"] == 4
+        assert all(c == 4 for c in t["data_cols"]), f"ragged widths: {t}\n{out}"
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # Wide colspan banner → first-cell + 3 empties.
+    assert "| XBPS Tech MBR — Recurring |  |  |  |" in lines
+    # rowspan 'Sortation' label: first row populated, continuation row holds col 0.
+    assert "| Sortation | Ayaz | GREEN | On track |" in lines
+    # Continuation row: col 0 held empty (Sortation NOT repeated), Gal in col 1,
+    # the colspan=2 cell text in col 2 + 1 trailing empty (col 3) → 4 wide.
+    assert "|  | Gal | Vendor slip resolved this week |  |" in lines
+    # colspan footer → first-cell + 3 empties.
+    assert "| Next review: first Monday of the month. |  |  |  |" in lines
+
+
+def test_html_to_text_xbps_mbr_mixed_no_word_loss():  # D-065 (d) no-word-loss
+    out = email_mod._html_to_text(_XBPS_MBR_MIXED_HTML)
+    for cell in (
+        "XBPS Tech MBR — Recurring", "Workstream", "Owner", "Status", "Notes",
+        "Sortation", "Ayaz", "GREEN", "On track", "Gal",
+        "Vendor slip resolved this week", "Pallet", "Tobias", "RED",
+        "Capacity risk", "Next review: first Monday of the month.",
+    ):
+        assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
+
+
+def test_html_to_text_xbps_mbr_mixed_is_idempotent():  # D-065 (d) idempotency
+    once = email_mod._html_to_text(_XBPS_MBR_MIXED_HTML)
+    twice = email_mod._html_to_text(once)
+    assert twice == once
+    assert "****" not in once
+    assert "\x01" not in once and "\x04" not in once
+
+
+# (D-065 e) ANTI-REGRESSION: a SPAN-FREE table (colspan/rowspan absent everywhere)
+# MUST be BYTE-IDENTICAL to its pre-fix output — the span machinery is a strict
+# SUPERSET (an absent/colspan=1/rowspan=1 cell expands to itself). Reuse the
+# existing clean multi-table report; the span code must not add a stray empty
+# column, shift a caption, or change the separator on any of the 33 clean emails.
+def test_html_to_text_span_free_table_byte_identical():  # D-065 (e)
+    """A span-free multi-table report is byte-identical to the pre-span converter
+    (no colspan/rowspan ⇒ each cell expands to itself ⇒ no new empty column, no
+    caption shift, same separators). Passes on BOTH pre- and post-fix converters."""
+    out = email_mod._html_to_text(_CLEAN_MULTI_TABLE_HTML)
+    _assert_all_tables_valid_gfm(out)
+    assert out == (
+        "| Initiative | Status | Owner | ETA | Notes |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Pallet Tech | GREEN | Gal | Fri | On track |\n"
+        "| Sortation | RED | Ayaz | Mon | Vendor slip |\n"
+        "| Risk | Sev | Owner | Mitigation | Due |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Capacity | High | Tobias | Add EU lane | Q3 |\n"
+        "| Suite | Pass | Fail |\n"
+        "| --- | --- | --- |\n"
+        "| e2e | 98% | 2% |"
+    )
+
+
+def test_html_to_text_span_free_single_cell_caption_lift_preserved():  # D-065 (e2)
+    """The D-061 merged-title→caption lift must STILL fire for a genuine 1-cell
+    (NO colspan) leading title over a wider body — the span machinery must not
+    swallow the legitimate caption lift (MASK-DON'T-FIX guardrail). A real
+    single-cell `<td>` with no colspan stays a 1-wide row → lifted to a caption."""
+    html = (
+        "<table>"
+        "<tr><td>Weekly Status</td></tr>"            # genuine 1-cell title (no span)
+        "<tr><th>Initiative</th><th>Status</th></tr>"
+        "<tr><td>Pallet Tech</td><td>GREEN</td></tr>"
+        "</table>"
+    )
+    out = email_mod._html_to_text(html)
+    _assert_all_tables_valid_gfm(out)
+    # The genuine no-colspan title still lifts to a bold caption above the grid.
+    assert out.startswith("**Weekly Status**")
+    assert "| Initiative | Status |" in out
+    assert "| --- | --- |" in out

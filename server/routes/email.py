@@ -2042,6 +2042,29 @@ def _img_marker_from_tag(match: "re.Match") -> str:
 
 _RE_TABLE_TAG = re.compile(r"</?table[^>]*>", re.IGNORECASE)
 
+# D-065: capture colspan/rowspan off a <td>/<th> OPEN tag BEFORE the attributes are
+# stripped. A bare/absent/invalid span defaults to 1 (HTML semantics). The value is
+# the first run of digits (handles colspan=3, colspan="3", colspan='3 '); a 0 or a
+# non-numeric value clamps to 1 so the grid never collapses or explodes.
+_RE_CELL_OPEN = re.compile(r"<t([hd])\b([^>]*)>", re.IGNORECASE)
+_RE_SPAN_ATTR = re.compile(r"\b(colspan|rowspan)\s*=\s*[\"']?\s*(\d+)", re.IGNORECASE)
+
+
+def _cell_span(attrs: str, which: str) -> int:
+    """Parse colspan/rowspan (``which``) from a cell tag's raw attribute string.
+
+    Defaults to 1 for absent/zero/garbage values (HTML semantics) so a normal
+    span-free cell expands to exactly itself — the strict-superset guarantee.
+    """
+    for name, val in _RE_SPAN_ATTR.findall(attrs):
+        if name.lower() == which:
+            try:
+                n = int(val)
+            except ValueError:
+                return 1
+            return n if n >= 1 else 1
+    return 1
+
 
 def _escape_pipes_in_cell(cell: str) -> str:
     """Escape any literal ``|`` inside ONE table cell's text as ``\\|`` (GFM rule).
@@ -2065,6 +2088,85 @@ def _escape_pipes_in_cell(cell: str) -> str:
     sentinel and no ``<table>``, so a second _html_to_text pass is a no-op.
     """
     return cell.replace("|", "\\|")
+
+
+# D-065 span sentinels (module level so the parser/expander helpers and the
+# _html_to_text cell-substitution share ONE definition).
+_SPAN_OPEN = "\x04"
+_SPAN_CLOSE = "\x05"
+_RE_CELL_SPAN_PREFIX = re.compile(
+    re.escape(_SPAN_OPEN) + r"(\d+),(\d+)" + re.escape(_SPAN_CLOSE)
+)
+
+
+def _parse_cell_span_prefix(piece: str) -> "tuple[str, int, int]":
+    """Strip the encoded "<SPAN_OPEN>colspan,rowspan<SPAN_CLOSE>" prefix off ONE
+    cell piece (the text between two cell sentinels) and return
+    ``(text, colspan, rowspan)``.
+
+    A piece with no prefix (legacy / a second idempotent pass over pipe output)
+    yields (text, 1, 1) — so the expander degrades to the pre-D-065 positional
+    behavior on any non-span input.
+    """
+    m = _RE_CELL_SPAN_PREFIX.match(piece)
+    if not m:
+        return piece, 1, 1
+    colspan = max(1, int(m.group(1)))
+    rowspan = max(1, int(m.group(2)))
+    return piece[m.end():], colspan, rowspan
+
+
+def _expand_row_with_spans(
+    parsed_cells: "list[tuple[str, int, int]]",
+    pending: "dict[int, int]",
+) -> "list[str]":
+    """Expand ONE source row's ``(text, colspan, rowspan)`` cells into a flat grid
+    row, honoring colspan (text-in-FIRST + N-1 trailing EMPTY columns) and the
+    rowspans HELD from prior rows (an EMPTY cell reserved at that exact column
+    index), per the D-065 user decisions.
+
+    ``pending`` is the per-column carry of rowspan continuations WITHIN the current
+    table block (keyed by grid-column index → remaining continuation rows). It is
+    mutated in place: this row CONSUMES one held continuation per occupied column,
+    and REGISTERS new continuations for any cell whose rowspan > 1.
+
+    No cell text is ever duplicated or dropped — colspan/rowspan only ADD empty
+    cells (hard no-word-loss). Alignment is POSITIONAL: a held column keeps the
+    same index so the row below never shifts left.
+    """
+    row: "list[str]" = []
+    c = 0  # current grid column index
+    src = list(parsed_cells)
+    si = 0
+    # Walk grid columns left-to-right. A column with a pending rowspan is filled
+    # with an EMPTY held cell (consuming one continuation); otherwise the next
+    # source cell lands there and claims colspan columns + registers its rowspan.
+    while si < len(src) or any(rem > 0 for rem in pending.values()):
+        held = pending.get(c, 0)
+        if held > 0:
+            row.append("")
+            if held - 1 <= 0:
+                pending.pop(c, None)
+            else:
+                pending[c] = held - 1
+            c += 1
+            continue
+        if si >= len(src):
+            # No more source cells AND no held continuation at THIS column — the
+            # row is naturally complete (trailing held columns beyond the row's
+            # own cells are not emitted; MAX-width padding reconciles ragged rows).
+            break
+        text, colspan, rowspan = src[si]
+        si += 1
+        # The cell's text goes in its FIRST column; the remaining colspan-1 grid
+        # columns are EMPTY (never the duplicated text).
+        for k in range(colspan):
+            row.append(text if k == 0 else "")
+            if rowspan > 1:
+                # Reserve THIS column on the next rowspan-1 rows (positional).
+                pending[c] = rowspan - 1
+            c += 1
+    return row
 
 
 def _mark_top_level_tables(text: str, sep: str) -> str:
@@ -2115,6 +2217,12 @@ def _html_to_text(html: str) -> str:
     _CELL_SEP = "\x01"
     _ROW_SEP = "\x02"
     _TABLE_SEP = "\x03"
+    # D-065 span markers (module-level _SPAN_OPEN/_SPAN_CLOSE): each cell sentinel is
+    # IMMEDIATELY followed by an encoded "<SPAN_OPEN>colspan,rowspan<SPAN_CLOSE>"
+    # prefix captured from the <td>/<th> tag's colspan/rowspan attributes BEFORE they
+    # are stripped, so the downstream row builder knows how many grid columns/rows
+    # each source cell occupies. The prefix is parsed off (never emitted), so the
+    # converter stays idempotent — a second pass over the pipe output sees no markers.
     # Each TOP-LEVEL table (the outermost <table>/</table> element) is a sentinel-
     # delimited block so the row buffer flushes at every top-level table boundary.
     # Without this, two adjacent Outlook tables fused into ONE block (one separator,
@@ -2138,7 +2246,18 @@ def _html_to_text(html: str) -> str:
     text = re.sub(r"</?(?:thead|tbody|tfoot|colgroup|col|caption)[^>]*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<tr[^>]*>", _ROW_SEP, text, flags=re.IGNORECASE)
     text = re.sub(r"</tr>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<t[hd][^>]*>", _CELL_SEP, text, flags=re.IGNORECASE)
+    # D-065: turn each cell OPEN tag into the cell sentinel PLUS an encoded span
+    # prefix (colspan,rowspan) captured from its attributes BEFORE they are stripped
+    # by the catch-all tag-strip below. Previously this discarded colspan/rowspan, so
+    # a <td colspan=3> became ONE grid cell and a <td rowspan=2> left the row below
+    # short — the converter could not reconcile widths or alignment (the last 9
+    # malformed Outlook tables). The span counts now survive to the row builder.
+    def _cell_sentinel(m: "re.Match[str]") -> str:
+        attrs = m.group(2) or ""
+        colspan = _cell_span(attrs, "colspan")
+        rowspan = _cell_span(attrs, "rowspan")
+        return f"{_CELL_SEP}{_SPAN_OPEN}{colspan},{rowspan}{_SPAN_CLOSE}"
+    text = _RE_CELL_OPEN.sub(_cell_sentinel, text)
     text = re.sub(r"</t[hd]>", "", text, flags=re.IGNORECASE)
     # List items get a GFM unordered-list marker. It MUST be line-anchored ("\n- "
     # → "- " at column 0 after the whitespace collapse below) so ReactMarkdown+
@@ -2216,6 +2335,12 @@ def _html_to_text(html: str) -> str:
     lines = text.split(_ROW_SEP)
     out_lines = []
     table_block = []  # buffered cell-row lists for the current contiguous block
+    # D-065: per-block carry of rowspan continuations (grid-column index → remaining
+    # rows). Mutated in place by _expand_row_with_spans; CLEARED whenever the block
+    # resets (each _TABLE_SEP boundary / prose flush) so a rowspan never leaks across
+    # a <table> boundary. A dict (not reassigned) so the expander mutates the SAME
+    # object the loop holds.
+    table_pending: "dict[int, int]" = {}
 
     def _flush_table_block():
         """Emit the buffered contiguous table block as valid GFM (caption +
@@ -2250,6 +2375,22 @@ def _html_to_text(html: str) -> str:
                 rows = rows[1:]
         if not rows:
             return
+        # DEGENERATE single-cell block (a lone section-title <table> with no body, or
+        # a one-row one-cell remnant): emit it as a bold caption + blank line, NOT a
+        # 1-col GFM table. THE D-064 ADJACENCY DEFECT: a single-cell title table
+        # emitted as '| Title |\n| --- |' and then immediately followed (no blank
+        # line) by a WIDER grid made remark-gfm parse both as ONE 1-col table (it
+        # fixes width from the header) and DROP the grid's data columns. A 1-row/1-col
+        # block carries no columnar data to preserve, so lifting it to a caption (the
+        # same form as the merged-title lift above) is loss-free AND the trailing
+        # blank line keeps the next table its own block. Idempotent: '**...**' carries
+        # no cell sentinel, so a re-run re-emits it unchanged.
+        if len(rows) == 1 and len(rows[0]) == 1:
+            title = rows[0][0].strip()
+            if title:
+                out_lines.append("**" + title + "**")
+                out_lines.append("")
+            return
         # MAX cell count across the (post-lift) rows — the widest row defines the
         # grid so nothing exceeds the separator. Deterministic for a given input.
         data_width = max(len(r) for r in rows)
@@ -2276,6 +2417,7 @@ def _html_to_text(html: str) -> str:
                 # Crossed a <table>/</table> boundary — end the prior table here.
                 _flush_table_block()
                 table_block = []
+                table_pending.clear()  # rowspans never leak across a <table> boundary
             if _CELL_SEP in line:
                 # Any text BEFORE the first cell sentinel is prose (a real cell always
                 # opens with _CELL_SEP), so flush any open block, emit the prose on its
@@ -2285,6 +2427,7 @@ def _html_to_text(html: str) -> str:
                 if prefix:
                     _flush_table_block()
                     table_block = []
+                    table_pending.clear()
                     out_lines.append(prefix)
                 # Split into cells POSITIONALLY. The old code dropped every empty cell
                 # (`[c for c in cells if c]`), which shifted later cells LEFT and broke
@@ -2298,13 +2441,41 @@ def _html_to_text(html: str) -> str:
                 # in cell text was the live h3/s2 / h2/s1 mismatch: it inflated the
                 # header's re-parsed column count past the separator width, so
                 # remark-gfm refused the table and rendered raw pipe text.
-                cells = [
-                    _escape_pipes_in_cell(c.replace("\n", " ").strip())
-                    for c in rest.split(_CELL_SEP)
-                ]
+                #
+                # D-065: each piece begins with the encoded "<SPAN_OPEN>colspan,
+                # rowspan<SPAN_CLOSE>" prefix captured from the <td>/<th> tag. Parse
+                # it off, then EXPAND: colspan=N → text-in-FIRST + N-1 trailing EMPTY
+                # cells; a rowspan held from a prior row reserves its column with an
+                # EMPTY cell (positional). The span counts (not the raw text) drive
+                # the grid width so a <td colspan=3> occupies 3 columns and a
+                # <td rowspan=2> keeps the row below aligned — the last 9 malformed
+                # Outlook tables. A span-free cell has (.,1,1) and expands to itself,
+                # so a normal table is byte-identical (strict superset).
+                parsed_cells = []
+                for piece in rest.split(_CELL_SEP):
+                    cell_text, colspan, rowspan = _parse_cell_span_prefix(piece)
+                    cell_text = _escape_pipes_in_cell(cell_text.replace("\n", " ").strip())
+                    parsed_cells.append((cell_text, colspan, rowspan))
+                if not any(text for text, _cs, _rs in parsed_cells) and not any(
+                    rem > 0 for rem in table_pending.values()
+                ):
+                    # An all-empty Outlook SPACER/layout row (every cell blank text)
+                    # with NO rowspan continuation pending. It is NOT data and must not
+                    # emit a pipe row or widen the grid — but it must ALSO NOT flush /
+                    # break the contiguous table block (the D-064 SPLIT-BLOCK DEFECT:
+                    # flushing here glued a 1-col section-title header to a wider grid,
+                    # so remark-gfm fixed the width from the 1-col header and DROPPED
+                    # the data columns). We DROP the spacer and KEEP buffering so the
+                    # title + grid stay ONE MAX-width block. A spacer carries no
+                    # surviving cell text, so dropping it loses no word. (When a
+                    # rowspan IS pending, an empty source row is a real continuation
+                    # row — it must still be expanded so the held column advances.)
+                    continue
+                cells = _expand_row_with_spans(parsed_cells, table_pending)
                 if not any(cells):
-                    _flush_table_block()
-                    table_block = []
+                    # Span expansion produced an all-empty grid row (e.g. a stray
+                    # empty continuation with nothing held): nothing to render, but the
+                    # pending map was already advanced inside the expander. Drop it.
                     continue
                 table_block.append(cells)
             else:
@@ -2314,10 +2485,12 @@ def _html_to_text(html: str) -> str:
                 # blank line of its own.
                 _flush_table_block()
                 table_block = []
+                table_pending.clear()
                 if line.strip():
                     out_lines.append(line)
     _flush_table_block()
     table_block = []
+    table_pending.clear()
     text = "\n".join(out_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
