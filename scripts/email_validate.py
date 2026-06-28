@@ -36,6 +36,15 @@ Steps:
       as the scanner will, then RE-READ the conversation's read state and assert it
       is STILL UNREAD. The re-read is the proof (not the tool's success string); if
       it marked the mail read the step FAILS LOUD so the wiring is never trusted.
+  (i) GFM-TABLE VALIDITY PROBE (D-063, AC-1 LIVE half): across the allowlisted Inbox
+      subfolders, read each UNREAD conversation as ``format="html"`` (NO markAs), run
+      every table-bearing message body through ``email._html_to_text``, and assert
+      EVERY emitted GFM table is structurally valid (header_cols == separator_cols ==
+      every data-row column count — exactly remark-gfm's render rule). Reports X/Y
+      table-bearing folder emails rendering valid GFM and FAILS LOUD on any
+      header/separator mismatch — the live settlement of the 17/40 -> 40/40 number
+      the offline fixtures cannot prove alone. Read tools ONLY; off GRASP quota;
+      never marks folder mail read.
 
 It is IDEMPOTENT: every artifact it creates (a throwaway draft, a flipped
 read-state) is cleaned up / restored by the end of the run; the folder-source
@@ -56,6 +65,7 @@ before flipping the always-on workers on.
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -306,6 +316,240 @@ def map_folder_message(message) -> dict:
         "isRead": bool(msg.get("isRead", False)),
         "recipientType": email._recipient_type({"to": to_list, "cc": cc_list}),
     }
+
+
+# ─── GFM table-validity helpers (D-063, offline-checkable) ────────────────────
+#
+# AC-1 LIVE half: confirm that EVERY Outlook table in a real folder email is
+# emitted by ``email._html_to_text`` as STRUCTURALLY VALID GFM. remark-gfm derives
+# a table's column count from the HEADER row and the delimiter/SEPARATOR row and
+# REQUIRES header_cols == separator_cols; when the header is wider than the
+# separator (the modal-sizing bug) remark-gfm REFUSES the table and renders the raw
+# "| a | b |" as a literal paragraph (the pipe-junk the user sees). These pure
+# helpers parse the converter's emitted markdown back into tables and apply EXACTLY
+# that rule so the live probe measures the SAME thing remark-gfm enforces.
+
+# A markdown table separator/delimiter cell: optional leading/trailing ':' around a
+# run of dashes, e.g. "---", ":--", "--:", ":-:" (GFM alignment markers).
+_GFM_SEP_CELL = re.compile(r"^\s*:?-{1,}:?\s*$")
+
+
+def _gfm_pipe_cols(line: str):
+    """Column count of a pipe row, or None if ``line`` is not a pipe row.
+
+    A GFM row is delimited by '|'. We split on '|' and drop the leading/trailing
+    empty cells produced by the outer pipes (a row is conventionally written with a
+    leading AND trailing pipe, as ``email._html_to_text`` always emits). The count
+    is the number of real cells BETWEEN the outer pipes. Returns None for any line
+    that is not a pipe row (prose, a bold caption, a blank line) so the caller can
+    treat it as a table boundary.
+    """
+    s = line.strip()
+    if not s or "|" not in s:
+        return None
+    # Split on '|'; the converter never emits escaped pipes inside a cell, so a
+    # plain split is faithful to its output.
+    parts = s.split("|")
+    # Drop the leading/trailing empty strings created by the outer pipes.
+    if parts and parts[0].strip() == "":
+        parts = parts[1:]
+    if parts and parts[-1].strip() == "":
+        parts = parts[:-1]
+    if not parts:
+        return None
+    return len(parts), parts
+
+
+def _is_separator_row(parts) -> bool:
+    """A separator row is a pipe row whose EVERY cell matches the dash delimiter."""
+    return bool(parts) and all(_GFM_SEP_CELL.match(c) for c in parts)
+
+
+def parse_gfm_tables(markdown: str) -> list:
+    """Parse ``markdown`` (``email._html_to_text`` output) into GFM tables.
+
+    A GFM table is a HEADER pipe row IMMEDIATELY followed by a SEPARATOR pipe row
+    (every cell a dash delimiter), then zero or more DATA pipe rows until the first
+    non-pipe / blank line. Returns a list of dicts, one per table:
+    ``{"header_cols": int, "separator_cols": int, "data_cols": [int, ...]}``. A pipe
+    row NOT followed by a separator (or a lone separator) is not a table and is
+    ignored — the parser only recognises the full remark-gfm-renderable form.
+    """
+    lines = (markdown or "").split("\n")
+    tables: list = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        cols_i = _gfm_pipe_cols(lines[i])
+        if cols_i is None:
+            i += 1
+            continue
+        # A header candidate: it must be a pipe row that is NOT itself a separator
+        # (a lone "| --- |" with no header above it is not a table header).
+        header_count, header_parts = cols_i
+        if _is_separator_row(header_parts):
+            i += 1
+            continue
+        # The very next line must be a separator row for this to be a GFM table.
+        if i + 1 >= n:
+            i += 1
+            continue
+        nxt = _gfm_pipe_cols(lines[i + 1])
+        if nxt is None or not _is_separator_row(nxt[1]):
+            i += 1
+            continue
+        sep_count = nxt[0]
+        # Collect the contiguous DATA rows after the separator.
+        data_cols: list = []
+        j = i + 2
+        while j < n:
+            d = _gfm_pipe_cols(lines[j])
+            if d is None or _is_separator_row(d[1]):
+                break
+            data_cols.append(d[0])
+            j += 1
+        tables.append({
+            "header_cols": header_count,
+            "separator_cols": sep_count,
+            "data_cols": data_cols,
+        })
+        i = j
+    return tables
+
+
+def gfm_table_validity_for_body(html: str) -> tuple[int, bool, str]:
+    """Run ``email._html_to_text(html)`` and validate EVERY emitted GFM table.
+
+    Returns ``(n_tables, all_valid, detail)`` where ``n_tables`` is the number of
+    GFM tables the converter emitted (a body with no table yields 0), ``all_valid``
+    is True iff EVERY table satisfies ``header_cols == separator_cols == every
+    data-row column count`` (exactly remark-gfm's render rule), and ``detail`` names
+    the first mismatch so an operator can see WHICH table broke. A zero-table body
+    is trivially valid (nothing to break).
+    """
+    converted = email._html_to_text(html or "")
+    tables = parse_gfm_tables(converted)
+    if not tables:
+        return 0, True, "no GFM table emitted"
+    for idx, t in enumerate(tables):
+        h = t["header_cols"]
+        s = t["separator_cols"]
+        if h != s:
+            return (
+                len(tables), False,
+                f"table #{idx + 1}: header_cols {h} != separator_cols {s} "
+                "(remark-gfm refuses this — renders as literal pipe text)",
+            )
+        bad = [w for w in t["data_cols"] if w != h]
+        if bad:
+            return (
+                len(tables), False,
+                f"table #{idx + 1}: data-row width {bad[0]} != header/separator "
+                f"width {h} (column-count mismatch)",
+            )
+    return len(tables), True, f"{len(tables)} GFM table(s) all valid (header==separator==data)"
+
+
+async def gfm_table_probe(*, allowlist=None, call_read=None, validate=None) -> StepResult:
+    """LIVE AC-1 reproducer: X/Y table-bearing folder emails render valid GFM.
+
+    Resolves the allowlisted Inbox subfolders (``email_list_folders`` →
+    ``resolve_subfolders``), lists each folder's conversations
+    (``email_folders``), filters to ``unreadCount`` > 0
+    (``filter_unread_conversations``), then for each unread conversation calls
+    ``email_read`` with ``format="html"`` and NO ``markAs`` key — EXACTLY as the
+    scanner does, off the GRASP quota and never marking folder mail read. For every
+    message body containing ``<table`` it runs ``gfm_table_validity_for_body`` (which
+    runs ``email._html_to_text`` then validates each emitted GFM table:
+    ``header_cols == separator_cols == every data-row width``). The step PASSES only
+    when every table-bearing email renders valid GFM (X == Y, zero header/separator
+    mismatches — the 40/40 target) and FAILS LOUD on any mismatch (the 17/40
+    baseline). A tick with NO table-bearing email reports 0/0 (the empty measurement
+    is made explicit — never a false 40/40 claim). The seams default to the live OWA
+    read path + the real validator but are injectable for offline tests.
+    """
+    if allowlist is None:
+        allowlist = EMAIL_SCAN_SUBFOLDERS
+    if call_read is None:
+        async def call_read(name, args):  # noqa: ANN001
+            return await email.call_read_tool(name, args)
+    if validate is None:
+        validate = gfm_table_validity_for_body
+
+    # 1) DISCOVER + RESOLVE folder name -> current id.
+    folders_payload = await call_read("email_list_folders", {})
+    _raise_if_quota(folders_payload)
+    resolved, unresolved = resolve_subfolders(folders_payload, list(allowlist))
+    if not resolved:
+        return StepResult(
+            "gfm-table-validity", False,
+            "NO allowlisted Inbox subfolder resolved to an id "
+            f"(unresolved={unresolved}) — cannot run the live GFM-table probe",
+        )
+
+    total_tabled = 0          # Y: table-bearing folder emails seen
+    valid_tabled = 0          # X: those whose every table renders valid GFM
+    seen_conversations = 0
+    first_mismatch = ""       # detail of the first malformed email, for fail-loud
+    seen_convo_ids: set = set()
+
+    # 2) For each resolved folder, read each UNREAD conversation's thread and run
+    #    every table-bearing message body through the converter.
+    for fname, fid in resolved.items():
+        folder_payload = await call_read("email_folders", {"folderId": fid, "limit": 100})
+        _raise_if_quota(folder_payload)
+        for conv in filter_unread_conversations(folder_payload):
+            conv_id = conv.get("conversationId")
+            if not conv_id:
+                continue
+            conv_id = str(conv_id)
+            if conv_id in seen_convo_ids:
+                continue  # a conversation can surface in >1 folder view — count once
+            seen_convo_ids.add(conv_id)
+            seen_conversations += 1
+
+            # email_read EXACTLY as the scanner does: format=html, NO markAs key.
+            args = {"conversationId": conv_id, "format": "html"}
+            assert "markAs" not in args  # structural never-mark-read guard (D-058/D-062)
+            read_payload = await call_read("email_read", args)
+            _raise_if_quota(read_payload)
+            content = read_payload.get("content") if isinstance(read_payload, dict) else None
+            messages = (content or {}).get("emails") if isinstance(content, dict) else None
+            messages = messages if isinstance(messages, list) else []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                body = str(msg.get("body", "") or "")
+                if "<table" not in body.lower():
+                    continue  # only TABLE-bearing emails count toward the 40/40
+                total_tabled += 1
+                n_tables, all_valid, detail = validate(body)
+                if all_valid:
+                    valid_tabled += 1
+                elif not first_mismatch:
+                    first_mismatch = (
+                        f"folder {fname!r} conversation {conv_id} message "
+                        f"{str(msg.get('itemId', '') or '')!r}: {detail}"
+                    )
+
+    if total_tabled == 0:
+        return StepResult(
+            "gfm-table-validity", True,
+            f"0/0 — no table-bearing folder email this tick across "
+            f"{len(resolved)} resolved folder(s) ({seen_conversations} unread "
+            f"conversation(s) read, unresolved={unresolved}); nothing to validate",
+        )
+
+    summary = (
+        f"{valid_tabled}/{total_tabled} table-bearing folder emails render valid GFM "
+        f"(zero header/separator mismatches) across {len(resolved)} folder(s)"
+    )
+    if valid_tabled == total_tabled:
+        return StepResult("gfm-table-validity", True, summary + " — all valid")
+    return StepResult(
+        "gfm-table-validity", False,
+        summary + f"; FIRST mismatch — {first_mismatch}",
+    )
 
 
 async def email_read_keeps_unread(*, conversation_id: str, email_read=None,
@@ -820,6 +1064,17 @@ async def _step_email_read_unread() -> StepResult:
     return await email_read_keeps_unread(conversation_id=conv_id)
 
 
+async def _step_gfm_table_probe() -> StepResult:
+    """(i) LIVE GFM-table-validity probe (AC-1 live half / D-063): X/Y table-bearing
+    folder emails render valid GFM (zero header/separator mismatches). Resolves the
+    allowlisted Inbox subfolders, reads each unread conversation as format="html"
+    (NO markAs), runs every table-bearing body through email._html_to_text, and
+    validates each emitted GFM table. Read tools ONLY; off GRASP; never marks read.
+    This is the live settlement of the 17/40 -> 40/40 number the offline fixtures
+    cannot prove on their own."""
+    return await gfm_table_probe()
+
+
 async def main() -> int:
     """Run all steps, print PASS/FAIL + a summary, return the process exit code."""
     print("email_validate: pre-flight for the always-on email workers (live OWA path).")
@@ -839,6 +1094,7 @@ async def main() -> int:
         _step_save_draft,
         _step_folder_source,
         _step_email_read_unread,
+        _step_gfm_table_probe,
     ]
     # run_steps keys the step name off __name__; give the lambda a name.
     steps[0].__name__ = "_step_scan"

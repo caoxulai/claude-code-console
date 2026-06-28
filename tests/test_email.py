@@ -5943,3 +5943,328 @@ def test_d062_once_only_conversion_idempotency():
     assert "\\<table\\>" not in body and "<table>" not in body
     # The merged-title caption appears exactly once (not doubled by a second pass).
     assert body.count("**Org Details**") == 1
+
+
+
+# ─── D-063: LIVE GFM-table-validity probe (scripts/email_validate.py) ─────
+#
+# AC-1 has two halves: the load-bearing OFFLINE fixtures (T1, above) AND a LIVE
+# 17/40 -> 40/40 measurement reproducer against the real aws-outlook-mcp. T2 adds
+# that live probe step to scripts/email_validate.py. Its load-bearing PURE pieces
+# are offline-checkable here:
+#   - parse_gfm_tables(markdown): split _html_to_text output into GFM tables,
+#     reporting per-table (header_cols, separator_cols, [data-row col counts]);
+#   - gfm_table_validity_for_body(html): run email._html_to_text and report
+#     (n_tables, all_valid, detail) where a table is VALID iff header_cols ==
+#     separator_cols == EVERY data-row col count (exactly remark-gfm's rule);
+#   - gfm_table_probe(...): the StepResult step that counts X/Y table-bearing
+#     folder emails rendering valid GFM, off GRASP, never marking mail read.
+# These OFFLINE tests pin the parser + body-validator + step seam with the live
+# MCP seams stubbed; the LIVE end-to-end 40/40 run happens only when an operator
+# runs `python3 scripts/email_validate.py`.
+
+
+def test_validate_parse_gfm_tables_extracts_header_separator_and_data_widths():
+    """parse_gfm_tables splits a markdown blob into GFM tables, each reporting the
+    header column count, the separator column count, and every data-row column
+    count. Non-table prose (a bold caption, a paragraph) is ignored; a real GFM
+    table is recognised by a header row immediately followed by a '| --- |'
+    separator row."""
+    md = (
+        "**Status Report**\n"
+        "\n"
+        "| Team | Status | Owner |\n"
+        "| --- | --- | --- |\n"
+        "| Relay | GREEN | Ann |\n"
+        "| Edge | RED | Bo |\n"
+        "\n"
+        "Some trailing prose, not a table.\n"
+    )
+    tables = validate_mod.parse_gfm_tables(md)
+    assert len(tables) == 1, "exactly one GFM table in the blob"
+    t = tables[0]
+    assert t["header_cols"] == 3
+    assert t["separator_cols"] == 3
+    assert t["data_cols"] == [3, 3], "two 3-column data rows"
+
+
+def test_validate_parse_gfm_tables_detects_two_separate_tables():
+    """Two adjacent valid tables (own header + own separator each) parse as TWO
+    distinct tables, not one fused block."""
+    md = (
+        "| A | B |\n"
+        "| --- | --- |\n"
+        "| 1 | 2 |\n"
+        "\n"
+        "| X | Y | Z |\n"
+        "| --- | --- | --- |\n"
+        "| 7 | 8 | 9 |\n"
+    )
+    tables = validate_mod.parse_gfm_tables(md)
+    assert len(tables) == 2
+    assert tables[0]["header_cols"] == 2 and tables[0]["separator_cols"] == 2
+    assert tables[1]["header_cols"] == 3 and tables[1]["separator_cols"] == 3
+
+
+def test_validate_parse_gfm_tables_reports_header_separator_mismatch_widths():
+    """The DETECTOR (converter-independent) must surface a header/separator
+    column-count mismatch when one is present in the markdown — the exact
+    17/40-baseline defect remark-gfm refuses to render (a 3-col header over a 1-col
+    separator). parse_gfm_tables reports the real widths so the validity rule
+    (header_cols == separator_cols) can flag it. This guards the probe's ABILITY to
+    catch a mismatch independent of whatever the converter currently emits."""
+    # A malformed GFM table exactly as the OLD modal-sizing converter produced it:
+    # a 3-column header over a 1-column separator.
+    malformed = (
+        "| A | B | C |\n"
+        "| --- |\n"
+        "| row1 |\n"
+    )
+    tables = validate_mod.parse_gfm_tables(malformed)
+    assert len(tables) == 1, "the header + dash-separator pair is one (malformed) table"
+    t = tables[0]
+    assert t["header_cols"] == 3
+    assert t["separator_cols"] == 1
+    assert t["header_cols"] != t["separator_cols"], \
+        "the detector must surface the mismatch the probe's validity rule rejects"
+
+
+def test_validate_gfm_table_validity_flags_header_separator_mismatch_only(monkeypatch):
+    """The header_cols == separator_cols check is INDEPENDENTLY load-bearing: a
+    converted blob whose DATA rows match the HEADER width but whose SEPARATOR is
+    narrower (3-col header / 2-col separator / 3-col data) is malformed GFM ONLY via
+    the header/separator rule (the data-row check compares data to the header, so it
+    would pass). The validator must still flag it — guarding the exact remark-gfm
+    constraint (header_cols == separator_cols), not just data widths. (Since the
+    landed converter now always emits valid GFM, this drives the validator against a
+    converter stub so the check is exercised in isolation.)"""
+    # header 3, separator 2, data 3 -> data matches the HEADER so the data-row check
+    # passes; ONLY h != s (3 != 2) catches this.
+    malformed_md = "| A | B | C |\n| --- | --- |\n| 1 | 2 | 3 |\n"
+    monkeypatch.setattr(email_mod, "_html_to_text", lambda html: malformed_md)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body("<table>...</table>")
+    assert n_tables >= 1, "the converted blob has a table"
+    assert all_valid is False, (
+        "a 3-col header over a 2-col separator is malformed GFM (remark-gfm refuses "
+        f"it) and must be counted INVALID even when data rows match (detail={detail!r})"
+    )
+    low = detail.lower()
+    assert "header" in low or "separator" in low or "mismatch" in low
+
+
+def test_validate_gfm_table_validity_flags_data_row_width_mismatch_only(monkeypatch):
+    """The data-row width check is INDEPENDENTLY load-bearing: a converted blob whose
+    header == separator but a DATA row is the wrong width (2-col header/separator,
+    3-col data row) is malformed GFM ONLY via the data-row rule (the header/separator
+    check would pass it). The validator must still flag it."""
+    # header 2, separator 2, but a 3-col data row -> ONLY the data-row check catches.
+    malformed_md = "| A | B |\n| --- | --- |\n| 1 | 2 | 3 |\n"
+    monkeypatch.setattr(email_mod, "_html_to_text", lambda html: malformed_md)
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body("<table>...</table>")
+    assert n_tables >= 1, "the converted blob has a table"
+    assert all_valid is False, (
+        "a 3-col data row under a 2-col header/separator is a column-count mismatch "
+        f"and must be counted INVALID (detail={detail!r})"
+    )
+    assert "mismatch" in detail.lower() or "width" in detail.lower()
+
+
+def test_validate_gfm_table_validity_accepts_well_formed_table():
+    """A fully-populated equal-width table is VALID: header == separator == every
+    data row. This is the post-fix success shape and the anti-regression case for
+    the currently-clean reports."""
+    html = (
+        "<table>"
+        "<tr><th>Team</th><th>Status</th><th>Owner</th></tr>"
+        "<tr><td>Relay</td><td>GREEN</td><td>Ann</td></tr>"
+        "<tr><td>Edge</td><td>AMBER</td><td>Bo</td></tr>"
+        "</table>"
+    )
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(html)
+    assert n_tables == 1
+    assert all_valid is True, f"a fully-populated equal-width table must be VALID (detail={detail!r})"
+
+
+def test_validate_gfm_table_validity_no_table_body_reports_zero():
+    """A body with NO table contributes zero table-bearing emails (n_tables==0),
+    and a zero-table body is trivially 'valid' (nothing to break)."""
+    html = "<p>Plain prose with <b>no</b> table at all.</p>"
+    n_tables, all_valid, detail = validate_mod.gfm_table_validity_for_body(html)
+    assert n_tables == 0
+    assert all_valid is True
+
+
+def test_validate_gfm_table_probe_counts_valid_over_table_bearing():
+    """gfm_table_probe walks the allowlisted folders' unread conversations, runs each
+    table-bearing body through the validator, and reports X/Y where Y is the number
+    of table-bearing folder emails and X the number rendering valid GFM. The step
+    PASSES only when X == Y (zero header/separator mismatches) and FAILS LOUD
+    otherwise. Read tools only; email_read carries NO markAs key.
+
+    The validator verdict is injected via the seam so the X/Y counting + fail-loud
+    is proven deterministically regardless of what the (now-fixed) converter emits:
+    the GSD email is rendered VALID, the MGR email INVALID, so the probe must report
+    1/2 and FAIL (the 17/40 condition)."""
+    gsd_html = (
+        "<table><tr><th>Team</th><th>Status</th></tr>"
+        "<tr><td>Relay</td><td>GREEN</td></tr></table>"
+    )
+    mgr_html = (
+        "<table><tr><td>A</td><td>B</td><td>C</td></tr>"
+        "<tr><td>row1</td></tr></table>"
+    )
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1},
+            {"name": "1 managers", "id": "AAMk-MGR", "unreadCount": 1},
+        ]},
+    ]}}
+    read_calls = []
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        if name == "email_folders":
+            fid = args.get("folderId")
+            if fid == "AAMk-GSD":
+                return {"content": {"emails": [
+                    {"conversationId": "C-GSD-1", "unreadCount": 1}]}}
+            if fid == "AAMk-MGR":
+                return {"content": {"emails": [
+                    {"conversationId": "C-MGR-1", "unreadCount": 1}]}}
+            return {"content": {"emails": []}}
+        if name == "email_read":
+            read_calls.append(dict(args))
+            cid = args.get("conversationId")
+            body = gsd_html if cid == "C-GSD-1" else mgr_html
+            return {"content": {"emails": [
+                {"itemId": "M1", "sender": {"name": "A", "email": "a@x.com"},
+                 "body": body, "isRead": False}]}}
+        raise AssertionError(f"unexpected read tool {name}")
+
+    def fake_validate(body):
+        # GSD body renders valid; MGR body (the 3-col header) renders invalid.
+        if "Relay" in body:
+            return (1, True, "valid")
+        return (1, False, "header_cols 3 != separator_cols 1")
+
+    res = _vrun(validate_mod.gfm_table_probe(
+        allowlist=["1 GSD", "1 managers"],
+        call_read=fake_call_read,
+        validate=fake_validate,
+    ))
+    # 2 table-bearing emails, only 1 renders valid -> FAIL (the 17/40 condition).
+    assert res.passed is False, res.detail
+    assert "1/2" in res.detail or "1 of 2" in res.detail, \
+        f"the step must report the X/Y valid-over-table-bearing count (detail={res.detail!r})"
+    # The first mismatch must be surfaced so an operator sees WHICH email broke.
+    assert "header_cols" in res.detail or "mismatch" in res.detail.lower()
+    # NEVER mark folder mail read: every email_read carries NO markAs key.
+    assert read_calls, "email_read must be called"
+    assert all("markAs" not in c for c in read_calls), \
+        "the probe's email_read must omit markAs (never mark folder mail read)"
+    assert all(c.get("format") == "html" for c in read_calls), \
+        "the probe must read format='html' (mirror the scanner, get raw <table> markup)"
+
+
+def test_validate_gfm_table_probe_passes_when_all_valid():
+    """When every table-bearing folder email renders valid GFM (the 40/40 target
+    after T1 lands), the probe PASSES and reports X == Y."""
+    clean_html = (
+        "<table>"
+        "<tr><th>Team</th><th>Status</th></tr>"
+        "<tr><td>Relay</td><td>GREEN</td></tr>"
+        "</table>"
+    )
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1},
+        ]},
+    ]}}
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        if name == "email_folders":
+            return {"content": {"emails": [
+                {"conversationId": "C-GSD-1", "unreadCount": 1}]}}
+        if name == "email_read":
+            return {"content": {"emails": [
+                {"itemId": "M1", "sender": {"name": "A", "email": "a@x.com"},
+                 "body": clean_html, "isRead": False}]}}
+        raise AssertionError(f"unexpected read tool {name}")
+
+    res = _vrun(validate_mod.gfm_table_probe(
+        allowlist=["1 GSD"],
+        call_read=fake_call_read,
+    ))
+    assert res.passed is True, res.detail
+    assert "1/1" in res.detail or "1 of 1" in res.detail
+
+
+def test_validate_gfm_table_probe_no_table_bearing_email_is_not_a_false_pass():
+    """If NO folder email carries a table this tick, the probe reports 0/0 and does
+    NOT claim a 40/40 success it never measured — it passes (nothing malformed) but
+    the detail makes the empty measurement explicit (anti VALIDATION-THEATER)."""
+    plain_html = "<p>Just a note, no table here.</p>"
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1},
+        ]},
+    ]}}
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        if name == "email_folders":
+            return {"content": {"emails": [
+                {"conversationId": "C-GSD-1", "unreadCount": 1}]}}
+        if name == "email_read":
+            return {"content": {"emails": [
+                {"itemId": "M1", "sender": {"name": "A", "email": "a@x.com"},
+                 "body": plain_html, "isRead": False}]}}
+        raise AssertionError(f"unexpected read tool {name}")
+
+    res = _vrun(validate_mod.gfm_table_probe(
+        allowlist=["1 GSD"],
+        call_read=fake_call_read,
+    ))
+    assert res.passed is True, res.detail
+    assert ("0/0" in res.detail or "0 of 0" in res.detail
+            or "no table-bearing" in res.detail.lower())
+
+
+def test_validate_gfm_table_probe_email_read_carries_no_markas():
+    """LOAD-BEARING never-mark-read: like email_read_keeps_unread, the probe's
+    structural guard is `assert 'markAs' not in args` on EVERY email_read it
+    issues (D-058/D-062). A regression that adds markAs to the probe read must be
+    caught here, not only at runtime against live mail."""
+    clean_html = (
+        "<table>"
+        "<tr><th>A</th><th>B</th></tr>"
+        "<tr><td>1</td><td>2</td></tr>"
+        "</table>"
+    )
+    list_folders_payload = {"content": {"folders": [
+        {"name": "Inbox", "id": "INBOX", "children": [
+            {"name": "1 GSD", "id": "AAMk-GSD", "unreadCount": 1},
+        ]},
+    ]}}
+    seen = []
+
+    async def fake_call_read(name, args):
+        if name == "email_list_folders":
+            return list_folders_payload
+        if name == "email_folders":
+            return {"content": {"emails": [
+                {"conversationId": "C-GSD-1", "unreadCount": 1}]}}
+        if name == "email_read":
+            seen.append(dict(args))
+            return {"content": {"emails": [
+                {"itemId": "M1", "sender": {"name": "A", "email": "a@x.com"},
+                 "body": clean_html, "isRead": False}]}}
+        raise AssertionError(f"unexpected read tool {name}")
+
+    _vrun(validate_mod.gfm_table_probe(allowlist=["1 GSD"], call_read=fake_call_read))
+    assert seen and all("markAs" not in c for c in seen), \
+        "every probe email_read must omit markAs (never mark folder mail read)"
