@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, autoFormatBody, seedRecipients, threadCardStates, setMyEmail } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, approveOutcome, autoFormatBody, seedRecipients, threadCardStates, setMyEmail } from './emailDetail';
 
 // --- Constants ---
 
@@ -654,27 +654,47 @@ export default function EmailPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ draft: text, etag: cur }),
       });
-      if (res.status === 409) {
+      const json = await res.json().catch(() => null);
+      // Dispatch the four distinct approve outcomes (approveOutcome, emailDetail.js).
+      // The four cases MUST stay distinct so the page never lies about what
+      // happened (D-068/T2).
+      const { outcome, etag: nextEtag, draftSaved, message } = approveOutcome(res.status, json);
+      if (nextEtag) setEtag(nextEtag);
+
+      if (outcome === 'conflict') {
         setError('Conflict: the queue was modified elsewhere. Refreshing...');
         refresh();
         return;
       }
-      if (!res.ok) {
-        setError('Failed to approve the draft.');
+      if (outcome === 'no_recipient') {
+        // The headline SILENT-SUCCESS-APPROVE fix: the backend resolved NO
+        // recipient, did NOT save a draft, and left the item UNAPPROVED (it stays
+        // in the review list, retryable). Surface a RED banner via the existing
+        // setError path — DISTINCT from the 409 "Conflict... Refreshing" (anti
+        // CONFLATE-NO-RECIPIENT-WITH-409) and NEVER the green "Copied!" toast.
+        // We do NOT refresh-as-conflict (there's nothing to reconcile) and do NOT
+        // touch editingId, so the user can add a recipient and Approve again; we
+        // also skip refresh() here because it would clear the banner the user
+        // needs to see (the item is already in the list, unchanged).
+        setError(message);
         return;
       }
-      const json = await res.json();
-      if (json && json.etag) setEtag(json.etag);
+      if (outcome === 'error') {
+        setError(message || 'Failed to approve the draft.');
+        return;
+      }
 
-      // Copy to clipboard
+      // outcome === 'ok' — the happy path. Copy to clipboard and show the green
+      // confirmation toast.
       try {
         await navigator.clipboard.writeText(text);
       } catch {
         // Clipboard may fail in non-secure contexts; the draft is still saved
       }
 
-      // Show confirmation message
-      const draftSaved = json && json.draftSaved === true;
+      // Show confirmation message. draftSaved:true => the Outlook draft landed;
+      // draftSaved:false here is now a NON-recipient reason (e.g. a domain-blocked
+      // draft), since no-recipient is a 4xx handled above.
       const msg = draftSaved ? 'Copied! Draft saved to Outlook.' : 'Copied!';
       setApproveMsg(prev => ({ ...prev, [id]: msg }));
       // Clear after a timer

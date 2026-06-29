@@ -27,6 +27,7 @@ import {
   previewOf,
   setMyEmail,
   getMyEmail,
+  approveOutcome,
 } from './emailDetail.js';
 
 // Set the test email so replyAllRecipients/seedRecipients tests have a known
@@ -1077,6 +1078,90 @@ test('autoFormatBody: a generic "🖼 [image]" marker is NOT an empty-emphasis a
   // * _ and whitespace. The image marker has letters/brackets, so it is kept.
   const body = '🖼 [image]';
   assert.equal(autoFormatBody(body), body);
+});
+
+// --- approveOutcome: how the approve POST response is dispatched (T2) -------
+// The approve POST has FOUR distinct outcomes the page must render differently
+// (D-068/T2). The backend was the SILENT-SUCCESS-APPROVE bug: a no-recipient
+// approve flipped the item to "approved" and returned 200 with draftSaved:false,
+// which the page rendered as the quiet green "Copied!" — telling the user a draft
+// was saved when none was. T1 changes that to a 422 {error:'no_recipient',
+// message:...}. approveOutcome turns (httpStatus, body) into a tagged decision so
+// the four cases NEVER collapse into one another:
+//   - 409                       -> { outcome: 'conflict' } (queue moved; refresh + banner)
+//   - 422 & error 'no_recipient'-> { outcome: 'no_recipient', message } (RED banner, item
+//                                    stays unapproved/retryable — DISTINCT from 409, no refresh-as-conflict)
+//   - any other non-2xx         -> { outcome: 'error', message } (generic failure banner)
+//   - 2xx                       -> { outcome: 'ok', draftSaved, etag } (green toast: draftSaved
+//                                    true => "Copied! Draft saved to Outlook.", false => "Copied!")
+// The no_recipient case MUST be distinct from the 409 conflict (anti
+// CONFLATE-NO-RECIPIENT-WITH-409 — a "Conflict... Refreshing" banner sends the
+// user to refresh uselessly instead of "add a recipient and retry"). Pure — no
+// DOM, no fetch.
+
+test('approveOutcome: 2xx with draftSaved:true -> "ok", draftSaved true, adopts etag', () => {
+  const r = approveOutcome(200, { available: true, draftSaved: true, item: {}, etag: 'e7' });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.draftSaved, true);
+  assert.equal(r.etag, 'e7');
+});
+
+test('approveOutcome: 2xx with draftSaved:false -> "ok", draftSaved false (still a green Copied!, NOT no_recipient)', () => {
+  // This is now a NON-recipient reason (e.g. a domain-blocked draft), since
+  // no-recipient is a 4xx. The page keeps today's plain "Copied!" here.
+  const r = approveOutcome(200, { available: true, draftSaved: false, item: {}, etag: 'e8' });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.draftSaved, false);
+  assert.notEqual(r.outcome, 'no_recipient');
+});
+
+test('approveOutcome: 409 conflict -> "conflict" (refresh + banner), NEVER no_recipient', () => {
+  const r = approveOutcome(409, { error: 'conflict', current: {}, etag: 'e2' });
+  assert.equal(r.outcome, 'conflict');
+  assert.notEqual(r.outcome, 'no_recipient');
+});
+
+test('approveOutcome: 422 no_recipient -> "no_recipient", carries the backend message (RED banner)', () => {
+  // The headline SILENT-SUCCESS-APPROVE fix: a no-recipient approve is a 422,
+  // NOT a 200/draftSaved:false. It must surface a distinct red-banner outcome
+  // with the actionable "add a recipient and retry" message.
+  const r = approveOutcome(422, {
+    error: 'no_recipient',
+    message: 'No recipient address — draft not saved; add a recipient and retry',
+  });
+  assert.equal(r.outcome, 'no_recipient');
+  assert.equal(r.message, 'No recipient address — draft not saved; add a recipient and retry');
+  // distinct from conflict so the page does NOT show "Conflict... Refreshing"
+  assert.notEqual(r.outcome, 'conflict');
+  // distinct from ok so the page does NOT show the green "Copied!" toast
+  assert.notEqual(r.outcome, 'ok');
+});
+
+test('approveOutcome: no_recipient with a missing message -> a sane default (never "undefined")', () => {
+  const r = approveOutcome(422, { error: 'no_recipient' });
+  assert.equal(r.outcome, 'no_recipient');
+  assert.ok(r.message && r.message.length > 0);
+  assert.notEqual(r.message, 'undefined');
+});
+
+test('approveOutcome: a 422 that is NOT no_recipient -> generic "error" (not the recipient banner)', () => {
+  const r = approveOutcome(422, { error: 'something_else', message: 'other' });
+  assert.equal(r.outcome, 'error');
+  assert.notEqual(r.outcome, 'no_recipient');
+});
+
+test('approveOutcome: a generic non-2xx (500) -> "error" with a readable message', () => {
+  const r = approveOutcome(500, { error: 'boom' });
+  assert.equal(r.outcome, 'error');
+  assert.ok(r.message && typeof r.message === 'string');
+});
+
+test('approveOutcome: a null/garbage body never crashes and degrades to "error" on non-2xx', () => {
+  assert.equal(approveOutcome(500, null).outcome, 'error');
+  assert.equal(approveOutcome(502, undefined).outcome, 'error');
+  // a 2xx with a null body still resolves to ok (the happy path tolerates an
+  // empty body — draftSaved falls to false, the page shows "Copied!").
+  assert.equal(approveOutcome(200, null).outcome, 'ok');
 });
 
 console.log(`\nall green: ${passed} tests passed`);

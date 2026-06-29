@@ -471,6 +471,54 @@ export function deleteOutcome(httpStatus, body) {
   return { outcome: 'failed', etag, reason };
 }
 
+// Dispatch the approve POST response into a tagged outcome (T2, D-068). The
+// approve POST has FOUR cases the page must render DISTINCTLY:
+//   - HTTP 409                       -> { outcome: 'conflict' } (queue moved
+//        elsewhere; the page re-reads and shows "Conflict... Refreshing").
+//   - HTTP 422 & error 'no_recipient'-> { outcome: 'no_recipient', message }
+//        The headline SILENT-SUCCESS-APPROVE fix: a no-recipient approve no longer
+//        returns 200/draftSaved:false (which the page rendered as the quiet green
+//        "Copied!"). T1 makes it a 422; the page must surface a RED banner with the
+//        actionable message and leave the item unapproved/retryable. This is
+//        DISTINCT from 409 (anti CONFLATE-NO-RECIPIENT-WITH-409 — a
+//        "Conflict... Refreshing" banner would send the user to refresh uselessly
+//        instead of "add a recipient and retry").
+//   - any other non-2xx              -> { outcome: 'error', message } (generic
+//        failure banner — e.g. a 500 or a different 4xx).
+//   - HTTP 2xx                       -> { outcome: 'ok', draftSaved, etag } (the
+//        happy path: draftSaved true => "Copied! Draft saved to Outlook.", false
+//        => plain "Copied!" — that 200/draftSaved:false path now only fires for a
+//        NON-recipient reason such as a domain-blocked draft).
+// The `message` prefers the body's message/error text, falling back to a sane
+// default so the page never renders the literal 'undefined'. Pure — no DOM, no
+// fetch.
+const NO_RECIPIENT_DEFAULT_MSG =
+  'No recipient address — draft not saved; add a recipient and retry';
+
+export function approveOutcome(httpStatus, body) {
+  const b = (body && typeof body === 'object') ? body : {};
+  const etag = typeof b.etag === 'string' ? b.etag : null;
+  if (httpStatus === 409) {
+    return { outcome: 'conflict', etag, message: '', draftSaved: false };
+  }
+  if (httpStatus === 422 && b.error === 'no_recipient') {
+    const message = (typeof b.message === 'string' && b.message.trim())
+      ? b.message.trim()
+      : NO_RECIPIENT_DEFAULT_MSG;
+    return { outcome: 'no_recipient', etag, message, draftSaved: false };
+  }
+  const ok2xx = httpStatus >= 200 && httpStatus < 300;
+  if (ok2xx) {
+    return { outcome: 'ok', etag, draftSaved: b.draftSaved === true, message: '' };
+  }
+  const message = (typeof b.message === 'string' && b.message.trim())
+    ? b.message.trim()
+    : ((typeof b.error === 'string' && b.error.trim())
+      ? b.error.trim()
+      : 'Failed to approve the draft.');
+  return { outcome: 'error', etag, message, draftSaved: false };
+}
+
 // Shrink-then-grow a textarea to its content: height = min(scrollHeight + 2, cap).
 // The +2 avoids a 1px scrollbar flicker; the cap keeps a pathologically long
 // draft from eating the panel (it scrolls past the cap). Extracted from the DOM
