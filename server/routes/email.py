@@ -4921,16 +4921,29 @@ async def approve_item(request: web.Request) -> web.Response:
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
     except filestore.ConflictError:
+        # Re-read once and retry: a concurrent write moved the etag. If the item was
+        # already approved by that concurrent write, treat THAT as the durable state.
         data, current_etag = await _load_async()
         item = next((it for it in data["items"] if it.get("id") == item_id), None)
-        if item and item.get("status") != "approved":
-            item["status"] = "approved"
+        if item and item.get("status") == "approved":
+            new_etag = current_etag
+        else:
+            if item:
+                item["status"] = "approved"
             try:
                 new_etag = filestore.write_json(EMAIL_PATH, data, current_etag)
-            except filestore.ConflictError:
-                new_etag = current_etag
-        else:
-            new_etag = current_etag
+            except filestore.ConflictError as e:
+                # A PERSISTENT conflict: our approve did NOT land. The Outlook draft
+                # + topic note are best-effort side-effects, but the store write is
+                # the source of truth — surface a 409 so the client re-reads, the
+                # SAME shape dismiss_item/mute_item use. Never report 200 for a
+                # non-persisted approve.
+                current, current_etag = filestore.read_json(EMAIL_PATH)
+                return web.json_response(
+                    {"error": "conflict", "message": str(e),
+                     "current": current, "etag": current_etag},
+                    status=409,
+                )
 
     _spawn_mark_read(_mark_read_map_for(item))
 

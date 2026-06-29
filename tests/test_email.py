@@ -7401,3 +7401,57 @@ def test_safe_body_truncate_no_table_near_cap_matches_plain_slice():  # B-1c
     # final partial line of prose.
     last_nl = naive.rfind("\n")
     assert safe == naive[: last_nl + 1] or safe == naive
+
+
+# ─── B-2: approve_item surfaces a persistent etag conflict as 409 (not 200) ────
+
+
+async def test_email_approve_persistent_conflict_returns_409(client, email_file, monkeypatch):  # B-2a
+    """A persistent double-ConflictError on the store write must surface a 409 (the
+    client re-reads) — NOT a 200 falsely claiming a non-persisted approve."""
+    _seed(email_file, [_make_item("i1", draft="final reply", senderEmail="bob@example.com")])
+
+    async def fake_owa_write(name, arguments):
+        return {"success": True, "draftId": "DRAFT123"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    # Force EVERY write_json to raise ConflictError -> the retry also conflicts.
+    def always_conflict(path, data, etag):
+        raise email_mod.filestore.ConflictError(path, etag, "other-etag")
+    monkeypatch.setattr(email_mod.filestore, "write_json", always_conflict)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 409, "persistent conflict must be a 409, not a masked 200"
+    body = await resp.json()
+    assert body["error"] == "conflict"
+    assert "current" in body and "etag" in body
+    # The store on disk still shows the item NOT approved (write never landed).
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] != "approved"
+
+
+async def test_email_approve_single_conflict_then_succeeds_is_200(client, email_file, monkeypatch):  # B-2b
+    """A SINGLE conflict followed by a successful retry stays a 200 with the approved
+    item — ordinary races must not become user-visible errors (no over-eager 409)."""
+    _seed(email_file, [_make_item("i1", draft="final reply", senderEmail="bob@example.com")])
+
+    async def fake_owa_write(name, arguments):
+        return {"success": True, "draftId": "DRAFT123"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    real_write = email_mod.filestore.write_json
+    calls = {"n": 0}
+
+    def conflict_once(path, data, etag):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise email_mod.filestore.ConflictError(path, etag, "other-etag")
+        return real_write(path, data, None)
+    monkeypatch.setattr(email_mod.filestore, "write_json", conflict_once)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200, "single-conflict-then-retry-succeeds must stay 200"
+    body = await resp.json()
+    assert body["item"]["status"] == "approved"
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "approved"
