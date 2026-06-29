@@ -742,18 +742,18 @@ def test_extract_thread_history_handles_garbage_without_fabricating():
 _MAWS_BODY = (
     "+ Grace, Sailini\n"
     "\n"
-    "Thanks Yibo for the background.\n"
+    "Thanks Mei for the background.\n"
     "\n"
     "Hi, managers, check this doc: https://chorus.aws.dev/doc/6SQyJYQGewO7 ...\n"
     "--\n"
     "Regrads,\n"
-    "Han, Bingfeng\n"
+    "Smith, Alex\n"
     "\n"
-    "From: Wang, Yibo yibo@example.com\n"
+    "From: Chen, Mei mei@example.com\n"
     "Date: Wednesday, June 24, 2026 at 10:23\n"
-    "To: Agarwal, Ankit ankit@example.com; Lakshmanan, Geetika geetika@example.com; "
-    "Seah, Yi Ling seah@example.com\n"
-    "Cc: Han, Bingfeng bfhan@example.com; agl-pe agl-pe@example.com\n"
+    "To: Jones, Sam sjones@example.com; Patel, Priya priya@example.com; "
+    "Kim, Ji jkim@example.com\n"
+    "Cc: Smith, Alex asmith@example.com; team-pe team-pe@example.com\n"
     "Subject: [Action needed] MAWS CN deprecation\n"
     "\n"
     "GL L7 SDMs,\n"
@@ -767,9 +767,9 @@ def _maws_payload() -> dict:
     """Graph get_email shape: a SINGLE message, the whole chain inline in body."""
     return {
         "email": {
-            "from": {"name": "Han, Bingfeng", "email": "bfhan@example.com"},
+            "from": {"name": "Smith, Alex", "email": "asmith@example.com"},
             "toRecipients": [
-                {"name": "Wang, Yibo", "email": "yibo@example.com"},
+                {"name": "Chen, Mei", "email": "mei@example.com"},
             ],
             "received": "2026-06-24T14:00:00Z",
             "subject": "[Action needed] MAWS CN deprecation",
@@ -781,8 +781,8 @@ def _maws_payload() -> dict:
 def test_extract_thread_history_splits_inline_quoted_chain():
     """A single inline-quoted Graph body splits into TWO ordered turns.
 
-    turn[0] = Wang, Yibo (oldest, the quoted original, with his two asks + his To:
-    list parsed into recipients); turn[1] = Han, Bingfeng (newest, his reply).
+    turn[0] = Chen, Mei (oldest, the quoted original, with his two asks + his To:
+    list parsed into recipients); turn[1] = Smith, Alex (newest, his reply).
     NO From:/Date:/Subject: header text remains in either turn's body — those
     fields are promoted to the structured turn fields, so the run-on blob is gone.
     """
@@ -791,22 +791,22 @@ def test_extract_thread_history_splits_inline_quoted_chain():
 
     oldest, newest = turns[0], turns[1]
 
-    # Oldest = the quoted original from Wang, Yibo (sender PARSED from From:).
-    assert "Wang, Yibo" in oldest["sender"]
-    assert "yibo@example.com" not in oldest["sender"]  # flattened to a name
+    # Oldest = the quoted original from Chen, Mei (sender PARSED from From:).
+    assert "Chen, Mei" in oldest["sender"]
+    assert "mei@example.com" not in oldest["sender"]  # flattened to a name
     # His two asks survived (no message content lost).
     assert "SDO is moving to deprecate MAWS" in oldest["body"]
     assert "confirm the migration plan" in oldest["body"]
     # The Date: string is kept verbatim (un-ISO, _parse_ts returns None — fine).
     assert oldest["timestamp"] == "Wednesday, June 24, 2026 at 10:23"
     # His To: list was parsed into the recipients field.
-    assert "Agarwal, Ankit" in oldest["recipients"]
-    assert "Seah, Yi Ling" in oldest["recipients"]
+    assert "Jones, Sam" in oldest["recipients"]
+    assert "Kim, Ji" in oldest["recipients"]
 
-    # Newest = Han, Bingfeng's reply (sender/recipients/timestamp from top_msg).
-    assert "Han, Bingfeng" in newest["sender"]
-    assert "Thanks Yibo for the background." in newest["body"]
-    assert "Wang, Yibo" in newest["recipients"]  # from top_msg toRecipients
+    # Newest = Smith, Alex's reply (sender/recipients/timestamp from top_msg).
+    assert "Smith, Alex" in newest["sender"]
+    assert "Thanks Mei for the background." in newest["body"]
+    assert "Chen, Mei" in newest["recipients"]  # from top_msg toRecipients
     assert newest["timestamp"] == "2026-06-24T14:00:00Z"
 
     # CRITICAL: the run-on header blob is gone from BOTH bodies.
@@ -819,7 +819,7 @@ def test_extract_thread_history_splits_inline_quoted_chain():
     # SEGMENT-BLEED guard: the reply text must NOT bleed into the quoted card,
     # nor the quoted original into the reply card.
     assert "SDO is moving to deprecate MAWS" not in newest["body"]
-    assert "Thanks Yibo for the background." not in oldest["body"]
+    assert "Thanks Mei for the background." not in oldest["body"]
 
 
 def test_extract_thread_history_single_fresh_email_is_one_turn():
@@ -886,13 +886,13 @@ def test_extract_thread_history_boundary_only_no_reply_text_degrades_to_one_turn
     quoted text is preserved (no message content silently lost)."""
     payload = {
         "email": {
-            "from": {"name": "Han, Bingfeng", "email": "bfhan@example.com"},
+            "from": {"name": "Smith, Alex", "email": "asmith@example.com"},
             "received": "2026-06-24T14:00:00Z",
             "subject": "Fwd: [Action needed] MAWS CN deprecation",
             "body": (
-                "From: Wang, Yibo yibo@example.com\n"
+                "From: Chen, Mei mei@example.com\n"
                 "Date: Wednesday, June 24, 2026 at 10:23\n"
-                "To: Agarwal, Ankit ankit@example.com\n"
+                "To: Jones, Sam sjones@example.com\n"
                 "Subject: [Action needed] MAWS CN deprecation\n"
                 "\n"
                 "GL L7 SDMs,\n"
@@ -936,7 +936,7 @@ def test_extract_thread_history_boundary_only_no_reply_text_degrades_to_one_turn
 # already in the stored body, not produced by the tag-strip). On the prior regexes
 # this split into 0 boundaries (one merged turn); the rework must recover the turns.
 _PALLET_BODY = (
-    "From: Kim, Seong\n"
+    "From: Park, Lee\n"
     "Subject: FW: Enabling pallet tech at existing AWD sites \n"
     "\n"
     "Team - FYI\n"
@@ -946,16 +946,16 @@ _PALLET_BODY = (
     "\n"
     "**Date: **Wednesday, September 17, 2025 at 4:51 PM\n"
     "\n"
-    "**To: **\"Rui, Ricardo\" , \"Ahsan, Ayaz\" , \"Marquez, Seville\" , \"Neuman, Kyle\" , \"Divekar, Pratik\" , \"Brownlee, Donavan\" , \"Ramakrishnan,\n"
-    " Raghavendra\" , \"Goldschmidt, Jeff\" , \"Kim, Seong\" , \"Lathan, Paul\" , \"Shadeck, Gal\" \n"
+    "**To: **\"Davis, Jordan\" , \"Ahsan, Ayaz\" , \"Marquez, Seville\" , \"Neuman, Kyle\" , \"Divekar, Pratik\" , \"Brownlee, Donavan\" , \"Ramakrishnan,\n"
+    " Raghavendra\" , \"Goldschmidt, Jeff\" , \"Park, Lee\" , \"Lathan, Paul\" , \"Shadeck, Gal\" \n"
     "\n"
     "**Cc: **\"Sankaranarayanan, Karthik\" , \"Barki, Jayanth\" , \"Vande Vegte, Danielle\" \n"
     "\n"
     "**Subject: **RE: Enabling pallet tech at existing AWD sites \n"
     "\n"
-    "+ Vipul\n"
+    "+ Riley\n"
     "\n"
-    "Ricardo and the team, thank you for joining and taking part in the discussion.\n"
+    "Jordan and the team, thank you for joining and taking part in the discussion.\n"
     "\n"
     "-----Original Appointment-----\n"
     "\n"
@@ -963,7 +963,7 @@ _PALLET_BODY = (
     "\n"
     "**Sent:** Wednesday, September 10, 2025 10:58 AM\n"
     "\n"
-    "**To:** Shadeck, Gal; Rui, Ricardo; Ahsan, Ayaz\n"
+    "**To:** Shadeck, Gal; Davis, Jordan; Ahsan, Ayaz\n"
     "\n"
     "**Cc:** Sankaranarayanan, Karthik; Barki, Jayanth\n"
     "\n"
@@ -982,9 +982,9 @@ def _pallet_payload() -> dict:
     with MARKDOWN-BOLDED quoted-header labels + an Original Appointment separator."""
     return {
         "email": {
-            "from": {"name": "Kim, Seong", "email": "skim@example.com"},
+            "from": {"name": "Park, Lee", "email": "lpark@example.com"},
             "toRecipients": [
-                {"name": "Rui, Ricardo", "email": "rrui@example.com"},
+                {"name": "Davis, Jordan", "email": "jdavis@example.com"},
             ],
             "received": "2025-09-17T16:41:00Z",
             "subject": "FW: Enabling pallet tech at existing AWD sites",
@@ -1028,18 +1028,18 @@ def test_extract_thread_history_bolded_headers_yields_three_turns():
     assert '"' not in quoted_re["sender"]  # surrounding quotes stripped
     assert "thank you for joining and taking part in the discussion" in quoted_re["body"]
     assert quoted_re["timestamp"] == "Wednesday, September 17, 2025 at 4:51 PM"
-    assert "Rui, Ricardo" in quoted_re["recipients"]
+    assert "Davis, Jordan" in quoted_re["recipients"]
     assert "Goldschmidt, Jeff" in quoted_re["recipients"]
     # The comma INSIDE a quoted ``"Last, First"`` name is NOT a recipient
     # separator: every ';'-joined entry is a full Last, First (none is a bare
-    # first-name fragment like "Ricardo" split off from "Rui, Ricardo").
+    # first-name fragment like "Jordan" split off from "Davis, Jordan").
     recip_entries = [e.strip() for e in quoted_re["recipients"].split(";")]
-    assert "Ricardo" not in recip_entries
-    assert "Rui, Ricardo" in recip_entries
+    assert "Jordan" not in recip_entries
+    assert "Davis, Jordan" in recip_entries
 
     # The latest reply (sender/recipients/timestamp from top_msg); the bare FW
     # wrapper (From:/Subject: FW:) above the reply text is stripped, not leaked.
-    assert "Kim, Seong" in latest["sender"]
+    assert "Park, Lee" in latest["sender"]
     assert latest["body"].strip() == "Team - FYI"
     assert latest["timestamp"] == "2025-09-17T16:41:00Z"
 
@@ -1071,13 +1071,13 @@ def test_split_quoted_thread_bare_headers_backward_compat():
     turns = email_mod._extract_thread_history(_maws_payload())
     assert len(turns) == 2, f"bare-header chain must still split into 2, got {len(turns)}"
     oldest, newest = turns[0], turns[1]
-    assert "Wang, Yibo" in oldest["sender"]
-    assert "yibo@example.com" not in oldest["sender"]
+    assert "Chen, Mei" in oldest["sender"]
+    assert "mei@example.com" not in oldest["sender"]
     assert oldest["timestamp"] == "Wednesday, June 24, 2026 at 10:23"
-    assert "Agarwal, Ankit" in oldest["recipients"]
+    assert "Jones, Sam" in oldest["recipients"]
     assert "SDO is moving to deprecate MAWS" in oldest["body"]
-    assert "Han, Bingfeng" in newest["sender"]
-    assert "Thanks Yibo for the background." in newest["body"]
+    assert "Smith, Alex" in newest["sender"]
+    assert "Thanks Mei for the background." in newest["body"]
     # No emphasis noise crept in via the superset relaxation.
     for t in turns:
         assert "**" not in t["sender"] and "**" not in t["recipients"]
@@ -1115,12 +1115,12 @@ def test_split_quoted_thread_lone_bolded_from_in_prose_does_not_false_split():
 
 def test_parse_outlook_header_block_value_on_next_line_and_blank_interleave():
     """D-060 rework core: a quoted header whose From: VALUE is on the FOLLOWING line
-    (``**From:`` then ``**"Wang, Yibo"``) and whose labels are BLANK-LINE interleaved
+    (``**From:`` then ``**"Chen, Mei"``) and whose labels are BLANK-LINE interleaved
     with a wrapped recipient list still parses — From: + Date: + Subject: confirmed,
     value recovered, body starts AFTER the block."""
     lines = [
         "**From:",
-        '**"Wang, Yibo"',
+        '**"Chen, Mei"',
         "",
         "**Date: **Tuesday, October 14, 2025 at 7:04 PM",
         "",
@@ -1136,7 +1136,7 @@ def test_parse_outlook_header_block_value_on_next_line_and_blank_interleave():
     fields, body_start = parsed
     assert email_mod._flatten_header_name(
         email_mod._strip_emphasis(fields["from"])
-    ) == "Wang, Yibo"
+    ) == "Chen, Mei"
     assert fields["date"] == "Tuesday, October 14, 2025 at 7:04 PM"
     recips = email_mod._flatten_header_recipients(email_mod._strip_emphasis(fields["to"]))
     assert "Manea, Daria" in recips and "Cao, Xulai" in recips
@@ -1177,7 +1177,7 @@ def test_split_quoted_thread_bolded_no_word_loss():
     # The actual body prose of the three turns — every one must survive.
     for prose in (
         "Team - FYI",
-        "+ Vipul",
+        "+ Riley",
         "thank you for joining and taking part in the discussion",
         "Booking time to walk through the proposal for enabling pallet tech",
     ):
@@ -1216,12 +1216,12 @@ def test_extract_email_body_flattens_sender_dict():
     Regression for the Thread Context display showing the raw dict.
     """
     payload = {"content": {"emails": [{
-        "sender": {"name": "Tangudu, Punith", "email": "punitt@example.com"},
+        "sender": {"name": "Taylor, Morgan", "email": "mtaylor@example.com"},
         "subject": "Travel Reminder",
         "body": "Hi all, gentle reminder.",
     }]}}
     out = email_mod._extract_email_body(payload)
-    assert "From: Tangudu, Punith" in out
+    assert "From: Taylor, Morgan" in out
     assert "{'name'" not in out and "'email'" not in out
     # A plain-string sender still works (no regression).
     out2 = email_mod._extract_email_body(
@@ -1749,12 +1749,12 @@ def test_extract_email_body_handles_graph_shape():
     payload = {"email": {
         "id": "AAMk1",
         "subject": "Travel Reminder",
-        "from": {"name": "Tangudu, Punith", "email": "punitt@example.com"},
+        "from": {"name": "Taylor, Morgan", "email": "mtaylor@example.com"},
         "body": "Hi all, gentle reminder.",
     }}
     out = email_mod._extract_email_body(payload)
     assert "Hi all, gentle reminder." in out
-    assert "From: Tangudu, Punith" in out
+    assert "From: Taylor, Morgan" in out
     assert "{'name'" not in out and "'email'" not in out
 
 
@@ -2075,25 +2075,25 @@ async def test_email_regenerate_empty_fields_keep_prior(client, email_file, monk
 
 def test_sender_list_from_history_dedupes_first_seen_wins():
     """Ordered oldest->newest, deduped by case-insensitive name, FIRST-seen display
-    string kept. Yibo->Bingfeng->Yibo collapses to ['Yibo','Bingfeng'] (no distinct
+    string kept. Mei->Alex->Mei collapses to ['Mei','Alex'] (no distinct
     participant silently dropped, order preserved)."""
     history = [
-        {"sender": "Yibo", "timestamp": "t1", "body": "a"},
-        {"sender": "Bingfeng", "timestamp": "t2", "body": "b"},
-        {"sender": "Yibo", "timestamp": "t3", "body": "c"},
+        {"sender": "Mei", "timestamp": "t1", "body": "a"},
+        {"sender": "Alex", "timestamp": "t2", "body": "b"},
+        {"sender": "Mei", "timestamp": "t3", "body": "c"},
     ]
-    assert email_mod._sender_list_from_history(history) == ["Yibo", "Bingfeng"]
+    assert email_mod._sender_list_from_history(history) == ["Mei", "Alex"]
 
 
 def test_sender_list_from_history_dedupe_is_case_and_space_insensitive():
     """Dedup key is lowercased+stripped, but the STORED string is the first-seen
-    display form (so 'Han ' and 'han' are one participant shown as 'Han ')."""
+    display form (so 'Lex ' and 'lex' are one participant shown as 'Lex ')."""
     history = [
-        {"sender": "Han", "timestamp": "t1", "body": "a"},
-        {"sender": "  han  ", "timestamp": "t2", "body": "b"},
-        {"sender": "HAN", "timestamp": "t3", "body": "c"},
+        {"sender": "Lex", "timestamp": "t1", "body": "a"},
+        {"sender": "  lex  ", "timestamp": "t2", "body": "b"},
+        {"sender": "LEX", "timestamp": "t3", "body": "c"},
     ]
-    assert email_mod._sender_list_from_history(history) == ["Han"]
+    assert email_mod._sender_list_from_history(history) == ["Lex"]
 
 
 def test_sender_list_from_history_drops_empties_and_bounds():
@@ -2158,14 +2158,14 @@ async def test_scan_sets_latest_sender_and_sender_list(email_file, monkeypatch):
         if name == "get_emails":
             return {"emails": [{
                 "id": "AAMkMAWS", "subject": "Re: MAWS CN deprecation",
-                "from": {"name": "Yibo", "email": "yibo@example.com"},
+                "from": {"name": "Mei", "email": "mei@example.com"},
                 "received": "2026-06-03T10:00:00Z", "is_read": False, "preview": "x",
             }]}
         if name == "get_email":
             return {"email": {"id": "AAMkMAWS", "subject": "Re: MAWS CN deprecation",
                               "messages": [
-                {"from": {"name": "Yibo"}, "received": "2026-06-01T10:00:00Z", "body": "first"},
-                {"from": {"name": "Bingfeng"}, "received": "2026-06-02T10:00:00Z", "body": "reply"},
+                {"from": {"name": "Mei"}, "received": "2026-06-01T10:00:00Z", "body": "first"},
+                {"from": {"name": "Alex"}, "received": "2026-06-02T10:00:00Z", "body": "reply"},
             ]}}
         return {}
 
@@ -2177,10 +2177,10 @@ async def test_scan_sets_latest_sender_and_sender_list(email_file, monkeypatch):
 
     await email_mod._scan_once({"ws_manager": _WS()})
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
-    # The newest turn is Bingfeng — the From column must show the LATEST sender,
-    # NOT the original (Yibo) nor the inbox 'from'.
-    assert saved["sender"] == "Bingfeng"
-    assert saved["senderList"] == ["Yibo", "Bingfeng"]
+    # The newest turn is Alex — the From column must show the LATEST sender,
+    # NOT the original (Mei) nor the inbox 'from'.
+    assert saved["sender"] == "Alex"
+    assert saved["senderList"] == ["Mei", "Alex"]
 
 
 async def test_scan_no_history_keeps_seeded_sender(email_file, monkeypatch):
@@ -2227,8 +2227,8 @@ async def test_scan_backfill_updates_sender_and_list(email_file, monkeypatch):
             return {"emails": []}  # no new inbox items
         if name == "get_email":
             return {"email": {"id": "AAMkBackfill", "subject": "S", "messages": [
-                {"from": {"name": "Han"}, "received": "2026-06-01T10:00:00Z", "body": "one"},
-                {"from": {"name": "Bingfeng"}, "received": "2026-06-02T10:00:00Z", "body": "two"},
+                {"from": {"name": "Lex"}, "received": "2026-06-01T10:00:00Z", "body": "one"},
+                {"from": {"name": "Alex"}, "received": "2026-06-02T10:00:00Z", "body": "two"},
             ]}}
         return {}
 
@@ -2240,8 +2240,8 @@ async def test_scan_backfill_updates_sender_and_list(email_file, monkeypatch):
 
     await email_mod._scan_once({"ws_manager": _WS()})
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
-    assert saved["sender"] == "Bingfeng"             # latest turn, not the stale original
-    assert saved["senderList"] == ["Han", "Bingfeng"]
+    assert saved["sender"] == "Alex"             # latest turn, not the stale original
+    assert saved["senderList"] == ["Lex", "Alex"]
 
 
 def test_skeleton_for_keeps_original_sender():
@@ -2266,7 +2266,7 @@ def test_html_to_text_emits_gfm_table_with_separator_row():
     html = (
         "<table><tr><th>Status</th><th>Owner</th><th>ETA</th></tr>"
         "<tr><td>Green</td><td>Han</td><td>Fri</td></tr>"
-        "<tr><td>Red</td><td>Bingfeng</td><td>Mon</td></tr></table>"
+        "<tr><td>Red</td><td>Alex</td><td>Mon</td></tr></table>"
     )
     out = email_mod._html_to_text(html)
     lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -2276,7 +2276,7 @@ def test_html_to_text_emits_gfm_table_with_separator_row():
     assert lines[1] == "| --- | --- | --- |"
     # Body rows also wrapped.
     assert lines[2] == "| Green | Han | Fri |"
-    assert lines[3] == "| Red | Bingfeng | Mon |"
+    assert lines[3] == "| Red | Alex | Mon |"
 
 
 def test_html_to_text_bullets_are_line_anchored_dashes():
@@ -2452,7 +2452,7 @@ def test_html_to_text_normal_table_byte_identical_backward_compat():
     html = (
         "<table><tr><th>Status</th><th>Owner</th><th>ETA</th></tr>"
         "<tr><td>Green</td><td>Han</td><td>Fri</td></tr>"
-        "<tr><td>Red</td><td>Bingfeng</td><td>Mon</td></tr></table>"
+        "<tr><td>Red</td><td>Alex</td><td>Mon</td></tr></table>"
     )
     out = email_mod._html_to_text(html)
     # Exactly the output the pre-existing test asserts — no caption, 3-col sep.
@@ -2460,7 +2460,7 @@ def test_html_to_text_normal_table_byte_identical_backward_compat():
         "| Status | Owner | ETA |\n"
         "| --- | --- | --- |\n"
         "| Green | Han | Fri |\n"
-        "| Red | Bingfeng | Mon |"
+        "| Red | Alex | Mon |"
     )
 
 
@@ -2743,7 +2743,7 @@ _SIG_TABLE_HTML = (
     "<tr><td>Senior Risk Manager, XBPS SOX Risk &amp; Controls</td></tr>"
     "<tr><td>Amazon.com Services LLC</td></tr>"
     "<tr><td>2021 7th Ave, Seattle, WA</td></tr>"
-    "<tr><td>Email:</td><td>pashton@example.com</td></tr>"
+    "<tr><td>Email:</td><td>casey@example.com</td></tr>"
     "<tr><td>Phone:</td><td>+1-206-555-0177</td></tr>"
     "</table>"
 )
@@ -2760,7 +2760,7 @@ def test_html_to_text_signature_table_is_valid_gfm():  # D-063 (b)
         "Peter Ashton",
         "Senior Risk Manager, XBPS SOX Risk & Controls",
         "Amazon.com Services LLC", "2021 7th Ave, Seattle, WA",
-        "Email:", "pashton@example.com", "Phone:", "+1-206-555-0177",
+        "Email:", "casey@example.com", "Phone:", "+1-206-555-0177",
     ):
         assert txt in out, f"signature line dropped: {txt!r}"
 
@@ -2772,7 +2772,7 @@ def test_html_to_text_signature_table_no_word_loss():  # D-063 (b) no-word-loss
         "Peter Ashton",
         "Senior Risk Manager, XBPS SOX Risk & Controls",
         "Amazon.com Services LLC", "2021 7th Ave, Seattle, WA",
-        "Email:", "pashton@example.com", "Phone:", "+1-206-555-0177",
+        "Email:", "casey@example.com", "Phone:", "+1-206-555-0177",
     ):
         assert out.count(cell) == 1, f"cell text count != 1: {cell!r}"
 
@@ -2987,17 +2987,17 @@ def test_quoted_body_index_keys_by_normalized_subject_and_sender():
     re_item = _make_item(
         "re1",
         subject="Re: [Action needed] MAWS CN deprecation",
-        sender="Han, Bingfeng",
+        sender="Smith, Alex",
         threadHistory=[
-            {"sender": "Wang, Yibo", "timestamp": "Wed", "body": "Yibo full original body", "recipients": "a; b"},
-            {"sender": "Han, Bingfeng", "timestamp": "", "body": "Han reply", "recipients": ""},
+            {"sender": "Chen, Mei", "timestamp": "Wed", "body": "Mei full original body", "recipients": "a; b"},
+            {"sender": "Smith, Alex", "timestamp": "", "body": "Alex reply", "recipients": ""},
         ],
     )
     idx = email_mod._quoted_body_index([re_item])
-    # Yibo's original is recoverable by (normalized subject, his name)
-    key = ("[action needed] maws cn deprecation", "wang, yibo")
+    # Mei's original is recoverable by (normalized subject, her name)
+    key = ("[action needed] maws cn deprecation", "chen, mei")
     assert key in idx
-    assert idx[key]["body"] == "Yibo full original body"
+    assert idx[key]["body"] == "Mei full original body"
 
 
 async def test_scan_backfills_body_from_quoted_copy_when_get_email_fails(email_file, monkeypatch):
@@ -3008,13 +3008,13 @@ async def test_scan_backfills_body_from_quoted_copy_when_get_email_fails(email_f
         messageId="AAMkRE",
         conversationId="AAMkRE",
         subject="Re: [Action needed] MAWS CN deprecation",
-        sender="Han, Bingfeng",
+        sender="Smith, Alex",
         emailBody="...",
         threadHistory=[
-            {"sender": "Wang, Yibo", "timestamp": "Wednesday, June 24, 2026 at 10:23",
-             "body": "GL L7 SDMs,\n\nSDO is moving to deprecate MAWS ... Thanks,\nYibo",
-             "recipients": "Agarwal, Ankit; Xu, Jun"},
-            {"sender": "Han, Bingfeng", "timestamp": "", "body": "Thanks Yibo", "recipients": ""},
+            {"sender": "Chen, Mei", "timestamp": "Wednesday, June 24, 2026 at 10:23",
+             "body": "GL L7 SDMs,\n\nSDO is moving to deprecate MAWS ... Thanks,\nMei",
+             "recipients": "Jones, Sam; Xu, Jun"},
+            {"sender": "Smith, Alex", "timestamp": "", "body": "Thanks Mei", "recipients": ""},
         ],
     )
     solo = _make_item(
@@ -3022,7 +3022,7 @@ async def test_scan_backfills_body_from_quoted_copy_when_get_email_fails(email_f
         messageId="AAMkSOLO",
         conversationId="AAMkSOLO",
         subject="[Action needed] MAWS CN deprecation",
-        sender="Wang, Yibo",
+        sender="Chen, Mei",
         emailBody="",            # body fetch never succeeded
         threadHistory=[],
         status="needs-review",
@@ -3048,11 +3048,11 @@ async def test_scan_backfills_body_from_quoted_copy_when_get_email_fails(email_f
     saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
     recovered = saved["solo1"]
     # Body recovered from the quoted copy — the FULL original, not the truncated snippet
-    assert "Thanks,\nYibo" in recovered["emailBody"]
+    assert "Thanks,\nMei" in recovered["emailBody"]
     assert recovered["emailBody"] != recovered["snippet"]
     # A threadHistory turn now exists so the card renders the full body, not snippet
     assert len(recovered.get("threadHistory") or []) >= 1
-    assert recovered["threadHistory"][0]["sender"] == "Wang, Yibo"
+    assert recovered["threadHistory"][0]["sender"] == "Chen, Mei"
 
 
 async def test_scan_does_not_fabricate_body_when_no_quoted_copy_exists(email_file, monkeypatch):
@@ -3063,7 +3063,7 @@ async def test_scan_does_not_fabricate_body_when_no_quoted_copy_exists(email_fil
         messageId="AAMkONLY",
         conversationId="AAMkONLY",
         subject="[Action needed] Unique unfetchable thread",
-        sender="Wang, Yibo",
+        sender="Chen, Mei",
         emailBody="",
         threadHistory=[],
         status="needs-review",
@@ -3103,11 +3103,11 @@ async def test_scan_inbox_fetch_failure_still_runs_backfill(email_file, monkeypa
         messageId="AAMkRE2",
         conversationId="AAMkRE2",
         subject="Re: [Action needed] MAWS CN deprecation",
-        sender="Han, Bingfeng",
+        sender="Smith, Alex",
         emailBody="...",
         threadHistory=[
-            {"sender": "Wang, Yibo", "timestamp": "Wed", "body": "Yibo full original ... Thanks,\nYibo", "recipients": "x; y"},
-            {"sender": "Han, Bingfeng", "timestamp": "", "body": "Han reply", "recipients": ""},
+            {"sender": "Chen, Mei", "timestamp": "Wed", "body": "Mei full original ... Thanks,\nMei", "recipients": "x; y"},
+            {"sender": "Smith, Alex", "timestamp": "", "body": "Alex reply", "recipients": ""},
         ],
     )
     solo = _make_item(
@@ -3115,7 +3115,7 @@ async def test_scan_inbox_fetch_failure_still_runs_backfill(email_file, monkeypa
         messageId="AAMkSOLO3",
         conversationId="AAMkSOLO3",
         subject="[Action needed] MAWS CN deprecation",
-        sender="Wang, Yibo",
+        sender="Chen, Mei",
         emailBody="",
         threadHistory=[],
         status="needs-review",
@@ -3141,7 +3141,7 @@ async def test_scan_inbox_fetch_failure_still_runs_backfill(email_file, monkeypa
 
     saved = {it["id"]: it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]}
     # Backfill still ran and recovered the standalone body from the quoted copy
-    assert "Thanks,\nYibo" in saved["solo3"]["emailBody"]
+    assert "Thanks,\nMei" in saved["solo3"]["emailBody"]
     assert saved["solo3"]["emailBody"] != saved["solo3"]["snippet"]
 
 
@@ -3847,7 +3847,7 @@ def test_validate_raise_if_quota_ignores_429_inside_successful_html_body():
             "message": "Found 11 email(s) in conversation",
             "emails": [{
                 "itemId": "AAkALgAA",
-                "sender": {"name": "Bhargava, Vipul", "email": "vipulb@example.com"},
+                "sender": {"name": "Brooks, Riley", "email": "riley@example.com"},
                 "isRead": False,
                 # Real Outlook markup: a GUID whose hex run contains "429" (429d),
                 # exactly the live false-positive trigger.
@@ -5852,12 +5852,12 @@ _D062_HTML_QUOTED_BODY = (
     "<p>Team - FYI, see below.</p>"
     "<p><b>From:</b> Shadeck, Gal</p>"
     "<p><b>Sent:</b> Wednesday, September 17, 2025 4:51 PM</p>"
-    "<p><b>To:</b> Rui, Ricardo; Ahsan, Ayaz</p>"
+    "<p><b>To:</b> Davis, Jordan; Ahsan, Ayaz</p>"
     "<p><b>Subject:</b> RE: Enabling pallet tech at existing AWD sites</p>"
-    "<p>Ricardo and the team, thank you for joining the discussion.</p>"
+    "<p>Jordan and the team, thank you for joining the discussion.</p>"
     "<p><strong>From:</strong> Shadeck, Gal</p>"
     "<p><strong>Sent:</strong> Wednesday, September 10, 2025 10:58 AM</p>"
-    "<p><strong>To:</strong> Shadeck, Gal; Rui, Ricardo</p>"
+    "<p><strong>To:</strong> Shadeck, Gal; Davis, Jordan</p>"
     "<p><strong>Subject:</strong> Enabling pallet tech at existing AWD sites</p>"
     "<p>Booking time to walk through the proposal for enabling pallet tech.</p>"
 )
@@ -5871,7 +5871,7 @@ def test_d062_html_quoted_body_splits_into_multiple_turns():
     the D-060 literal-** path) feeds the splitter."""
     owa_emails = [{
         "itemId": "HTML-QUOTE-1",
-        "sender": {"name": "Kim, Seong", "email": "skim@example.com"},
+        "sender": {"name": "Park, Lee", "email": "lpark@example.com"},
         "dateTimeSent": "2026-06-27T16:41:00Z",
         "subject": "FW: Enabling pallet tech at existing AWD sites",
         "body": _D062_HTML_QUOTED_BODY,
