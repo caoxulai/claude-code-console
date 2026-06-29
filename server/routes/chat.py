@@ -283,16 +283,42 @@ async def restart_session_handler(request: web.Request) -> web.Response:
 
 
 def _mark_session_interactive(session_id: str, title: str) -> None:
-    """Prepend a mode entry to make the session visible in claude --resume, then add a title."""
-    for d in PROJECTS_BASE.iterdir():
+    """Prepend a mode entry to make the session visible in claude --resume, then add a title.
+
+    The spawned ``claude --resume`` subprocess also appends to this .jsonl, so the
+    write is done atomically (temp file in the same dir + os.replace) to avoid a
+    partial/truncated file on disk. Note: the read-modify-write is a one-shot
+    creation-time prepend; an append landing in the narrow window between our read
+    and the replace is still overwritten — the atomic replace only prevents a
+    torn/truncated file, it does not eliminate that inherent race. A candidate dir
+    or session file that errors (unreadable, disappeared) is skipped, not fatal.
+    """
+    try:
+        entries = PROJECTS_BASE.iterdir()
+    except OSError:
+        return
+    for d in entries:
         if not d.is_dir():
             continue
         path = d / f"{session_id}.jsonl"
-        if path.exists():
+        try:
+            if not path.exists():
+                continue
             # Read existing content
-            content = path.read_text()
+            content = path.read_text(encoding="utf-8")
             # Prepend mode entry (makes it pass the interactive check)
             mode_entry = json.dumps({"type": "mode", "mode": "normal"}) + "\n"
             title_entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": session_id}) + "\n"
-            path.write_text(mode_entry + title_entry + content)
+            # Atomic replace: write to a temp file in the same dir, then os.replace
+            # so readers never observe a half-written file.
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            try:
+                tmp.write_text(mode_entry + title_entry + content, encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
             return
+        except OSError:
+            # Unreadable / vanished file: skip it rather than 500 the session path.
+            continue
