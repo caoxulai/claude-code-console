@@ -15,6 +15,18 @@ SKILLS_DIR = Path.home() / ".claude" / "skills"
 COMMANDS_DIR = Path.home() / ".claude" / "commands"
 
 
+def _validate_skill_name(name: str) -> None:
+    """Reject a path-segment that could escape the skills/commands dirs.
+
+    ``create_skill`` already guards new names; the read/write/delete handlers
+    take ``{name}`` from the URL and must apply the SAME guard (defense in depth)
+    so a future routing/normalization change can never let ``..``/``/`` resolve a
+    file outside SKILLS_DIR/COMMANDS_DIR. Behavior-preserving for legitimate names.
+    """
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise web.HTTPBadRequest(reason="invalid skill name")
+
+
 def register(app: web.Application):
     app.router.add_get("/api/skills", list_skills)
     app.router.add_get("/api/skills/{name}", get_skill)
@@ -83,6 +95,7 @@ async def list_skills(request: web.Request) -> web.Response:
 
 async def get_skill(request: web.Request) -> web.Response:
     name = request.match_info["name"]
+    _validate_skill_name(name)
     # Check skills dir first, then commands
     skill_file = SKILLS_DIR / name / "SKILL.md"
     if not skill_file.exists():
@@ -95,6 +108,7 @@ async def get_skill(request: web.Request) -> web.Response:
 
 async def put_skill(request: web.Request) -> web.Response:
     name = request.match_info["name"]
+    _validate_skill_name(name)
     body = await read_json_body(request)
     content = body.get("content", "")
     expected_etag = body.get("etag")
@@ -139,6 +153,7 @@ async def create_skill(request: web.Request) -> web.Response:
 
 async def delete_skill(request: web.Request) -> web.Response:
     name = request.match_info["name"]
+    _validate_skill_name(name)
     skill_dir = SKILLS_DIR / name
     skill_file = COMMANDS_DIR / f"{name}.md"
 

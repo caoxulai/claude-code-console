@@ -3221,6 +3221,21 @@ async def test_skills_create_rejects_bad_name(client, skills_dirs):
     assert resp.status == 400
 
 
+def test_skills_validate_name_rejects_traversal_segments():
+    """The read/write/delete handlers must share create's name guard so a
+    ``..``/``/`` segment can never resolve a file outside the skills dirs
+    (defense in depth — closes the create-vs-get/put/delete asymmetry)."""
+    from server.routes import skills as skills_mod
+    from aiohttp import web as _web
+
+    for bad in ("..", "../evil", "a/b", "a\\b", ""):
+        with pytest.raises(_web.HTTPBadRequest):
+            skills_mod._validate_skill_name(bad)
+    # legitimate names pass untouched (behavior-preserving)
+    for ok in ("deploy", "my-skill", "skill_1"):
+        skills_mod._validate_skill_name(ok)
+
+
 async def test_skills_put_etag_conflict(client, skills_dirs):
     got = await (await client.get("/api/skills/deploy")).json()
     import time as _t
