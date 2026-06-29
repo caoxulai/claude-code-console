@@ -1842,7 +1842,7 @@ def test_graph_mcp_params_injects_node24_path(monkeypatch, tmp_path):
     only — never mutates os.environ or the aws-outlook launch."""
     node24 = tmp_path / "node24bin"
     node24.mkdir()
-    monkeypatch.setenv("CLAUDE_WEB_NODE24_BIN", str(node24))
+    monkeypatch.setattr("server.config.cfg.node24_bin_override", str(node24))
     before_os_path = __import__("os").environ.get("PATH", "")
 
     params = email_mod._graph_mcp_params()
@@ -1860,7 +1860,7 @@ def test_graph_mcp_params_forces_owa_backend(monkeypatch, tmp_path):
     of the bundle's default 'grasp' backend. See docs/email-owa-backend-runbook.md."""
     node24 = tmp_path / "node24bin"
     node24.mkdir()
-    monkeypatch.setenv("CLAUDE_WEB_NODE24_BIN", str(node24))
+    monkeypatch.setattr("server.config.cfg.node24_bin_override", str(node24))
 
     params = email_mod._graph_mcp_params()
     env = params.env or {}
@@ -1873,7 +1873,7 @@ def test_graph_mcp_params_owa_default_yields_to_explicit_config(monkeypatch, tmp
     mcpServers entry env still wins, so the backend remains operator-overridable."""
     node24 = tmp_path / "node24bin"
     node24.mkdir()
-    monkeypatch.setenv("CLAUDE_WEB_NODE24_BIN", str(node24))
+    monkeypatch.setattr("server.config.cfg.node24_bin_override", str(node24))
     monkeypatch.setattr(
         email_mod, "_find_graph_mcp_entry",
         lambda: {"command": "manager-outlook-mcp", "args": [],

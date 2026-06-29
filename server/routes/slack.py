@@ -131,6 +131,7 @@ import anyio
 from aiohttp import web
 
 from server import filestore
+from server.config import cfg
 from server.routes import read_json_body
 from server.routes.workers import register_worker, mark_worker_run
 from server.session_manager import is_auth_error
@@ -149,14 +150,10 @@ logger = logging.getLogger(__name__)
 def _resolve_slack_path() -> Path:
     """Resolve the slack_threads.json sidecar.
 
-    Precedence:
-      1. ``CLAUDE_WEB_SLACK_PATH`` env override.
-      2. ``<cwd>/.claude/slack_threads.json`` — same dir convention crons uses.
+    Precedence: cfg.slack_path (sourced from CLAUDE_WEB_SLACK_PATH env or
+    data_dir default in server/config.py).
     """
-    env = os.environ.get("CLAUDE_WEB_SLACK_PATH")
-    if env:
-        return Path(env)
-    return Path.cwd() / ".claude" / "slack_threads.json"
+    return cfg.slack_path
 
 
 # Resolved once at import; kept as a module attribute so it stays inspectable and
@@ -164,12 +161,9 @@ def _resolve_slack_path() -> Path:
 SLACK_PATH = _resolve_slack_path()
 
 # The owner's Slack username — used for self-exclusion (skip DMs where *I* sent
-# the last message) and style-sample filtering. Derived from CLAUDE_WEB_MY_EMAIL
-# (strip the @domain) with an explicit CLAUDE_WEB_MY_USERNAME override.
-_MY_USERNAME: str = (
-    os.environ.get("CLAUDE_WEB_MY_USERNAME", "").strip().lower()
-    or os.environ.get("CLAUDE_WEB_MY_EMAIL", "").split("@")[0].strip().lower()
-)
+# the last message) and style-sample filtering. Derived from cfg.my_username
+# (which resolves CLAUDE_WEB_MY_USERNAME or the local part of CLAUDE_WEB_MY_EMAIL).
+_MY_USERNAME: str = cfg.my_username
 
 
 def _style_path() -> Path:

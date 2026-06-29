@@ -65,7 +65,6 @@ before flipping the always-on workers on.
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import secrets
 import sys
@@ -83,7 +82,8 @@ from server.routes import email  # noqa: E402
 ACTIVE_TODO_CAP = getattr(email, "EMAIL_ACTIVE_TODO_CAP", 100)
 
 # A safe self-address used for the throwaway draft (never sent).
-SELF_ADDRESS = getattr(email, "_MY_EMAIL", "") or os.environ.get("CLAUDE_WEB_MY_EMAIL", "")
+from server.config import cfg as _cfg  # noqa: E402
+SELF_ADDRESS = getattr(email, "_MY_EMAIL", "") or _cfg.my_email
 
 # Subject prefix for the throwaway draft so it is unmistakably this job's artifact.
 _THROWAWAY_SUBJECT_PREFIX = "[email_validate throwaway]"

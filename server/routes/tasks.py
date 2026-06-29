@@ -17,6 +17,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.config import cfg
 from server.routes import read_json_body
 
 from server import filestore
@@ -34,17 +35,11 @@ logger = logging.getLogger(__name__)
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 CLAUDE_PROJECTS_BASE = Path.home() / ".claude" / "projects"
 
-# The user-created task store lives alongside the claude-web config file
-# (default ~/.claude-web/config.json), so it follows CLAUDE_WEB_CONFIG if
-# overridden.
-_CONFIG_PATH = Path(os.environ.get(
-    "CLAUDE_WEB_CONFIG",
-    Path.home() / ".claude-web" / "config.json",
-))
-# Console-created tasks live here — NEVER in ~/.claude/tasks (that is Claude
-# Code's own state, which we keep read-only except for the explicit
-# complete/delete actions on its files).
-USER_TASKS_PATH = _CONFIG_PATH.parent / "tasks.json"
+# Console-created tasks live alongside the claude-web config file
+# (default ~/.claude-web/config.json). The path is centralised in cfg.
+# NEVER in ~/.claude/tasks (that is Claude Code's own state, which we keep
+# read-only except for the explicit complete/delete actions on its files).
+USER_TASKS_PATH = cfg.config_path.parent / "tasks.json"
 
 # Synthetic _sessionId used for all console-created tasks, so they flow through
 # the same list/complete/delete/trigger-goal plumbing as Claude tasks without

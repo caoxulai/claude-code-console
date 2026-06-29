@@ -44,13 +44,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import secrets
 import time
 from pathlib import Path
 
 from aiohttp import web
 
+from server.config import cfg
 from server.routes import read_json_body
 
 from server import filestore
@@ -61,15 +61,10 @@ logger = logging.getLogger(__name__)
 def _resolve_tasks_path() -> Path:
     """Resolve the scheduled_tasks.json the harness scheduler actually fires from.
 
-    Precedence:
-      1. ``CLAUDE_WEB_TASKS_PATH`` env override (explicit alignment escape hatch).
-      2. ``<cwd>/.claude/scheduled_tasks.json`` — where the harness writes durable
-         tasks (cwd-relative); the server shares the session's cwd.
+    Precedence: cfg.tasks_path (sourced from CLAUDE_WEB_TASKS_PATH env or
+    data_dir default in server/config.py).
     """
-    env = os.environ.get("CLAUDE_WEB_TASKS_PATH")
-    if env:
-        return Path(env)
-    return Path.cwd() / ".claude" / "scheduled_tasks.json"
+    return cfg.tasks_path
 
 
 # Resolved once at import (the server's cwd is fixed for its lifetime). Kept as a
@@ -80,14 +75,10 @@ TASKS_PATH = _resolve_tasks_path()
 def _resolve_runs_path() -> Path:
     """Resolve the cron run-history sidecar file.
 
-    Derived from the SAME logic as TASKS_PATH so the two files stay aligned:
-    ``cron_runs.json`` lives in the same dir as the harness scheduled_tasks.json.
-    A ``CLAUDE_WEB_CRON_RUNS_PATH`` env override mirrors ``CLAUDE_WEB_TASKS_PATH``.
+    Precedence: cfg.runs_path (sourced from CLAUDE_WEB_CRON_RUNS_PATH env or
+    derived from tasks_path in server/config.py).
     """
-    env = os.environ.get("CLAUDE_WEB_CRON_RUNS_PATH")
-    if env:
-        return Path(env)
-    return TASKS_PATH.parent / "cron_runs.json"
+    return cfg.runs_path
 
 
 # Run-history is a SEPARATE store, never written into scheduled_tasks.json. WHY:

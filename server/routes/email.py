@@ -43,6 +43,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from server import filestore
+from server.config import cfg
 from server.routes import read_json_body
 from server.routes.workers import register_worker, mark_worker_run
 from server.session_manager import is_auth_error
@@ -55,14 +56,10 @@ logger = logging.getLogger(__name__)
 def _resolve_email_path() -> Path:
     """Resolve the email_threads.json sidecar.
 
-    Precedence:
-      1. CLAUDE_WEB_EMAIL_PATH env override.
-      2. <cwd>/.claude/email_threads.json
+    Precedence: cfg.email_path (sourced from CLAUDE_WEB_EMAIL_PATH env or
+    data_dir default in server/config.py).
     """
-    env = os.environ.get("CLAUDE_WEB_EMAIL_PATH")
-    if env:
-        return Path(env)
-    return Path.cwd() / ".claude" / "email_threads.json"
+    return cfg.email_path
 
 
 EMAIL_PATH = _resolve_email_path()
@@ -579,7 +576,7 @@ def _resolve_node24_bin() -> str:
     found -- NEVER silently falls back to the default Node 22 (which produces the
     opaque 'Connection closed').
     """
-    override = os.environ.get(_NODE24_ENV_OVERRIDE)
+    override = cfg.node24_bin_override
     if override and Path(override).is_dir():
         return override
     matches = sorted(p for p in glob.glob(_NODE24_GLOB) if Path(p).is_dir())
@@ -1712,7 +1709,7 @@ def _unwrap_list(payload, *keys) -> list:
     return []
 
 
-_MY_EMAIL = os.environ.get("CLAUDE_WEB_MY_EMAIL", "").strip().lower()
+_MY_EMAIL = cfg.my_email
 
 
 def _detail_recipients(payload, key: str) -> list:

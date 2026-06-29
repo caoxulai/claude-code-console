@@ -13,6 +13,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.config import cfg
 from server.routes import read_json_body
 from server.routes.workers import register_worker, mark_worker_run
 
@@ -25,9 +26,7 @@ def _resolve_workspace_dir() -> Path:
     /home/<user> which symlinks to /local/home/<user>; Claude records cwds
     under the real /local/home path, so we must resolve() to match.
     """
-    env = os.environ.get("CLAUDE_WEB_WORKSPACE")
-    base = Path(env) if env else Path.home() / "workspace" / "projects"
-    return base.resolve()
+    return cfg.workspace_dir
 
 
 WORKSPACE_DIR = _resolve_workspace_dir()
@@ -283,13 +282,9 @@ def _get_all_project_dirs() -> list[Path]:
 
 def _load_project_urls_config() -> dict:
     """Load project URLs from user config file."""
-    config_path = Path(os.environ.get(
-        "CLAUDE_WEB_CONFIG",
-        Path.home() / ".claude-web" / "config.json",
-    ))
-    if config_path.is_file():
+    if cfg.config_path.is_file():
         try:
-            data = json.loads(config_path.read_text())
+            data = json.loads(cfg.config_path.read_text())
             return data.get("projectUrls", {})
         except (json.JSONDecodeError, OSError):
             pass
@@ -601,7 +596,7 @@ async def get_config(request: web.Request) -> web.Response:
                 "slug": _project_path_to_claude_slug(str(d)),
             })
 
-    my_email = os.environ.get("CLAUDE_WEB_MY_EMAIL", "")
+    my_email = cfg.my_email
 
     return web.json_response({
         "home": str(home),

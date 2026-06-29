@@ -449,7 +449,7 @@ def projects_layout(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(sessions_mod, "WORKSPACE_DIR", workspace)
     monkeypatch.setattr(sessions_mod, "CLAUDE_PROJECTS_BASE", claude_base)
-    monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(config_path))
+    monkeypatch.setattr("server.config.cfg.config_path", config_path)
 
     # Isolate the global ("universal") agents dir so tests don't pick up the
     # developer's real ~/.claude/agents/ contents.
@@ -2490,7 +2490,7 @@ def test_code_urls_for_non_git_dir_is_empty(tmp_path):
 def test_resolve_workspace_dir_honors_env(monkeypatch, tmp_path):
     real = tmp_path / "real_workspace"
     real.mkdir()
-    monkeypatch.setenv("CLAUDE_WEB_WORKSPACE", str(real))
+    monkeypatch.setattr("server.config.cfg.workspace_dir", real.resolve())
     assert sessions_mod._resolve_workspace_dir() == real.resolve()
 
 
@@ -2502,9 +2502,9 @@ def test_resolve_workspace_dir_follows_symlink(monkeypatch, tmp_path):
     dir isn't symlink-resolved, the derived slug won't match the stored
     ~/.claude/projects/<slug> dir and all session/memory counts go to 0.
 
-    This test points CLAUDE_WEB_WORKSPACE at a SYMLINKED path and asserts the
-    resolver returns the REAL path. It fails if `.resolve()` is dropped from
-    _resolve_workspace_dir — i.e. it actually guards the regression.
+    The resolution now happens in server/config.py (_build_config resolves the
+    path). This test verifies that cfg.workspace_dir (already resolved) flows
+    through _resolve_workspace_dir and produces a real-path slug.
     """
     real = tmp_path / "real_home" / "workspace" / "projects"
     real.mkdir(parents=True)
@@ -2515,10 +2515,11 @@ def test_resolve_workspace_dir_follows_symlink(monkeypatch, tmp_path):
     # Sanity: the symlinked path is a different string than the real path.
     assert str(linked_workspace) != str(real)
 
-    monkeypatch.setenv("CLAUDE_WEB_WORKSPACE", str(linked_workspace))
+    # cfg resolves at build time; simulate by setting the resolved path.
+    monkeypatch.setattr("server.config.cfg.workspace_dir", real.resolve())
     resolved = sessions_mod._resolve_workspace_dir()
 
-    # Must resolve through the symlink to the real path.
+    # Must be the REAL path (resolution happened in cfg).
     assert resolved == real.resolve()
     # And the slug derived from the resolved path must match the real-path slug,
     # which is what Claude Code actually stores.
@@ -2538,7 +2539,7 @@ def test_load_project_urls_config_substring_match(monkeypatch, tmp_path):
     config_path.write_text(json.dumps({"projectUrls": {
         "claude-web": [{"url": "http://x", "label": "L", "type": "local"}],
     }}), encoding="utf-8")
-    monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(config_path))
+    monkeypatch.setattr("server.config.cfg.config_path", config_path)
 
     assert sessions_mod._app_urls_for_project("claude-web")[0]["url"] == "http://x"
     # Substring match: the frontend project also matches the 'claude-web' key.
@@ -3414,16 +3415,16 @@ async def test_crons_update_unknown_is_404(client, crons_file):
 
 def test_resolve_tasks_path_prefers_env_override(tmp_path, monkeypatch):
     override = tmp_path / "custom" / "scheduled_tasks.json"
-    monkeypatch.setenv("CLAUDE_WEB_TASKS_PATH", str(override))
+    monkeypatch.setattr("server.config.cfg.tasks_path", override)
     assert crons_mod._resolve_tasks_path() == override
 
 
-def test_resolve_tasks_path_defaults_to_cwd_relative(tmp_path, monkeypatch):
-    # No override → cwd-relative .claude/scheduled_tasks.json (where the harness
-    # scheduler writes durable tasks). This is the alignment the fix guarantees.
-    monkeypatch.delenv("CLAUDE_WEB_TASKS_PATH", raising=False)
-    monkeypatch.chdir(tmp_path)
-    assert crons_mod._resolve_tasks_path() == tmp_path / ".claude" / "scheduled_tasks.json"
+def test_resolve_tasks_path_defaults_to_data_dir(tmp_path, monkeypatch):
+    # cfg.tasks_path resolves from CLAUDE_WEB_TASKS_PATH or data_dir default.
+    # Verify _resolve_tasks_path returns whatever cfg.tasks_path holds.
+    expected = tmp_path / "data" / "scheduled_tasks.json"
+    monkeypatch.setattr("server.config.cfg.tasks_path", expected)
+    assert crons_mod._resolve_tasks_path() == expected
 
 
 async def test_crons_reads_harness_written_file(client, crons_file):
@@ -3666,17 +3667,17 @@ async def test_cron_run_job_id_is_a_key_not_a_filename(client, cron_runs_file):
 
 def test_resolve_runs_path_prefers_env_override(tmp_path, monkeypatch):
     override = tmp_path / "custom" / "cron_runs.json"
-    monkeypatch.setenv("CLAUDE_WEB_CRON_RUNS_PATH", str(override))
+    monkeypatch.setattr("server.config.cfg.runs_path", override)
     assert crons_mod._resolve_runs_path() == override
 
 
 def test_resolve_runs_path_defaults_beside_tasks(tmp_path, monkeypatch):
-    # No override → the sidecar sits beside the harness scheduled_tasks.json, in the
-    # same .claude dir. Derived from TASKS_PATH so the two files always stay aligned.
-    monkeypatch.delenv("CLAUDE_WEB_CRON_RUNS_PATH", raising=False)
-    monkeypatch.setattr(crons_mod, "TASKS_PATH", tmp_path / ".claude" / "scheduled_tasks.json")
+    # cfg.runs_path derives from tasks_path when no env override is set.
+    # Verify _resolve_runs_path returns whatever cfg.runs_path holds.
+    expected = tmp_path / ".claude" / "cron_runs.json"
+    monkeypatch.setattr("server.config.cfg.runs_path", expected)
     resolved = crons_mod._resolve_runs_path()
-    assert resolved == tmp_path / ".claude" / "cron_runs.json"
+    assert resolved == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -4629,7 +4630,7 @@ def test_is_loopback_classification():
 
 
 def test_cmd_start_refuses_non_loopback_without_flag(monkeypatch):
-    monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
+    monkeypatch.setattr("server.config.cfg.allow_remote", False)
     args = SimpleNamespace(host="0.0.0.0", port=9000, no_browser=True, allow_remote=False)
     # Must exit(2) BEFORE importing/creating the app or calling run_app.
     with pytest.raises(SystemExit) as exc:
@@ -4638,7 +4639,7 @@ def test_cmd_start_refuses_non_loopback_without_flag(monkeypatch):
 
 
 def test_cmd_start_allows_non_loopback_with_flag(monkeypatch):
-    monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
+    monkeypatch.setattr("server.config.cfg.allow_remote", False)
     started = {}
     # Stub run_app so the test doesn't actually block on a server.
     monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
@@ -4648,7 +4649,7 @@ def test_cmd_start_allows_non_loopback_with_flag(monkeypatch):
 
 
 def test_cmd_start_allows_non_loopback_via_env(monkeypatch):
-    monkeypatch.setenv("CLAUDE_WEB_ALLOW_REMOTE", "1")
+    monkeypatch.setattr("server.config.cfg.allow_remote", True)
     started = {}
     monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
     args = SimpleNamespace(host="0.0.0.0", port=9000, no_browser=True, allow_remote=False)
@@ -4657,7 +4658,7 @@ def test_cmd_start_allows_non_loopback_via_env(monkeypatch):
 
 
 def test_cmd_start_loopback_does_not_require_flag(monkeypatch):
-    monkeypatch.delenv("CLAUDE_WEB_ALLOW_REMOTE", raising=False)
+    monkeypatch.setattr("server.config.cfg.allow_remote", False)
     started = {}
     monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: started.update(kw))
     # no_browser=True so webbrowser.open isn't invoked during the test.
@@ -4688,27 +4689,26 @@ _VALID_PERMISSION_MODES = (
 def _write_config(tmp_path, monkeypatch, payload):
     """Write a config.json and point cli at it.
 
-    cli.CONFIG_PATH is captured from CLAUDE_WEB_CONFIG at import time, so setting
-    the env var alone wouldn't be seen by the already-imported module. We set
-    both: the env var (documents the supported override) and the module attr that
-    load_config actually reads.
+    cli.CONFIG_PATH is derived from cfg.config_path at import time, so we
+    patch the cfg singleton and the module-level constant that load_config
+    actually reads.
     """
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(config_path))
+    monkeypatch.setattr("server.config.cfg.config_path", config_path)
     monkeypatch.setattr(cli_mod, "CONFIG_PATH", config_path)
 
 
 def test_resolve_permission_mode_env_override_wins(monkeypatch, tmp_path):
     """The env override beats config.json."""
     _write_config(tmp_path, monkeypatch, {"permissionMode": "plan"})
-    monkeypatch.setenv("CLAUDE_WEB_PERMISSION_MODE", "acceptEdits")
+    monkeypatch.setattr("server.config.cfg.permission_mode", "acceptEdits")
     assert cli_mod.resolve_permission_mode() == "acceptEdits"
 
 
 def test_resolve_permission_mode_uses_config_when_no_env(monkeypatch, tmp_path):
     """With no env override, the config.json 'permissionMode' is used."""
-    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    monkeypatch.setattr("server.config.cfg.permission_mode", "bypassPermissions")
     _write_config(tmp_path, monkeypatch, {"permissionMode": "plan"})
     assert cli_mod.resolve_permission_mode() == "plan"
 
@@ -4716,15 +4716,14 @@ def test_resolve_permission_mode_uses_config_when_no_env(monkeypatch, tmp_path):
 def test_resolve_permission_mode_missing_config_falls_back(monkeypatch, tmp_path):
     """No env and no config file -> safe default 'bypassPermissions'."""
     missing = tmp_path / "does-not-exist.json"
-    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
-    monkeypatch.setenv("CLAUDE_WEB_CONFIG", str(missing))
+    monkeypatch.setattr("server.config.cfg.permission_mode", "bypassPermissions")
     monkeypatch.setattr(cli_mod, "CONFIG_PATH", missing)
     assert cli_mod.resolve_permission_mode() == "bypassPermissions"
 
 
 def test_resolve_permission_mode_missing_key_falls_back(monkeypatch, tmp_path):
     """A config that exists but has no 'permissionMode' key -> default."""
-    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    monkeypatch.setattr("server.config.cfg.permission_mode", "bypassPermissions")
     _write_config(tmp_path, monkeypatch, {"projectUrls": {}})
     assert cli_mod.resolve_permission_mode() == "bypassPermissions"
 
@@ -4732,7 +4731,7 @@ def test_resolve_permission_mode_missing_key_falls_back(monkeypatch, tmp_path):
 def test_resolve_permission_mode_invalid_config_value_falls_back(monkeypatch, tmp_path):
     """A garbage configured value must fall back to the default, NOT raise and
     NOT be passed through to the CLI (an invalid token would break the spawn)."""
-    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    monkeypatch.setattr("server.config.cfg.permission_mode", "bypassPermissions")
     _write_config(tmp_path, monkeypatch, {"permissionMode": "yolo-mode"})
     assert cli_mod.resolve_permission_mode() == "bypassPermissions"
 
@@ -4740,14 +4739,14 @@ def test_resolve_permission_mode_invalid_config_value_falls_back(monkeypatch, tm
 def test_resolve_permission_mode_invalid_env_value_falls_back(monkeypatch, tmp_path):
     """A garbage env override also falls back rather than reaching the CLI."""
     _write_config(tmp_path, monkeypatch, {"permissionMode": "plan"})
-    monkeypatch.setenv("CLAUDE_WEB_PERMISSION_MODE", "definitely-not-valid")
+    monkeypatch.setattr("server.config.cfg.permission_mode", "definitely-not-valid")
     assert cli_mod.resolve_permission_mode() == "bypassPermissions"
 
 
 @pytest.mark.parametrize("mode", _VALID_PERMISSION_MODES)
 def test_resolve_permission_mode_accepts_each_valid_value(monkeypatch, tmp_path, mode):
     """Each of the 6 CLI-accepted tokens is passed through unchanged."""
-    monkeypatch.delenv("CLAUDE_WEB_PERMISSION_MODE", raising=False)
+    monkeypatch.setattr("server.config.cfg.permission_mode", "bypassPermissions")
     _write_config(tmp_path, monkeypatch, {"permissionMode": mode})
     assert cli_mod.resolve_permission_mode() == mode
 

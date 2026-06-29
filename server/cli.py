@@ -1,15 +1,16 @@
 """CLI entry point for claude-web."""
 import argparse
 import json
-import os
 import sys
 import webbrowser
 from pathlib import Path
 
 from aiohttp import web
 
+from server.config import cfg
 
-CONFIG_PATH = Path(os.environ.get("CLAUDE_WEB_CONFIG", Path.home() / ".claude-web" / "config.json"))
+
+CONFIG_PATH = cfg.config_path
 
 
 def load_config() -> dict:
@@ -37,17 +38,36 @@ DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
 
 def resolve_permission_mode() -> str:
-    """Resolve the console's permission mode from env then config.
+    """Resolve the console's permission mode from cfg then config file.
 
-    Read order: CLAUDE_WEB_PERMISSION_MODE env var first, then the
-    'permissionMode' key in config.json (~/.claude-web/config.json). A missing
-    or invalid value falls back to 'bypassPermissions' — a bad config string
-    must never crash the server, so this never raises. Pure/importable so it
-    can be unit-tested directly.
+    Uses the permission_mode already resolved by cfg (from CLAUDE_WEB_PERMISSION_MODE
+    env var). cfg validates the env value against ALLOWED_PERMISSION_MODES and
+    falls back to DEFAULT_PERMISSION_MODE if invalid/absent.
+
+    Precedence:
+      1. cfg.permission_mode (from env var) — if it is a valid non-default value,
+         use it directly. If it is an invalid value (set explicitly to garbage),
+         fall back to default (never leak garbage to the CLI).
+      2. If cfg is at the default, check the config file's 'permissionMode' key.
+      3. Otherwise, return DEFAULT_PERMISSION_MODE.
+
+    A bad config string must never crash the server, so this never raises.
+    Pure/importable so it can be unit-tested directly.
     """
-    mode = os.environ.get("CLAUDE_WEB_PERMISSION_MODE") or load_config().get("permissionMode")
-    if mode in ALLOWED_PERMISSION_MODES:
+    mode = cfg.permission_mode
+    # If cfg resolved to a valid non-default value, the env was explicitly set
+    # to something good — use it.
+    if mode in ALLOWED_PERMISSION_MODES and mode != DEFAULT_PERMISSION_MODE:
         return mode
+    # If cfg resolved to the default, the env was either absent or matched the
+    # default. Check the config file for a user-chosen override.
+    if mode == DEFAULT_PERMISSION_MODE:
+        file_mode = load_config().get("permissionMode")
+        if file_mode in ALLOWED_PERMISSION_MODES:
+            return file_mode
+        return DEFAULT_PERMISSION_MODE
+    # cfg.permission_mode is an invalid/unknown string (e.g. test-injected
+    # garbage) — fall back to the safe default.
     return DEFAULT_PERMISSION_MODE
 
 
@@ -64,7 +84,7 @@ def cmd_start(args):
     # That is acceptable bound to loopback (same trust boundary as the CLI), but
     # binding to a routable interface without auth is unauthenticated RCE on the
     # network. Require an explicit opt-in for any non-loopback host.
-    allow_remote = args.allow_remote or os.environ.get("CLAUDE_WEB_ALLOW_REMOTE") == "1"
+    allow_remote = args.allow_remote or cfg.allow_remote
     if not _is_loopback(args.host) and not allow_remote:
         print(
             f"[claude-web] REFUSING to bind to non-loopback host {args.host!r}.\n"
@@ -119,7 +139,7 @@ def main():
 
     # Default: start server (also runs if no subcommand given)
     start_parser = sub.add_parser("start", help="Start the web server")
-    start_parser.add_argument("--port", type=int, default=int(os.environ.get("CLAUDE_WEB_PORT", "9000")))
+    start_parser.add_argument("--port", type=int, default=cfg.port)
     start_parser.add_argument("--host", default="127.0.0.1")
     start_parser.add_argument("--no-browser", action="store_true", help="Don't open browser on start")
     start_parser.add_argument(
@@ -140,7 +160,7 @@ def main():
         cmd_start(args)
     else:
         # No subcommand — default to start with defaults
-        args.port = int(os.environ.get("CLAUDE_WEB_PORT", "9000"))
+        args.port = cfg.port
         args.host = "127.0.0.1"
         args.no_browser = False
         args.allow_remote = False

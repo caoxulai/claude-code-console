@@ -1,12 +1,11 @@
 """aiohttp application factory for Claude Code Console."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from aiohttp import web
 
-from server.cli import resolve_permission_mode
+from server.config import cfg
 from server.ws import WebSocketManager
 from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents, slack, email, workers
 
@@ -36,13 +35,11 @@ def create_app() -> web.Application:
 
     # Shared state
     app["ws_manager"] = WebSocketManager()
-    app["default_cwd"] = Path(
-        os.environ.get("CLAUDE_WEB_CWD", str(Path.home()))
-    ).expanduser().resolve()
+    app["default_cwd"] = cfg.default_cwd
     app["allowed_cwd_roots"] = ALLOWED_CWD_ROOTS
     # Resolve the permission mode once at startup so chat.py can read it
     # per-request without re-parsing config (env > config.json > bypassPermissions).
-    app["permission_mode"] = resolve_permission_mode()
+    app["permission_mode"] = cfg.permission_mode
 
     # WebSocket
     app.router.add_get("/ws", app["ws_manager"].handle)

@@ -273,15 +273,11 @@ def make_app(secret: str, default_cwd: Path) -> web.Application:
 def main() -> None:
     _ensure_env()
     load_dotenv(ENV_PATH)
-    secret = os.environ.get("CLAUDE_WEB_SECRET", "")
-    if not secret:
-        raise SystemExit("CLAUDE_WEB_SECRET not set in .env")
-    port = int(os.environ.get("CLAUDE_WEB_PORT", "9000"))
-    default_cwd = Path(os.environ.get("CLAUDE_WEB_CWD", str(Path.home()))).expanduser().resolve()
-    app = make_app(secret, default_cwd)
-    print(f"[claude-web] listening on 127.0.0.1:{port}, default cwd={default_cwd}")
-    print(f"[claude-web] pair a device: GET /auth?secret={secret}")
-    web.run_app(app, host="127.0.0.1", port=port, print=lambda *_: None)
+    from server.config import cfg  # noqa: E402 — import after load_dotenv
+    app = make_app(cfg.secret, cfg.default_cwd)
+    print(f"[claude-web] listening on 127.0.0.1:{cfg.port}, default cwd={cfg.default_cwd}")
+    print(f"[claude-web] pair a device: GET /auth?secret={cfg.secret}")
+    web.run_app(app, host="127.0.0.1", port=cfg.port, print=lambda *_: None)
 
 
 if __name__ == "__main__":

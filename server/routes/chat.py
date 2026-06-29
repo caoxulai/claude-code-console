@@ -11,7 +11,6 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
-from server.cli import load_config
 from server.routes import read_json_body
 from server.routes.workers import register_worker
 from server.session_manager import (
@@ -37,15 +36,12 @@ _DEFAULT_PERMISSION_MODE = "bypassPermissions"
 def _resolve_permission_mode(app: web.Application) -> str:
     """Resolve the configured permission mode, validated against the CLI tokens.
 
-    Prefers a value already resolved onto the app (populated at startup);
-    otherwise reads CLAUDE_WEB_PERMISSION_MODE / config.json's permissionMode.
+    Reads app['permission_mode'] which is populated at startup from cfg.
     Invalid or missing values fall back to bypassPermissions so we never hand
-    the CLI a token it would reject. Kept overridable via app state and env so
-    tests can pin a mode without touching the process environment.
+    the CLI a token it would reject. Kept overridable via app state so tests
+    can pin a mode without touching the process environment.
     """
     mode = app.get("permission_mode")
-    if mode is None:
-        mode = os.environ.get("CLAUDE_WEB_PERMISSION_MODE") or load_config().get("permissionMode")
     if mode in _VALID_PERMISSION_MODES:
         return mode
     return _DEFAULT_PERMISSION_MODE
