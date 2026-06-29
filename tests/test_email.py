@@ -7239,3 +7239,165 @@ def test_html_to_text_adjacent_diff_width_tables_is_idempotent():  # D-066 (c) i
     twice = email_mod._html_to_text(once)
     assert twice == once
     assert "\x01" not in once and "\x04" not in once
+
+
+# ─── B-1: safe body-cap truncation (does not sever GFM tables mid-row) ─────────
+#
+# The 32k emailBody cap slices body_text[:_EMAIL_BODY_CAP] at three body-STORING
+# sites (folder prefetch / Graph prefetch / backfill). body_text is the OUTPUT of
+# _html_to_text (full GFM, tables already converted), so a raw slice can cut a
+# table mid-row -> remark-gfm then renders the whole table as literal pipe text.
+# _safe_body_truncate must trim only a trailing partial/severed row (and a now-
+# orphaned header+separator), never reorder or drop earlier content.
+
+
+def _build_boundary_crossing_table_body(cap):
+    """Build a >cap body whose FINAL GFM table straddles char `cap`, cut so the raw
+    `[:cap]` slice leaves a severed row with FEWER columns than the separator (the
+    realistic remark-gfm-rejected case — a row cut before its trailing cells).
+
+    Returns (full_body, safe_prefix) where safe_prefix is everything that MUST
+    survive byte-identical (all complete lines up to but excluding the severed row).
+    """
+    # A complete, valid 3-col table earlier in the body — must be preserved intact.
+    early_table = (
+        "| Metric | Value | Owner |\n"
+        "| --- | --- | --- |\n"
+        "| Latency | 120ms | Ada |\n"
+        "| Errors | 0 | Bo |\n"
+    )
+    para = "This is an earlier paragraph of prose that carries real words.\n"
+    prefix = para + early_table + "\n"
+    filler_line = "Filler sentence number {:05d} keeps the body growing steadily.\n"
+    n = 0
+    # Grow until the final table's header+separator sit just below the cap, leaving
+    # exactly the start of the first data row above the cap so the cut severs it.
+    final_header = "| Region | Status | Notes |\n| --- | --- | --- |\n"
+    # The first data row; we want the cut to land after its first cell only, so the
+    # retained partial reads "| NA | Gr" -> 2 cols under a 3-col separator (broken).
+    final_row = "| NA | Green status reported in the eastern region | followup needed |\n"
+    # Pad so that (prefix + final_header) ends a few chars before `cap`, with the
+    # data row crossing it. Reserve room: cut should land ~8 chars into the row.
+    target_header_end = cap - 8
+    # Coarse pad with whole filler lines, then a single exact-length pad line so the
+    # header ends precisely at target_header_end (avoids overshooting the cap).
+    while len(prefix) + len(final_header) + len(filler_line.format(n)) < target_header_end:
+        prefix += filler_line.format(n)
+        n += 1
+    pad_needed = target_header_end - (len(prefix) + len(final_header))
+    if pad_needed > 1:
+        prefix += ("P" * (pad_needed - 1)) + "\n"
+    prefix += final_header
+    safe_prefix = prefix  # complete content up to (not including) the severed row
+    full_body = prefix + final_row + "| EU | Amber follow-up | second row |\n"
+    assert len(full_body) > cap, "body must exceed the cap for this test to be meaningful"
+    # The cut must land INSIDE the first data row (mid-cell), not on a newline.
+    assert cap < len(full_body) and full_body[cap - 1] != "\n", \
+        "fixture must cut mid-row"
+    assert len(prefix) < cap, "header must be retained, the data row severed"
+    return full_body, safe_prefix
+
+
+def test_safe_body_truncate_does_not_sever_final_table():  # B-1a
+    """A >32k body whose final table crosses the cap boundary mid-row -> the capped
+    body has ONLY valid GFM tables (header_cols == separator_cols == every data row),
+    no severed trailing row left behind."""
+    cap = email_mod._EMAIL_BODY_CAP
+    full_body, _ = _build_boundary_crossing_table_body(cap)
+
+    # Sanity: the NAIVE slice DOES leave a broken table (this is the bug we fix).
+    naive = full_body[:cap]
+    naive_tables = validate_mod.parse_gfm_tables(naive)
+    naive_broken = any(
+        t["separator_cols"] != t["header_cols"]
+        or any(c != t["separator_cols"] for c in t["data_cols"])
+        for t in naive_tables
+    )
+    assert naive_broken, "fixture must produce a severed table under a naive slice"
+
+    safe = email_mod._safe_body_truncate(full_body, cap)
+    assert len(safe) <= cap, "safe truncation must not exceed the cap"
+    tables = validate_mod.parse_gfm_tables(safe)
+    for t in tables:
+        assert t["header_cols"] == t["separator_cols"], (
+            f"header_cols != separator_cols: {t}"
+        )
+        for dc in t["data_cols"]:
+            assert dc == t["separator_cols"], (
+                f"data-row width {dc} != separator {t['separator_cols']}: {t}"
+            )
+
+
+def test_safe_body_truncate_no_word_loss_before_severed_row():  # B-1b
+    """Everything BEFORE the severed row is byte-identical — no overshoot eating
+    complete earlier rows/paragraphs, no reorder."""
+    cap = email_mod._EMAIL_BODY_CAP
+    full_body, safe_prefix = _build_boundary_crossing_table_body(cap)
+    safe = email_mod._safe_body_truncate(full_body, cap)
+    # The retained body is a PREFIX of the safe_prefix (it may stop earlier — at the
+    # last complete line before the cap — but never reorders or rewrites content).
+    assert safe_prefix.startswith(safe.rstrip("\n")) or safe.rstrip("\n") == "" or \
+        safe_prefix.startswith(safe), \
+        "retained body must be a byte-identical prefix of the pre-severed content"
+    # The earlier complete table's content survives intact (no row dropped).
+    assert "| Latency | 120ms | Ada |" in safe
+    assert "| Errors | 0 | Bo |" in safe
+    assert "This is an earlier paragraph" in safe
+
+
+def test_safe_body_truncate_no_ghost_table():  # B-1a (ghost-table trap)
+    """When dropping the severed row would leave a header + separator with NO data
+    rows, the orphaned header+separator are dropped too (no empty ghost table)."""
+    cap = 200
+    # Body whose final table's ONLY data row is severed by the cap, so dropping it
+    # leaves a header+separator orphan.
+    head = "Intro paragraph that is comfortably complete.\n\n"
+    head += "| Col A | Col B |\n| --- | --- |\n"
+    body = head + ("| " + "Z" * 400 + " | partial")  # severed single data row
+    safe = email_mod._safe_body_truncate(body, cap)
+    tables = validate_mod.parse_gfm_tables(safe)
+    assert tables == [], f"expected no ghost header-only table, got {tables}\n{safe!r}"
+    assert "Intro paragraph" in safe
+
+
+def test_safe_body_truncate_under_cap_unchanged():  # B-1c
+    """A body at/under the cap is returned unchanged (identity)."""
+    cap = email_mod._EMAIL_BODY_CAP
+    body = "Short body with a complete table.\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+    assert email_mod._safe_body_truncate(body, cap) == body
+
+
+def test_safe_body_truncate_newline_boundary_keeps_complete_line():  # B-1c
+    """A >cap body whose cap lands EXACTLY on a newline (last line complete, no
+    table near the cut) must keep that complete final line — do NOT eat it."""
+    line = "Each of these lines is exactly forty characters!\n"  # complete lines
+    # Build so that char `cap` falls right after a newline.
+    cap = 0
+    body = ""
+    while len(body) < 1000:
+        body += line
+    # Pick a cap that lands exactly on a newline boundary inside the body.
+    cap = body.index("\n", 500) + 1
+    assert body[cap - 1] == "\n"
+    extra = body + "trailing partial line with no newline at the very end"
+    safe = email_mod._safe_body_truncate(extra, cap)
+    # The naive slice already ends on a complete line — safe truncation must match it
+    # (modulo trailing whitespace) and must NOT drop the final complete line.
+    assert safe.rstrip("\n") == extra[:cap].rstrip("\n")
+    assert safe.endswith("characters!") or safe.endswith("characters!\n")
+
+
+def test_safe_body_truncate_no_table_near_cap_matches_plain_slice():  # B-1c
+    """A >cap body with NO table near the cut yields the same content the plain
+    [:cap] slice does, modulo trailing whitespace (only the trailing partial line
+    of prose is trimmed back to the last newline)."""
+    cap = email_mod._EMAIL_BODY_CAP
+    para = "Prose paragraph with ordinary words and no pipe characters at all.\n"
+    body = para * 600  # well over the cap, no tables anywhere
+    assert len(body) > cap
+    safe = email_mod._safe_body_truncate(body, cap)
+    naive = body[:cap]
+    # Everything up to the last complete line is identical; safe only trims the
+    # final partial line of prose.
+    last_nl = naive.rfind("\n")
+    assert safe == naive[: last_nl + 1] or safe == naive

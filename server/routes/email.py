@@ -89,6 +89,57 @@ def _email_topics_dir() -> Path:
 # emailBody cap: spec mandates capping at 32k chars when storing items.
 _EMAIL_BODY_CAP = 32768
 
+# A GFM table separator row: '| --- | :--: | ... |' — every cell between the outer
+# pipes is a dash delimiter (optionally with leading/trailing alignment colons).
+_GFM_SEP_ROW = re.compile(r"^\|(?:\s*:?-+:?\s*\|)+\s*$")
+
+
+def _safe_body_truncate(text: str, cap: int) -> str:
+    """Cap ``text`` at ``cap`` chars WITHOUT severing a GFM table mid-row.
+
+    ``text`` is the OUTPUT of ``_html_to_text`` (full GFM, tables already
+    converted), so a raw ``text[:cap]`` slice can cut a table data row in half ->
+    remark-gfm then rejects the whole table and renders it as literal pipe text.
+
+    The truncation is no-word-loss beyond the intentional cap: it only trims the
+    trailing PARTIAL line the cap cut through (back to the last complete-line
+    boundary), and — if that leaves a GFM table header+separator with NO data rows
+    (a ghost table) — drops the orphaned header+separator too. Everything BEFORE
+    the severed row is byte-identical; nothing is reordered or rewritten.
+    """
+    if text is None:
+        return text
+    if len(text) <= cap:
+        return text
+
+    sliced = text[:cap]
+    # The slice ended mid-line UNLESS the very next char is a newline (i.e. the cut
+    # landed exactly at the end of a complete line). When it cut mid-line, drop the
+    # trailing partial line back to the last complete-line boundary.
+    if text[cap:cap + 1] != "\n":
+        nl = sliced.rfind("\n")
+        sliced = sliced[: nl + 1] if nl != -1 else ""
+
+    # Drop a now-orphaned table header+separator: if the retained tail is a GFM
+    # separator row whose data rows were all trimmed away, removing only the
+    # separator would still leave a 1-row "ghost" header. Drop BOTH so no empty
+    # table renders. (The header is the non-blank line immediately above it.)
+    lines = sliced.split("\n")
+    # Trailing empty strings come from the final newline / blank-line table
+    # terminator; ignore them when locating the last content line.
+    last = len(lines) - 1
+    while last >= 0 and lines[last].strip() == "":
+        last -= 1
+    if last >= 1 and _GFM_SEP_ROW.match(lines[last].strip()):
+        # lines[last] is an orphan separator (no data row beneath survived) and
+        # lines[last-1] is its header — drop both, keep everything before.
+        head = lines[: last - 1]
+        # Preserve a single trailing newline if the kept content had one.
+        sliced = "\n".join(head)
+        if head and sliced:
+            sliced += "\n"
+    return sliced
+
 _SNIPPET_CAP = 2000
 _DRAFT_CAP = 8000
 
@@ -1223,7 +1274,7 @@ def _build_prompt(action: str, payload: dict) -> str:
             item = payload.get("item") or {}
             subject = _one_line(str(item.get("subject", "")), 300)
             sender = _one_line(str(item.get("sender", "")), 200)
-            body = str(item.get("emailBody", ""))[:_EMAIL_BODY_CAP]
+            body = _safe_body_truncate(str(item.get("emailBody", "")), _EMAIL_BODY_CAP)
             snippet = str(item.get("snippet", ""))[:_SNIPPET_CAP]
             # Use full body if available, else snippet
             context = body if body.strip() else snippet
@@ -3666,7 +3717,7 @@ async def _scan_once(app) -> None:
                 body_payload = _owa_conversation_to_payload(owa_msgs)
                 body_text = _extract_email_body(body_payload)
                 if body_text:
-                    raw["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+                    raw["emailBody"] = _safe_body_truncate(body_text, _EMAIL_BODY_CAP)
                 history = _extract_thread_history(body_payload)
                 if history:
                     raw["threadHistory"] = history
@@ -3679,7 +3730,7 @@ async def _scan_once(app) -> None:
                 body_payload = await call_read_tool("get_email", {"message_id": msg_id})
                 body_text = _extract_email_body(body_payload)
                 if body_text:
-                    raw["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+                    raw["emailBody"] = _safe_body_truncate(body_text, _EMAIL_BODY_CAP)
                 history = _extract_thread_history(body_payload)
                 if history:
                     raw["threadHistory"] = history
@@ -3763,7 +3814,7 @@ async def _scan_once(app) -> None:
                 logger.info("Email body recovered from quoted copy for %s", msg_id)
 
         if body_text:
-            it["emailBody"] = body_text[:_EMAIL_BODY_CAP]
+            it["emailBody"] = _safe_body_truncate(body_text, _EMAIL_BODY_CAP)
         if history:
             it["threadHistory"] = history
             # Same overwrite as the new-item path: land the latest sender +
