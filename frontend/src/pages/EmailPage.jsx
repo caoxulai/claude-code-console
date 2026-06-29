@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FiRefreshCw, FiRotateCw, FiTrash2, FiTrash, FiSave, FiChevronDown, FiChevronRight,
   FiCheckCircle, FiAlertCircle, FiClock, FiBellOff, FiPause, FiPlay,
@@ -383,14 +383,34 @@ export default function EmailPage() {
     return () => clearInterval(id);
   }, []);
 
+  // The stored draft of the currently-OPEN row. When NOT editing, the textarea
+  // shows `item.draft` directly (value = editing ? draftText : item.draft), so a
+  // live refresh that swaps the open row's body (the "updating this draft…" path)
+  // changes the textarea content WITHOUT touching draftText. We thread that single
+  // value into the auto-size deps so the open row still re-sizes when its body
+  // changes underneath it — without re-running on every unrelated queue refresh.
+  const openItemDraft = expandedId !== null
+    ? (items.find(it => it.id === expandedId)?.draft ?? '')
+    : '';
+
   // Auto-size the draft textarea whenever the row it belongs to opens or its
-  // displayed text changes by a NON-typing path — expanding a row, or Polish
-  // replacing the text. (Typing is sized inline in the textarea's onChange.) The
-  // textarea only exists while a row is expanded, so this no-ops otherwise.
+  // displayed text changes by a NON-typing path — expanding a row, Polish
+  // replacing the text, or a live refresh swapping the open row's stored draft.
+  // (Typing is sized inline in the textarea's onChange.) The textarea only exists
+  // while a row is expanded, so this no-ops otherwise.
+  //
+  // Deps are the values that actually change the textarea's CONTENT:
+  // expandedId/editingId (which row's box is shown), draftText (the in-edit text,
+  // covering typing + Polish), and openItemDraft (the open row's STORED draft,
+  // covering a background re-draft of an open-but-unedited row). The whole `items`
+  // array is deliberately NOT a dep — it re-sized the box on every queue refresh
+  // even when the open row was unchanged; openItemDraft is the precise slice that
+  // matters, so unrelated rows churning no longer re-fires this. autoSizeDraft is
+  // a stable closure reading draftRef, hence the exhaustive-deps disable.
   useEffect(() => {
     autoSizeDraft();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expandedId, editingId, draftText, items]);
+  }, [expandedId, editingId, draftText, openItemDraft]);
 
   // Manual refresh
   const refreshQueue = async () => {
@@ -585,13 +605,21 @@ export default function EmailPage() {
       const item = items.find(it => it.id === id);
       const text = (editingId === id) ? draftText : (item ? (item.draft || '') : '');
 
+      // Thread the etag through this call in a LOCAL variable. setEtag() is a
+      // next-render update invisible to the rest of THIS function, so after a
+      // same-call save the closure `etag` is still the STALE pre-save value — the
+      // approve POST below must send the POST-save etag or the backend 409s a
+      // perfectly fine approve (the same local-`cur` pattern dismissAll/deleteAll
+      // use; the dismissAll comment documents exactly this next-render gotcha).
+      let cur = etag;
+
       // If the draft OR the reply-all recipients were edited, persist first so
       // approve reads the latest values (the backend resolves To/CC from the
       // persisted item — D-056 #3). We send the recipient arrays only when the
       // user actually changed them, so a draft-only approve never rewrites them.
       const draftDirty = editingId === id && draftText !== (item ? (item.draft || '') : '');
       if (draftDirty || recipientsDirty) {
-        const savePayload = { draft: text, etag };
+        const savePayload = { draft: text, etag: cur };
         if (recipientsDirty) {
           savePayload.toRecipients = recipientsTo;
           savePayload.ccRecipients = recipientsCc;
@@ -612,15 +640,19 @@ export default function EmailPage() {
           return;
         }
         const saveJson = await saveRes.json();
-        setEtag(saveJson.etag ?? null);
+        // Advance the LOCAL etag from the save response so the approve POST uses
+        // the fresh one (setEtag alone wouldn't reach the line below this turn).
+        cur = saveJson.etag ?? cur;
+        setEtag(cur);
         setRecipientsDirty(false);
       }
 
-      // POST approve
+      // POST approve — send the threaded `cur` (post-save when dirty, else the
+      // current closure etag), never the stale pre-save closure value.
       const res = await fetch(`/api/email/queue/${encodeURIComponent(id)}/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft: text, etag }),
+        body: JSON.stringify({ draft: text, etag: cur }),
       });
       if (res.status === 409) {
         setError('Conflict: the queue was modified elsewhere. Refreshing...');
@@ -1903,22 +1935,36 @@ export default function EmailPage() {
     </button>
   );
 
-  // Partition items
-  const needsReviewItems = items.filter(isActionable);
-  const approvedItems = items.filter(it => it.status === 'approved');
-  const dismissedItems = items.filter(it => it.status === 'dismissed');
-  const deletedItems = items.filter(it => it.status === 'deleted');
-
-  const replyItems = needsReviewItems.filter(it => reviewGroup(it) === 'reply');
-
-  // Sub-group Reply by recipientType: to-only (direct to me), to (me in To shared), cc (me in CC), dl (via distribution list), unknown
-  const toOnlyItems = replyItems.filter(it => it.recipientType === 'to-only');
-  const toItems = replyItems.filter(it => it.recipientType === 'to');
-  const ccItems = replyItems.filter(it => it.recipientType === 'cc');
-  const dlItems = replyItems.filter(it => it.recipientType === 'dl');
-  const unknownItems = replyItems.filter(it => !it.recipientType || it.recipientType === 'unknown');
-  const fyiItems = needsReviewItems.filter(it => reviewGroup(it) === 'fyi');
-  const classifyingItems = needsReviewItems.filter(it => reviewGroup(it) === 'classifying');
+  // Partition items into the rendered sections. These ~9 filter passes recompute
+  // ONLY when `items` changes (not on every render) — `items` is the SOLE input:
+  // isActionable/reviewGroup (lib/emailQueue, pure stable imports) read only
+  // it.status/it.classification and the recipientType sub-filters read only
+  // it.recipientType, so there is no other key to memo on. Rendered output is
+  // identical — same items, same sections, same order (see D-066).
+  const {
+    needsReviewItems, approvedItems, dismissedItems, deletedItems,
+    replyItems, toOnlyItems, toItems, ccItems, dlItems, unknownItems,
+    fyiItems, classifyingItems,
+  } = useMemo(() => {
+    const needsReview = items.filter(isActionable);
+    const reply = needsReview.filter(it => reviewGroup(it) === 'reply');
+    // Sub-group Reply by recipientType: to-only (direct to me), to (me in To
+    // shared), cc (me in CC), dl (via distribution list), unknown.
+    return {
+      needsReviewItems: needsReview,
+      approvedItems: items.filter(it => it.status === 'approved'),
+      dismissedItems: items.filter(it => it.status === 'dismissed'),
+      deletedItems: items.filter(it => it.status === 'deleted'),
+      replyItems: reply,
+      toOnlyItems: reply.filter(it => it.recipientType === 'to-only'),
+      toItems: reply.filter(it => it.recipientType === 'to'),
+      ccItems: reply.filter(it => it.recipientType === 'cc'),
+      dlItems: reply.filter(it => it.recipientType === 'dl'),
+      unknownItems: reply.filter(it => !it.recipientType || it.recipientType === 'unknown'),
+      fyiItems: needsReview.filter(it => reviewGroup(it) === 'fyi'),
+      classifyingItems: needsReview.filter(it => reviewGroup(it) === 'classifying'),
+    };
+  }, [items]);
 
   // Muted-conversations management: the keys of the muted map, newest-muted
   // first. An email mute key is the raw conversationId, so a label resolves from
