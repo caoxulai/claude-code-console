@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiCopy, FiCheck, FiZap, FiCheckCircle, FiTrash2, FiUser, FiGlobe, FiFolder, FiCpu, FiArrowUpCircle, FiArrowDownCircle, FiAlertTriangle } from 'react-icons/fi';
+import { FiChevronDown, FiChevronRight, FiEdit3, FiSave, FiPlus, FiCode, FiGithub, FiCopy, FiCheck, FiZap, FiCheckCircle, FiTrash2, FiUser, FiGlobe, FiFolder, FiCpu, FiArrowUpCircle, FiArrowDownCircle, FiAlertTriangle } from 'react-icons/fi';
 import { SkeletonCard } from '../components/Skeleton';
 import { useTriggerGoal } from '../hooks/useTriggerGoal';
 import SessionPickerModal from '../components/SessionPickerModal';
@@ -637,35 +637,36 @@ export default function ProjectsPage() {
             ))}
             {(project.codeUrls && project.codeUrls.length > 0
               ? project.codeUrls
-              : project.codeUrl ? [{ name: 'Code Repo', url: project.codeUrl }] : []
-            ).map((repo) => (
-              <a
-                key={repo.url}
-                href={repo.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                title={repo.url}
-                onClick={(e) => e.stopPropagation()}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '0.3em',
-                  background: 'var(--pill-dev-bg)',
-                  color: 'var(--pill-dev-text)',
-                  fontSize: '0.72em',
-                  fontWeight: 600,
-                  padding: '2px 8px',
-                  borderRadius: '999px',
-                  border: '1px solid var(--pill-dev-border)',
-                  textDecoration: 'none',
-                }}
-              >
-                <FiCode size={11} />
-                {/* Label with the repo name when there are several; a single
-                    repo keeps the familiar "Code Repo" label. */}
-                {(project.codeUrls && project.codeUrls.length > 1) ? repo.name : 'Code Repo'}
-              </a>
-            ))}
+              : project.codeUrl ? [{ name: 'Code Repo', url: project.codeUrl, kind: 'gitfarm' }] : []
+            ).map((repo) => {
+              const isGithub = repo.kind === 'github' || repo.url?.includes('github.com');
+              return (
+                <a
+                  key={repo.url}
+                  href={repo.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={repo.url}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.3em',
+                    background: 'var(--pill-dev-bg)',
+                    color: 'var(--pill-dev-text)',
+                    fontSize: '0.72em',
+                    fontWeight: 600,
+                    padding: '2px 8px',
+                    borderRadius: '999px',
+                    border: '1px solid var(--pill-dev-border)',
+                    textDecoration: 'none',
+                  }}
+                >
+                  {isGithub ? <FiGithub size={11} /> : <FiCode size={11} />}
+                  {isGithub ? 'GitHub' : (project.codeUrls && project.codeUrls.length > 1) ? repo.name : 'Code Repo'}
+                </a>
+              );
+            })}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.25em', marginTop: '0.2em', minWidth: 0 }}>
             <span style={{

@@ -480,33 +480,47 @@ def _collect_memory_files(session_dir: Path | None) -> list[dict]:
 # and captures the package name. A trailing .git suffix (if present) is stripped.
 _GITFARM_PKG_RE = re.compile(r"git\.amazon\.com(?::\d+)?/pkg/(?P<pkg>[^/\s]+?)(?:\.git)?/?$")
 
+# Matches a GitHub remote (SSH or HTTPS) and captures owner/repo.
+_GITHUB_RE = re.compile(r"github\.com[:/](?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$")
 
-def _git_remote_url(project_path: Path) -> str | None:
-    """Read the origin remote URL from a git checkout's .git/config, if any.
 
-    `project_path` is the directory that directly contains `.git`. Parses the
-    config file directly rather than shelling out to git so the call is cheap
-    and side-effect free. Returns None when the directory is not a git repo, has
-    no [remote "origin"] section, or the file is unreadable.
+def _git_all_remotes(project_path: Path) -> list[tuple[str, str]]:
+    """Return all (name, url) remote pairs from a git checkout's .git/config.
+
+    Parses the config file directly — no subprocess, cheap and side-effect free.
+    Returns an empty list when the directory is not a git repo or is unreadable.
     """
     config_path = project_path / ".git" / "config"
     if not config_path.is_file():
-        return None
+        return []
     try:
         text = config_path.read_text(encoding="utf-8")
     except OSError:
-        return None
-    in_origin = False
+        return []
+    remotes: list[tuple[str, str]] = []
+    current_remote: str | None = None
     for raw in text.splitlines():
         line = raw.strip()
-        if line.startswith("[") and line.endswith("]"):
-            in_origin = line.replace(" ", "") == '[remote"origin"]'
+        if line.startswith('[') and line.endswith(']'):
+            inner = line[1:-1].strip()
+            if inner.startswith('remote '):
+                current_remote = inner.split(None, 1)[1].strip('"')
+            else:
+                current_remote = None
             continue
-        if in_origin and line.startswith("url"):
-            _, _, value = line.partition("=")
+        if current_remote and line.startswith('url'):
+            _, _, value = line.partition('=')
             value = value.strip()
             if value:
-                return value
+                remotes.append((current_remote, value))
+    return remotes
+
+
+def _git_remote_url(project_path: Path) -> str | None:
+    """Read the origin remote URL (kept for backward compat with callers)."""
+    for name, url in _git_all_remotes(project_path):
+        if name == 'origin':
+            return url
     return None
 
 
@@ -518,6 +532,16 @@ def _gitfarm_code_url(remote: str | None) -> str | None:
     if not match:
         return None
     return f"https://code.amazon.com/packages/{match.group('pkg')}"
+
+
+def _github_url(remote: str | None) -> str | None:
+    """https://github.com/<owner>/<repo> for a GitHub remote, else None."""
+    if not remote:
+        return None
+    match = _GITHUB_RE.search(remote)
+    if not match:
+        return None
+    return f"https://github.com/{match.group('owner')}/{match.group('repo')}"
 
 
 # Where to look for git checkouts when the project root itself isn't one.
@@ -533,31 +557,36 @@ _NESTED_GIT_GLOBS = (
 
 
 def _code_urls_for_project(project_path: Path) -> list[dict]:
-    """All GitFarm code.amazon.com repos reachable from a project.
+    """All code repo URLs (GitFarm + GitHub) reachable from a project.
 
-    Checks the project root's own remote first; if the root isn't a GitFarm
+    Checks the project root's own remotes first; if the root isn't a known
     checkout (e.g. a Brazil workspace wrapper), scans a bounded set of nested
-    locations for package repos. Returns a deduped list of {name, url}, ordered
-    with the root repo (if any) first. Empty when nothing GitFarm-shaped is
-    found, so the field is always present.
+    locations. Returns a deduped list of {name, url, kind} where kind is
+    'gitfarm' or 'github', ordered with root-level repos first.
     """
     found: list[dict] = []
     seen: set[str] = set()
 
-    def add(checkout_dir: Path):
-        url = _gitfarm_code_url(_git_remote_url(checkout_dir))
-        if url and url not in seen:
-            seen.add(url)
-            found.append({"name": url.rsplit("/", 1)[-1], "url": url})
+    def add_checkout(checkout_dir: Path) -> None:
+        for _remote_name, remote_url in _git_all_remotes(checkout_dir):
+            gf = _gitfarm_code_url(remote_url)
+            if gf and gf not in seen:
+                seen.add(gf)
+                found.append({"name": gf.rsplit("/", 1)[-1], "url": gf, "kind": "gitfarm"})
+            gh = _github_url(remote_url)
+            if gh and gh not in seen:
+                seen.add(gh)
+                repo_name = gh.rsplit("/", 1)[-1]
+                found.append({"name": repo_name, "url": gh, "kind": "github"})
 
     # 1. The project root itself.
-    add(project_path)
+    add_checkout(project_path)
 
     # 2. Nested package repos (Brazil workspace layout, etc.).
     for pattern in _NESTED_GIT_GLOBS:
         for git_dir in project_path.glob(pattern):
             if git_dir.is_dir():
-                add(git_dir.parent)
+                add_checkout(git_dir.parent)
 
     return found
 

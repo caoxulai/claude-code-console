@@ -2408,20 +2408,23 @@ async def test_projects_code_url_maps_gitfarm_remote(client, projects_layout):
     )
 
 
-async def test_projects_code_url_null_without_gitfarm_remote(client, projects_layout):
-    """Projects lacking a git.amazon.com/pkg remote get codeUrl null.
+async def test_projects_code_url_null_without_any_remote(client, projects_layout):
+    """Projects with no git repo at all get codeUrl null and empty codeUrls."""
+    projects = await _get_projects(client)
+    # gamma has no .git at all.
+    assert projects["gamma"]["codeUrl"] is None
+    assert projects["gamma"]["codeUrls"] == []
 
-    Covers three cases: no git repo at all (gamma), and a non-GitFarm remote
-    (alpha pointed at github). Both must yield null rather than a bogus URL.
-    """
+
+async def test_projects_github_remote_surfaced_as_code_url(client, projects_layout):
+    """A GitHub remote is included in codeUrls with kind='github'."""
     workspace = projects_layout["workspace"]
     _write_git_remote(workspace / "alpha", "git@github.com:someuser/somerepo.git")
 
     projects = await _get_projects(client)
-    # gamma has no .git at all.
-    assert projects["gamma"]["codeUrl"] is None
-    # alpha's remote isn't a GitFarm package URL.
-    assert projects["alpha"]["codeUrl"] is None
+    github_urls = [u for u in projects["alpha"]["codeUrls"] if u.get("kind") == "github"]
+    assert len(github_urls) == 1
+    assert github_urls[0]["url"] == "https://github.com/someuser/somerepo"
 
 
 def test_code_url_strips_dot_git_suffix(tmp_path):
@@ -2431,7 +2434,8 @@ def test_code_url_strips_dot_git_suffix(tmp_path):
     _write_git_remote(proj, "ssh://git.amazon.com/pkg/ClaudeCodeConsole.git")
     urls = sessions_mod._code_urls_for_project(proj)
     assert urls == [{"name": "ClaudeCodeConsole",
-                     "url": "https://code.amazon.com/packages/ClaudeCodeConsole"}]
+                     "url": "https://code.amazon.com/packages/ClaudeCodeConsole",
+                     "kind": "gitfarm"}]
 
 
 def test_code_url_matches_remote_with_port(tmp_path):
@@ -2441,7 +2445,8 @@ def test_code_url_matches_remote_with_port(tmp_path):
     _write_git_remote(proj, "ssh://git.amazon.com:2222/pkg/XiaoGeLao")
     urls = sessions_mod._code_urls_for_project(proj)
     assert urls == [{"name": "XiaoGeLao",
-                     "url": "https://code.amazon.com/packages/XiaoGeLao"}]
+                     "url": "https://code.amazon.com/packages/XiaoGeLao",
+                     "kind": "gitfarm"}]
 
 
 def test_code_urls_scans_nested_brazil_repos(tmp_path):
