@@ -7455,3 +7455,320 @@ async def test_email_approve_single_conflict_then_succeeds_is_200(client, email_
     assert body["item"]["status"] == "approved"
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
     assert saved["status"] == "approved"
+
+
+# ─── D-068 / T1: folder-scan sender lift + body-recipient parser + backfill ────
+# self-heal + approve fail-loud. The subfolder (OWA email_read) scan path persisted
+# BLANK senderEmail (0/200 live) and BLANK recipient emails (the OWA structured
+# recipients[] are NAME-ONLY). Fix: lift the head sender identity off the OWA
+# payload, recover recipient addresses by parsing the quoted-body header lines
+# (match-or-leave-blank, NEVER fabricate), self-heal the ~200 persisted items via
+# the backfill loop, and make approve FAIL LOUD (HTTP 422) when no recipient
+# resolves so the page shows a RED banner instead of a quiet green "Copied!".
+
+
+# --- (parser) pure address-extracting counterpart to _flatten_header_name -------
+
+
+def test_extract_header_addrs_clean_pairs():
+    """A clean 'Name <addr>; Other <o@x>' header value yields exact (name, addr)
+    pairs. The angle-bracket address is recovered (the counterpart to
+    _flatten_header_name, which DROPS the address to keep only the name)."""
+    value = '"Bhargava, Vipul" <vipul@amazon.com>; Darmane, Aniss <darmanea@amazon.com>'
+    pairs = email_mod._extract_header_addrs(value)
+    by_name = {n.lower(): a for n, a in pairs}
+    assert by_name.get("bhargava, vipul") == "vipul@amazon.com"
+    assert by_name.get("darmane, aniss") == "darmanea@amazon.com"
+    # Every captured address is well-formed (the _valid_email gate).
+    for _n, a in pairs:
+        assert email_mod._valid_email(a)
+
+
+def test_extract_header_addrs_bare_address_and_dropped_malformed():
+    """A bare 'addr@host' (no name, no angle brackets) maps the address to itself;
+    a malformed token with no parseable address is DROPPED (never fabricated)."""
+    pairs = email_mod._extract_header_addrs(
+        "darmanea@amazon.com; Just A Name With No Address; ; not-an-email")
+    addrs = [a for _n, a in pairs]
+    assert "darmanea@amazon.com" in addrs
+    # A name-only entry and a garbage token produce NO (name, addr) address pair.
+    assert "Just A Name With No Address" not in addrs
+    assert all(email_mod._valid_email(a) for _n, a in pairs)
+
+
+def test_extract_header_addrs_empty_value():
+    """An empty / non-string value yields [] (never raises, never fabricates)."""
+    assert email_mod._extract_header_addrs("") == []
+    assert email_mod._extract_header_addrs(None) == []
+
+
+# --- (b) name-only OWA recipients[] + quoted body fills matching emails ---------
+
+
+def test_fill_recipient_emails_from_body_matches_and_leaves_unmatched_blank():
+    """A name-only toRecipients/ccRecipients entry gets its email filled from a
+    'Name <addr@amazon.com>' header line in the quoted body, matched CASE-
+    INSENSITIVELY tolerant of Outlook '"Last, First"' forms. A name with NO
+    parseable/matchable address stays email:'' — NEVER a fabricated/cross-assigned
+    address (the FABRICATE-OR-MISASSIGN trap)."""
+    item = {
+        "toRecipients": [
+            {"name": "Bhargava, Vipul", "email": ""},
+            {"name": "Nobody, Here", "email": ""},  # no address in the body
+        ],
+        "ccRecipients": [{"name": "Darmane, Aniss", "email": ""}],
+    }
+    body = (
+        "Latest reply text.\n\n"
+        "From: Darmane, Aniss <darmanea@amazon.com>\n"
+        "Sent: Monday, June 1, 2026 9:00 AM\n"
+        "To: Bhargava, Vipul <vipul@amazon.com>\n"
+        "Cc: Darmane, Aniss <darmanea@amazon.com>\n"
+        "Subject: Re: Black Falcon COE Final Review\n\n"
+        "Quoted body text."
+    )
+    email_mod._fill_recipient_emails_from_body(item, body)
+    to_by_name = {r["name"].lower(): r["email"] for r in item["toRecipients"]}
+    cc_by_name = {r["name"].lower(): r["email"] for r in item["ccRecipients"]}
+    assert to_by_name["bhargava, vipul"] == "vipul@amazon.com"
+    # Unmatchable name stays blank — no guess, no cross-assignment.
+    assert to_by_name["nobody, here"] == ""
+    assert cc_by_name["darmane, aniss"] == "darmanea@amazon.com"
+
+
+def test_fill_recipient_emails_from_body_is_fill_only():
+    """FILL-ONLY (anti SELF-HEAL-CLOBBERS-GOOD-DATA): an entry that already carries a
+    populated email is NEVER overwritten/cleared, even if the body would parse a
+    different address for that name."""
+    item = {"toRecipients": [{"name": "Bhargava, Vipul", "email": "already@amazon.com"}]}
+    body = "To: Bhargava, Vipul <different@amazon.com>\nFrom: X <x@x.com>\nSent: now\nSubject: s\n\nbody"
+    email_mod._fill_recipient_emails_from_body(item, body)
+    assert item["toRecipients"][0]["email"] == "already@amazon.com"
+
+
+def test_fill_recipient_emails_from_body_no_match_no_fabrication():
+    """A body with NO parseable header addresses leaves every name-only entry blank
+    (never invents an address)."""
+    item = {"toRecipients": [{"name": "Someone, Else", "email": ""}]}
+    email_mod._fill_recipient_emails_from_body(item, "Just prose, no headers here.\n")
+    assert item["toRecipients"][0]["email"] == ""
+
+
+# --- (a) folder candidate whose OWA payload head has sender.email lifts onto item -
+
+
+async def test_d068_folder_scan_lifts_sender_email_from_owa_payload(email_file, monkeypatch):
+    """DONE-WHEN (a): a NEWLY-ingested subfolder email is stored with a populated
+    senderEmail matching the OWA email_read payload's head sender.email — anti-bogus:
+    assert the EXACT address; RED if blank (today's never-implemented gap)."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 leads", "id": "AAMk-LEADS", "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-LEADS": [{"conversationId": "CONV-BF", "topic": "Black Falcon COE Final Review",
+                        "unreadCount": 1, "lastDeliveryTime": "2026-06-26T09:00:00Z"}],
+    }
+    messages_by_conv = {
+        "CONV-BF": [{"itemId": "BF-1",
+                     "sender": {"name": "Darmane, Aniss", "email": "darmanea@amazon.com"},
+                     "from": {"name": "Darmane, Aniss", "email": "darmanea@amazon.com"},
+                     "dateTimeSent": "2026-06-26T09:00:00Z",
+                     "subject": "Black Falcon COE Final Review",
+                     "body": "Please review the COE.", "isRead": False}],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = next(it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]
+                if it.get("conversationId") == "CONV-BF")
+    assert item.get("sourceFolder") == "1 leads"
+    assert item.get("senderEmail") == "darmanea@amazon.com", \
+        "folder item must capture the head sender.email (was blank — the D-058 gap)"
+
+
+async def test_d068_folder_scan_recovers_recipient_emails_from_body(email_file, monkeypatch):
+    """DONE-WHEN (b): the OWA structured recipients[] are NAME-ONLY; the matching
+    addresses live in the quoted body header lines. A folder scan fills the matching
+    toRecipients/ccRecipients email AND leaves an unmatchable name email:'' (no
+    fabrication)."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 leads", "id": "AAMk-LEADS", "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-LEADS": [{"conversationId": "CONV-R", "topic": "Re: Body recipients",
+                        "unreadCount": 1, "lastDeliveryTime": "2026-06-26T10:00:00Z"}],
+    }
+    # The OWA recipients[] carry NAMES but NO email key (the genuine OWA limitation);
+    # _MY_EMAIL is present with an address so the recipientType still classifies.
+    quoted_body = (
+        "<p>My reply.</p>"
+        "<p><b>From:</b> Origin, Sender &lt;origin@amazon.com&gt;<br>"
+        "<b>Sent:</b> Monday, June 1, 2026 9:00 AM<br>"
+        "<b>To:</b> Bhargava, Vipul &lt;vipul@amazon.com&gt;; Unmatched, Person<br>"
+        "<b>Cc:</b> Carol, Lee &lt;carol@amazon.com&gt;<br>"
+        "<b>Subject:</b> Re: Body recipients</p>"
+        "<p>Quoted text here.</p>"
+    )
+    messages_by_conv = {
+        "CONV-R": [{"itemId": "R-1",
+                    "sender": {"name": "Origin, Sender", "email": "origin@amazon.com"},
+                    "dateTimeSent": "2026-06-26T10:00:00Z", "subject": "Re: Body recipients",
+                    "body": quoted_body,
+                    "recipients": [{"name": "Bhargava, Vipul"},
+                                   {"name": "Unmatched, Person"}],
+                    "ccRecipients": [{"name": "Carol, Lee"}],
+                    "isRead": False}],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool",
+                        _b58_scan_read_tool(folder_children, conversations_by_id,
+                                            messages_by_conv))
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = next(it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]
+                if it.get("conversationId") == "CONV-R")
+    to_by_name = {r["name"].lower(): r.get("email", "") for r in item.get("toRecipients") or []}
+    cc_by_name = {r["name"].lower(): r.get("email", "") for r in item.get("ccRecipients") or []}
+    assert to_by_name.get("bhargava, vipul") == "vipul@amazon.com"
+    # Unmatchable recipient stays blank — no fabricated/cross-assigned address.
+    assert to_by_name.get("unmatched, person") == ""
+    assert cc_by_name.get("carol, lee") == "carol@amazon.com"
+
+
+# --- (backfill self-heal) blank-senderEmail folder item re-enters backfill --------
+
+
+async def test_d068_backfill_self_heals_blank_sender_with_populated_body(email_file, monkeypatch):
+    """SELF-HEAL: an EXISTING folder item with a blank senderEmail (and a body ALREADY
+    populated) must re-enter the backfill loop and get its sender lifted from the OWA
+    payload (anti FRESH-ONLY / CODE-ONLY-NO-DATA-HEAL: a healed-body item with a
+    blank sender would never re-enter a body-only-gated backfill)."""
+    _seed(email_file, [_make_item(
+        "f1", status="needs-review", messageId="AAMk-HEAL", conversationId="AAMk-HEAL",
+        sourceFolder="1 leads", senderEmail="", emailBody="Already-populated body.",
+        toRecipients=[{"name": "Bhargava, Vipul", "email": ""}], ccRecipients=[])])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [], "count": 0, "folder": "inbox"}
+        if name == "email_list_folders":
+            return _b58_list_folders_payload([])
+        if name == "email_read":
+            # Realistic OWA format=html body: <b> header labels + &lt;addr&gt;-escaped
+            # addresses (the angle brackets survive _html_to_text's tag strip via the
+            # entity decode, exactly like the live folder path).
+            return {"content": {"emails": [
+                {"itemId": "AAMk-HEAL",
+                 "sender": {"name": "Darmane, Aniss", "email": "darmanea@amazon.com"},
+                 "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Re: Project update",
+                 "body": ("<p>My reply.</p>"
+                          "<p><b>From:</b> Darmane, Aniss &lt;darmanea@amazon.com&gt;<br>"
+                          "<b>Sent:</b> Mon<br>"
+                          "<b>To:</b> Bhargava, Vipul &lt;vipul@amazon.com&gt;<br>"
+                          "<b>Subject:</b> Re: Project update</p>"
+                          "<p>Quoted.</p>"),
+                 "recipients": [{"name": "Bhargava, Vipul"}], "isRead": False}]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert item.get("senderEmail") == "darmanea@amazon.com", \
+        "backfill must lift the sender even when emailBody is already populated"
+    # The body recipient parse also healed the name-only To entry on backfill.
+    to_by_name = {r["name"].lower(): r.get("email", "") for r in item.get("toRecipients") or []}
+    assert to_by_name.get("bhargava, vipul") == "vipul@amazon.com"
+    # FILL-ONLY: the already-good body was not wiped on this partial re-fetch.
+    assert "Already-populated body." in (item.get("emailBody") or "") or \
+        "My reply." in (item.get("emailBody") or "")
+
+
+async def test_d068_backfill_does_not_blank_good_data(email_file, monkeypatch):
+    """SELF-HEAL-CLOBBERS-GOOD-DATA guard: a folder backfill that recovers a sender
+    must NOT blank an already-populated recipient email on the partial re-fetch."""
+    _seed(email_file, [_make_item(
+        "f1", status="needs-review", messageId="AAMk-KEEP", conversationId="AAMk-KEEP",
+        sourceFolder="1 leads", senderEmail="", emailBody="",
+        toRecipients=[{"name": "Bhargava, Vipul", "email": "vipul@amazon.com"}])])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [], "count": 0, "folder": "inbox"}
+        if name == "email_list_folders":
+            return _b58_list_folders_payload([])
+        if name == "email_read":
+            return {"content": {"emails": [
+                {"itemId": "AAMk-KEEP",
+                 "sender": {"name": "X", "email": "x@amazon.com"},
+                 "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Re: Project update",
+                 "body": "Recovered body.",
+                 "recipients": [{"name": "Bhargava, Vipul"}], "isRead": False}]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert item.get("senderEmail") == "x@amazon.com"
+    # The already-good email survived (fill-only, never wiped).
+    assert item["toRecipients"][0]["email"] == "vipul@amazon.com"
+
+
+# --- (c) approve fail-loud (422) when NO recipient resolves --------------------
+
+
+async def test_d068_approve_no_recipient_fails_loud_422(client, email_file, monkeypatch):
+    """SILENT-SUCCESS-APPROVE fix (the headline bug): an approve that resolves NO
+    recipient must NOT flip to 'approved' and must NOT return 200/draftSaved:false.
+    It returns a 422 {error:'no_recipient', message} DISTINCT from the 409 shape, and
+    the item stays actionable so the user can add a recipient and retry."""
+    # A draft is present but there is NO senderEmail and NO captured recipients, so
+    # the reply-all To resolves EMPTY.
+    _seed(email_file, [_make_item(
+        "i1", status="needs-review", draft="final reply",
+        senderEmail="", toRecipients=[], ccRecipients=[])])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "SHOULD-NOT-FIRE"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 422, "a no-recipient approve must fail loud (422), not 200"
+    body = await resp.json()
+    assert body.get("error") == "no_recipient"
+    assert body.get("error") != "conflict", "must be DISTINCT from the 409 conflict shape"
+    assert isinstance(body.get("message"), str) and body["message"].strip()
+    # No draft was attempted, and the item is NOT approved on disk (retryable).
+    assert calls == [], "email_draft must not be called when no recipient resolves"
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] != "approved", "item must stay actionable for retry"
+
+
+async def test_d068_approve_with_healed_sender_degrades_to_sender_and_saves(
+        client, email_file, monkeypatch):
+    """DONE-WHEN (d) + REPLY-ALL-DEGRADE: an item with a healed senderEmail but NO
+    captured to/cc degrades to To=[sender] (NEVER fabricated), the draft-save path is
+    invoked, and the item flips to 'approved' (happy path preserved)."""
+    _seed(email_file, [_make_item(
+        "i1", status="needs-review", draft="final reply",
+        senderEmail="darmanea@amazon.com", toRecipients=[], ccRecipients=[])])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "DRAFT-OK"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/i1/approve", json={})
+    assert resp.status == 200, "a resolvable-sender approve stays the happy 200 path"
+    body = await resp.json()
+    assert body["item"]["status"] == "approved"
+    assert body.get("draftSaved") is True
+    assert len(calls) == 1 and calls[0][0] == "email_draft"
+    assert calls[0][1]["operation"] == "create"
+    # The degraded To is the healed sender — never empty, never fabricated.
+    assert "darmanea@amazon.com" in calls[0][1]["to"]
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "approved"

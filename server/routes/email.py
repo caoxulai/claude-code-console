@@ -1759,6 +1759,39 @@ def _capture_recipients(target: dict, body_payload) -> None:
         target["recipientType"] = _recipient_type({"to": to_list, "cc": cc_list})
 
 
+def _lift_owa_sender(target: dict, body_payload) -> None:
+    """Lift the head message's sender identity ({name,email}) onto ``target``.
+
+    The OWA folder scan (D-058) builds its scan candidate from the cheap
+    ``email_folders`` listing, which carries only a NAME list (``senders``) — no
+    ``from`` dict and no address. So _flatten_from fell to its legacy ``senders[]``
+    branch and HARD-CODED senderEmail "" (0/200 folder items captured a sender, the
+    D-068 bug). After the body pre-fetch builds ``body_payload`` via
+    _owa_conversation_to_payload, this reads the head message's ``from``/``sender``
+    ({name,email}) and sets ``target['from'] = {name,email}`` (so a later
+    _flatten_from takes its dict branch unchanged) AND ``target['senderEmail']``
+    directly. FILL-ONLY on senderEmail: a blank/missing address never overwrites an
+    address already present (anti SELF-HEAL-CLOBBERS-GOOD-DATA). NEVER fabricates: a
+    payload without a head sender email is a no-op. Mirrors how the inbox/Graph path
+    already populates senderEmail via from.email — the inbox path is untouched.
+    """
+    if not isinstance(target, dict) or not isinstance(body_payload, dict):
+        return
+    head = body_payload.get("email")
+    if not isinstance(head, dict):
+        return
+    frm = head.get("from") or head.get("sender")
+    if not isinstance(frm, dict):
+        return
+    name = str(frm.get("name", "") or "").strip()
+    email = str(frm.get("email", "") or "").strip()
+    if not email:
+        return  # never fabricate / blank a populated address
+    target["from"] = {"name": name, "email": email}
+    if not str(target.get("senderEmail") or "").strip():
+        target["senderEmail"] = email
+
+
 def _recipient_type(raw: dict) -> str:
     """Determine whether the user is in To (only), To (shared), or CC.
 
@@ -2929,6 +2962,226 @@ def _flatten_header_recipients(value: str) -> str:
     return "; ".join(names)
 
 
+# Pull an email address out of ONE recipient entry: an angle-bracketed ``<addr>`` or
+# a bare ``addr@host`` token. Reuses the same address SHAPE as the angle-bracket
+# strip in _html_to_text (~2359); the captured value is still gated through
+# _valid_email so only a well-formed address is ever stored (NEVER fabricated).
+_RE_ENTRY_ANGLE_ADDR = re.compile(r"<\s*([^<>@\s]+@[^<>@\s]+)\s*>")
+_RE_ENTRY_BARE_ADDR = re.compile(r"([^\s<>;,]+@[^\s<>;,]+)")
+
+
+# One ``Name <addr@host>`` recipient entry — a (lazy) prefix up to and including the
+# angle-bracketed address. Used to split an unquoted ``Last, First <a>; ... `` /
+# ``Last, First <a> Last2, First2 <b>`` list on the ADDRESS boundary so the inner
+# ``Last, First`` comma is never mistaken for a delimiter (D-068).
+_RE_NAME_ANGLE_ENTRY = re.compile(r".*?<\s*[^<>@\s]+@[^<>@\s]+\s*>")
+# Same idea for a BARE address (no angle brackets): _html_to_text strips the
+# ``<addr>`` wrapper (~2359) so the folder body header reads ``Last, First addr@host``.
+# A lazy prefix up to and including a bare ``addr@host`` token closes one entry, so
+# ``Carol, Lee carol@host`` is ONE entry (name "Carol, Lee"), not shattered on the
+# inner comma. The trailing ``[^\s;,]*`` swallows any glued trailing punctuation.
+_RE_NAME_BARE_ENTRY = re.compile(r"[^@]*?[^\s<>;,]+@[^\s<>;,]+")
+
+
+def _split_header_entries(value: str) -> list[str]:
+    """Split a 'To:'/'Cc:' header VALUE into per-recipient entry strings.
+
+    Each entry keeps its ``Name <addr>`` shape intact (the address-extracting
+    counterpart needs the addr, unlike _flatten_header_recipients which only wants
+    the name). Splitting precedence (Outlook ``Last, First`` names carry INNER
+    commas, so a naive comma split shatters them):
+
+    1. ``;`` present  -> split on ``;`` (Outlook's canonical recipient delimiter).
+    2. no ``;`` but angle-bracketed addresses present -> split on the ADDRESS
+       boundary (each ``<addr>`` closes one entry), so an unquoted
+       ``Last, First <a@x> Other, Name <b@x>`` is two entries, not shattered on the
+       name commas.
+    3. quoted ``"Last, First"`` span present -> keep as ONE entry (the comma is a
+       name comma; we never know the bare-list delimiter safely).
+    4. otherwise -> fall back to a comma split (a Gmail-style ``a@x, b@x`` list).
+
+    Empty/whitespace entries are dropped.
+    """
+    v = (value or "").strip()
+    if not v:
+        return []
+    if ";" in v:
+        parts = _RE_RECIP_SPLIT_SEMI.split(v)
+    elif _RE_ENTRY_ANGLE_ADDR.search(v):
+        # Unquoted angle-bracket address list: split on the address boundary so an
+        # inner ``Last, First`` comma is never a delimiter. Trailing text after the
+        # last address (rare) is appended as its own entry.
+        parts = _RE_NAME_ANGLE_ENTRY.findall(v)
+        consumed = "".join(parts)
+        tail = v[len(consumed):].strip(" ,;")
+        if tail:
+            parts.append(tail)
+    elif _RE_ENTRY_BARE_ADDR.search(v):
+        # Bare-address list (the folder path: _html_to_text strips ``<addr>`` to a
+        # bare ``addr@host``). Split on the bare-address boundary so ``Carol, Lee
+        # carol@host`` stays ONE entry, not shattered on the inner comma.
+        parts = _RE_NAME_BARE_ENTRY.findall(v)
+        consumed = "".join(parts)
+        tail = v[len(consumed):].strip(" ,;")
+        if tail:
+            parts.append(tail)
+    elif _RE_QUOTED_NAME.search(v):
+        # A quoted "Last, First" with no ';' — the comma is inside the name, so do
+        # NOT comma-split (would shatter the name); treat the whole value as one entry.
+        parts = [v]
+    else:
+        parts = _RE_RECIP_SPLIT_COMMA.split(v)
+    return [p.strip(" ,;") for p in parts if p.strip(" ,;")]
+
+
+def _entry_address(entry: str) -> str:
+    """Extract a VALID email address from one ``Name <addr>`` / bare ``addr`` entry.
+
+    Prefers an angle-bracketed ``<addr>``; falls back to a bare ``addr@host`` token.
+    Returns "" when no well-formed address is present (gated through _valid_email so
+    a malformed token is dropped, never stored). PURE — the address-extracting
+    counterpart to _flatten_header_name (which DROPS the address to keep the name).
+    """
+    s = (entry or "").strip()
+    if not s:
+        return ""
+    m = _RE_ENTRY_ANGLE_ADDR.search(s)
+    cand = m.group(1).strip() if m else ""
+    if not cand:
+        # No angle brackets — strip any quoted name span first so a bare list like
+        # '"Last, First" addr@host' doesn't match inside the quotes, then look for a
+        # bare address token.
+        unquoted = _RE_QUOTED_NAME.sub(" ", s)
+        bm = _RE_ENTRY_BARE_ADDR.search(unquoted)
+        cand = bm.group(1).strip() if bm else ""
+    return cand if _valid_email(cand) else ""
+
+
+def _extract_header_addrs(value: str) -> list[tuple[str, str]]:
+    """Extract (display_name, email) pairs from a captured To:/Cc: header VALUE.
+
+    The address-extracting counterpart to _flatten_header_name: where that helper
+    DROPS the trailing ``<addr>`` to keep only the name, this keeps BOTH. Splits the
+    value into per-recipient entries (``_split_header_entries`` — quoted-name / ';'
+    preferred over ','), then for each entry pairs the flattened display name with the
+    extracted, _valid_email-gated address. An entry with no parseable address yields
+    NO pair (never a fabricated address). Used to build the body name->addr map that
+    fills the name-only OWA recipients (D-068). Returns [] for an empty/None value.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in _split_header_entries(value):
+        addr = _entry_address(entry)
+        if not addr:
+            continue  # no parseable address — never fabricate one
+        name = _flatten_header_name(entry)
+        pairs.append((name, addr))
+    return pairs
+
+
+def _normalize_recipient_name(name: str) -> str:
+    """Normalize a recipient display name for CASE-INSENSITIVE matching.
+
+    Lowercases, strips, collapses internal whitespace and drops surrounding double
+    quotes so an OWA ``"Last, First"`` matches a body header's ``Last, First`` form.
+    Returns "" for an empty/None name.
+    """
+    n = str(name or "").strip().strip('"').strip()
+    return re.sub(r"\s+", " ", n).lower()
+
+
+def _recipient_addr_map_from_body(body: str) -> dict[str, str]:
+    """Build a {normalized_name: email} map from a quoted-body's header lines.
+
+    Walks the body with the EXISTING quoted-header machinery — for every Outlook
+    header block (`_parse_outlook_header_block`) found anywhere in the body it reads
+    the raw (still-address-bearing) ``to``/``cc`` values and pairs each name with its
+    address via `_extract_header_addrs`. Builds the map across ALL turns. FIRST-SEEN
+    wins (so an earlier turn's address is not silently overwritten by a later turn).
+    A name with no parseable address is simply absent (never mapped to "").
+    """
+    out: dict[str, str] = {}
+    if not body:
+        return out
+    lines = body.split("\n")
+    i = 0
+    while i < len(lines):
+        block = _parse_outlook_header_block(lines, i)
+        if block is None:
+            i += 1
+            continue
+        fields, body_start = block
+        for key in ("to", "cc"):
+            raw = _strip_emphasis(fields.get(key, ""))
+            for name, addr in _extract_header_addrs(raw):
+                norm = _normalize_recipient_name(name)
+                if norm and norm not in out:
+                    out[norm] = addr
+        i = max(body_start, i + 1)
+    return out
+
+
+def _recipient_emails_snapshot(item: dict) -> dict[str, str]:
+    """Snapshot the CURRENT {normalized_name: email} of an item's captured recipients.
+
+    Used to PRESERVE prior-captured addresses across a backfill re-fetch: the OWA
+    re-fetch's structured recipients[] are NAME-ONLY, so _capture_recipients would
+    overwrite a previously-recovered email with "" (the SELF-HEAL-CLOBBERS-GOOD-DATA
+    trap). Snapshotting before _capture_recipients and re-filling after restores them.
+    Only non-empty emails are captured.
+    """
+    snap: dict[str, str] = {}
+    if not isinstance(item, dict):
+        return snap
+    for key in ("toRecipients", "ccRecipients"):
+        for entry in item.get(key) or []:
+            if not isinstance(entry, dict):
+                continue
+            email = str(entry.get("email") or "").strip()
+            norm = _normalize_recipient_name(entry.get("name", ""))
+            if email and norm and norm not in snap:
+                snap[norm] = email
+    return snap
+
+
+def _fill_recipient_emails_from_body(item: dict, body: str,
+                                     prior: "dict[str, str] | None" = None) -> None:
+    """Fill the EMPTY ``email`` of name-only toRecipients/ccRecipients.
+
+    The OWA structured recipients[] are NAME-ONLY (a genuine OWA limitation); the real
+    addresses live in the quoted-body header lines. This builds a name->addr map from
+    the body (`_recipient_addr_map_from_body`) — preferred — and falls back to the
+    optional ``prior`` map (a pre-_capture_recipients snapshot, so an address already
+    recovered on an earlier scan is restored after a name-only re-fetch overwrote the
+    list). Fills each recipient entry whose email is currently empty by a
+    CASE-INSENSITIVE name match (tolerant of Outlook ``"Last, First"`` forms).
+    FILL-ONLY: an already-populated email is NEVER overwritten/cleared (anti
+    SELF-HEAL-CLOBBERS-GOOD-DATA). NEVER fabricates: a name with no parseable/matchable
+    address stays email:'' (no guess, no cross-assignment).
+    """
+    if not isinstance(item, dict):
+        return
+    name_to_addr = _recipient_addr_map_from_body(body) if body else {}
+    if prior:
+        # Body wins; prior fills only the names the body didn't recover.
+        for norm, addr in prior.items():
+            name_to_addr.setdefault(norm, addr)
+    if not name_to_addr:
+        return
+    for key in ("toRecipients", "ccRecipients"):
+        entries = item.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("email") or "").strip():
+                continue  # fill-only — never overwrite a populated address
+            norm = _normalize_recipient_name(entry.get("name", ""))
+            addr = name_to_addr.get(norm)
+            if addr:
+                entry["email"] = addr
+
+
 # label -> regex ; built once, used by the block walker. Each regex anchors a
 # DISTINCT label word so the iteration order does not matter (no shadowing).
 _OUTLOOK_HEADER_LABELS = (
@@ -3718,7 +3971,16 @@ async def _scan_once(app) -> None:
                 history = _extract_thread_history(body_payload)
                 if history:
                     raw["threadHistory"] = history
+                # SENDER LIFT (D-068): the folder candidate carried only a NAME list,
+                # so _skeleton_for/_flatten_from would HARD-CODE senderEmail "". Lift
+                # the head sender {name,email} off the OWA payload BEFORE _skeleton_for
+                # runs so it captures the real address (mirrors the inbox path).
+                _lift_owa_sender(raw, body_payload)
                 _capture_recipients(raw, body_payload)
+                # RECIPIENT CAPTURE FROM BODY (D-068): the OWA recipients[] are
+                # NAME-ONLY, so fill the matching toRecipients/ccRecipients email from
+                # the quoted-body header lines (match-or-leave-blank, never fabricate).
+                _fill_recipient_emails_from_body(raw, body_text)
             except Exception as e:  # noqa: BLE001 -- body fetch is best-effort
                 logger.warning("Email folder body fetch failed for %s (%s): %s",
                                owa_conv_id, raw.get("_sourceFolder"), _scrub(str(e)))
@@ -3741,10 +4003,35 @@ async def _scan_once(app) -> None:
     # Backfill: retry body fetch for existing items that have an empty emailBody
     # (prior scan failures, timeouts, or transient errors). Cap at 5 per cycle to
     # avoid overwhelming the MCP session.
+    #
+    # D-068 SELF-HEAL: a folder item ALSO re-enters backfill when its emailBody is
+    # already populated but its senderEmail is blank — otherwise a healed-body folder
+    # item with a blank sender would NEVER re-enter a body-only-gated backfill (the
+    # FRESH-ONLY / CODE-ONLY-NO-DATA-HEAL trap), and the ~200 already-broken items
+    # would stay permanently blank. The per-cycle cap below still bounds it, so the
+    # backlog drains over successive scans. Inbox items keep the original body-only
+    # gate.
+    #
+    # The re-inclusion is gated on the BLANK SENDER (a determinate, always-healable
+    # signal — the OWA head always carries sender.email), NOT on blank recipient
+    # emails alone. Recipient addresses are recovered OPPORTUNISTICALLY on the same
+    # pass (_fill_recipient_emails_from_body), but a single fresh folder message
+    # legitimately has NO quoted-body header lines, so its name-only recipients can
+    # never resolve an address — re-including such an item forever on a blank-recipient
+    # signal would PERMANENTLY occupy a backfill slot and STARVE the other items'
+    # sender heal. So once an item's sender is healed (and body present) it stops
+    # re-entering backfill, letting the next blank-sender items drain.
     _BACKFILL_PER_CYCLE = 5
+
+    def _folder_needs_sender_heal(it: dict) -> bool:
+        sf = it.get("sourceFolder")
+        if not sf or sf == "Inbox":
+            return False
+        return not str(it.get("senderEmail") or "").strip()
+
     missing_body = [
         it for it in data["items"]
-        if not it.get("emailBody")
+        if (not it.get("emailBody") or _folder_needs_sender_heal(it))
         and it.get("status") in {"needs-classify", "needs-draft", "needs-review", "edited"}
         and (it.get("messageId") or it.get("conversationId"))
     ][:_BACKFILL_PER_CYCLE]
@@ -3775,7 +4062,17 @@ async def _scan_once(app) -> None:
                 body_payload = _owa_conversation_to_payload(owa_msgs)
                 body_text = _extract_email_body(body_payload)
                 history = _extract_thread_history(body_payload)
+                # SELF-HEAL (D-068): lift the sender + parse recipients-from-body onto
+                # the EXISTING persisted item so the ~200 already-blank folder items
+                # drain over successive scans. The OWA re-fetch's recipients[] are
+                # NAME-ONLY, so snapshot any prior-recovered emails BEFORE
+                # _capture_recipients overwrites the list, then re-fill from the body
+                # AND that prior snapshot — never blanking an already-good
+                # sender/recipient (anti SELF-HEAL-CLOBBERS-GOOD-DATA).
+                prior_recip = _recipient_emails_snapshot(it)
+                _lift_owa_sender(it, body_payload)
                 _capture_recipients(it, body_payload)
+                _fill_recipient_emails_from_body(it, body_text, prior=prior_recip)
             except Exception as e:  # noqa: BLE001 -- one folder backfill must not abort
                 logger.warning("Email folder body backfill failed for %s (%s): %s",
                                msg_id, source_folder, _scrub(str(e)))
@@ -4905,7 +5202,24 @@ async def approve_item(request: web.Request) -> web.Response:
             except Exception as e:  # noqa: BLE001
                 logger.warning("Email approve: draft save failed: %s", _scrub(str(e)))
         else:
+            # FAIL-LOUD (D-068, the headline SILENT-SUCCESS-APPROVE fix): the item has
+            # a draft but the reply-all To resolves EMPTY (no senderEmail, no captured
+            # recipients). The old code logged this, STILL flipped the item to
+            # "approved", and returned 200/draftSaved:false — the frontend rendered a
+            # quiet green "Copied!" though NO draft was saved. Instead, do NOT flip the
+            # status and do NOT write: return a 422 the page surfaces as a RED banner,
+            # DISTINCT from the 409 conflict shape (anti CONFLATE-NO-RECIPIENT-WITH-409
+            # — the page must say "add a recipient and retry", not "Conflict...
+            # Refreshing"). The item stays actionable so the user can add a recipient
+            # and approve again. NEVER fabricate a recipient to force a save.
             logger.warning("Email approve: no recipient resolved — cannot save draft")
+            return web.json_response(
+                {"error": "no_recipient",
+                 "message": ("No recipient address — draft not saved; "
+                             "add a recipient and retry"),
+                 "etag": current_etag},
+                status=422,
+            )
 
     # Topic memory (best-effort, logged)
     try:
