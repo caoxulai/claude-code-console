@@ -1397,4 +1397,72 @@ test('dismissOutcome: a null/garbage body never crashes and degrades to "error" 
   assert.equal(ok.markReadFailed, false);
 });
 
+// --- approveOutcome: APPROVE FAIL-LOUD RED-banner routing (D-072 clause 4, T2) -
+// VERIFY + REGRESSION-PIN. The backend already returns a 422 BEFORE flipping
+// status or saving a draft: {error:'no_recipient'} when reply-all resolves to a
+// fully-empty To (server/routes/email.py ~5684), and {error:'unresolved_recipients',
+// names:[...]} when the To partially resolved but one or more ORIGINAL name-only
+// recipients couldn't be mapped to an address (~5639). EmailPage.approve()
+// dispatches approveOutcome(res.status, json) and routes:
+//   no_recipient / unresolved_recipients / error -> a RED setError(...) banner
+//        (item stays unapproved, NO refresh, NEVER the green "Copied!")
+//   409                                          -> the DISTINCT "Conflict... Refreshing" banner + refresh()
+//   2xx draftSaved                               -> the green "Copied!" toast
+// These tests pin the four outcomes so a FUTURE change that collapses
+// no_recipient / unresolved_recipients onto the 409 conflict (anti
+// CONFLATE-WITH-409) or onto the ok toast (anti SILENT-GREEN-APPROVE) goes RED
+// here — even though the page's setError vs. toast pixels stay browser-unverified.
+
+test('AC-10 #1: httpStatus 422 + error no_recipient -> {outcome:no_recipient, draftSaved:false, non-empty message}', () => {
+  const r = approveOutcome(422, {
+    error: 'no_recipient',
+    message: 'No recipient address — draft not saved; add a recipient and retry',
+  });
+  assert.equal(r.outcome, 'no_recipient');
+  assert.equal(r.draftSaved, false);
+  assert.ok(r.message && r.message.length > 0, 'message must be non-empty');
+  assert.notEqual(r.message, 'undefined');
+  // routes to the RED setError banner — NOT the 409 conflict, NOT the green toast
+  assert.notEqual(r.outcome, 'conflict');
+  assert.notEqual(r.outcome, 'ok');
+});
+
+test('AC-10 #2: httpStatus 422 + error unresolved_recipients + names[] -> {outcome:unresolved_recipients, names, message NAMING the people}', () => {
+  const names = ['Wang, Yibo', 'Liu, Yang (Jonathan)'];
+  const r = approveOutcome(422, { error: 'unresolved_recipients', names });
+  assert.equal(r.outcome, 'unresolved_recipients');
+  assert.deepEqual(r.names, names);
+  assert.equal(r.draftSaved, false);
+  // the message must NAME every unresolved person so the banner is actionable
+  assert.ok(r.message.includes('Wang, Yibo'), 'message names the first unresolved recipient');
+  assert.ok(r.message.includes('Liu, Yang (Jonathan)'), 'message names the second unresolved recipient');
+  assert.notEqual(r.message, 'undefined');
+  // DISTINCT from conflict and ok (and from no_recipient, which names no one)
+  assert.notEqual(r.outcome, 'conflict');
+  assert.notEqual(r.outcome, 'ok');
+  assert.notEqual(r.outcome, 'no_recipient');
+});
+
+test('AC-10 #3: httpStatus 409 -> {outcome:conflict} — DISTINCT from the two 422 RED outcomes (anti CONFLATE-WITH-409)', () => {
+  const r = approveOutcome(409, { error: 'conflict', etag: 'e2', current: {} });
+  assert.equal(r.outcome, 'conflict');
+  // The 409 "Conflict... Refreshing" path must NEVER be reached by the two 422
+  // fail-loud codes — refreshing wouldn't fix a missing/unresolved recipient.
+  assert.notEqual(r.outcome, 'no_recipient');
+  assert.notEqual(r.outcome, 'unresolved_recipients');
+  assert.notEqual(r.outcome, 'ok');
+});
+
+test('AC-10 #4: a 2xx with draftSaved -> {outcome:ok} (the green "Copied!" path) — provably NOT the RED cases', () => {
+  const r = approveOutcome(200, { available: true, draftSaved: true, item: {}, etag: 'e7' });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.draftSaved, true);
+  // the happy path stays the green toast and is NEVER one of the RED fail-loud
+  // outcomes (so the RED cases are provably distinct from the green toast).
+  assert.notEqual(r.outcome, 'no_recipient');
+  assert.notEqual(r.outcome, 'unresolved_recipients');
+  assert.notEqual(r.outcome, 'conflict');
+  assert.notEqual(r.outcome, 'error');
+});
+
 console.log(`\nall green: ${passed} tests passed`);

@@ -4707,7 +4707,7 @@ def test_build_reply_all_body_multi_turn_includes_every_turn_in_order():
 
     # Outlook-style attribution labels appear (per-turn header block).
     assert "From:" in html_body
-    assert "Sent:" in html_body
+    assert "Date:" in html_body  # D-072: render header uses Date:, not Sent:
     assert "To:" in html_body
     assert "Subject:" in html_body
     # Subject reproduced from the item.
@@ -4905,8 +4905,8 @@ async def test_email_approve_body_is_reply_all_with_quoted_thread(client, email_
     i_old = body_html.index("Oldest thread message.")
     i_new = body_html.index("Newest thread message.")
     assert i_reply < i_old < i_new
-    # Per-turn attribution present (not a bare reply).
-    assert "From:" in body_html and "Sent:" in body_html
+    # Per-turn attribution present (not a bare reply). D-072: header uses Date:.
+    assert "From:" in body_html and "Date:" in body_html
 
 
 # ─── D-058: folder-source pre-flight (scripts/email_validate.py) ──────────────
@@ -8821,3 +8821,574 @@ async def test_d071_folder_mark_read_failure_surfaces_markreadfailed_without_blo
     assert body.get("markReadFailed") in (None, False), (
         "a SUCCESSFUL folder mark-read must NOT set markReadFailed (anti "
         f"false-alarm, AC-5); body was {body}")
+
+
+# ─── D-072: reply-all quoted-thread de-dup (extraction + render + artifact scrub) ──
+#
+# ROOT CAUSE: the multi-message OWA branch of _extract_thread_history stored each
+# OWA message body VERBATIM, but each OWA reply body ALREADY embeds its own full
+# nested quoted chain (`From: ... Date: ...`). _build_reply_all_body then synthesized
+# its OWN header on top of EVERY stored turn and rendered all of them, producing an
+# O(N^2) duplicated blob. The fix: route the multi-message branch through
+# _split_quoted_thread (de-dup the chain) AND a render-side belt-and-suspenders that
+# strips any residual nested tail + cleans presentation artifacts.
+#
+# Fixture mirrors the REAL stored 5-message thread 'Suggestion for Preventing
+# Accidental Mass Delete': five distinct senders, each with a unique sentence, where
+# the NEWEST message body re-embeds the WHOLE nested chain (the O(N^2) source). The
+# quoted headers carry the senders' ORIGINAL Outlook local-time dates (NOT derivable
+# from ISO-Z because senders sit in different timezones).
+
+# Each older message's own unique sentence (oldest -> newest):
+_D072_VIPUL = "This proposal enforces a DELETE threshold before a mass delete runs."
+_D072_JONATHAN = "I think we should also log every bulk delete for the audit trail."
+_D072_AVANTI = "Prefect, this aligns with what the security team asked for."
+_D072_KRISTEN = "Looping in the platform owners so they can weigh in on the rollout."
+_D072_NEWEST = "Confirmed, I will draft the one-pager and circulate it tomorrow."
+
+# The newest OWA message body: the newest author's own words on top, then the FULL
+# nested chain quoted below (each older message under its own Outlook header block,
+# carrying its ORIGINAL local-time date). This is RAW format=html as the live OWA
+# path now fetches (D-062) — <b> labels, &lt;addr&gt;-escaped addresses, a leaked
+# markdown link, and an [image:] marker so the artifact-scrub assertions bite.
+_D072_NEWEST_BODY_HTML = (
+    "<p>" + _D072_NEWEST + "</p>"
+    "<p><b>From:</b> Wang, Yibo &lt;yibo@amazon.com&gt;<br>"
+    "<b>Sent:</b> Thursday, October 2, 2025 at 9:10 AM<br>"
+    "<b>To:</b> Tian, Kristen &lt;kristen@amazon.com&gt;<br>"
+    "<b>Subject:</b> RE: Suggestion for Preventing Accidental Mass Delete</p>"
+    "<p>" + _D072_KRISTEN + " See the [runbook](https://wiki.example.com/runbook).</p>"
+    "<p><b>From:</b> Tian, Kristen &lt;kristen@amazon.com&gt;<br>"
+    "<b>Sent:</b> Wednesday, October 1, 2025 at 3:22 PM<br>"
+    "<b>To:</b> Wang, Yibo &lt;yibo@amazon.com&gt;<br>"
+    "<b>Subject:</b> RE: Suggestion for Preventing Accidental Mass Delete</p>"
+    "<p>" + _D072_AVANTI + "</p>"
+    "<p><b>From:</b> Avanti, Reddy &lt;avanti@amazon.com&gt;<br>"
+    "<b>Sent:</b> Wednesday, October 1, 2025 at 1:56 PM<br>"
+    "<b>To:</b> Wang, Yibo &lt;yibo@amazon.com&gt;<br>"
+    "<b>Subject:</b> RE: Suggestion for Preventing Accidental Mass Delete</p>"
+    "<p>" + _D072_JONATHAN + "</p>"
+    "<p><b>From:</b> Liu, Yang (Jonathan) &lt;amzyangl@amazon.com&gt;<br>"
+    "<b>Sent:</b> Wednesday, October 1, 2025 at 12:07 PM<br>"
+    "<b>To:</b> Bhargava, Vipul &lt;vipul@amazon.com&gt;<br>"
+    "<b>Subject:</b> RE: Suggestion for Preventing Accidental Mass Delete</p>"
+    "<p>" + _D072_VIPUL + " <img src=\"cid:image001.png@01D.\" alt=\"image001.png\"></p>"
+)
+
+# The per-message VERBATIM bodies as _scan_once's multi-message branch sees them: the
+# OWA payload delivers them newest-first, and EACH body re-embeds the chain below it
+# (monotonically growing — the O(N^2) source). For the regression we only need the
+# NEWEST to carry the whole chain; the OWA array order is newest-first.
+def _d072_owa_payload():
+    """The legacy multi-message OWA payload shape ({content:{emails:[...]}}),
+    newest-first, where the newest body re-embeds the full nested chain."""
+    return {"content": {"emails": [
+        {"itemId": "M5", "sender": {"name": "Wang, Yibo", "email": "yibo@amazon.com"},
+         "dateTimeSent": "2025-10-02T16:10:00Z",
+         "subject": "RE: Suggestion for Preventing Accidental Mass Delete",
+         "recipients": [{"name": "Tian, Kristen"}],
+         "body": _D072_NEWEST_BODY_HTML, "isRead": False},
+        {"itemId": "M4", "sender": {"name": "Tian, Kristen", "email": "kristen@amazon.com"},
+         "dateTimeSent": "2025-10-01T22:22:00Z",
+         "subject": "RE: Suggestion for Preventing Accidental Mass Delete",
+         "recipients": [{"name": "Wang, Yibo"}],
+         "body": "<p>" + _D072_KRISTEN + "</p>", "isRead": False},
+        {"itemId": "M3", "sender": {"name": "Avanti, Reddy", "email": "avanti@amazon.com"},
+         "dateTimeSent": "2025-10-01T20:56:00Z",
+         "subject": "RE: Suggestion for Preventing Accidental Mass Delete",
+         "recipients": [{"name": "Wang, Yibo"}],
+         "body": "<p>" + _D072_AVANTI + "</p>", "isRead": False},
+        {"itemId": "M2", "sender": {"name": "Liu, Yang (Jonathan)", "email": "amzyangl@amazon.com"},
+         "dateTimeSent": "2025-10-01T19:07:00Z",
+         "subject": "RE: Suggestion for Preventing Accidental Mass Delete",
+         "recipients": [{"name": "Bhargava, Vipul"}],
+         "body": "<p>" + _D072_JONATHAN + "</p>", "isRead": False},
+        {"itemId": "M1", "sender": {"name": "Bhargava, Vipul", "email": "vipul@amazon.com"},
+         "dateTimeSent": "2025-10-01T18:07:00Z",
+         "subject": "Suggestion for Preventing Accidental Mass Delete",
+         "recipients": [{"name": "Liu, Yang (Jonathan)"}],
+         "body": "<p>" + _D072_VIPUL + "</p>", "isRead": False},
+    ]}}
+
+
+def test_d072_extraction_dedup_multi_message_owa_one_per_turn():
+    """AC-1/AC-2/AC-7/AC-8: the multi-message OWA branch de-dups the nested chain so
+    the stored threadHistory is ONE message per turn, each carrying its OWN words only
+    and NO body re-containing an older message — recovered from the newest body's
+    inline chain via _split_quoted_thread (NOT the verbatim per-message bodies)."""
+    history = email_mod._extract_thread_history(_d072_owa_payload())
+
+    # Five distinct turns, oldest -> newest.
+    assert len(history) == 5, f"expected 5 de-duped turns, got {len(history)}"
+
+    # Concatenate every turn's body once; each unique sentence must appear EXACTLY
+    # once across the whole stored history (the O(N^2) blob would repeat them).
+    all_bodies = "\n".join(t["body"] for t in history)
+    for sentence in (_D072_VIPUL.split(".")[0], _D072_JONATHAN, _D072_AVANTI,
+                     _D072_KRISTEN, _D072_NEWEST):
+        assert all_bodies.count(sentence) == 1, (
+            f"{sentence!r} appears {all_bodies.count(sentence)}x in stored history "
+            "(expected exactly once — de-dup means stop REPEATING)")
+
+    # No stored turn body re-contains an OLDER message's words (no nested tail).
+    # Order is oldest->newest, so turn i must not contain turn j<i's unique sentence.
+    sentences = [_D072_VIPUL.split(".")[0], _D072_JONATHAN, _D072_AVANTI,
+                 _D072_KRISTEN, _D072_NEWEST]
+    for i, turn in enumerate(history):
+        for j in range(i):
+            assert sentences[j] not in turn["body"], (
+                f"turn {i} re-contains turn {j}'s words — nested tail not stripped")
+
+    # The recovered Outlook local-time dates (NOT the ISO-Z stamps) are on the turns.
+    timestamps = " | ".join(t.get("timestamp", "") for t in history)
+    assert "1:56 PM" in timestamps, "Avanti's recovered local-time date must be used"
+    assert "12:07 PM" in timestamps, "Jonathan's recovered local-time date must be used"
+
+
+def test_d072_extraction_single_message_graph_unchanged():
+    """AC-9: the single-message Graph branch is BYTE-FOR-BYTE unchanged — it still
+    routes through _split_quoted_thread on the one inline-quoted body."""
+    payload = {"email": {
+        "from": {"name": "Wang, Yibo", "email": "yibo@amazon.com"},
+        "received": "2025-10-02T16:10:00Z",
+        "subject": "RE: Suggestion for Preventing Accidental Mass Delete",
+        "to": [{"name": "Tian, Kristen", "email": "kristen@amazon.com"}],
+        "body": _D072_NEWEST_BODY_HTML,
+    }}
+    history = email_mod._extract_thread_history(payload)
+    all_bodies = "\n".join(t["body"] for t in history)
+    # The single-message branch already de-dups via _split_quoted_thread, so each
+    # unique sentence still appears exactly once (the inbox path "worked").
+    for sentence in (_D072_JONATHAN, _D072_AVANTI, _D072_KRISTEN, _D072_NEWEST):
+        assert all_bodies.count(sentence) == 1
+
+
+def test_d072_render_dedup_already_stored_blob_belt_and_suspenders():
+    """AC-7 (no migration): an ALREADY-STORED item whose newest turn body still
+    re-contains the whole nested chain de-dups at RENDER time — each unique sentence
+    and quoted block appears exactly once, with NO file migration."""
+    # Simulate the OLD buggy stored shape: the newest turn body is the verbatim OWA
+    # body that re-embeds the full chain (the O(N^2) blob already on disk today).
+    newest_blob = email_mod._html_to_text(_D072_NEWEST_BODY_HTML)
+    item = _make_item(
+        "i1",
+        subject="Suggestion for Preventing Accidental Mass Delete",
+        threadHistory=[
+            _turn("Bhargava, Vipul", "Wednesday, October 1, 2025 at 11:07 AM",
+                  "Liu, Yang (Jonathan)", _D072_VIPUL),
+            _turn("Liu, Yang (Jonathan)", "Wednesday, October 1, 2025 at 12:07 PM",
+                  "Bhargava, Vipul", _D072_JONATHAN),
+            _turn("Avanti, Reddy", "Wednesday, October 1, 2025 at 1:56 PM",
+                  "Wang, Yibo", _D072_AVANTI),
+            _turn("Tian, Kristen", "Wednesday, October 1, 2025 at 3:22 PM",
+                  "Wang, Yibo", _D072_KRISTEN),
+            # The buggy verbatim newest turn re-containing the whole nested chain:
+            _turn("Wang, Yibo", "Thursday, October 2, 2025 at 9:10 AM",
+                  "Tian, Kristen", newest_blob),
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("Here is my reply.", item)
+
+    # Each unique sentence appears EXACTLY once across the rendered draft.
+    assert html_body.count("enforces a DELETE threshold") == 1, (
+        "Vipul's sentence must render exactly once (belt-and-suspenders de-dup)")
+    assert html_body.count("Prefect") == 1, "Avanti's 'Prefect' must render exactly once"
+    assert html_body.count(_D072_JONATHAN) == 1
+    assert html_body.count(_D072_KRISTEN) == 1
+    assert html_body.count(_D072_NEWEST) == 1
+
+    # Exactly 5 quoted blocks (one per message). The builder wraps each turn in a
+    # `<div style="margin-top:12px">` header block.
+    assert html_body.count('<div style="margin-top:12px">') == 5, (
+        "expected exactly 5 quoted blocks (one per message)")
+
+
+def test_d072_render_header_uses_date_not_sent_and_separate_cc():
+    """AC-5: the rendered header uses `Date:` (NOT `Sent:`), with a SEPARATE `Cc:`
+    line when the turn carries a cc; the recovered local-time string is used."""
+    item = _make_item(
+        "i1",
+        subject="Re: Launch",
+        threadHistory=[
+            {"sender": "Alpha One", "timestamp": "Monday, June 1, 2026 9:00 AM",
+             "to": "Bravo Two", "cc": "Carol Three",
+             "recipients": "Bravo Two; Carol Three", "body": "Body one."},
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("My reply.", item)
+    assert "Date:" in html_body, "header must use Date:"
+    assert "Sent:" not in html_body, "header must NOT use Sent: (Outlook Date: style)"
+    assert "Cc:" in html_body, "a turn with a cc must render a separate Cc: line"
+    assert "Bravo Two" in html_body and "Carol Three" in html_body
+    # The recovered local-time string is rendered verbatim (NOT a reformatted ISO).
+    assert "Monday, June 1, 2026 9:00 AM" in html_body
+
+
+def test_d072_render_artifact_scrub_links_image_markers_and_recipient_commas():
+    """AC-3/AC-4: render-side artifact cleanup — collapse [label](url) -> label, drop
+    the [image:]/glyph marker WHOLE line, keep internal-comma recipient names intact
+    against the REAL ADDRESS-GLUED bytes (anti HAND-SPACED-FIXTURE)."""
+    # The recipients string is the REAL address-glued OWA forward header bytes.
+    glued_recipients = ("Wang, Yibo yibo@amazon.com, Liu, Yang (Jonathan) "
+                        "amzyangl@amazon.com, Tian, Kristen kristen@amazon.com")
+    body_with_artifacts = (
+        "See the [runbook](https://wiki.example.com/runbook) for details.\n"
+        "\U0001f5bc [image: image001.png]\n"
+        "The mid-prose word image survives.\n"
+        "Final substantive line."
+    )
+    item = _make_item(
+        "i1",
+        subject="Re: Artifacts",
+        threadHistory=[
+            {"sender": "Wang, Yibo", "timestamp": "Mon", "recipients": glued_recipients,
+             "body": body_with_artifacts},
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("Reply.", item)
+
+    # (a) markdown link collapsed to its label; no leaked ](http syntax / URL.
+    assert "runbook" in html_body
+    assert "](http" not in html_body, "leaked markdown-link syntax must be collapsed"
+    assert "wiki.example.com" not in html_body, "the URL is noise — dropped"
+    # (b) the [image:] marker WHOLE line dropped; a mid-prose 'image' survives.
+    assert "[image:" not in html_body, "the [image:] placeholder line must be dropped"
+    assert "\U0001f5bc" not in html_body, "the image glyph marker must be dropped"
+    assert "The mid-prose word image survives." in html_body
+    assert "Final substantive line." in html_body, "substantive content must survive"
+    # (c) internal-comma recipient names stay intact (not shattered).
+    assert "Wang, Yibo" in html_body, "internal-comma name 'Wang, Yibo' must stay intact"
+    assert "Liu, Yang (Jonathan)" in html_body, "the (Jonathan) name must stay intact"
+    assert "Tian, Kristen" in html_body
+    # No literal raw From: leaked into the rendered quote (the header is the synthesized
+    # one; a stored nested 'From:' tail would be stripped — none here, so just check
+    # the markdown emphasis form never leaks).
+    assert "**From:" not in html_body
+
+
+def test_d072_render_name_only_quoted_recipient_list_splits_per_name():
+    """REGRESSION (case-3): a name-only quoted recipient list (no ';', no address)
+    like ``"Davis, Jordan" , "Ahsan, Ayaz" , ...`` must split into ONE entry per
+    name — never one mangled blob with leaked interior double-quotes.
+
+    Guards the _split_header_entries case-3 fix: the address-glued case-2 shape was
+    already covered, but the name-only quoted shape (the REAL stored OWA forward
+    To:/Cc: bytes) regressed when recipient flattening routed through
+    _clean_recipient_names. Asserts at BOTH the helper and the rendered-draft layer.
+    """
+    name_only = ('"Davis, Jordan" , "Ahsan, Ayaz" , "Marquez, Seville" , '
+                 '"Goldschmidt, Jeff"')
+
+    # Helper layer: each quoted span is its own entry, no leaked quotes, no shatter.
+    entries = email_mod._split_header_entries(name_only)
+    assert entries == ["Davis, Jordan", "Ahsan, Ayaz", "Marquez, Seville",
+                       "Goldschmidt, Jeff"]
+    assert all('"' not in e for e in entries), "interior quotes must not leak"
+
+    # Flatten layer: clean ';'-joined display names, internal commas intact.
+    cleaned = email_mod._clean_recipient_names(name_only)
+    clean_entries = [e.strip() for e in cleaned.split(";")]
+    assert clean_entries == ["Davis, Jordan", "Ahsan, Ayaz", "Marquez, Seville",
+                             "Goldschmidt, Jeff"]
+    assert "Jordan" not in clean_entries, "'Davis, Jordan' must not shatter"
+    assert '"' not in cleaned
+
+    # Render layer: the names land intact in the user-facing draft (no leaked quote
+    # like ``Davis, Jordan" , "Ahsan``).
+    item = _make_item(
+        "i1",
+        subject="Re: Name-only recipients",
+        threadHistory=[
+            {"sender": "Shadeck, Gal", "timestamp": "Wed", "recipients": name_only,
+             "body": "Thanks all."},
+        ],
+    )
+    html_body = email_mod._build_reply_all_body("Reply.", item)
+    assert "Davis, Jordan" in html_body
+    assert "Ahsan, Ayaz" in html_body
+    assert "Goldschmidt, Jeff" in html_body
+    assert 'Jordan" , "Ahsan' not in html_body, "leaked interior quotes must be gone"
+
+
+def test_d072_full_thread_render_exactly_once_per_message():
+    """DONE-WHEN (integration): extraction de-dup feeds render de-dup so the full
+    5-message OWA thread renders each message EXACTLY once, 5 quoted blocks, no
+    leaked artifacts — the headline outcome."""
+    history = email_mod._extract_thread_history(_d072_owa_payload())
+    item = _make_item(
+        "i1",
+        subject="Suggestion for Preventing Accidental Mass Delete",
+        threadHistory=history,
+    )
+    html_body = email_mod._build_reply_all_body("Sounds good to me.", item)
+
+    assert html_body.count("enforces a DELETE threshold") == 1
+    assert html_body.count("Prefect") == 1
+    assert html_body.count('<div style="margin-top:12px">') == 5
+    # No leaked presentation artifacts.
+    assert "**From:" not in html_body
+    assert "](http" not in html_body
+    assert "[image:" not in html_body
+    assert "\U0001f5bc" not in html_body
+
+
+def test_d072_read_only_boundary_unchanged():
+    """AC-11: the send-safety frozensets are unchanged by this render-only fix."""
+    assert "email_draft" not in email_mod._EMAIL_READ_ONLY_TOOLS
+    assert "send_email" not in email_mod._EMAIL_READ_ONLY_TOOLS
+    assert "mark_email_read" not in email_mod._EMAIL_READ_ONLY_TOOLS
+    # The Graph gated-write set stays write-only (no read tool leaked in).
+    assert "get_emails" not in email_mod._GRAPH_GATED_WRITE_TOOLS
+
+
+# ─── D-072 RE-FIX: the RECURSIVE-nesting + bare-comma + ISO-Z real-byte traps ─────
+#
+# The first D-072 fixture (_D072_NEWEST_BODY_HTML) was NON-recursively nested: each
+# older quoted body was a single non-quoting sentence, so _split_quoted_thread saw
+# exactly 5 boundaries and the gate len(split)>=len(emails) (5>=5) passed. The REAL
+# OWA newest body is RECURSIVELY nested — each quoted older message ITSELF embeds the
+# whole chain below it — so a linear boundary scan emitted 11 turns (Jonathan x4,
+# Avanti x3, ...): the O(N^2) blob reborn. Plus the real bodies render SOME nested
+# headers as a table-flattened ``From:``/``Subject:`` pair with NO Date:, which the
+# From:+Date:+Subject: SHAPE gate misses, so a quoted message bleeds into the prior
+# turn. These fixtures MODEL the recursion (anti SYNTHETIC-FIXTURE-CLEANER-THAN-REAL)
+# so the de-dup is exercised against the shape that actually shipped.
+
+# Reduced (table-flattened) nested header: From:+Subject: pair, NO Date:, under a ---
+# rule — the form _html_to_text emits when a quoted header was an HTML <table>.
+def _d072r_reduced_hdr(frm):
+    return ("---\n"
+            f"From: {frm}\n"
+            "Subject: Re: Suggestion for Preventing Accidental Mass Delete\n\n")
+
+
+# Full Outlook header block (markdown-emphasis labels, value-on-next-line, the legacy
+# OWA shape the real stored body carries) carrying the sender's ORIGINAL local time.
+def _d072r_full_hdr(frm, when, to):
+    return (f"**From: **\n**\"{frm}\" \n\n"
+            f"**Date: **{when}\n\n"
+            f"**To: **{to}\n\n"
+            "**Subject: **Re: Suggestion for Preventing Accidental Mass Delete\n\n")
+
+
+_D072R_VIPUL = "This proposal enforces a DELETE threshold before a mass delete runs."
+_D072R_JONATHAN = "I think we should also log every bulk delete for the audit trail."
+_D072R_AVANTI = "Prefect, this aligns with what the security team asked for."
+_D072R_KRISTEN = "Looping in the platform owners so they can weigh in on the rollout."
+_D072R_NEWEST = "Confirmed, I will draft the one-pager and circulate it tomorrow."
+
+
+def _d072r_recursive_newest_body():
+    """The newest body with RECURSIVE nesting that MIRRORS the real stored shape: each
+    quoted older message is opened by a FULL Outlook header block (the real OWA reply
+    quote form — ``**From: **``/``**Date: **``/``**To: **``/``**Subject: **``) AND
+    ALSO re-embeds the whole chain below it (the O(N^2) source). A redundant DEEPER
+    table-flattened reduced header (``---``/``From:``/``Subject:``, NO Date:) is mixed
+    in as a TAIL — the real bytes carried both forms; the reduced form only ever
+    appears as a redundant copy of a message that ALSO appears under a full block
+    elsewhere, so stripping the reduced tail never loses the only copy."""
+    m1 = _D072R_VIPUL + "\n"
+    m2 = (_D072R_JONATHAN + "\n"
+          + _d072r_full_hdr("Bhargava, Vipul",
+                            "Wednesday, October 1, 2025 at 11:07 AM",
+                            "Liu, Yang (Jonathan)") + m1
+          # redundant deeper reduced-header copy of Vipul's message (a real-byte tail).
+          + _d072r_reduced_hdr("Bhargava, Vipul") + m1)
+    m3 = (_D072R_AVANTI + "\n"
+          + _d072r_full_hdr("Liu, Yang (Jonathan)",
+                            "Wednesday, October 1, 2025 at 12:07 PM",
+                            "Bhargava, Vipul") + m2)
+    m4 = (_D072R_KRISTEN + "\n"
+          + _d072r_full_hdr("Avanti, Reddy",
+                            "Wednesday, October 1, 2025 at 1:56 PM",
+                            "Wang, Yibo") + m3)
+    m5 = (_D072R_NEWEST + "\n"
+          + _d072r_full_hdr("Tian, Kristen",
+                            "Thursday, October 2, 2025 at 3:22 PM",
+                            "Wang, Yibo") + m4)
+    return m5
+
+
+def _d072r_recursive_owa_payload():
+    """Multi-message OWA payload (newest-first) where the NEWEST body is RECURSIVELY
+    nested (each older quote re-embeds the chain below it)."""
+    return {"content": {"emails": [
+        {"itemId": "M5", "sender": {"name": "Wang, Yibo", "email": "yibo@amazon.com"},
+         "dateTimeSent": "2025-10-02T16:10:00Z", "subject": "RE: x",
+         "recipients": [{"name": "Tian, Kristen"}],
+         "body": _d072r_recursive_newest_body(), "isRead": False},
+        {"itemId": "M4", "sender": {"name": "Tian, Kristen", "email": "kristen@amazon.com"},
+         "dateTimeSent": "2025-10-01T22:22:00Z", "subject": "RE: x",
+         "recipients": [{"name": "Wang, Yibo"}],
+         "body": _D072R_KRISTEN, "isRead": False},
+        {"itemId": "M3", "sender": {"name": "Avanti, Reddy", "email": "avanti@amazon.com"},
+         "dateTimeSent": "2025-10-01T20:56:00Z", "subject": "RE: x",
+         "recipients": [{"name": "Wang, Yibo"}],
+         "body": _D072R_AVANTI, "isRead": False},
+        {"itemId": "M2", "sender": {"name": "Liu, Yang (Jonathan)", "email": "amzyangl@amazon.com"},
+         "dateTimeSent": "2025-10-01T19:07:00Z", "subject": "RE: x",
+         "recipients": [{"name": "Bhargava, Vipul"}],
+         "body": _D072R_JONATHAN, "isRead": False},
+        {"itemId": "M1", "sender": {"name": "Bhargava, Vipul", "email": "vipul@amazon.com"},
+         "dateTimeSent": "2025-10-01T18:07:00Z", "subject": "x",
+         "recipients": [{"name": "Liu, Yang (Jonathan)"}],
+         "body": _D072R_VIPUL, "isRead": False},
+    ]}}
+
+
+def test_d072r_recursive_nesting_extracts_one_per_turn():
+    """AC-1/AC-7/AC-8 on the REAL recursive shape: the newest body re-embeds the whole
+    chain at EVERY nesting level, so a linear scan over-produces (11 turns, sentences
+    repeated). After de-dup the stored history is EXACTLY one message per turn and each
+    unique sentence appears EXACTLY once (the O(N^2) blob is NOT reborn)."""
+    history = email_mod._extract_thread_history(_d072r_recursive_owa_payload())
+    assert len(history) == 5, f"expected 5 de-duped turns, got {len(history)}"
+    all_bodies = "\n".join(t["body"] for t in history)
+    for sentence in (_D072R_VIPUL.split(".")[0], _D072R_JONATHAN, _D072R_AVANTI,
+                     _D072R_KRISTEN, _D072R_NEWEST):
+        assert all_bodies.count(sentence) == 1, (
+            f"{sentence!r} appears {all_bodies.count(sentence)}x — O(N^2) blob reborn")
+    # No turn body re-contains an OLDER message (no nested tail survived).
+    sentences = [_D072R_VIPUL.split(".")[0], _D072R_JONATHAN, _D072R_AVANTI,
+                 _D072R_KRISTEN, _D072R_NEWEST]
+    for i, turn in enumerate(history):
+        for j in range(i):
+            assert sentences[j] not in turn["body"], (
+                f"turn {i} re-contains turn {j}'s words — nested tail not stripped")
+
+
+def test_d072r_recursive_render_exactly_five_blocks():
+    """AC-7: feeding the de-duped recursive history to the render emits EXACTLY 5
+    quoted blocks, each unique sentence once — the headline outcome on real bytes."""
+    history = email_mod._extract_thread_history(_d072r_recursive_owa_payload())
+    item = _make_item("i1", subject="Suggestion for Preventing Accidental Mass Delete",
+                      threadHistory=history)
+    html_body = email_mod._build_reply_all_body("Sounds good.", item)
+    assert html_body.count('<div style="margin-top:12px">') == 5
+    assert html_body.count("enforces a DELETE threshold") == 1
+    assert html_body.count("Prefect") == 1
+
+
+def test_d072r_reduced_header_is_a_dedup_boundary():
+    """The table-flattened reduced header (From:+Subject:, NO Date:) is recognized as
+    a nested-quote boundary so a turn body is cut at it — _parse_outlook_header_block
+    (which requires a Date:) MUST still NOT treat it as a full block (no false split
+    elsewhere), but _strip_turn_own_words cuts there."""
+    body = ("My own words here.\n"
+            "---\n"
+            "From: Someone, Else\n"
+            "Subject: Re: x\n\n"
+            "Their quoted words that must NOT bleed in.")
+    own = email_mod._strip_turn_own_words(body)
+    assert "My own words here." in own
+    assert "Their quoted words" not in own, "reduced header must cut the nested tail"
+    # The SHAPE gate (needs From:+Date:+Subject:) still rejects it as a full block.
+    lines = body.split("\n")
+    from_idx = next(i for i, ln in enumerate(lines) if ln.startswith("From:"))
+    assert email_mod._parse_outlook_header_block(lines, from_idx) is None
+
+
+def test_d072r_strip_turn_own_words_no_boundary_is_noloss():
+    """A turn body with NO nested header is returned UNCHANGED (no-loss)."""
+    body = "Just a normal reply.\n\nThanks,\nAlice"
+    assert email_mod._strip_turn_own_words(body) == body
+
+
+def test_d072r_bare_comma_recipient_list_keeps_lastfirst_intact():
+    """AC-4 on the REAL stored shape: a BARE name-only comma list (no ';', no address,
+    no quotes) like ``Wang, Yibo, Liu, Yang (Jonathan), Chimote, Avanti`` must pair
+    into intact ``Last, First`` names — NOT shatter every name into two phantoms.
+
+    This is the case-4 the spec's own example names and the prior fixture left
+    untested (it only pinned the address-glued case-2 and quoted case-3 shapes)."""
+    bare = ("Wang, Yibo, Liu, Yang (Jonathan), Liu, Audrey, Tian, Kristen, "
+            "Ma, Ke, Wu, Di")
+    entries = email_mod._split_header_entries(bare)
+    assert entries == ["Wang, Yibo", "Liu, Yang (Jonathan)", "Liu, Audrey",
+                       "Tian, Kristen", "Ma, Ke", "Wu, Di"], entries
+    # No name shattered: 'Yibo' / 'Audrey' never stand alone as their own entry.
+    assert "Yibo" not in entries and "Audrey" not in entries
+
+    cleaned = email_mod._clean_recipient_names(bare)
+    clean_entries = [e.strip() for e in cleaned.split(";")]
+    assert clean_entries == ["Wang, Yibo", "Liu, Yang (Jonathan)", "Liu, Audrey",
+                             "Tian, Kristen", "Ma, Ke", "Wu, Di"]
+
+    # Render layer: the names land intact (no ``Wang; Yibo`` shatter) in the draft.
+    item = _make_item("i1", subject="Re: bare recipients", threadHistory=[
+        {"sender": "Bhargava, Vipul", "timestamp": "Mon", "recipients": bare,
+         "body": "Thanks all."}])
+    html_body = email_mod._build_reply_all_body("Reply.", item)
+    assert "Wang, Yibo" in html_body
+    assert "Liu, Yang (Jonathan)" in html_body
+    assert "Wang; Yibo" not in html_body, "internal-comma name must not shatter"
+
+
+def test_d072r_bare_comma_odd_count_falls_back_no_wrong_pairing():
+    """An ODD-count bare comma list is ambiguous (a lone single-token name mixed in),
+    so the pairing does NOT fire — it falls back to the naive split rather than
+    guessing a wrong pairing."""
+    assert email_mod._split_header_entries("Alice, Bob, Carol") == ["Alice", "Bob", "Carol"]
+
+
+def test_d072r_gmail_bare_address_list_unaffected_by_pairing():
+    """A Gmail-style bare-ADDRESS list still splits on the address boundary (case-2),
+    NOT the new Last,First pairing — pairing only fires when no address is present."""
+    assert email_mod._split_header_entries("alice@x.com, bob@x.com") == [
+        "alice@x.com", "bob@x.com"]
+
+
+def test_d072r_render_humanizes_iso_z_timestamp_no_machine_leak():
+    """AC-5 on the REAL stored shape: an ALREADY-STORED turn carries a raw ISO-Z
+    timestamp (no recovered local-time date). The render MUST NOT leak the machine
+    ISO-Z form into the Date: header — it humanizes to a readable 12-hour form."""
+    item = _make_item("i1", subject="Re: ISO render", threadHistory=[
+        {"sender": "Liu, Yang (Jonathan)", "timestamp": "2025-10-01T18:56:40Z",
+         "recipients": "Chimote, Avanti, Liu, Audrey", "body": "Body."},
+        {"sender": "Wang, Yibo", "timestamp": "2025-10-02T19:07:15Z",
+         "recipients": "Chimote, Avanti", "body": "Body two."},
+    ])
+    html_body = email_mod._build_reply_all_body("Reply.", item)
+    assert "2025-10-01T18:56:40Z" not in html_body, "raw ISO-Z must NOT leak"
+    assert "2025-10-02T19:07:15Z" not in html_body, "raw ISO-Z must NOT leak"
+    # Humanized to a 12-hour AM/PM form.
+    assert "Date:" in html_body and "Sent:" not in html_body
+    assert ("AM" in html_body or "PM" in html_body), "a 12-hour time must render"
+    assert "2025" in html_body, "the year survives the humanize"
+
+
+def test_d072r_render_epoch_ms_timestamp_no_machine_leak():
+    """AC-5: the latest (top) turn often carries the item's raw epoch-ms ``ts``; that
+    machine number must NOT leak into the Date: header either."""
+    item = _make_item("i1", subject="Re: epoch render", threadHistory=[
+        {"sender": "Bhargava, Vipul", "timestamp": "1759432035000",
+         "recipients": "Liu, Yang (Jonathan)", "body": "Latest reply."},
+    ])
+    html_body = email_mod._build_reply_all_body("Reply.", item)
+    assert "1759432035000" not in html_body, "raw epoch-ms must NOT leak into header"
+    assert "PM" in html_body or "AM" in html_body
+
+
+def test_d072r_render_recovered_local_time_passes_through_verbatim():
+    """A recovered Outlook local-time string (the AC-1 re-extraction path) is the
+    AUTHORITATIVE sender-local display and passes through the render UNCHANGED — the
+    humanizer only touches machine ISO-Z / epoch forms."""
+    item = _make_item("i1", subject="Re: local time", threadHistory=[
+        {"sender": "Avanti, Reddy",
+         "timestamp": "Wednesday, October 1, 2025 at 1:56 PM",
+         "recipients": "Wang, Yibo", "body": "Body."},
+    ])
+    html_body = email_mod._build_reply_all_body("Reply.", item)
+    assert "Wednesday, October 1, 2025 at 1:56 PM" in html_body
+
+
+def test_d072r_render_header_date_helper_units():
+    """_render_header_date: ISO-Z + epoch -> humanized; human string + empty + garbage
+    -> passthrough (no-loss)."""
+    f = email_mod._render_header_date
+    assert f("2025-10-01T18:56:40Z") == "Wednesday, October 1, 2025 at 6:56 PM"
+    assert f("1759432035000").endswith("PM") or f("1759432035000").endswith("AM")
+    assert f("Wednesday, October 1, 2025 at 1:56 PM") == \
+        "Wednesday, October 1, 2025 at 1:56 PM"
+    assert f("") == ""
+    assert f("not a date") == "not a date"

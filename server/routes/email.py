@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import glob
 import html
 import json
@@ -1975,23 +1975,95 @@ def _esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+# A raw machine ISO-8601 stamp (``2025-10-01T18:56:40Z`` / ``...+00:00``) — the form
+# the stored turns carry when no Outlook local-time date was recovered. Detected so
+# the render can humanize it instead of leaking the machine form into a header.
+_RE_ISO_STAMP = re.compile(r"^\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?"
+                           r"(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?\s*$")
+# A raw epoch stamp (all digits): seconds (10) or milliseconds (13). The latest-reply
+# top turn carries the item's epoch ``ts`` when no quoted-header date was recovered.
+_RE_EPOCH_STAMP = re.compile(r"^\s*\d{10}(?:\d{3})?\s*$")
+
+
+def _humanize_dt(dt) -> str:
+    """A parsed datetime -> ``Weekday, Month D, YYYY at H:MM AM/PM`` (12-hour, no
+    leading-zero hour, e.g. ``1:56 PM``). PURE."""
+    hour12 = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{dt.strftime('%A, %B')} {dt.day}, {dt.year} at {hour12}:{dt.minute:02d} {ampm}"
+
+
+def _render_header_date(ts: str) -> str:
+    """Humanize ONE quoted-turn timestamp for the rendered ``Date:`` header.
+
+    Three timestamp shapes reach a stored turn:
+      * a RECOVERED Outlook local-time string (``Wednesday, October 1, 2025 at 1:56
+        PM``) — the _split_quoted_thread turns carry the sender's ORIGINAL local time
+        parsed out of the quoted header. Passed through VERBATIM (it is already the
+        human form, in the sender's own timezone — the authoritative display).
+      * a raw machine ISO-8601 stamp (``2025-10-01T18:56:40Z``) — the form an
+        ALREADY-STORED quoted turn carries when no local-time date was recovered.
+      * a raw epoch stamp (``1759432035000`` ms / 10-digit s) — the form the latest
+        (top) turn carries from the item's ``ts``.
+
+    AC-5 FORBIDS leaking a machine ISO-Z / epoch form into a header, so BOTH machine
+    forms are reformatted to a readable ``Month D, YYYY at H:MM AM/PM`` 12-hour form
+    (the stamp's own offset is honored — a ``Z`` stamp renders its UTC wall-clock; we
+    never CLAIM a viewer timezone we don't have, since the sender's exact local time is
+    only recoverable from the quoted-header string via the AC-1 re-extraction path).
+
+    Any other / unparseable string passes through unchanged (no-loss). PURE.
+    """
+    s = (ts or "").strip()
+    if not s:
+        return ""
+    if _RE_EPOCH_STAMP.match(s):
+        try:
+            raw = int(s)
+            secs = raw / 1000 if len(s) == 13 else raw
+            return _humanize_dt(datetime.fromtimestamp(secs, timezone.utc))
+        except (ValueError, OverflowError, OSError):
+            return s  # implausible epoch — keep verbatim, never blank
+    if not _RE_ISO_STAMP.match(s):
+        return s  # already a human local-time string (or free text) — pass through
+    dt = _parse_ts(s)
+    if dt is None:
+        return s  # shape looked ISO but did not parse — keep verbatim, never blank
+    return _humanize_dt(dt)
+
+
 def _build_reply_all_body(reply_text: str, item: dict) -> str:
     """Build the Outlook reply-all HTML draft body (PURE — no I/O, deterministic).
 
     Layout: the user's ``reply_text`` on top (with the existing ``\\n`` → ``<br>``
     transform preserved), then an Outlook-style quoted block reproducing the
     ENTIRE thread — EVERY turn in ``item['threadHistory']`` in the array's existing
-    oldest→newest order, never re-sorted / de-duped / summarized / skipped. Each
-    quoted message carries a From/Sent/To/Subject header block above its body.
+    oldest→newest order, never re-sorted / summarized / skipped. Each quoted message
+    carries a ``From:``/``Date:``/``To:``/(``Cc:``)/``Subject:`` header block above
+    its body (D-072: ``Date:`` not ``Sent:``; a SEPARATE ``Cc:`` line when the turn
+    carries one).
+
+    DE-DUP (D-072 part 2 belt-and-suspenders): each turn body is run through
+    ``_strip_nested_quoted_tail`` (cut a body that still re-contains an older message
+    at its first quoted boundary) + ``_clean_quoted_body`` (drop ``[image:]``/glyph
+    placeholder lines, collapse ``[label](url)`` -> label, re-join broken mid-list
+    wraps) BEFORE escaping, so an ALREADY-STORED O(N^2) blob de-dups at RENDER time
+    with NO file migration. Recipient strings route through ``_clean_recipient_names``
+    so an address-glued ``Wang, Yibo yibo@amazon.com`` stays the intact name
+    ``Wang, Yibo``. The header timestamp passes a recovered local-time string through
+    verbatim and humanizes a raw machine ISO-Z stamp to a readable ``Month D, YYYY at
+    H:MM AM/PM`` (``_render_header_date``) so the machine ISO-Z form never leaks into a
+    ``Date:`` header (D-072 AC-5).
 
     ALL external text (sender / timestamp / recipients / subject / each turn body)
-    is ``html.escape``-d FIRST, then the per-turn body's ``\\n`` → ``<br>`` is
-    applied AFTER escaping (escape-first-then-inject-<br>) so a hostile turn body
-    can't smuggle markup. Reads only ``threadHistory`` + ``subject`` already on the
-    item — makes NO MCP / network call (the thread data is already captured). A
-    turn missing a field renders that header line omitted, never a literal
-    None/undefined. The send-safety boundary is untouched: this only shapes the
-    DRAFT body; approve still calls email_draft create only.
+    is ``html.escape``-d FIRST (the scrub helpers run on RAW text, then ``_esc`` is
+    the LAST transform), then the per-turn body's ``\\n`` → ``<br>`` is applied AFTER
+    escaping (escape-first-then-inject-<br>) so a hostile turn body can't smuggle
+    markup. Reads only ``threadHistory`` + ``subject`` already on the item — makes NO
+    MCP / network call (the thread data is already captured). A turn missing a field
+    renders that header line omitted, never a literal None/undefined. The send-safety
+    boundary is untouched: this only shapes the DRAFT body; approve still calls
+    email_draft create only.
     """
     reply_html = _esc(reply_text).replace("\n", "<br>")
     subject = str(item.get("subject", "") or "")
@@ -2006,19 +2078,46 @@ def _build_reply_all_body(reply_text: str, item: dict) -> str:
         if not isinstance(turn, dict):
             continue
         sender = _esc(turn.get("sender"))
-        timestamp = _esc(turn.get("timestamp"))
-        recipients = _esc(turn.get("recipients"))
+        # Header timestamp: a turn carries EITHER the recovered Outlook local-time
+        # string (the _split_quoted_thread turns parse the sender's ORIGINAL local time
+        # out of the quoted header — passed through verbatim) OR, for an ALREADY-STORED
+        # turn with no recovered date, a raw machine ISO-Z stamp. _render_header_date
+        # humanizes the ISO-Z form to a readable ``Month D, YYYY at H:MM AM/PM`` (AC-5
+        # FORBIDS leaking the machine ISO-Z into a header) and leaves an already-human
+        # string untouched. Humanize on the RAW value, THEN escape (escape last).
+        timestamp = _esc(_render_header_date(str(turn.get("timestamp") or "")))
+        # Separate To:/Cc: when the turn carries them as distinct fields (the
+        # _split_quoted_thread turns do); otherwise fall back to the combined
+        # ``recipients`` string rendered as the To: line (no fabricated Cc:). Each
+        # recipient STRING is routed through _clean_recipient_names FIRST (address-
+        # glued ``Wang, Yibo yibo@amazon.com`` -> ``Wang, Yibo``, internal commas
+        # intact) THEN escaped (escape-first-then-inject preserved — _esc is last).
+        to_val = _esc(_clean_recipient_names(str(turn.get("to") or "")))
+        cc_val = _esc(_clean_recipient_names(str(turn.get("cc") or "")))
+        recipients = _esc(_clean_recipient_names(str(turn.get("recipients") or "")))
+
+        # Belt-and-suspenders de-dup (D-072 part 2): strip any residual nested quoted
+        # tail BEFORE escaping so an ALREADY-STORED verbatim blob de-dups at RENDER
+        # time with NO file migration, then scrub render-side artifacts. Both run on
+        # the RAW text; escape-first-then-inject-<br> is preserved below.
+        raw_body = str(turn.get("body") or "")
+        raw_body = _strip_nested_quoted_tail(raw_body)
+        raw_body = _clean_quoted_body(raw_body)
         # Escape the body FIRST, then convert its newlines to <br> (escape can't
         # touch the <br> tags this way, and the body text stays inert).
-        body_html = _esc(turn.get("body")).replace("\n", "<br>")
+        body_html = _esc(raw_body).replace("\n", "<br>")
 
         header_lines = []
         if sender:
             header_lines.append(f"<b>From:</b> {sender}")
         if timestamp:
-            header_lines.append(f"<b>Sent:</b> {timestamp}")
-        if recipients:
+            header_lines.append(f"<b>Date:</b> {timestamp}")
+        if to_val:
+            header_lines.append(f"<b>To:</b> {to_val}")
+        elif recipients:
             header_lines.append(f"<b>To:</b> {recipients}")
+        if cc_val:
+            header_lines.append(f"<b>Cc:</b> {cc_val}")
         if subject:
             header_lines.append(f"<b>Subject:</b> {_esc(subject)}")
         header_html = "<br>".join(header_lines)
@@ -3012,6 +3111,31 @@ _RE_NAME_ANGLE_ENTRY = re.compile(r".*?<\s*[^<>@\s]+@[^<>@\s]+\s*>")
 _RE_NAME_BARE_ENTRY = re.compile(r"[^@]*?[^\s<>;,]+@[^\s<>;,]+")
 
 
+def _pair_bare_lastfirst(value: str) -> "list[str] | None":
+    """Pair a BARE comma list of unquoted ``Last, First`` names into per-name entries.
+
+    The REAL stored OWA per-turn ``recipients`` string is a name-only comma list with
+    NO ';', NO addresses, and NO quotes (``Wang, Yibo, Liu, Yang (Jonathan), Chimote,
+    Avanti``) — _split_header_entries' naive comma fallback (case 4) SHATTERS every
+    ``Last, First`` into two phantom names (``Wang; Yibo; Liu; ...``). OWA renders each
+    recipient as ``Last, First``, so consecutive comma tokens pair up: tokens
+    ``[Wang, Yibo, Liu, Yang (Jonathan), Chimote, Avanti]`` -> entries ``["Wang, Yibo",
+    "Liu, Yang (Jonathan)", "Chimote, Avanti"]``.
+
+    Fires (returns the paired entries) ONLY when the list cleanly pairs: an EVEN count
+    of >= 2 non-empty comma tokens. An ODD count is ambiguous (a lone single-token name
+    mixed in), so this returns None and the caller keeps the naive split rather than
+    guessing a wrong pairing. PURE. Caller has already ruled out ';' / addresses /
+    quotes, so every comma here is either a Last/First separator or a between-names
+    separator — the pairing resolves which.
+    """
+    tokens = [t.strip() for t in value.split(",")]
+    tokens = [t for t in tokens if t]
+    if len(tokens) < 2 or len(tokens) % 2 != 0:
+        return None
+    return [f"{tokens[i]}, {tokens[i + 1]}" for i in range(0, len(tokens), 2)]
+
+
 def _split_header_entries(value: str) -> list[str]:
     """Split a 'To:'/'Cc:' header VALUE into per-recipient entry strings.
 
@@ -3025,9 +3149,19 @@ def _split_header_entries(value: str) -> list[str]:
        boundary (each ``<addr>`` closes one entry), so an unquoted
        ``Last, First <a@x> Other, Name <b@x>`` is two entries, not shattered on the
        name commas.
-    3. quoted ``"Last, First"`` span present -> keep as ONE entry (the comma is a
-       name comma; we never know the bare-list delimiter safely).
-    4. otherwise -> fall back to a comma split (a Gmail-style ``a@x, b@x`` list).
+    3. quoted ``"Last, First"`` span present (no ';' / no address) -> the double
+       quotes ARE the delimiter, so extract EACH quoted span as its own entry (the
+       comma INSIDE a span is a name comma, never a separator). A name-only OWA list
+       like ``"Davis, Jordan" , "Ahsan, Ayaz" , ...`` becomes one entry per name —
+       NOT one mangled blob with leaked interior quotes.
+    4. UNQUOTED bare ``Last, First`` comma list (no ';' / no address / no quotes) that
+       cleanly pairs (an even count of comma tokens) -> pair consecutive tokens into
+       ``Last, First`` entries (``_pair_bare_lastfirst``), so ``Wang, Yibo, Liu, Yang
+       (Jonathan)`` is two names, not four shards. This is the REAL stored per-turn
+       ``recipients`` shape (D-072 AC-4); without it the naive case-5 split shatters
+       every name.
+    5. otherwise -> fall back to a comma split (a Gmail-style ``a@x, b@x`` list, or an
+       odd-count bare list that does not cleanly pair).
 
     Empty/whitespace entries are dropped.
     """
@@ -3055,11 +3189,19 @@ def _split_header_entries(value: str) -> list[str]:
         if tail:
             parts.append(tail)
     elif _RE_QUOTED_NAME.search(v):
-        # A quoted "Last, First" with no ';' — the comma is inside the name, so do
-        # NOT comma-split (would shatter the name); treat the whole value as one entry.
-        parts = [v]
+        # A quoted "Last, First" list with no ';' and no address (the name-only OWA
+        # shape ``"Davis, Jordan" , "Ahsan, Ayaz" , ...``). The double quotes ARE the
+        # delimiter, so extract EACH quoted span as its own entry — the comma inside a
+        # span is a name comma, never a separator. (A plain comma split would shatter
+        # the names; keeping the whole value as one entry leaks the interior quotes.)
+        parts = _RE_QUOTED_NAME.findall(v)
     else:
-        parts = _RE_RECIP_SPLIT_COMMA.split(v)
+        # No ';', no address, no quotes: a bare ``Last, First`` comma list (the REAL
+        # stored per-turn recipients shape). Pair consecutive tokens into ``Last,
+        # First`` entries when the list cleanly pairs (even count); otherwise fall back
+        # to the naive comma split (Gmail-style ``a, b`` list / odd-count list).
+        paired = _pair_bare_lastfirst(v)
+        parts = paired if paired is not None else _RE_RECIP_SPLIT_COMMA.split(v)
     return [p.strip(" ,;") for p in parts if p.strip(" ,;")]
 
 
@@ -3467,6 +3609,183 @@ def _strip_leading_fw_wrapper(seg_lines: list[str]) -> list[str]:
     return seg_lines[k:]
 
 
+def _first_quoted_boundary(lines: list[str]) -> "int | None":
+    """Index of the FIRST quoted-message boundary in ``lines`` (else None).
+
+    Reuses the SAME boundary detection ``_split_quoted_thread`` uses — an Outlook
+    header BLOCK (``_parse_outlook_header_block`` SHAPE: From: + Date/Sent + Subject:),
+    a Gmail ``On ... wrote:`` line, or a ``-----Original <word>-----`` separator. A
+    lone ``From:`` in prose is NEVER a boundary (the multi-line shape gate). PURE.
+    """
+    i = 0
+    while i < len(lines):
+        if _parse_outlook_header_block(lines, i) is not None:
+            return i
+        if _RE_GMAIL_WROTE.match(lines[i]) or _RE_ORIGINAL_SEP.match(lines[i]):
+            return i
+        i += 1
+    return None
+
+
+# Max non-blank lines between a quoted-header ``From:`` and its ``Subject:`` for the
+# REDUCED-header detector below. A real reduced header is From: then (optionally
+# Date/Sent/To/Cc) then Subject: within a few lines; this bounds the lookahead so a
+# prose ``From:`` mention can't reach an unrelated ``Subject:`` far below.
+_REDUCED_HEADER_MAX_LOOKAHEAD = 6
+
+
+def _first_reduced_header_boundary(lines: list[str]) -> "int | None":
+    """Index of the first REDUCED quoted-header that ``_parse_outlook_header_block``
+    misses because it carries NO Date:/Sent: line (else None).
+
+    The REAL OWA HTML renders SOME nested quoted headers as a TABLE — _html_to_text
+    flattens those to a bare ``From: <name>`` + ``Subject: ...`` pair (sometimes under
+    a ``---`` rule) with NO Date: line, so the From:+Date:+Subject: SHAPE gate in
+    ``_parse_outlook_header_block`` does NOT fire and the quoted message below bleeds
+    into the preceding turn's body (the O(N^2) recursion source on real data). This
+    detector recognizes that two-or-more-label form: a ``From:`` LABEL line followed —
+    within _REDUCED_HEADER_MAX_LOOKAHEAD non-blank lines, allowing only intervening
+    header-label/blank lines — by a ``Subject:`` LABEL line. The pair of header labels
+    in order is the quoted-header signature; a lone ``From:`` in prose (no trailing
+    Subject:) is NEVER matched. Returns the index of the ``From:`` line (or the ``---``
+    rule directly above it, so the rule is stripped with the header). PURE.
+    """
+    i = 0
+    while i < len(lines):
+        m = _match_header_label(lines[i])
+        if m is not None and m[0] == "from":
+            # Look ahead for a Subject: label, tolerating only blank lines and other
+            # header labels (Date/Sent/To/Cc) in between — never prose.
+            seen_nonblank = 0
+            j = i + 1
+            while j < len(lines) and seen_nonblank < _REDUCED_HEADER_MAX_LOOKAHEAD:
+                ln = lines[j]
+                if ln.strip() == "":
+                    j += 1
+                    continue
+                seen_nonblank += 1
+                lm = _match_header_label(ln)
+                if lm is None:
+                    break  # prose before a Subject: — not a header block
+                if lm[0] == "subject":
+                    # Cut at the ``---`` rule directly above the From: when present.
+                    start = i
+                    p = i - 1
+                    while p >= 0 and lines[p].strip() == "":
+                        p -= 1
+                    if p >= 0 and re.match(r"^\s*-{3,}\s*$", lines[p]):
+                        start = p
+                    return start
+                j += 1
+        i += 1
+    return None
+
+
+def _strip_turn_own_words(body: str) -> str:
+    """Cut ONE quoted turn's body at its first nested quoted header, keeping only that
+    turn's OWN words (the prose ABOVE any nested header).
+
+    De-dup means STOP REPEATING, not lose data: a recursively-nested OWA body has each
+    quoted older message ALSO carrying its own full chain, so a single split segment
+    can still re-contain a sibling/older message below a nested header. This cuts the
+    segment at the EARLIER of (a) a recognized boundary (``_first_quoted_boundary`` —
+    full Outlook block / Gmail / Original-Message separator) or (b) a REDUCED header
+    the SHAPE gate misses (``_first_reduced_header_boundary`` — the table-flattened
+    From:+Subject: pair with no Date:). A body with NO nested header is returned
+    unchanged (no-loss). PURE / idempotent.
+    """
+    if not body:
+        return body
+    lines = body.split("\n")
+    a = _first_quoted_boundary(lines)
+    b = _first_reduced_header_boundary(lines)
+    cut = min(x for x in (a, b) if x is not None) if (a is not None or b is not None) else None
+    if cut is None:
+        return body
+    return "\n".join(lines[:cut]).rstrip()
+
+
+def _strip_nested_quoted_tail(body: str) -> str:
+    """Cut a body at its FIRST nested quoted-message boundary, keeping only its OWN
+    words (the text ABOVE the first quoted older message).
+
+    De-dup means STOP REPEATING, not lose data: when a body re-contains an older
+    message (an OWA reply embeds its full nested chain), this returns only the
+    author's own top text — never truncating a body that has NO boundary (returned
+    unchanged, no-loss). Uses the SAME boundary detection as ``_split_quoted_thread``
+    so detection/stripping can't drift. PURE.
+    """
+    if not body:
+        return body
+    lines = body.split("\n")
+    boundary = _first_quoted_boundary(lines)
+    if boundary is None:
+        return body  # no nested tail — keep the whole body (no-loss)
+    return "\n".join(lines[:boundary]).rstrip()
+
+
+# Markdown link ``[label](url)`` -> keep only ``label`` (the URL is noise in a quote).
+_RE_MD_LINK = re.compile(r"\[([^\]]*)\]\((?:[^)]*)\)")
+# The D-059 read-view image marker TOKEN: the optional glyph + a bracketed
+# ``[image: NAME]`` / ``[image]`` placeholder. Matched as a self-contained token (the
+# bracket form is REQUIRED) so it can be dropped whether it stands alone on its own
+# line OR is glued to the end of a prose line (an inline ``<img>`` lands beside its
+# text). A mid-prose mention of the WORD "image" (no brackets) is never matched, so it
+# survives. The optional leading ``\s*`` swallows the space that joined it to prose.
+_RE_IMAGE_MARKER = re.compile(
+    r"\s*(?:\U0001f5bc\s*)?\[image(?::[^\]]*)?\]", re.IGNORECASE)
+# A broken mid-recipient-list line-wrap: a ``- ,`` continuation that split a
+# ``Last, First`` list across lines (``Liu, Audrey\n- , Tian, Kristen``). Re-join.
+_RE_BROKEN_LIST_WRAP = re.compile(r"\n\s*-\s*,\s*")
+
+
+def _clean_quoted_body(body: str) -> str:
+    """Strip leaked presentation artifacts from ONE quoted turn body (RENDER-side).
+
+    NOT in ``_html_to_text`` (that converter deliberately emits the D-059 read-view
+    image marker for the read panel — this cleanup runs only when SHAPING the reply
+    DRAFT). Three fixes (D-072 part 3): (a) collapse ``[label](url)`` -> ``label``;
+    (b) drop a WHOLE-line ``\U0001f5bc [image: NAME]`` / ``[image:]`` placeholder (a
+    mid-prose 'image' word survives); (c) re-join a broken mid-recipient-list line
+    wrap (``Liu, Audrey\n- , Tian, Kristen``). PURE/idempotent. No substantive
+    content removed — only presentation noise.
+    """
+    if not body:
+        return body
+    # (c) re-join broken mid-list wraps FIRST (before line-anchored drops).
+    body = _RE_BROKEN_LIST_WRAP.sub("; ", body)
+    # (a) collapse markdown links to their label.
+    body = _RE_MD_LINK.sub(r"\1", body)
+    # (b) drop the image-marker token wherever it appears (standalone line OR glued to
+    # the end of a prose line via an inline <img>); a mid-prose 'image' word survives.
+    body = _RE_IMAGE_MARKER.sub("", body)
+    # Drop any now-blank lines the marker removal left behind (it stood alone).
+    kept = [ln for ln in body.split("\n") if ln.strip() != ""]
+    return "\n".join(kept)
+
+
+def _clean_recipient_names(value: str) -> str:
+    """Flatten a rendered To:/Cc: recipient STRING to clean display names (D-072 #3d).
+
+    The REAL stored OWA forward header is ADDRESS-GLUED (``Wang, Yibo yibo@amazon.com,
+    Liu, Yang (Jonathan) amzyangl@amazon.com, ...``) — a naive comma split SHATTERS an
+    internal-comma name like ``Wang, Yibo`` into ``Wang; Yibo``. Route it through the
+    EXISTING ``_split_header_entries`` ADDRESS-boundary splitter so each ``Last, First``
+    name stays ONE entry, then drop the address via ``_flatten_header_name`` (names are
+    the quote's signal; the address is noise). PURE. A value with NO parseable
+    address/entry falls back to itself (no-loss — a plain display string passes
+    through). De-dupes nothing (preserves order + duplicates the source carried).
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    entries = _split_header_entries(v)
+    if not entries:
+        return v
+    names = [n for n in (_flatten_header_name(e) for e in entries) if n]
+    return "; ".join(names) if names else v
+
+
 def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
     """Split a SINGLE inline-quoted reply chain into per-message turns.
 
@@ -3480,6 +3799,13 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
     * each subsequent segment is one older quoted message — its From:/Date:(Sent:)/
       To:(+Cc:) header lines are PARSED into the structured fields and STRIPPED out
       of the body (killing the run-on blob), Subject: is dropped.
+
+    Each turn carries SEPARATE ``to``/``cc`` display strings (D-072) in addition to
+    the combined ``recipients`` string (kept for the frontend read-view) so the
+    reply-all render can emit a distinct ``Cc:`` line. Recipient strings are
+    flattened via the address-boundary ``_split_header_entries`` splitter (through
+    ``_clean_recipient_names``) so an internal-comma name like ``Wang, Yibo
+    <yibo@amazon.com>`` stays ONE intact name, never shattered into ``Wang; Yibo``.
 
     Returns [] when there is NO detectable boundary (the caller then falls back to
     the single whole-body turn — byte-identical backward compat) or when the split
@@ -3549,11 +3875,13 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
                 or top_msg.get("date") or ""
             )
             recipients = _msg_recipients_str(top_msg)
+            to_ = recipients
+            cc = ""
         else:
             # Quoted message. Prefer the structured header block parse (handles
             # value-on-next-line, blank-interleaving, wrapped recipient lists); fall
             # back to the bare per-line strip for a separator with no Outlook block.
-            sender = timestamp = recipients = ""
+            sender = timestamp = recipients = to_ = cc = ""
             block = (
                 _parse_outlook_header_block(lines, header_start)
                 if header_start is not None else None
@@ -3562,8 +3890,10 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
                 fields, body_start = block
                 sender = _flatten_header_name(_strip_emphasis(fields["from"]))
                 timestamp = _strip_emphasis(fields["date"])
-                to_ = _flatten_header_recipients(_strip_emphasis(fields["to"]))
-                cc = _flatten_header_recipients(_strip_emphasis(fields["cc"]))
+                # Address-boundary split (NOT a naive comma split) so an internal-comma
+                # name like ``Wang, Yibo <yibo@amazon.com>`` stays one intact name.
+                to_ = _clean_recipient_names(_strip_emphasis(fields["to"]))
+                cc = _clean_recipient_names(_strip_emphasis(fields["cc"]))
                 if cc:
                     recipients = (to_ + "; " + cc) if to_ else cc
                 else:
@@ -3583,6 +3913,11 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
                         break
                 seg_body = "\n".join(seg[consumed:])
 
+        # Keep ONLY this turn's own words: cut at the first nested quoted header so a
+        # recursively-nested OWA segment can't re-contain a sibling/older message (the
+        # O(N^2) recursion source). Handles BOTH the full Outlook block and the
+        # table-flattened reduced From:+Subject: header the SHAPE gate misses.
+        seg_body = _strip_turn_own_words(seg_body)
         seg_body = _scrub(seg_body)[:_THREAD_TURN_BODY_CAP].strip()
         if not seg_body:
             continue  # never emit a blank/ghost card
@@ -3593,7 +3928,49 @@ def _split_quoted_thread(body: str, top_msg: dict) -> list[dict]:
             "body": seg_body,
             "recipients": _scrub(_one_line(str(recipients), 200)),
         })
-    return turns
+    return _dedup_quoted_turns(turns)
+
+
+# All whitespace (spaces, NBSP, the newlines nesting depth re-wraps) for a turn-
+# identity signature: removed ENTIRELY so two copies of the same message that differ
+# only in where a line wraps (``[\n@Liu`` vs ``[@Liu,\nYang``) hash identically.
+_RE_WS_ANY = re.compile(r"\s+")
+
+
+def _dedup_quoted_turns(turns: list[dict]) -> list[dict]:
+    """Collapse turns that are the SAME quoted message repeated at different nesting
+    depths (the O(N^2) recursive-nesting source).
+
+    A REAL OWA reply body does not merely quote the one message it replied to — each
+    quoted older message ITSELF carries its own full nested chain, so a single newest
+    body re-contains the oldest message once per recursion level (Jonathan x4,
+    Avanti x3, ...). _split_quoted_thread's linear boundary scan therefore emits the
+    same logical message multiple times. This collapses them to ONE turn each, keeping
+    FIRST-SEEN order, so the stored history is one-message-per-turn (D-072 AC-1/AC-7).
+
+    Identity = (sender, timestamp, body) with ALL whitespace REMOVED and lower-cased.
+    Whitespace is dropped entirely (not just run-collapsed) because the recursion
+    re-wraps the SAME prose at different nesting depths, shifting where a newline lands
+    relative to punctuation (``Prefect [\\n@Liu`` vs ``Prefect [@Liu,\\nYang``) — only a
+    whitespace-insensitive compare recognizes those as one message. Two DIFFERENT
+    messages that share a sender + timestamp would need identical non-whitespace bytes
+    to collide, so a genuine distinct reply is never dropped. PURE / order-preserving.
+    A turn missing a body is impossible here (the caller already dropped blank
+    segments).
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for turn in turns:
+        sig = (
+            _RE_WS_ANY.sub("", str(turn.get("sender", ""))).lower(),
+            _RE_WS_ANY.sub("", str(turn.get("timestamp", ""))).lower(),
+            _RE_WS_ANY.sub("", str(turn.get("body", ""))).lower(),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(turn)
+    return out
 
 
 def _extract_thread_history(payload) -> list[dict]:
@@ -3631,11 +4008,44 @@ def _extract_thread_history(payload) -> list[dict]:
             split.reverse()
             return split[-_THREAD_HISTORY_MAX_TURNS:]
 
+    # Multi-message OWA case (D-072 part 1): each OWA reply body ALREADY embeds its
+    # own full nested chain, so storing each VERBATIM produced an O(N^2) blob (the
+    # newest body alone re-contains the whole thread). The conversation is also
+    # available as a SINGLE fully-nested chain in the NEWEST message body — route it
+    # through the SAME _split_quoted_thread the single-message branch uses. When the
+    # split recovers >= the number of messages (full chain), use those de-duped turns
+    # (each message once, its OWN words only, oldest->newest) INSTEAD of the verbatim
+    # bodies; this ALSO recovers each older message's ORIGINAL Outlook LOCAL-TIME date
+    # (NOT derivable from the ISO-Z stamps — senders are in different timezones).
+    if len(emails) > 1:
+        # Newest detection mirrors the per-message ordering below: when every message
+        # carries a parseable timestamp, pick the max; otherwise the OWA array is
+        # newest-first by convention, so emails[0] is the newest (the fallback).
+        msgs = [m for m in emails if isinstance(m, dict)]
+        newest = msgs[0] if msgs else None
+        ts_keys = [
+            _msg_sort_ts(m) for m in msgs
+        ]
+        if msgs and all(k is not None for k in ts_keys):
+            newest = max(zip(ts_keys, range(len(msgs)), msgs))[2]
+        if isinstance(newest, dict):
+            newest_body = _html_to_text(str(newest.get("body", "") or ""))
+            split = _split_quoted_thread(newest_body, newest)
+            if len(split) >= len([m for m in emails if isinstance(m, dict)]):
+                split.reverse()  # newest-first -> oldest->newest
+                return split[-_THREAD_HISTORY_MAX_TURNS:]
+
     turns: list[dict] = []
     for idx, msg in enumerate(emails):
         if not isinstance(msg, dict):
             continue
         body = _html_to_text(str(msg.get("body", "") or ""))
+        # FALLBACK de-dup (the split did NOT recover the full chain): cut each body at
+        # its FIRST nested quoted boundary so no body re-contains an OLDER message,
+        # while keeping the message's OWN substantive words (no-loss — a body with no
+        # boundary is unchanged). This keeps every message exactly once.
+        if len(emails) > 1:
+            body = _strip_nested_quoted_tail(body)
         body = _scrub(body)[:_THREAD_TURN_BODY_CAP].strip()
         if not body:
             continue  # never fabricate a turn for a body-less message
@@ -3791,6 +4201,27 @@ def _parse_ts(value: str):
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except (ValueError, TypeError):
+        return None
+
+
+def _msg_sort_ts(msg: dict):
+    """Comparable epoch-seconds float for a message's timestamp, or None.
+
+    Reads the same received/sent fields the turn-builder uses and parses via
+    ``_parse_ts`` -> ``.timestamp()`` so a NAIVE vs AWARE datetime never raises a
+    TypeError when compared (the failure mode of comparing datetimes directly across
+    differing tzinfo). Returns None when no parseable timestamp exists.
+    """
+    if not isinstance(msg, dict):
+        return None
+    raw = (msg.get("received") or msg.get("receivedDateTime") or msg.get("timestamp")
+           or msg.get("sentDateTime") or msg.get("date") or "")
+    dt = _parse_ts(_one_line(str(raw), 100))
+    if dt is None:
+        return None
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
         return None
 
 
