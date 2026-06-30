@@ -655,9 +655,9 @@ export default function EmailPage() {
         body: JSON.stringify({ draft: text, etag: cur }),
       });
       const json = await res.json().catch(() => null);
-      // Dispatch the four distinct approve outcomes (approveOutcome, emailDetail.js).
-      // The four cases MUST stay distinct so the page never lies about what
-      // happened (D-068/T2).
+      // Dispatch the five distinct approve outcomes (approveOutcome, emailDetail.js).
+      // The five cases MUST stay distinct so the page never lies about what
+      // happened (D-068/D-069/T2).
       const { outcome, etag: nextEtag, draftSaved, message } = approveOutcome(res.status, json);
       if (nextEtag) setEtag(nextEtag);
 
@@ -676,6 +676,19 @@ export default function EmailPage() {
         // touch editingId, so the user can add a recipient and Approve again; we
         // also skip refresh() here because it would clear the banner the user
         // needs to see (the item is already in the list, unchanged).
+        setError(message);
+        return;
+      }
+      if (outcome === 'unresolved_recipients') {
+        // The PARTIAL-resolve anti-SILENT-DROP fix (D-069 part 4): the reply-all
+        // To resolved but one or more ORIGINAL name-only To recipients could NOT
+        // be mapped to an address (the contacts resolver refused to fabricate).
+        // Saving would silently DROP those people, so the backend failed loud and
+        // named them in `message`. Surface the SAME RED banner as no_recipient —
+        // DISTINCT from the 409 "Conflict... Refreshing" (refreshing wouldn't fix
+        // it) and NEVER the green "Copied!". No refresh() (nothing to reconcile;
+        // it would clear the banner) and no editingId change, so the user can add
+        // the named recipients via the recipient editor and Approve again.
         setError(message);
         return;
       }

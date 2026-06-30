@@ -471,18 +471,28 @@ export function deleteOutcome(httpStatus, body) {
   return { outcome: 'failed', etag, reason };
 }
 
-// Dispatch the approve POST response into a tagged outcome (T2, D-068). The
-// approve POST has FOUR cases the page must render DISTINCTLY:
+// Dispatch the approve POST response into a tagged outcome (T2, D-068/D-069). The
+// approve POST has FIVE cases the page must render DISTINCTLY:
 //   - HTTP 409                       -> { outcome: 'conflict' } (queue moved
 //        elsewhere; the page re-reads and shows "Conflict... Refreshing").
 //   - HTTP 422 & error 'no_recipient'-> { outcome: 'no_recipient', message }
 //        The headline SILENT-SUCCESS-APPROVE fix: a no-recipient approve no longer
 //        returns 200/draftSaved:false (which the page rendered as the quiet green
 //        "Copied!"). T1 makes it a 422; the page must surface a RED banner with the
-//        actionable message and leave the item unapproved/retryable. This is
-//        DISTINCT from 409 (anti CONFLATE-NO-RECIPIENT-WITH-409 — a
-//        "Conflict... Refreshing" banner would send the user to refresh uselessly
-//        instead of "add a recipient and retry").
+//        actionable message and leave the item unapproved/retryable. This is the
+//        FULLY-empty-To case. DISTINCT from 409 (anti CONFLATE-NO-RECIPIENT-WITH-409
+//        — a "Conflict... Refreshing" banner would send the user to refresh
+//        uselessly instead of "add a recipient and retry").
+//   - HTTP 422 & error 'unresolved_recipients' (D-069 part 4) ->
+//        { outcome: 'unresolved_recipients', message, names } The PARTIAL-resolve
+//        anti-SILENT-DROP fix: the To resolved but one or more ORIGINAL name-only
+//        To recipients could NOT be mapped to an address (the contacts resolver
+//        refused to fabricate). Saving would silently DROP those people, so T1
+//        fails loud with this code, naming the unresolved display names. The page
+//        shows a RED banner naming exactly who to add manually via the recipient
+//        editor — item stays unapproved/retryable. This is a 5th DISTINCT outcome:
+//        it must NOT collapse onto 409 (useless refresh), onto no_recipient (names
+//        no one), or onto the generic error (no actionable names).
 //   - any other non-2xx              -> { outcome: 'error', message } (generic
 //        failure banner — e.g. a 500 or a different 4xx).
 //   - HTTP 2xx                       -> { outcome: 'ok', draftSaved, etag } (the
@@ -506,6 +516,17 @@ export function approveOutcome(httpStatus, body) {
       ? b.message.trim()
       : NO_RECIPIENT_DEFAULT_MSG;
     return { outcome: 'no_recipient', etag, message, draftSaved: false };
+  }
+  if (httpStatus === 422 && b.error === 'unresolved_recipients') {
+    const names = Array.isArray(b.names) ? b.names : [];
+    const message = (typeof b.message === 'string' && b.message.trim())
+      ? b.message.trim()
+      // A sane default that NAMES the unresolved recipients (never the literal
+      // 'undefined') so the user knows exactly who to add via the recipient editor.
+      : (names.length
+        ? `Couldn't resolve these recipients: ${names.join('; ')}. Add them manually and retry.`
+        : "Couldn't resolve one or more recipients — draft not saved; add them manually and retry.");
+    return { outcome: 'unresolved_recipients', etag, message, names, draftSaved: false };
   }
   const ok2xx = httpStatus >= 200 && httpStatus < 300;
   if (ok2xx) {
