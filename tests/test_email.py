@@ -8474,3 +8474,37 @@ async def test_d070_scan_path_email_read_calls_carry_no_markas(email_file, monke
     for args in email_read_calls:
         assert "markAs" not in args, \
             f"scan-path email_read must NOT carry markAs (never-mark-read): {args}"
+
+
+def test_d070_dispatch_keys_on_source_not_id_format(monkeypatch):
+    """ANTI-TRAP (USER-INTENT #1): routing must key on the sourceFolder discriminator,
+    NEVER on whether the id 'looks like' an OWA ('AAQk…') vs Graph ('AAMk…') id.
+
+    Force the discriminator and the id-shape to DISAGREE in both directions:
+      - a FOLDER item carrying a GRAPH-shaped conversationId ('AAMk…') must STILL go
+        the OWA folder path (an id-sniffer would misroute it to Graph -> silently
+        stays unread, the exact bug);
+      - an INBOX item carrying an OWA-shaped conversationId ('AAQk…') must STILL go the
+        Graph path (an id-sniffer would misroute it to OWA).
+
+    The two routes never both fire, and the conversationId is passed THROUGH verbatim
+    (no id-shape rewriting). This is the test the prefix-shaped dispatch cases above
+    cannot catch, since there sourceFolder and id-shape happen to agree.
+    """
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+
+    # FOLDER item, but its conversationId is Graph-shaped ('AAMk…').
+    folder_item = _make_item("f-graphid", sourceFolder="Projects",
+                             conversationId="AAMkGRAPH-LOOKING-1",
+                             messageId="AAMkGRAPH-LOOKING-1", subject="Re: Folder/GraphId")
+    email_mod._spawn_mark_read_for_item(folder_item)
+    assert graph_calls == [], "a folder item must NOT use the Graph path even with a Graph-shaped id"
+    assert folder_calls == [("AAMkGRAPH-LOOKING-1", "Re: Folder/GraphId")]
+
+    # INBOX item (no sourceFolder), but its conversationId is OWA-shaped ('AAQk…').
+    inbox_item = _make_item("ib-owaid", conversationId="AAQkOWA-LOOKING-2",
+                            messageId="AAQkOWA-LOOKING-2", subject="Re: Inbox/OwaId")
+    email_mod._spawn_mark_read_for_item(inbox_item)
+    assert folder_calls == [("AAMkGRAPH-LOOKING-1", "Re: Folder/GraphId")], \
+        "an inbox item must NOT use the OWA folder path even with an OWA-shaped id"
+    assert graph_calls == [{"AAQkOWA-LOOKING-2": "Re: Inbox/OwaId"}]
