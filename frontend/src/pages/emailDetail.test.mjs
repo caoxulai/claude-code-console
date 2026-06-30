@@ -1164,4 +1164,75 @@ test('approveOutcome: a null/garbage body never crashes and degrades to "error" 
   assert.equal(approveOutcome(200, null).outcome, 'ok');
 });
 
+// --- approveOutcome: the FIFTH outcome — unresolved_recipients (D-069 part 4) -
+// The contacts resolver leaves a genuinely-unresolvable name-only TO recipient
+// with email:'' rather than fabricating an address. Saving a partial draft would
+// silently DROP those people (the anti-SILENT-DROP intent). T1 makes approve
+// fail loud with a NEW 422 code {error:'unresolved_recipients', message, names,
+// etag} that is DISTINCT from both the 409 conflict and the 422 no_recipient.
+// approveOutcome must map it to a 5th tagged outcome carrying the unresolved
+// display names so the page can name exactly who to add manually — never
+// collapsing it onto conflict (which would uselessly refresh) or no_recipient
+// (which names no one) or the generic error.
+
+test('approveOutcome: 422 unresolved_recipients -> 5th distinct outcome carrying message + names', () => {
+  const r = approveOutcome(422, {
+    error: 'unresolved_recipients',
+    message: "Couldn't resolve these recipients: Monnig, Benjamin; Wang, Xiaoguang(Ken)",
+    names: ['Monnig, Benjamin', 'Wang, Xiaoguang(Ken)'],
+    etag: 'e5',
+  });
+  assert.equal(r.outcome, 'unresolved_recipients');
+  assert.equal(r.message, "Couldn't resolve these recipients: Monnig, Benjamin; Wang, Xiaoguang(Ken)");
+  assert.deepEqual(r.names, ['Monnig, Benjamin', 'Wang, Xiaoguang(Ken)']);
+  assert.equal(r.etag, 'e5');
+  assert.equal(r.draftSaved, false);
+  // DISTINCT from every other outcome — must not be swallowed by any of them.
+  assert.notEqual(r.outcome, 'conflict');
+  assert.notEqual(r.outcome, 'no_recipient');
+  assert.notEqual(r.outcome, 'error');
+  assert.notEqual(r.outcome, 'ok');
+});
+
+test('approveOutcome: unresolved_recipients with a missing message -> sane default that NAMES the people (never "undefined")', () => {
+  const r = approveOutcome(422, { error: 'unresolved_recipients', names: ['Cao, Xulai'] });
+  assert.equal(r.outcome, 'unresolved_recipients');
+  assert.ok(r.message && r.message.length > 0);
+  assert.notEqual(r.message, 'undefined');
+  // the default names the unresolved recipient(s) so the user knows who to add
+  assert.ok(r.message.includes('Cao, Xulai'));
+  assert.deepEqual(r.names, ['Cao, Xulai']);
+});
+
+test('approveOutcome: unresolved_recipients with a non-array names -> names defaults to []', () => {
+  const r = approveOutcome(422, { error: 'unresolved_recipients', message: 'm', names: 'not-an-array' });
+  assert.equal(r.outcome, 'unresolved_recipients');
+  assert.deepEqual(r.names, []);
+});
+
+test('approveOutcome: the FIVE outcomes stay DISTINCT — no_recipient is NOT mistaken for unresolved_recipients', () => {
+  // A 422 no_recipient (fully-empty To) must STILL be 'no_recipient', not the
+  // new code — they hinge on b.error, not the status.
+  const noRec = approveOutcome(422, { error: 'no_recipient', message: 'add a recipient and retry' });
+  assert.equal(noRec.outcome, 'no_recipient');
+  assert.notEqual(noRec.outcome, 'unresolved_recipients');
+
+  // A 409 is still conflict, never the new code.
+  const conflict = approveOutcome(409, { error: 'conflict', etag: 'e2' });
+  assert.equal(conflict.outcome, 'conflict');
+  assert.notEqual(conflict.outcome, 'unresolved_recipients');
+
+  // A 422 unresolved_recipients is its own outcome.
+  const unres = approveOutcome(422, { error: 'unresolved_recipients', message: 'm', names: ['A'] });
+  assert.equal(unres.outcome, 'unresolved_recipients');
+
+  // A different 422 falls through to generic error, NOT the new code.
+  const other = approveOutcome(422, { error: 'something_else' });
+  assert.equal(other.outcome, 'error');
+  assert.notEqual(other.outcome, 'unresolved_recipients');
+
+  // The happy path stays ok.
+  assert.equal(approveOutcome(200, { draftSaved: true }).outcome, 'ok');
+});
+
 console.log(`\nall green: ${passed} tests passed`);
