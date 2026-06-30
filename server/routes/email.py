@@ -1933,6 +1933,35 @@ def _reply_all_recipients(item: dict) -> tuple[list[str], list[str]]:
     return to, cc
 
 
+def _unresolved_to_names(item: dict) -> list[str]:
+    """Display names of the item's ORIGINAL To recipients that lack a valid address.
+
+    These are the name-only To entries (no _valid_email ``email``) that the reply-all
+    resolver would SILENTLY DROP from the saved draft. Used by approve to FAIL LOUD
+    (D-069 part 2) instead of saving a partial draft. CC entries are deliberately NOT
+    scanned — CC is non-critical (AC-7: only an unresolved TO blocks). Returns [] when
+    every named To entry carries a valid address (the inbox path is always fully
+    resolved, so this is a no-op there) OR when toRecipients are email-string entries
+    (a persisted user edit, which has no name-only dict). De-dupes, preserves order.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in (item.get("toRecipients") or []):
+        if not isinstance(entry, dict):
+            continue  # an edited email-string list has no name-only entry to drop
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        if _valid_email(_recipient_email(entry)):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
 def _esc(value) -> str:
     """HTML-escape any external value (None-safe → '') for the draft body.
 
@@ -3182,6 +3211,104 @@ def _fill_recipient_emails_from_body(item: dict, body: str,
                 entry["email"] = addr
 
 
+# Contacts-directory lookups are BOUNDED so a large To list can't stall the scan
+# cycle / hammer the OWA contacts session. _CONTACTS_LOOKUPS_PER_CYCLE is the
+# per-scan budget (the _BACKFILL_PER_CYCLE spirit); each item also caps at
+# _CONTACTS_LOOKUPS_PER_ITEM so one huge To list can't drain the whole cycle.
+_CONTACTS_LOOKUPS_PER_CYCLE = 25
+_CONTACTS_LOOKUPS_PER_ITEM = 8
+
+
+async def _resolve_recipient_emails_from_contacts(
+        item: dict, budget: "list[int]") -> None:
+    """Resolve still-blank name-only toRecipients/ccRecipients via email_contacts.
+
+    The FALLBACK after _fill_recipient_emails_from_body: a single folder message with
+    NO quoted-body header block (e.g. a meeting invite) recovers no address from the
+    body, so its OWA name-only recipients stay email:''. For each such entry this queries
+    the OWA contacts directory (``call_read_tool('email_contacts', {'query': <name>,
+    'limit': ...})`` — the ONLY way to reach email_contacts; it is in the read-only
+    allowlist and routes to the legacy OWA session, OFF the GRASP/Graph quota, so this is
+    NOT gated by the Graph throttle). email_contacts has no read-state side effect and is
+    called WITHOUT any markAs (the never-mark-read invariant).
+
+    MATCH EXACT + case-insensitive on _normalize_recipient_name: the contact's returned
+    name must normalize-EQUAL the recipient name (tolerant of 'Last, First' and the
+    parenthetical 'Wang, Xiaoguang(Ken)' form). An ambiguous/multi-result query with NO
+    exact normalized match, or no result, leaves email:'' — NEVER first-of-many, fuzzy,
+    or substring (the never-fabricate invariant). The matched address must pass
+    _valid_email or it is dropped.
+
+    FILL-ONLY: an entry already carrying a populated email is skipped (no lookup, no
+    overwrite — anti SELF-HEAL-CLOBBERS-GOOD-DATA / idempotent). BOUNDED: ``budget`` is a
+    single-element ``[remaining]`` mutable counter shared across the whole scan cycle
+    (decremented per lookup), and each item caps its own lookups at
+    _CONTACTS_LOOKUPS_PER_ITEM. When a cap truncates the remaining unresolved names,
+    they are logged at WARNING (no silent truncation).
+
+    Folder-only at its callers (guarded on ``sourceFolder`` set and != 'Inbox'); the
+    inbox/Graph capture path is never passed here.
+    """
+    if not isinstance(item, dict):
+        return
+
+    # Collect the still-blank name-only entries (To + CC) in stable order.
+    pending: list[dict] = []
+    for key in ("toRecipients", "ccRecipients"):
+        for entry in item.get(key) or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("email") or "").strip():
+                continue  # FILL-ONLY: already resolved (body or earlier pass)
+            name = str(entry.get("name") or "").strip()
+            if name:
+                pending.append(entry)
+
+    if not pending:
+        return
+
+    item_cap = _CONTACTS_LOOKUPS_PER_ITEM
+    unresolved_after_cap: list[str] = []
+
+    for entry in pending:
+        name = str(entry.get("name") or "").strip()
+        # Bound BOTH the per-item cap and the shared per-cycle budget. When either is
+        # exhausted, the rest are recorded for a single fail-loud log (never silently
+        # dropped) and left blank.
+        if item_cap <= 0 or budget[0] <= 0:
+            unresolved_after_cap.append(name)
+            continue
+        item_cap -= 1
+        budget[0] -= 1
+        target_norm = _normalize_recipient_name(name)
+        addr = ""
+        try:
+            result = await call_read_tool(
+                "email_contacts", {"query": name, "limit": 10})
+        except Exception as e:  # noqa: BLE001 -- one bad lookup must not abort the item
+            logger.warning("Email contacts lookup failed for %s: %s",
+                           _scrub(name), _scrub(str(e)))
+            continue
+        for contact in _unwrap_list(result, "contacts", "results", "emails", "value"):
+            if not isinstance(contact, dict):
+                continue
+            if _normalize_recipient_name(contact.get("name", "")) != target_norm:
+                continue  # EXACT normalized match only — never a fuzzy/first-of-many pick
+            cand = _recipient_email(contact)
+            if _valid_email(cand):
+                addr = cand
+                break
+        if addr:
+            entry["email"] = addr
+
+    if unresolved_after_cap:
+        logger.warning(
+            "Email contacts: lookup budget exhausted; %d name(s) left unresolved: %s",
+            len(unresolved_after_cap),
+            _scrub("; ".join(unresolved_after_cap)),
+        )
+
+
 # label -> regex ; built once, used by the block walker. Each regex anchors a
 # DISTINCT label word so the iteration order does not matter (no shadowing).
 _OUTLOOK_HEADER_LABELS = (
@@ -3943,6 +4070,12 @@ async def _scan_once(app) -> None:
                                   str(r.get("id", "") or r.get("messageId", ""))))
     admitted = new_items[:headroom]
 
+    # Shared per-cycle budget for the contacts-directory recipient resolver (D-069).
+    # A single mutable [remaining] counter threaded through BOTH the new-item folder
+    # branch and the backfill folder branch so a large To list across many items can't
+    # blow the cycle / hammer the OWA contacts session.
+    contacts_budget = [_CONTACTS_LOOKUPS_PER_CYCLE]
+
     # For each admitted email, pre-fetch body + thread history via Graph get_email.
     # The SAME response ({email:{...}}) yields BOTH the concatenated body
     # (_extract_email_body) and the structured multi-turn threadHistory
@@ -3981,6 +4114,12 @@ async def _scan_once(app) -> None:
                 # NAME-ONLY, so fill the matching toRecipients/ccRecipients email from
                 # the quoted-body header lines (match-or-leave-blank, never fabricate).
                 _fill_recipient_emails_from_body(raw, body_text)
+                # CONTACTS FALLBACK (D-069): body parse is FIRST; for any To/CC entry
+                # the body did NOT resolve (e.g. a single meeting invite with no quoted
+                # thread), look up the name in the OWA contacts directory. Folder-only:
+                # this branch is the _owaConversationId path, so the scoping is
+                # structural. EXACT match or leave-blank — never fabricate.
+                await _resolve_recipient_emails_from_contacts(raw, contacts_budget)
             except Exception as e:  # noqa: BLE001 -- body fetch is best-effort
                 logger.warning("Email folder body fetch failed for %s (%s): %s",
                                owa_conv_id, raw.get("_sourceFolder"), _scrub(str(e)))
@@ -4073,6 +4212,14 @@ async def _scan_once(app) -> None:
                 _lift_owa_sender(it, body_payload)
                 _capture_recipients(it, body_payload)
                 _fill_recipient_emails_from_body(it, body_text, prior=prior_recip)
+                # CONTACTS FALLBACK (D-069): resolve any still-blank name-only
+                # recipient via the contacts directory after the body parse + prior
+                # snapshot fill. Runs AFTER the fills so an already-resolved address
+                # (body OR an earlier contacts pass) is never re-looked-up or
+                # clobbered (idempotent, anti SELF-HEAL-CLOBBERS-GOOD-DATA). Shares the
+                # SAME per-cycle budget as the new-item branch. Folder-only: this
+                # branch is gated on is_folder_item.
+                await _resolve_recipient_emails_from_contacts(it, contacts_budget)
             except Exception as e:  # noqa: BLE001 -- one folder backfill must not abort
                 logger.warning("Email folder body backfill failed for %s (%s): %s",
                                msg_id, source_folder, _scrub(str(e)))
@@ -5178,6 +5325,31 @@ async def approve_item(request: web.Request) -> web.Response:
                 to_addrs, _ = _reply_all_recipients(item)
         else:
             to_addrs, cc_addrs = _reply_all_recipients(item)
+        # FAIL-LOUD ON PARTIAL RESOLVE (D-069 part 2): when the reply-all To resolves
+        # NON-empty but one or more of the item's ORIGINAL To recipients are name-only
+        # with no valid email (would be SILENTLY DROPPED from the draft), do NOT save a
+        # partial draft and do NOT flip to approved. Return a 422 'unresolved_recipients'
+        # NAMING the unresolved display names — a 5th DISTINCT outcome from the 409
+        # conflict and the empty-To 'no_recipient' 422, so the page can say "add these
+        # people and retry" rather than a useless refresh. CC name-only entries DO NOT
+        # block (AC-7: only an unresolved TO blocks). No-op for inbox items (their To is
+        # always fully address-resolved via Graph) and for an edited recipient list
+        # (email-string entries carry no name-only dict). NEVER fabricate to force a save.
+        unresolved_to = _unresolved_to_names(item) if to_addrs else []
+        if unresolved_to:
+            logger.warning(
+                "Email approve: %d To recipient(s) unresolved — not saving partial draft: %s",
+                len(unresolved_to), _scrub("; ".join(unresolved_to)))
+            return web.json_response(
+                {"error": "unresolved_recipients",
+                 "message": (
+                     "Couldn't resolve these recipients: "
+                     + "; ".join(unresolved_to)
+                     + ". Draft not saved — add them manually and retry."),
+                 "names": unresolved_to,
+                 "etag": current_etag},
+                status=422,
+            )
         if to_addrs:
             try:
                 result = await _call_owa_write_tool("email_draft", {

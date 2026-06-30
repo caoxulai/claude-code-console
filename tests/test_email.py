@@ -7772,3 +7772,471 @@ async def test_d068_approve_with_healed_sender_degrades_to_sender_and_saves(
     assert "darmanea@amazon.com" in calls[0][1]["to"]
     saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
     assert saved["status"] == "approved"
+
+
+# ─── D-069 / T1: contacts-directory fallback recipient resolver (folder-only) ──
+# When the quoted-body parse leaves a name-only To/CC entry blank (a single meeting
+# invite with no quoted thread), resolve it via the OWA email_contacts directory:
+# EXACT normalized-name match or leave-blank (NEVER fabricate). Body stays the FIRST
+# source; contacts is the FALLBACK. Folder-only; inbox path untouched. Approve now
+# FAILS LOUD (422 unresolved_recipients) when an ORIGINAL To recipient stays blank.
+
+
+def _contacts_seam(directory, calls=None):
+    """Fake call_read_tool that answers email_contacts from a {query: [contacts]}
+    directory (each contact a {name,email} dict). Records the queries it was asked
+    so a 'never consulted' assertion can verify body-first ordering."""
+    async def fake_read_tool(name, arguments):
+        if name == "email_contacts":
+            q = str(arguments.get("query", ""))
+            if calls is not None:
+                calls.append(q)
+            # markAs must NEVER be passed to email_contacts.
+            assert "markAs" not in arguments, "email_contacts must omit markAs"
+            return {"content": {"contacts": list(directory.get(q, []))}}
+        return {}
+    return fake_read_tool
+
+
+# --- (a) resolver fill-only + EXACT-match + never-fabricate --------------------
+
+
+async def test_d069_resolver_exact_match_fills_to_and_cc(monkeypatch):
+    """An exact 'Last, First' contacts match fills a name-only To/CC entry; the
+    parenthetical 'Wang, Xiaoguang(Ken)' nickname form resolves; a populated email is
+    never overwritten."""
+    item = {
+        "sourceFolder": "1 leads",
+        "toRecipients": [
+            {"name": "Monnig, Benjamin", "email": ""},
+            {"name": "Wang, Xiaoguang(Ken)", "email": ""},
+            {"name": "Already, Here", "email": "already@amazon.com"},
+        ],
+        "ccRecipients": [{"name": "Cao, Xulai", "email": ""}],
+    }
+    directory = {
+        "Monnig, Benjamin": [{"name": "Monnig, Benjamin", "email": "benmonni@amazon.com"}],
+        "Wang, Xiaoguang(Ken)": [{"name": "Wang, Xiaoguang(Ken)", "email": "xgwang@amazon.com"}],
+        "Already, Here": [{"name": "Already, Here", "email": "WRONG@amazon.com"}],
+        "Cao, Xulai": [{"name": "Cao, Xulai", "email": "xulaicao@amazon.com"}],
+    }
+    calls = []
+    monkeypatch.setattr(email_mod, "call_read_tool", _contacts_seam(directory, calls))
+    await email_mod._resolve_recipient_emails_from_contacts(item, [10])
+    to_by = {r["name"]: r["email"] for r in item["toRecipients"]}
+    cc_by = {r["name"]: r["email"] for r in item["ccRecipients"]}
+    assert to_by["Monnig, Benjamin"] == "benmonni@amazon.com"
+    assert to_by["Wang, Xiaoguang(Ken)"] == "xgwang@amazon.com"
+    # FILL-ONLY: a populated email is never looked up / overwritten.
+    assert to_by["Already, Here"] == "already@amazon.com"
+    assert "Already, Here" not in calls, "a populated entry must not trigger a lookup"
+    assert cc_by["Cao, Xulai"] == "xulaicao@amazon.com"
+
+
+async def test_d069_resolver_ambiguous_no_exact_match_stays_blank(monkeypatch):
+    """A multi-result query with NO exact normalized-name match leaves email:'' —
+    NEVER first-of-many, fuzzy, or substring (the AC-2 never-fabricate invariant)."""
+    item = {
+        "sourceFolder": "1 leads",
+        "toRecipients": [{"name": "Smith, John", "email": ""}],
+        "ccRecipients": [],
+    }
+    # Two results, NEITHER normalizes-equal to "Smith, John" exactly.
+    directory = {
+        "Smith, John": [
+            {"name": "Smith, Johnny", "email": "johnny@amazon.com"},
+            {"name": "Smith, Jon", "email": "jon@amazon.com"},
+        ],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool", _contacts_seam(directory))
+    await email_mod._resolve_recipient_emails_from_contacts(item, [10])
+    assert item["toRecipients"][0]["email"] == "", \
+        "an ambiguous no-exact-match must stay blank — never a best guess"
+
+
+async def test_d069_resolver_no_result_no_fabrication(monkeypatch):
+    """A name with no contacts result stays email:'' (never invents an address)."""
+    item = {
+        "sourceFolder": "1 leads",
+        "toRecipients": [{"name": "Ghost, Nobody", "email": ""}],
+        "ccRecipients": [],
+    }
+    monkeypatch.setattr(email_mod, "call_read_tool", _contacts_seam({}))  # empty directory
+    await email_mod._resolve_recipient_emails_from_contacts(item, [10])
+    assert item["toRecipients"][0]["email"] == ""
+
+
+async def test_d069_resolver_rejects_invalid_contact_address(monkeypatch):
+    """A contact whose returned address is malformed (fails _valid_email) is NOT
+    written — match-or-leave-blank, never a junk address."""
+    item = {
+        "sourceFolder": "1 leads",
+        "toRecipients": [{"name": "Bad, Addr", "email": ""}],
+        "ccRecipients": [],
+    }
+    directory = {"Bad, Addr": [{"name": "Bad, Addr", "email": "not-an-email"}]}
+    monkeypatch.setattr(email_mod, "call_read_tool", _contacts_seam(directory))
+    await email_mod._resolve_recipient_emails_from_contacts(item, [10])
+    assert item["toRecipients"][0]["email"] == ""
+
+
+async def test_d069_resolver_per_item_cap_truncates_and_logs(monkeypatch, caplog):
+    """(cap) The per-item lookup budget bounds the number of contacts calls; when a
+    cap truncates lookups, the unresolved names are logged (no silent truncation)."""
+    import logging
+    item = {
+        "sourceFolder": "1 leads",
+        "toRecipients": [{"name": f"Person{i}, Test", "email": ""} for i in range(5)],
+        "ccRecipients": [],
+    }
+    directory = {f"Person{i}, Test": [{"name": f"Person{i}, Test",
+                                       "email": f"p{i}@amazon.com"}] for i in range(5)}
+    calls = []
+    monkeypatch.setattr(email_mod, "call_read_tool", _contacts_seam(directory, calls))
+    # Budget of 2 must stop after 2 lookups; the remaining 3 names are left blank
+    # AND logged.
+    with caplog.at_level(logging.WARNING, logger=email_mod.logger.name):
+        await email_mod._resolve_recipient_emails_from_contacts(item, [2])
+    assert len(calls) == 2, "must not exceed the budget of 2 lookups"
+    filled = [r for r in item["toRecipients"] if r["email"]]
+    assert len(filled) == 2, "exactly the budgeted lookups resolved"
+    blob = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "Person2, Test" in blob or "unresolved" in blob.lower(), \
+        "truncated lookups must be logged (no silent truncation)"
+
+
+def test_d069_contacts_per_cycle_constant_present():
+    """The per-cycle budget is a named module constant (the _BACKFILL_PER_CYCLE spirit)."""
+    assert isinstance(getattr(email_mod, "_CONTACTS_LOOKUPS_PER_CYCLE", None), int)
+    assert email_mod._CONTACTS_LOOKUPS_PER_CYCLE > 0
+
+
+# --- (c) body-first / contacts-fallback ordering ------------------------------
+
+
+async def test_d069_body_supplied_address_skips_contacts(email_file, monkeypatch):
+    """ORDERING: when the body-parse already supplied an address for a name, that
+    address persists and email_contacts is NOT consulted for it (body is FIRST,
+    contacts is the fallback for names the body didn't resolve)."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 leads", "id": "AAMk-LEADS",
+                        "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-LEADS": [{"conversationId": "CONV-ORD", "topic": "Re: ordering",
+                        "unreadCount": 1, "lastDeliveryTime": "2026-06-26T10:00:00Z"}],
+    }
+    # The quoted body resolves "Bhargava, Vipul" -> vipul@amazon.com; the contacts
+    # directory has a DIFFERENT address for that name to prove contacts is NOT used.
+    quoted_body = (
+        "<p>My reply.</p>"
+        "<p><b>From:</b> Origin, Sender &lt;origin@amazon.com&gt;<br>"
+        "<b>Sent:</b> Mon<br>"
+        "<b>To:</b> Bhargava, Vipul &lt;vipul@amazon.com&gt;<br>"
+        "<b>Subject:</b> Re: ordering</p>"
+        "<p>Quoted.</p>"
+    )
+    messages_by_conv = {
+        "CONV-ORD": [{"itemId": "ORD-1",
+                      "sender": {"name": "Origin, Sender", "email": "origin@amazon.com"},
+                      "from": {"name": "Origin, Sender", "email": "origin@amazon.com"},
+                      "dateTimeSent": "2026-06-26T10:00:00Z", "subject": "Re: ordering",
+                      "body": quoted_body,
+                      "recipients": [{"name": "Bhargava, Vipul"}], "isRead": False}],
+    }
+    contact_calls = []
+    base = _b58_scan_read_tool(folder_children, conversations_by_id, messages_by_conv)
+
+    async def fake_read_tool(name, arguments):
+        if name == "email_contacts":
+            contact_calls.append(str(arguments.get("query", "")))
+            return {"content": {"contacts": [{"name": "Bhargava, Vipul",
+                                              "email": "CONTACTS-WRONG@amazon.com"}]}}
+        return await base(name, arguments)
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = next(it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]
+                if it.get("conversationId") == "CONV-ORD")
+    to_by = {r["name"]: r["email"] for r in item.get("toRecipients") or []}
+    assert to_by.get("Bhargava, Vipul") == "vipul@amazon.com", \
+        "body address must win and persist"
+    assert "Bhargava, Vipul" not in contact_calls, \
+        "contacts must NOT be consulted for a name the body already resolved"
+
+
+# --- (b) folder-only scoping: inbox item is a no-op ---------------------------
+
+
+async def test_d069_inbox_item_resolver_is_noop(email_file, monkeypatch):
+    """FOLDER-ONLY scoping: an Inbox item is never passed to the contacts resolver —
+    email_contacts is NOT consulted and the inbox To (from the Graph capture) is
+    unchanged. Confirms the fix never alters the verified-correct inbox path."""
+    _seed(email_file, [])
+    inbox_emails = [{"id": "INBOX-9", "subject": "Inbox subj",
+                     "from": {"name": "Root", "email": "root@example.com"},
+                     "received": "2026-06-26T11:00:00Z", "is_read": False, "preview": "p",
+                     # Graph detail carries a name-only To (it never does live, but
+                     # this proves the resolver is not invoked for inbox items).
+                     "to": [{"name": "Name Only", "email": ""}], "cc": []}]
+    contact_calls = []
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": list(inbox_emails), "count": len(inbox_emails),
+                    "folder": "inbox"}
+        if name == "get_email":
+            mid = arguments.get("message_id")
+            for e in inbox_emails:
+                if e.get("id") == mid:
+                    return {"email": dict(e, body="Inbox body.")}
+            return {}
+        if name == "email_list_folders":
+            return _b58_list_folders_payload([])
+        if name == "email_contacts":
+            contact_calls.append(str(arguments.get("query", "")))
+            return {"content": {"contacts": [{"name": "Name Only",
+                                              "email": "should-not-be-used@example.com"}]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = next(it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]
+                if it.get("messageId") == "INBOX-9")
+    assert item.get("sourceFolder") == "Inbox"
+    assert contact_calls == [], "email_contacts must NOT be consulted for an inbox item"
+    to_by = {r["name"]: r.get("email", "") for r in item.get("toRecipients") or []}
+    # The inbox capture's value is left exactly as captured (the resolver is a no-op).
+    assert to_by.get("Name Only") == ""
+
+
+# --- (wire) folder scan resolves a name-only To via contacts (DONE-WHEN) ------
+
+
+async def test_d069_folder_scan_resolves_name_only_to_via_contacts(email_file, monkeypatch):
+    """DONE-WHEN: a subfolder item whose body has NO quoted headers (a meeting invite)
+    has its name-only To recipients populated from the contacts directory; a genuinely
+    unresolvable name stays email:'' (never fabricated)."""
+    _seed(email_file, [])
+    folder_children = [{"name": "1 leads", "id": "AAMk-LEADS",
+                        "unreadCount": 1, "children": []}]
+    conversations_by_id = {
+        "AAMk-LEADS": [{"conversationId": "CONV-DG", "topic": "DG Weekly Program Review",
+                        "unreadCount": 1, "lastDeliveryTime": "2026-06-26T10:00:00Z"}],
+    }
+    # A single meeting invite: a plain body with NO quoted From/To/Cc header block,
+    # so the body parse recovers nothing — contacts is the only path.
+    messages_by_conv = {
+        "CONV-DG": [{"itemId": "DG-1",
+                     "sender": {"name": "Hang, Minghui", "email": "hangmh@amazon.com"},
+                     "from": {"name": "Hang, Minghui", "email": "hangmh@amazon.com"},
+                     "dateTimeSent": "2026-06-26T10:00:00Z",
+                     "subject": "DG Weekly Program Review with Tech",
+                     "body": "<p>Join the weekly review. No quoted thread here.</p>",
+                     "recipients": [{"name": "Monnig, Benjamin"},
+                                    {"name": "Wang, Xiaoguang(Ken)"},
+                                    {"name": "Phantom, Unknown"}],
+                     "ccRecipients": [],
+                     "isRead": False}],
+    }
+    directory = {
+        "Monnig, Benjamin": [{"name": "Monnig, Benjamin", "email": "benmonni@amazon.com"}],
+        "Wang, Xiaoguang(Ken)": [{"name": "Wang, Xiaoguang(Ken)", "email": "xgwang@amazon.com"}],
+    }
+    base = _b58_scan_read_tool(folder_children, conversations_by_id, messages_by_conv)
+
+    async def fake_read_tool(name, arguments):
+        if name == "email_contacts":
+            q = str(arguments.get("query", ""))
+            return {"content": {"contacts": list(directory.get(q, []))}}
+        return await base(name, arguments)
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = next(it for it in json.loads(email_file.read_text(encoding="utf-8"))["items"]
+                if it.get("conversationId") == "CONV-DG")
+    assert item.get("sourceFolder") == "1 leads"
+    to_by = {r["name"]: r.get("email", "") for r in item.get("toRecipients") or []}
+    assert to_by.get("Monnig, Benjamin") == "benmonni@amazon.com"
+    assert to_by.get("Wang, Xiaoguang(Ken)") == "xgwang@amazon.com"
+    # The unresolvable name stays blank — never fabricated.
+    assert to_by.get("Phantom, Unknown") == ""
+
+
+async def test_d069_backfill_self_heal_resolves_via_contacts(email_file, monkeypatch):
+    """SELF-HEAL: an EXISTING folder item with a blank senderEmail re-enters backfill;
+    after the body-parse (no quoted headers) leaves a To name-only, the contacts
+    resolver fills it. Fill-only/idempotent: a re-run does not re-look-up a resolved
+    address."""
+    _seed(email_file, [_make_item(
+        "f1", status="needs-review", messageId="AAMk-BH", conversationId="AAMk-BH",
+        sourceFolder="1 leads", senderEmail="", emailBody="",
+        toRecipients=[{"name": "Monnig, Benjamin", "email": ""}], ccRecipients=[])])
+
+    contact_calls = []
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [], "count": 0, "folder": "inbox"}
+        if name == "email_list_folders":
+            return _b58_list_folders_payload([])
+        if name == "email_read":
+            return {"content": {"emails": [
+                {"itemId": "AAMk-BH",
+                 "sender": {"name": "Hang, Minghui", "email": "hangmh@amazon.com"},
+                 "from": {"name": "Hang, Minghui", "email": "hangmh@amazon.com"},
+                 "dateTimeSent": "2026-06-26T09:00:00Z", "subject": "Re: Project update",
+                 "body": "<p>No quoted thread, just prose.</p>",
+                 "recipients": [{"name": "Monnig, Benjamin"}], "isRead": False}]}}
+        if name == "email_contacts":
+            contact_calls.append(str(arguments.get("query", "")))
+            return {"content": {"contacts": [{"name": "Monnig, Benjamin",
+                                              "email": "benmonni@amazon.com"}]}}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    await email_mod._scan_once({"ws_manager": _B58WSNoop()})
+
+    item = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert item.get("senderEmail") == "hangmh@amazon.com"
+    to_by = {r["name"]: r.get("email", "") for r in item.get("toRecipients") or []}
+    assert to_by.get("Monnig, Benjamin") == "benmonni@amazon.com", \
+        "backfill must resolve the name-only To via contacts"
+    assert contact_calls == ["Monnig, Benjamin"], "contacts consulted once for the blank name"
+
+
+# --- (e) approve unresolved_recipients 422 shape ------------------------------
+
+
+async def test_d069_approve_unresolved_to_fails_loud_422(client, email_file, monkeypatch):
+    """PARTIAL-RESOLVE FAIL-LOUD: when the reply-all To resolves non-empty but one or
+    more ORIGINAL To recipients are name-only (email:''), approve does NOT save a
+    partial draft, does NOT flip to approved, and returns a 422 'unresolved_recipients'
+    NAMING the unresolved display names (distinct from 409 conflict and 422
+    no_recipient)."""
+    _seed(email_file, [_make_item(
+        "u1", status="needs-review", draft="final reply", sourceFolder="1 leads",
+        senderEmail="sender@example.com",
+        toRecipients=[
+            {"name": "Resolved, One", "email": "one@example.com"},
+            {"name": "Monnig, Benjamin", "email": ""},      # unresolved
+            {"name": "Phantom, Unknown", "email": ""},      # unresolved
+        ],
+        ccRecipients=[])])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "SHOULD-NOT-FIRE"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/u1/approve", json={})
+    assert resp.status == 422
+    body = await resp.json()
+    assert body.get("error") == "unresolved_recipients"
+    assert body.get("error") != "conflict"
+    assert body.get("error") != "no_recipient"
+    names = body.get("names")
+    assert isinstance(names, list)
+    assert "Monnig, Benjamin" in names and "Phantom, Unknown" in names
+    assert "Resolved, One" not in names, "a resolved To recipient is not 'unresolved'"
+    assert isinstance(body.get("message"), str) and "Monnig, Benjamin" in body["message"]
+    assert "etag" in body
+    # No draft saved, item stays actionable.
+    assert calls == [], "no draft must be saved on a partial resolve"
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] != "approved", "item stays unapproved/retryable"
+
+
+async def test_d069_approve_unresolved_cc_does_not_block(client, email_file, monkeypatch):
+    """CC-DOES-NOT-BLOCK (AC-7): an unresolved name-only CC is non-critical — when ALL
+    To resolve, approve still saves the draft and returns ok (only an unresolved TO
+    blocks)."""
+    _seed(email_file, [_make_item(
+        "c1", status="needs-review", draft="final reply", sourceFolder="1 leads",
+        senderEmail="sender@example.com",
+        toRecipients=[{"name": "Resolved, One", "email": "one@example.com"}],
+        ccRecipients=[{"name": "NameOnly, Cc", "email": ""}])])  # unresolved CC
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D1"}}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/c1/approve", json={})
+    assert resp.status == 200, "an unresolved CC must NOT block the save"
+    body = await resp.json()
+    assert body["item"]["status"] == "approved"
+    assert body.get("draftSaved") is True
+    assert len(calls) == 1 and calls[0][0] == "email_draft"
+
+
+async def test_d069_approve_fully_empty_to_still_no_recipient(client, email_file, monkeypatch):
+    """REGRESSION: the fully-empty-To case (no sender, no captured recipients) keeps
+    returning 'no_recipient' (NOT 'unresolved_recipients') — the two 422 codes stay
+    distinct."""
+    _seed(email_file, [_make_item(
+        "e1", status="needs-review", draft="final reply",
+        senderEmail="", toRecipients=[], ccRecipients=[])])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "draftId": "X"}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/e1/approve", json={})
+    assert resp.status == 422
+    body = await resp.json()
+    assert body.get("error") == "no_recipient", \
+        "fully-empty To stays no_recipient, distinct from unresolved_recipients"
+    assert calls == []
+
+
+async def test_d069_approve_inbox_item_unaffected(client, email_file, monkeypatch):
+    """SAFETY-NET: the unresolved guard is a no-op for an inbox item (To always fully
+    address-resolved via Graph), so approve still returns ok — no inbox regression."""
+    _seed(email_file, [_make_item(
+        "ib1", status="needs-review", draft="final reply", sourceFolder="Inbox",
+        senderEmail="sender@example.com",
+        toRecipients=[{"name": "Resolved, One", "email": "one@example.com"}],
+        ccRecipients=[])])
+    calls = []
+
+    async def fake_owa_write(name, arguments):
+        calls.append((name, arguments))
+        return {"success": True, "content": {"draftId": "D1"}}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    resp = await client.post("/api/email/queue/ib1/approve", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "approved"
+    assert len(calls) == 1 and calls[0][0] == "email_draft"
+
+
+# --- (g) _MY_EMAIL me-filtering is exercised when set -------------------------
+
+
+def test_d069_my_email_me_filtering_active_when_set(monkeypatch):
+    """AC (part 5): with _MY_EMAIL set, _reply_all_recipients DROPS self from To and
+    APPENDS self to CC. Pins the me-filtering branch fires (it is a no-op when the env
+    var is unset — this test sets it explicitly)."""
+    monkeypatch.setattr(email_mod, "_MY_EMAIL", "xulaicao@amazon.com")
+    item = _make_item(
+        "m1", senderEmail="boss@example.com",
+        toRecipients=[{"name": "Me", "email": "xulaicao@amazon.com"},
+                      {"name": "Bob", "email": "bob@example.com"}],
+        ccRecipients=[{"name": "Carol", "email": "carol@example.com"}])
+    to, cc = email_mod._reply_all_recipients(item)
+    to_lower = [a.lower() for a in to]
+    cc_lower = [a.lower() for a in cc]
+    # Self DROPPED from To.
+    assert "xulaicao@amazon.com" not in to_lower
+    assert "boss@example.com" in to_lower and "bob@example.com" in to_lower
+    # Self APPENDED to CC exactly once.
+    assert cc_lower.count("xulaicao@amazon.com") == 1
+    assert "carol@example.com" in cc_lower
