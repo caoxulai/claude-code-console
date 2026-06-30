@@ -21,3 +21,10 @@ data/
 
 # Local docs — may contain personal/internal details; not shared to remote
 docs/
+
+# Internal build/publish infra — not part of the public repo
+build-tools/
+Config
+scripts/install.sh
+scripts/slack-warmup-session.sh
+scripts/README.md

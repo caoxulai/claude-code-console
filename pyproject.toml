@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "Web UI for managing Claude Code sessions, memory, skills, and projects"
 requires-python = ">=3.10"
 # scripts (console entry points) and dependencies are declared in setup.py so
-# the same metadata drives both `pip install .` and the Brazil build.
+# the same metadata drives every `pip install .`.
 dynamic = ["scripts", "dependencies"]
 
 [project.optional-dependencies]

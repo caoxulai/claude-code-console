@@ -1,6 +1,6 @@
 # Claude Code Console (`claude-web`)
 
-A web GUI for managing your [Claude Code](https://docs.hub.amazon.dev/claude-code) setup — sessions, memory, skills, projects, MCP servers, hooks, cron jobs, and more — all from a browser, reachable from any device.
+A web GUI for managing your [Claude Code](https://docs.claude.com/en/docs/claude-code) setup — sessions, memory, skills, projects, MCP servers, hooks, cron jobs, and more — all from a browser, reachable from any device.
 
 Claude Code stores everything on disk under `~/.claude/` (session transcripts, memory files, skills, settings). This console reads and manages that data through a clean web interface instead of the CLI and a text editor.
 
@@ -36,108 +36,24 @@ The server runs locally on `127.0.0.1:9000` by default and serves a pre-built Re
 
 ## Installation
 
-> Looking for a standalone, wiki-ready install guide to share? See
-> [`docs/INSTALL.md`](docs/INSTALL.md).
-
-> **TL;DR for consumers** — on an Amazon Linux Cloud Desktop, run:
-> ```bash
-> mwinit   # required first — or `mwinit -o` if it says "WebAuthn is not supported on this platform"
-> bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
-> claude-web
-> ```
-> That's the whole thing — the script checks every prerequisite and installs
-> what's missing. (`mwinit` is still required first: the curl reads your existing
-> Midway cookie, it can't create one.)
->
-> **Using it from a Mac?** Start the console on the desktop, then tunnel to it:
-> ```bash
-> # on the Cloud Desktop (`--no-browser` skips the no-op browser attempt; plain `claude-web` is fine too):
-> claude-web start --no-browser
-> # on your Mac (new terminal, leave running) — use YOUR desktop's hostname:
-> ssh -N -L 9000:127.0.0.1:9000 dev-dsk-<you>-....amazon.com
-> ```
-> Then open <http://127.0.0.1:9000> in your Mac's browser. (Find your hostname by
-> running `hostname -f` on the Cloud Desktop.)
->
-> The detailed steps below are only if you want to do it by hand or something
-> goes wrong.
-
-> **New here?** Do the **Prerequisites** once, then use **Option A** (one
-> command). You do **not** need to check out any code or know anything about how
-> the console is built.
-
 ### Prerequisites
 
-Do these once on your Cloud Desktop, in order. **For Option A you only need #1
-and #2** — the script installs #3 and #4 for you; do them by hand only for
-Option B (manual).
+1. **Python ≥ 3.10** and **Node.js** (for building the frontend).
+2. **[Claude Code](https://docs.claude.com/en/docs/claude-code)** installed and used at least once. The console is a *viewer and manager* for the data Claude Code stores in `~/.claude/`; if you've never run `claude`, the pages will simply be empty (and the Chat page needs the `claude` binary on your `PATH`).
 
-1. **An Amazon Cloud Desktop** running Amazon Linux (x86_64 or ARM/aarch64).
-   This is where the console runs. (macOS is not yet supported.)
-2. **Midway credentials.** Run `mwinit` (you'll need this within the last ~20h).
-   - If it says *"WebAuthn is not supported on this platform"*, run `mwinit -o`
-     instead: enter your PIN, then touch your security key.
-3. **Builder Toolbox** *(auto-installed by Option A)*. For Option B, check with
-   `toolbox --version`; if not found, install it from
-   <https://builderhub.corp.amazon.com/docs/builder-toolbox/user-guide/getting-started.html>,
-   then open a new terminal.
-4. **Claude Code** *(auto-installed by Option A)*. The console is a *viewer and
-   manager* for the data Claude Code stores in `~/.claude/`. If you've never run
-   `claude`, the pages will simply be empty (and the Chat page needs the `claude`
-   binary on your `PATH`). For Option B, install the **Amazon internal
-   distribution** via Builder Toolbox (`toolbox install claude-code`) — do *not*
-   use npm/Homebrew/public installers. See
-   <https://docs.hub.amazon.dev/docs/claude-code/user-guide/getting-started.html>.
-
-### Install it — pick one
-
-The tool ships as a fully self-contained bundle (its own Python + the web UI +
-all dependencies), so no code checkout is needed for Options A or B.
-
-#### Option A — One command (recommended)
-
-The one-liner downloads and runs a script that does the real work: it checks
-every prerequisite, installs anything missing (including Builder Toolbox and
-Claude Code), then runs `toolbox install claude-web` for you — which is why you
-don't type `toolbox` yourself here.
-
-```bash
-bash <(curl -fsSL -b ~/.midway/cookie "https://code.amazon.com/packages/ClaudeCodeConsole/blobs/mainline/--/scripts/install.sh?raw=1")
-```
-
-> Both flags are required: `-b ~/.midway/cookie` sends your Midway session
-> (without it you get a `401`), and `?raw=1` fetches the raw script instead of
-> the HTML Code Browser page. Keep the URL in quotes.
-
-#### Option B — Manual, step by step
-
-Prefer to run each step yourself (or Option A failed)? Run these in order:
-
-```bash
-# 1. Register the tool registry (one time, ever)
-toolbox registry add s3://buildertoolbox-registry-claude-code-console-us-west-2/tools.json
-
-# 2. Install the tool
-toolbox install claude-web
-```
-
-#### Option C — From source (for development only)
-
-Use this only if you're modifying the console itself. Requires Python ≥ 3.10,
-Node.js, and GitFarm access. (You then run with `.venv/bin/claude-web` instead
-of the steps below.)
+### Install from source
 
 ```bash
 # 1. Clone
-git clone ssh://git.amazon.com/pkg/ClaudeCodeConsole claude-web
+git clone https://github.com/caoxulai/claude-code-console.git claude-web
 cd claude-web
 
 # 2. Build the frontend (produces frontend/dist/)
 cd frontend && npm install && npm run build && cd ..
 
-# 3. Install the package (editable)
+# 3. Install the package
 python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e .
 ```
 
 For frontend hot-reload during development, run the Vite dev server (proxies
@@ -150,26 +66,11 @@ cd frontend && npm run dev                 # frontend on :9001 (proxies /api to 
 ### Run it
 
 ```bash
-claude-web
+.venv/bin/claude-web
 ```
 
 The server starts on `http://127.0.0.1:9000` and your browser opens to it. Leave
 the terminal running — closing it (or pressing `Ctrl-C`) stops the server.
-
-> **Browsing from a Mac?** The console runs on your Cloud Desktop and binds to
-> `127.0.0.1` there, so opening `127.0.0.1:9000` on your Mac won't reach it.
-> Instead, on the Cloud Desktop run (`--no-browser` skips the no-op browser
-> attempt on the headless host; plain `claude-web` works too):
-> ```bash
-> claude-web start --no-browser
-> ```
-> then on your Mac (new terminal, leave it running) forward the port over SSH —
-> use your own desktop's hostname (`hostname -f` shows it):
-> ```bash
-> ssh -N -L 9000:127.0.0.1:9000 dev-dsk-<you>-....amazon.com
-> ```
-> and open <http://127.0.0.1:9000> in your Mac's browser. More detail and
-> options in [Accessing from a Mac (Cloud Desktop → laptop)](#accessing-from-a-mac-cloud-desktop--laptop).
 
 **Other useful commands:**
 ```bash
@@ -178,29 +79,14 @@ claude-web start --no-browser   # don't auto-open a browser (headless/remote hos
 claude-web setup                # create the optional config file (see Configuration)
 ```
 
-### Updating
-
-```bash
-toolbox update claude-web
-# or, if you used the Option A script: bash scripts/install.sh --update
-```
-
-> claude-web is published on the `stable` channel, so `toolbox install` /
-> `toolbox update` just work. Preview builds go to `head` — add `--channel head`
-> to opt in.
-
 ### Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| `toolbox: command not found` | Builder Toolbox isn't installed — see Prerequisite 3, then open a new terminal. |
-| `mwinit`: *"WebAuthn is not supported on this platform"* | Use the OTP/security-key flow instead: `mwinit -o` (enter PIN, then touch your security key). |
-| Install `curl: ... 401` | Your Midway session isn't being sent. Run `mwinit` (or `mwinit -o`), and make sure the curl includes `-b ~/.midway/cookie` and the URL ends in `?raw=1`. |
-| `AccessDenied` / registry add fails | Run `mwinit` (or `mwinit -o`) and retry. |
-| `claude-web: command not found` after install | Open a new terminal so `~/.toolbox/bin` is on your `PATH`, or run `~/.toolbox/bin/claude-web`. |
+| `claude-web: command not found` | Activate the venv (`source .venv/bin/activate`) or run `.venv/bin/claude-web`. |
 | Browser doesn't open (remote/headless) | Use `claude-web start --no-browser`, then open `http://127.0.0.1:9000` yourself (tunnel/port-forward if remote — see [Accessing from other devices](#accessing-from-other-devices)). |
 | Pages are empty | You haven't used Claude Code yet, or your projects live somewhere other than `~/workspace/projects` — set `CLAUDE_WEB_WORKSPACE` (see [Configuration](#configuration)). |
-| Chat page errors | The `claude` binary isn't on your `PATH`. Install Claude Code (Prerequisite 4). |
+| Chat page errors | The `claude` binary isn't on your `PATH`. Install Claude Code (Prerequisite 2). |
 
 ---
 
@@ -263,18 +149,18 @@ through to the CLI.
 The server binds to `127.0.0.1` and has **no authentication** — it can read/write
 your `~/.claude` files and run shell commands. The recommended way to reach it
 from a phone or laptop is to keep it on loopback and forward the port over a
-trusted channel: expose `:9000` through a tunnel from your Cloud Desktop (e.g.
-AWS Tunnels + AEA) or an SSH port-forward, then open the tunnel URL.
+trusted channel: an SSH port-forward from the remote host running the console,
+then open the forwarded URL.
 
-### Accessing from a Mac (Cloud Desktop → laptop)
+### Accessing from a laptop (remote host → laptop)
 
-This is the common setup: the console runs on your Cloud Desktop, but you want
-to use it in your Mac's browser. Because the server stays on `127.0.0.1` of the
-Cloud Desktop, you reach it with an **SSH port-forward** — a secure tunnel that
-maps a port on your Mac to `127.0.0.1:9000` on the desktop. Nothing is exposed
-to the network.
+This is the common setup: the console runs on a remote host (e.g. a dev server),
+but you want to use it in your laptop's browser. Because the server stays on
+`127.0.0.1` of the remote host, you reach it with an **SSH port-forward** — a
+secure tunnel that maps a port on your laptop to `127.0.0.1:9000` on the host.
+Nothing is exposed to the network.
 
-1. **On the Cloud Desktop**, start the console. `--no-browser` skips the
+1. **On the remote host**, start the console. `--no-browser` skips the
    browser-open attempt (which no-ops on a headless host anyway — plain
    `claude-web` works the same for tunneling):
    ```bash
@@ -282,26 +168,24 @@ to the network.
    ```
    Leave this terminal running.
 
-2. **On your Mac**, open a second terminal and forward the port. Use the same
-   host you normally SSH to your Cloud Desktop with:
+2. **On your laptop**, open a second terminal and forward the port. Use the same
+   host you normally SSH to:
    ```bash
-   ssh -N -L 9000:127.0.0.1:9000 <your-cloud-desktop-host>
+   ssh -N -L 9000:127.0.0.1:9000 <your-remote-host>
    ```
-   - `<your-cloud-desktop-host>` is whatever you use today, e.g.
-     `dev-dsk-$USER-...amazon.com` or an alias from your `~/.ssh/config`.
+   - `<your-remote-host>` is whatever you use today, e.g. a hostname or an alias
+     from your `~/.ssh/config`.
    - `-N` means "just forward, don't open a shell." Leave it running while you
      use the console; press `Ctrl-C` to disconnect.
-   - If port `9000` is already taken on your Mac, map a different local port:
+   - If port `9000` is already taken on your laptop, map a different local port:
      `-L 9100:127.0.0.1:9000`, then use `:9100` in step 3.
 
-3. **On your Mac**, open <http://127.0.0.1:9000> (or `:9100` if you remapped).
-   You're now using the console running on your Cloud Desktop.
+3. **On your laptop**, open <http://127.0.0.1:9000> (or `:9100` if you remapped).
+   You're now using the console running on the remote host.
 
-> **Tip:** if you connect through Midway/PCSK, make sure your SSH session is
-> authenticated (`mwinit`, or `mwinit -o` if WebAuthn isn't supported on your
-> platform) before step 2, or the tunnel will fail to establish. The forward
-> adds no new auth of its own — anyone who can SSH to your desktop can already
-> reach the port.
+> **Tip:** the forward adds no new auth of its own — anyone who can SSH to your
+> host can already reach the port. Make sure your SSH session is established
+> before step 2.
 
 ### Binding to a routable interface (not recommended)
 
@@ -320,7 +204,7 @@ control the network and accept that risk, pass `--allow-remote` (or set
 cd frontend && npm run build             # rebuild the UI
 ```
 
-The package builds in Brazil as `ClaudeCodeConsole` (a `custom-build` hybrid that runs the Vite build then `brazilpython`). See [`docs/TOOLBOX_VENDING.md`](docs/TOOLBOX_VENDING.md) for the full build + vending runbook.
+The build is a two-step hybrid: `npm run build` produces the static frontend under `frontend/dist/`, which is copied into `server/static/` and shipped as package data so the server serves the UI at runtime with no Node present.
 
 ## Project layout
 

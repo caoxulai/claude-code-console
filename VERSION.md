@@ -6,7 +6,7 @@ First stable release. A full-featured web console for managing Claude Code sessi
 
 ### Core Platform
 - **Dashboard** — at-a-glance stats: active sessions, tasks, projects, usage
-- **Multi-project discovery** — auto-detects GitFarm repos in nested Brazil workspaces
+- **Multi-project discovery** — auto-detects git repos in nested workspaces
 - **Command Palette** (Cmd+K) — fuzzy search across pages, sessions, projects, and memory
 - **Grouped sidebar navigation** — Overview / Connect / Work / AI Core / Extend / System
 
