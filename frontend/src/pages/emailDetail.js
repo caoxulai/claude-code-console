@@ -495,13 +495,27 @@ export function deleteOutcome(httpStatus, body) {
 //        no one), or onto the generic error (no actionable names).
 //   - any other non-2xx              -> { outcome: 'error', message } (generic
 //        failure banner — e.g. a 500 or a different 4xx).
-//   - HTTP 2xx                       -> { outcome: 'ok', draftSaved, etag } (the
-//        happy path: draftSaved true => "Copied! Draft saved to Outlook.", false
-//        => plain "Copied!" — that 200/draftSaved:false path now only fires for a
-//        NON-recipient reason such as a domain-blocked draft).
+//   - HTTP 2xx                       -> { outcome: 'ok', draftSaved, etag,
+//        markReadFailed, markReadMessage } (the happy path: draftSaved true =>
+//        "Copied! Draft saved to Outlook.", false => plain "Copied!" — that
+//        200/draftSaved:false path now only fires for a NON-recipient reason such
+//        as a domain-blocked draft).
 // The `message` prefers the body's message/error text, falling back to a sane
 // default so the page never renders the literal 'undefined'. Pure — no DOM, no
 // fetch.
+//
+// D-071 (subfolder mark-read): the approve still SUCCEEDS even when marking the
+// ORIGINAL Outlook message read fails (the draft-save is the primary action; the
+// folder->Graph mark-read is best-effort/background). So the 2xx outcome carries
+// markReadFailed/markReadMessage so the page can show a NON-blocking amber notice
+// ("Draft saved — couldn't mark the original read.") instead of a plain green
+// "Copied!" — fixing the silent-green complaint (the user saw green while the
+// original stayed unread in Outlook). These fields are surfaced ONLY on the 2xx
+// 'ok' branch: markReadFailed is MEANINGLESS on a failed approve (conflict /
+// no_recipient / unresolved_recipients / error), where no draft was saved and no
+// mark-read was attempted. markReadFailed DEFAULTS to false (strict `=== true`)
+// so an inbox approve or an OLDER backend that omits the field NEVER trips the
+// notice (anti FALSE-ALARM — AC-5).
 const NO_RECIPIENT_DEFAULT_MSG =
   'No recipient address — draft not saved; add a recipient and retry';
 
@@ -530,7 +544,21 @@ export function approveOutcome(httpStatus, body) {
   }
   const ok2xx = httpStatus >= 200 && httpStatus < 300;
   if (ok2xx) {
-    return { outcome: 'ok', etag, draftSaved: b.draftSaved === true, message: '' };
+    return {
+      outcome: 'ok',
+      etag,
+      draftSaved: b.draftSaved === true,
+      message: '',
+      // D-071: only true when the backend explicitly reports the original could
+      // NOT be marked read; absent/false on inbox + older responses (anti
+      // false-alarm). markReadMessage is the backend's short, ready-to-show
+      // notice text (escaped at the render boundary, T4's concern) — '' when
+      // absent so the page falls back to its default amber copy.
+      markReadFailed: b.markReadFailed === true,
+      markReadMessage: (typeof b.markReadMessage === 'string' && b.markReadMessage.trim())
+        ? b.markReadMessage.trim()
+        : '',
+    };
   }
   const message = (typeof b.message === 'string' && b.message.trim())
     ? b.message.trim()
@@ -538,6 +566,49 @@ export function approveOutcome(httpStatus, body) {
       ? b.error.trim()
       : 'Failed to approve the draft.');
   return { outcome: 'error', etag, message, draftSaved: false };
+}
+
+// Dispatch the dismiss POST response into a tagged outcome (T3, D-071). The
+// dismiss path previously had no outcome helper — the EmailPage dismiss handler
+// inlined its status checks — but dismiss now ALSO routes a subfolder (folder/OWA)
+// item's original through the off-quota Graph mark_email_read path, so it shares
+// the SAME mark-read failure surface as approve. This pure reader mirrors
+// approveOutcome's shape so the dismiss notice is derived the SAME testable way:
+//   - HTTP 409 -> { outcome: 'conflict' } (queue moved elsewhere; re-read + banner)
+//   - non-2xx  -> { outcome: 'error', message } (generic failure banner)
+//   - HTTP 2xx -> { outcome: 'ok', markReadFailed, markReadMessage } (dismiss
+//        succeeded; show a NON-blocking amber notice when the original couldn't be
+//        marked read — never block the dismiss, never silently swallow it).
+// As with approve, markReadFailed/markReadMessage are surfaced ONLY on the 2xx
+// branch (meaningless on a conflict/error where nothing was dismissed) and
+// markReadFailed DEFAULTS to false (strict `=== true`) so an inbox dismiss or an
+// older backend that omits the field never trips the notice (AC-5). Dismiss has
+// no draftSaved (it saves no draft) and — like today — no etag on success. Pure —
+// no DOM, no fetch.
+export function dismissOutcome(httpStatus, body) {
+  const b = (body && typeof body === 'object') ? body : {};
+  const etag = typeof b.etag === 'string' ? b.etag : null;
+  if (httpStatus === 409) {
+    return { outcome: 'conflict', etag, message: '', markReadFailed: false, markReadMessage: '' };
+  }
+  const ok2xx = httpStatus >= 200 && httpStatus < 300;
+  if (ok2xx) {
+    return {
+      outcome: 'ok',
+      etag,
+      message: '',
+      markReadFailed: b.markReadFailed === true,
+      markReadMessage: (typeof b.markReadMessage === 'string' && b.markReadMessage.trim())
+        ? b.markReadMessage.trim()
+        : '',
+    };
+  }
+  const message = (typeof b.message === 'string' && b.message.trim())
+    ? b.message.trim()
+    : ((typeof b.error === 'string' && b.error.trim())
+      ? b.error.trim()
+      : 'Failed to dismiss.');
+  return { outcome: 'error', etag, message, markReadFailed: false, markReadMessage: '' };
 }
 
 // Shrink-then-grow a textarea to its content: height = min(scrollHeight + 2, cap).

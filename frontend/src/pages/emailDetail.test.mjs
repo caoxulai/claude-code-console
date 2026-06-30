@@ -28,6 +28,7 @@ import {
   setMyEmail,
   getMyEmail,
   approveOutcome,
+  dismissOutcome,
 } from './emailDetail.js';
 
 // Set the test email so replyAllRecipients/seedRecipients tests have a known
@@ -1233,6 +1234,167 @@ test('approveOutcome: the FIVE outcomes stay DISTINCT — no_recipient is NOT mi
 
   // The happy path stays ok.
   assert.equal(approveOutcome(200, { draftSaved: true }).outcome, 'ok');
+});
+
+// --- approveOutcome: D-071 markReadFailed / markReadMessage on the 2xx branch -
+// The subfolder (OWA) mark-read fix routes a folder item's ORIGINAL message
+// through the off-quota Graph mark_email_read path AFTER the durable draft-save.
+// The draft-save is the PRIMARY action and always wins, so when the mark-read
+// can't complete (Graph id unresolved, or mark_email_read reports failure) the
+// approve STILL succeeds (2xx) but the body carries markReadFailed:true (+ a short
+// markReadMessage). The page must then show a NON-blocking amber notice ("Draft
+// saved — couldn't mark the original read.") instead of a plain green "Copied!" —
+// the fix for the silent-green complaint (green shown while the original stayed
+// unread in Outlook). These fields ride ONLY on the 2xx 'ok' branch; on
+// conflict/no_recipient/unresolved_recipients/error they are meaningless (no
+// draft saved, no mark-read attempted). markReadFailed DEFAULTS to false (strict
+// `=== true`) so an inbox approve or an OLDER backend that omits the field NEVER
+// trips the notice (anti FALSE-ALARM — AC-5). The EXACT field names are pinned
+// here so a backend rename goes RED. Escape is the render boundary's concern (T4),
+// not this pure reader's.
+
+test('approveOutcome: 2xx + markReadFailed:true + message -> ok, markReadFailed true, exact message', () => {
+  const r = approveOutcome(200, {
+    available: true,
+    draftSaved: true,
+    item: {},
+    etag: 'e7',
+    markReadFailed: true,
+    markReadMessage: "Draft saved — couldn't mark the original read.",
+  });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.draftSaved, true);
+  assert.equal(r.markReadFailed, true);
+  assert.equal(r.markReadMessage, "Draft saved — couldn't mark the original read.");
+  assert.equal(r.etag, 'e7');
+});
+
+test('approveOutcome: 2xx with markReadFailed ABSENT -> markReadFailed false (anti false-alarm, AC-5)', () => {
+  // An inbox approve OR an older backend that predates D-071 omits the field
+  // entirely — it must never trip the notice (false defaults).
+  const r = approveOutcome(200, { available: true, draftSaved: true, item: {}, etag: 'e8' });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.markReadFailed, false);
+  assert.equal(r.markReadMessage, '');
+});
+
+test('approveOutcome: 2xx with markReadFailed:false -> false (mark-read succeeded, no notice)', () => {
+  const r = approveOutcome(200, {
+    available: true, draftSaved: true, etag: 'e9', markReadFailed: false, markReadMessage: '',
+  });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.markReadFailed, false);
+  assert.equal(r.markReadMessage, '');
+});
+
+test('approveOutcome: markReadFailed coerces strictly — only literal true trips it', () => {
+  // A truthy-but-not-true value (1, "true", {}) must NOT trip the notice — the
+  // backend contract is a real boolean true.
+  for (const bad of [1, 'true', {}, 'yes']) {
+    const r = approveOutcome(200, { draftSaved: true, markReadFailed: bad });
+    assert.equal(r.markReadFailed, false, `markReadFailed must be false for ${JSON.stringify(bad)}`);
+  }
+});
+
+test('approveOutcome: markReadMessage is trimmed; blank/non-string -> "" (never "undefined")', () => {
+  assert.equal(approveOutcome(200, { markReadFailed: true, markReadMessage: '  hi  ' }).markReadMessage, 'hi');
+  assert.equal(approveOutcome(200, { markReadFailed: true, markReadMessage: '   ' }).markReadMessage, '');
+  assert.equal(approveOutcome(200, { markReadFailed: true, markReadMessage: 42 }).markReadMessage, '');
+  assert.equal(approveOutcome(200, { markReadFailed: true }).markReadMessage, '');
+  assert.notEqual(approveOutcome(200, { markReadFailed: true }).markReadMessage, 'undefined');
+});
+
+test('approveOutcome: markReadFailed is IGNORED on the failed branches (meaningless on a failed approve)', () => {
+  // A 409 / 422 / 500 never carries a draft-saved mark-read decision — the field
+  // must not leak a `true` onto a failure outcome (it would mislead the UI).
+  const conflict = approveOutcome(409, { error: 'conflict', etag: 'e2', markReadFailed: true });
+  assert.equal(conflict.outcome, 'conflict');
+  assert.notEqual(conflict.markReadFailed, true);
+
+  const noRec = approveOutcome(422, { error: 'no_recipient', markReadFailed: true });
+  assert.equal(noRec.outcome, 'no_recipient');
+  assert.notEqual(noRec.markReadFailed, true);
+
+  const unres = approveOutcome(422, { error: 'unresolved_recipients', names: ['A'], markReadFailed: true });
+  assert.equal(unres.outcome, 'unresolved_recipients');
+  assert.notEqual(unres.markReadFailed, true);
+
+  const err = approveOutcome(500, { error: 'boom', markReadFailed: true });
+  assert.equal(err.outcome, 'error');
+  assert.notEqual(err.markReadFailed, true);
+});
+
+// --- dismissOutcome: the dismiss path's tagged outcome (T3, D-071) ----------
+// Dismiss now ALSO routes a subfolder item's original through the Graph
+// mark_email_read path, so it shares the SAME mark-read failure surface as
+// approve. dismissOutcome mirrors approveOutcome's shape so the dismiss notice is
+// derived the SAME testable way — { outcome:'conflict'|'error'|'ok', etag,
+// markReadFailed, markReadMessage }. As with approve, markReadFailed/Message ride
+// ONLY the 2xx branch and DEFAULT to false (strict `=== true`) so an inbox dismiss
+// or an older backend never trips the notice (AC-5). Dismiss has no draftSaved.
+
+test('dismissOutcome: 2xx + markReadFailed:true + message -> ok, markReadFailed true, exact message', () => {
+  const r = dismissOutcome(200, {
+    ok: true,
+    removed: true,
+    markReadFailed: true,
+    markReadMessage: "Dismissed — couldn't mark the original read.",
+  });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.markReadFailed, true);
+  assert.equal(r.markReadMessage, "Dismissed — couldn't mark the original read.");
+});
+
+test('dismissOutcome: 2xx with markReadFailed ABSENT -> markReadFailed false (anti false-alarm, AC-5)', () => {
+  const r = dismissOutcome(200, { ok: true, removed: true });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.markReadFailed, false);
+  assert.equal(r.markReadMessage, '');
+});
+
+test('dismissOutcome: 2xx with markReadFailed:false -> false (mark-read succeeded, no notice)', () => {
+  const r = dismissOutcome(200, { ok: true, markReadFailed: false, markReadMessage: '' });
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.markReadFailed, false);
+  assert.equal(r.markReadMessage, '');
+});
+
+test('dismissOutcome: 409 conflict -> "conflict", markReadFailed ignored (false), adopts etag', () => {
+  const r = dismissOutcome(409, { error: 'conflict', etag: 'e2', current: {}, markReadFailed: true });
+  assert.equal(r.outcome, 'conflict');
+  assert.notEqual(r.markReadFailed, true);
+  assert.equal(r.etag, 'e2');
+});
+
+test('dismissOutcome: non-2xx (500) -> "error" with a readable message, markReadFailed ignored', () => {
+  const r = dismissOutcome(500, { error: 'boom', markReadFailed: true });
+  assert.equal(r.outcome, 'error');
+  assert.ok(r.message && typeof r.message === 'string');
+  assert.notEqual(r.message, 'undefined');
+  assert.notEqual(r.markReadFailed, true);
+});
+
+test('dismissOutcome: markReadFailed coerces strictly — only literal true trips it', () => {
+  for (const bad of [1, 'true', {}, 'yes']) {
+    const r = dismissOutcome(200, { ok: true, markReadFailed: bad });
+    assert.equal(r.markReadFailed, false, `markReadFailed must be false for ${JSON.stringify(bad)}`);
+  }
+});
+
+test('dismissOutcome: markReadMessage is trimmed; blank/non-string -> "" (never "undefined")', () => {
+  assert.equal(dismissOutcome(200, { markReadFailed: true, markReadMessage: '  hi  ' }).markReadMessage, 'hi');
+  assert.equal(dismissOutcome(200, { markReadFailed: true, markReadMessage: '   ' }).markReadMessage, '');
+  assert.equal(dismissOutcome(200, { markReadFailed: true, markReadMessage: 42 }).markReadMessage, '');
+  assert.notEqual(dismissOutcome(200, { markReadFailed: true }).markReadMessage, 'undefined');
+});
+
+test('dismissOutcome: a null/garbage body never crashes and degrades to "error" on non-2xx', () => {
+  assert.equal(dismissOutcome(500, null).outcome, 'error');
+  assert.equal(dismissOutcome(502, undefined).outcome, 'error');
+  // a 2xx with a null body still resolves to ok (markReadFailed defaults false).
+  const ok = dismissOutcome(200, null);
+  assert.equal(ok.outcome, 'ok');
+  assert.equal(ok.markReadFailed, false);
 });
 
 console.log(`\nall green: ${passed} tests passed`);

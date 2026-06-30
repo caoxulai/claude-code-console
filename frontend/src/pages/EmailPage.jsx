@@ -14,7 +14,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 // these inline so the page sections and the bubble can never drift.
 import { isActionable, reviewGroup, countActionable } from '../lib/emailQueue';
 // Pure decision helpers shared with emailDetail.test.mjs (no jsdom/vitest).
-import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, approveOutcome, autoFormatBody, seedRecipients, threadCardStates, setMyEmail } from './emailDetail';
+import { latestThreadView, threadSummaryParts, fromColumnLabel, sourceFolderLabel, mutedLabel, sortedMutedKeys, polishSource, autoSizeHeight, displayTimestamp, deleteOutcome, approveOutcome, dismissOutcome, autoFormatBody, seedRecipients, threadCardStates, setMyEmail } from './emailDetail';
 
 // --- Constants ---
 
@@ -198,9 +198,35 @@ export default function EmailPage() {
 
   const [health, setHealth] = useState(null);
 
-  // Approve confirmation message per item (transient)
+  // Per-item transient action toast: id -> { text, tone }. tone 'ok' is the green
+  // "Copied!"/"Copied! Draft saved to Outlook." (approve) / "Dismissed" path's
+  // confirmation; tone 'warn' is the amber, NON-blocking "Draft saved — couldn't
+  // mark the original read." / "Dismissed — couldn't mark the original read."
+  // notice (D-071): the approve/dismiss SUCCEEDED (draft saved / item dismissed)
+  // but the best-effort, off-quota Graph mark-read of the ORIGINAL Outlook message
+  // couldn't be confirmed, so we tell the user the original may still read as
+  // unread — instead of a plain green that lies (the silent-green complaint). It's
+  // INFORMATIONAL, not a hard error, so it reuses this toast machinery rather than
+  // the red setError banner. Same 5s auto-clear timer for both tones.
   const [approveMsg, setApproveMsg] = useState({});
   const approveMsgRef = useRef({});
+
+  // Set the per-item action toast and arm its 5s auto-clear (shared by approve and
+  // dismiss so both surface the green/amber notice the same way). tone is 'ok'
+  // (green) or 'warn' (amber). The text is data-derived (the backend's mark-read
+  // notice) — rendered as a React child ({…} escaped), never dangerouslySetInnerHTML.
+  const showActionMsg = (id, text, tone) => {
+    setApproveMsg(prev => ({ ...prev, [id]: { text, tone } }));
+    if (approveMsgRef.current[id]) clearTimeout(approveMsgRef.current[id]);
+    approveMsgRef.current[id] = setTimeout(() => {
+      setApproveMsg(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      delete approveMsgRef.current[id];
+    }, 5000);
+  };
 
   // Transient "Copied" flag for the subject copy button (per item), so the user
   // can paste the subject into Outlook search. Clears after a short timer.
@@ -658,7 +684,7 @@ export default function EmailPage() {
       // Dispatch the five distinct approve outcomes (approveOutcome, emailDetail.js).
       // The five cases MUST stay distinct so the page never lies about what
       // happened (D-068/D-069/T2).
-      const { outcome, etag: nextEtag, draftSaved, message } = approveOutcome(res.status, json);
+      const { outcome, etag: nextEtag, draftSaved, message, markReadFailed, markReadMessage } = approveOutcome(res.status, json);
       if (nextEtag) setEtag(nextEtag);
 
       if (outcome === 'conflict') {
@@ -705,21 +731,30 @@ export default function EmailPage() {
         // Clipboard may fail in non-secure contexts; the draft is still saved
       }
 
-      // Show confirmation message. draftSaved:true => the Outlook draft landed;
-      // draftSaved:false here is now a NON-recipient reason (e.g. a domain-blocked
-      // draft), since no-recipient is a 4xx handled above.
-      const msg = draftSaved ? 'Copied! Draft saved to Outlook.' : 'Copied!';
-      setApproveMsg(prev => ({ ...prev, [id]: msg }));
-      // Clear after a timer
-      if (approveMsgRef.current[id]) clearTimeout(approveMsgRef.current[id]);
-      approveMsgRef.current[id] = setTimeout(() => {
-        setApproveMsg(prev => {
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
-        delete approveMsgRef.current[id];
-      }, 5000);
+      // Show the confirmation toast. The draft IS saved regardless (the primary
+      // action succeeded) — but the best-effort, off-quota Graph mark-read of the
+      // ORIGINAL Outlook message is a SEPARATE outcome the backend reports via
+      // markReadFailed (D-071). When it failed (a subfolder/OWA item whose Graph
+      // message id couldn't be resolved, or a mark_email_read that reported
+      // failure), show an AMBER, non-blocking notice naming that the original may
+      // still read as unread — NEVER a plain green that lies (the silent-green
+      // complaint). When it didn't fail (every inbox item, every successful folder
+      // mark-read, and any older backend that omits the flag — markReadFailed
+      // defaults to false), keep the exact current green confirmation (AC-5: no
+      // false alarm). Either way the draft is saved, so we still copy + refresh +
+      // clear editingId below — markReadFailed is informational, NOT an abort.
+      if (markReadFailed) {
+        showActionMsg(
+          id,
+          markReadMessage || "Draft saved — couldn't mark the original read.",
+          'warn',
+        );
+      } else {
+        // draftSaved:true => the Outlook draft landed; draftSaved:false here is now
+        // a NON-recipient reason (e.g. a domain-blocked draft), since no-recipient
+        // is a 4xx handled above.
+        showActionMsg(id, draftSaved ? 'Copied! Draft saved to Outlook.' : 'Copied!', 'ok');
+      }
 
       setEditingId(null);
       refresh();
@@ -805,6 +840,17 @@ export default function EmailPage() {
   };
 
   // Dismiss
+  //
+  // Dismiss now ALSO routes a subfolder (folder/OWA) item's ORIGINAL through the
+  // off-quota Graph mark_email_read path (D-071), exactly like approve, so it
+  // shares the SAME mark-read failure surface. We dispatch the response via the
+  // pure dismissOutcome (emailDetail.js) — mirroring approveOutcome — so the amber
+  // notice is derived the SAME testable way. The dismiss SUCCEEDS regardless of
+  // the mark-read result (it's best-effort/background); when the original couldn't
+  // be marked read we show the amber, NON-blocking toast instead of silently
+  // leaving it unread, and still refresh() / collapse the row as before. An inbox
+  // dismiss (and any older backend that omits the flag) never trips it (markRead-
+  // Failed defaults to false — AC-5).
   const dismiss = async (id) => {
     setBusyId(id);
     try {
@@ -813,17 +859,30 @@ export default function EmailPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ etag }),
       });
-      if (res.status === 409) {
+      const json = await res.json().catch(() => null);
+      const { outcome, etag: nextEtag, message, markReadFailed, markReadMessage } = dismissOutcome(res.status, json);
+      if (nextEtag) setEtag(nextEtag);
+
+      if (outcome === 'conflict') {
         setError('Conflict: the queue was modified elsewhere. Refreshing...');
         refresh();
         return;
       }
-      if (!res.ok) {
-        setError('Failed to dismiss the item.');
+      if (outcome === 'error') {
+        setError(message || 'Failed to dismiss the item.');
         return;
       }
-      const json = await res.json();
-      setEtag(json.etag ?? null);
+
+      // outcome === 'ok' — the item is dismissed. The mark-read of the original is
+      // best-effort: when it failed, surface the amber notice (the dismiss still
+      // succeeded), else show nothing extra (the row simply moves to Dismissed).
+      if (markReadFailed) {
+        showActionMsg(
+          id,
+          markReadMessage || "Dismissed — couldn't mark the original read.",
+          'warn',
+        );
+      }
       if (expandedId === id) { setExpandedId(null); setEditingId(null); }
       setError(null);
       refresh();
@@ -1798,11 +1857,36 @@ export default function EmailPage() {
           </div>
         )}
 
-        {/* Approve confirmation */}
+        {/* Approve/dismiss confirmation toast (per item, 5s). Two tones:
+            - 'ok'   : the green "Copied!"/"Copied! Draft saved to Outlook." (and
+              the dismiss happy path shows nothing — it just moves the row).
+            - 'warn' : the amber, NON-blocking D-071 notice ("Draft saved —
+              couldn't mark the original read." / "Dismissed — couldn't mark the
+              original read.") when the best-effort, off-quota Graph mark-read of
+              the ORIGINAL Outlook message couldn't be confirmed. INFORMATIONAL,
+              not a hard error — it uses the established amber treatment (var(
+              --warning) + FiAlertCircle + the same surface/border boxed style as
+              the delete-failure notice above), which is dark-mode-safe. The text
+              is backend/data-derived → React {…} interpolation only, never
+              dangerouslySetInnerHTML. */}
         {approveMsg[item.id] && (
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', color: 'var(--accent)', fontSize: '0.85em', marginTop: 'var(--space-sm)', fontWeight: 600 }}>
-            <FiCheckCircle size={14} /> {approveMsg[item.id]}
-          </div>
+          approveMsg[item.id].tone === 'warn' ? (
+            <div
+              style={{
+                display: 'flex', alignItems: 'flex-start', gap: '0.4em',
+                color: 'var(--warning)', fontSize: '0.82em', marginTop: 'var(--space-sm)',
+                padding: '0.5em 0.7em', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius)', background: 'var(--surface)',
+              }}
+            >
+              <FiAlertCircle size={14} style={{ flexShrink: 0, marginTop: '0.1em' }} />
+              <span>{approveMsg[item.id].text}</span>
+            </div>
+          ) : (
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', color: 'var(--accent)', fontSize: '0.85em', marginTop: 'var(--space-sm)', fontWeight: 600 }}>
+              <FiCheckCircle size={14} /> {approveMsg[item.id].text}
+            </div>
+          )
         )}
       </div>
     );

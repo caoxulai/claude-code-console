@@ -31,6 +31,11 @@ email_mod = pytest.importorskip(
 
 from server.app import create_app  # noqa: E402
 
+# Capture the REAL folder inline mark-read at import, BEFORE the autouse
+# _inert_mark_read fixture replaces it with a no-op (D-071): the D-071 integration
+# tests restore this so they exercise the genuine resolve-Graph-id + mark path.
+_REAL_MARK_FOLDER_READ_INLINE = getattr(email_mod, "_mark_folder_read_inline", None)
+
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -107,11 +112,17 @@ def _inert_mark_read(monkeypatch):
     """
     if hasattr(email_mod, "_spawn_mark_read"):
         monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda cid: None)
-    # The source-aware dispatcher (D-070) spawns an OWA mark-read for folder items;
-    # neutralize that background task too so a folder dismiss/approve in a test that
-    # does not specifically assert mark-read never opens a real MCP stdio connection.
-    if hasattr(email_mod, "_spawn_mark_folder_read"):
-        monkeypatch.setattr(email_mod, "_spawn_mark_folder_read", lambda cid, subject: None)
+    # The source-aware mark-read (D-071) marks FOLDER items read INLINE: it resolves
+    # the OWA conversation to a Graph message id then PATCHes via Graph mark_email_read.
+    # Neutralize that inline helper by default (return False == markReadFailed) so a
+    # folder dismiss/approve in a test that does not specifically assert mark-read
+    # never opens a real MCP stdio connection; the dedicated D-071 tests install their
+    # own call_read_tool / _call_graph_write_tool_oneshot stubs to override this.
+    if hasattr(email_mod, "_mark_folder_read_inline"):
+        async def _inert_mark_folder_read_inline(item):
+            return False
+        monkeypatch.setattr(email_mod, "_mark_folder_read_inline",
+                            _inert_mark_folder_read_inline)
 
 
 def _stub_agent(monkeypatch, result):
@@ -8247,199 +8258,461 @@ def test_d069_my_email_me_filtering_active_when_set(monkeypatch):
     assert "carol@example.com" in cc_lower
 
 
-# === D-070: source-aware mark-read on approve/dismiss ========================
-# Folder (OWA) items carry an OWA conversation id the Graph mark_email_read can't
-# flip; route them through email_read+markAs:'read'. Inbox items keep the Graph
-# path. Scan/backfill must NEVER carry markAs. mute never marks read.
+# === D-071 unit: retired OWA no-op + new resolve-Graph-id helpers ============
+# D-070 routed folder mark-read through email_read+markAs:'read' — a VERIFIED SILENT
+# NO-OP (OWA SetReadState hardcodes the inbox ContextFolderId + never inspects the
+# response). D-071 RETIRES that path entirely: the OWA-markAs helpers
+# (_mark_folder_read / _spawn_mark_folder_read / _owa_mark_read_succeeded) are GONE,
+# and folder items are marked read by resolving their OWA conversation to a Graph
+# message id (T0-verified, see the module block comment) then PATCHing it via the
+# SAME off-quota Graph mark_email_read the inbox uses. The end-to-end approve/dismiss
+# routing + markReadFailed contract is pinned by the test_d071_* integration tests
+# below; these unit tests pin the RETIREMENT and the new pure helpers.
 
 
-def _capture_dispatch(monkeypatch):
-    """Record which mark-read seam (Graph vs OWA-folder) the dispatcher chooses."""
-    graph_calls = []
-    folder_calls = []
-    monkeypatch.setattr(email_mod, "_spawn_mark_read",
-                        lambda messages: graph_calls.append(messages))
-    monkeypatch.setattr(email_mod, "_spawn_mark_folder_read",
-                        lambda cid, subject: folder_calls.append((cid, subject)))
-    return graph_calls, folder_calls
+def test_d071_retired_owa_markas_symbols_are_gone():
+    """AC-7: the dead OWA-markAs no-op path is RETIRED — no production symbol remains.
+
+    A folder mark-read must never be able to reach the verified silent no-op again,
+    so the three helpers that implemented it are removed outright (no caller, no
+    symbol). This goes RED if any of them is reintroduced.
+    """
+    for dead in ("_mark_folder_read", "_spawn_mark_folder_read",
+                 "_owa_mark_read_succeeded"):
+        assert not hasattr(email_mod, dead), (
+            f"{dead} is the retired OWA-markAs no-op path and must NOT exist "
+            "(folder mark-read now resolves a Graph id; see D-071)")
 
 
-def test_d070_dispatch_folder_item_routes_to_owa(monkeypatch):
-    """A FOLDER item (sourceFolder set and != 'Inbox') routes to the OWA folder
-    mark-read with its conversationId DIRECTLY — NOT the Graph {message_id: subject}
-    map (which reproduces the bug)."""
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
-    item = _make_item("f1", sourceFolder="Team Updates",
-                      conversationId="AAQkOWA-conv-1", subject="Re: Sprint")
-    email_mod._spawn_mark_read_for_item(item)
-    assert graph_calls == []
-    assert folder_calls == [("AAQkOWA-conv-1", "Re: Sprint")]
+def test_d071_ews_to_graph_folder_id_translates_base64url():
+    """T0-verified: the email_list_folders id is a Graph immutable folder id in
+    STANDARD base64; get_emails needs the base64url form ('/'->'-', '+'->'_')."""
+    std = "AAMkAGM3.../jnEEKc5O/AAA+B=="
+    assert email_mod._ews_to_graph_folder_id(std) == "AAMkAGM3...-jnEEKc5O-AAA_B=="
+    # Idempotent on an already-translated id (no '/' or '+' left to change).
+    once = email_mod._ews_to_graph_folder_id(std)
+    assert email_mod._ews_to_graph_folder_id(once) == once
+    assert email_mod._ews_to_graph_folder_id("") == ""
 
 
-def test_d070_dispatch_inbox_item_routes_to_graph(monkeypatch):
-    """An INBOX item (sourceFolder unset or 'Inbox') keeps the Graph mark-read path
-    via the {message_id: subject} map — byte-for-byte the old behavior."""
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
-    # sourceFolder unset
-    item1 = _make_item("ib1", messageId="AAMkMSG-1", conversationId="AAMkMSG-1",
-                       subject="Re: Hi")
-    email_mod._spawn_mark_read_for_item(item1)
-    # sourceFolder explicitly 'Inbox'
-    item2 = _make_item("ib2", sourceFolder="Inbox", messageId="AAMkMSG-2",
-                       conversationId="AAMkMSG-2", subject="Re: Yo")
-    email_mod._spawn_mark_read_for_item(item2)
-    assert folder_calls == []
-    assert graph_calls == [{"AAMkMSG-1": "Re: Hi"}, {"AAMkMSG-2": "Re: Yo"}]
+def test_d071_normalize_match_subject_strips_prefixes_and_nbsp():
+    """The OWA folder conversation subject and the Graph row subject match through a
+    normalize that collapses whitespace incl. NBSP (U+00A0, seen live) and strips a
+    run of leading Re:/Fwd:/Fw: prefixes."""
+    n = email_mod._normalize_match_subject
+    # NBSP + reply prefix + case + extra space all normalize to the same key.
+    assert n("CRIS connect on XBPS topics") == n("Re:  CRIS  connect on XBPS topics")
+    assert n("Fwd: Re: Hello") == n("hello")
+    assert n("") == ""
 
 
-async def test_d070_mark_folder_read_calls_email_read_with_markas(monkeypatch):
-    """_mark_folder_read calls email_read with conversationId + markAs:'read' (the
-    OWA SetReadState primitive) — the ONLY place markAs appears."""
-    calls = []
+def test_d071_owa_folder_id_for_name_resolves_inbox_child():
+    """The single-name folder resolver returns the Inbox child's id WITHOUT the
+    unread>0 cheap-skip filter (mark-read needs the id even at unread==1), and "" on
+    any miss/malformed payload (never fabricates an id)."""
+    payload = {"folders": [{"name": "Inbox", "id": "INBOX", "children": [
+        {"name": "1 leads", "id": "AAMkFID-leads", "unreadCount": 0},
+        {"name": "1 GSD", "id": "AAMkFID-gsd", "unreadCount": 3}]}]}
+    # unread==0 must still resolve (no cheap-skip on the mark-read path).
+    assert email_mod._owa_folder_id_for_name(payload, "1 leads") == "AAMkFID-leads"
+    assert email_mod._owa_folder_id_for_name(payload, "1 GSD") == "AAMkFID-gsd"
+    # A name not under Inbox -> "" (never fabricated).
+    assert email_mod._owa_folder_id_for_name(payload, "Nonexistent") == ""
+    # Malformed payloads degrade to "".
+    assert email_mod._owa_folder_id_for_name({}, "1 leads") == ""
+    assert email_mod._owa_folder_id_for_name({"folders": []}, "1 leads") == ""
+    assert email_mod._owa_folder_id_for_name(None, "1 leads") == ""
+
+
+async def test_d071_resolve_folder_graph_ids_collects_all_matching_unread(monkeypatch):
+    """AC-10: the resolver returns EVERY unread Graph message matching the item's
+    subject (none dropped), keyed {graph_id: subject}, via the T0-verified chain
+    (email_list_folders -> name->id -> base64url translate -> get_emails)."""
+    seen_get_emails = []
 
     async def fake_read_tool(name, arguments):
-        calls.append((name, dict(arguments)))
-        return {"success": True, "messages": [{"id": "x", "isRead": True}]}
+        if name == "email_list_folders":
+            return {"folders": [{"name": "Inbox", "children": [
+                {"name": "1 leads", "id": "AAMk/FID+leads", "unreadCount": 2}]}]}
+        if name == "get_emails":
+            seen_get_emails.append(dict(arguments))
+            return {"emails": [
+                {"id": "AAMkG-1", "subject": "Re: Sprint", "is_read": False},
+                {"id": "AAMkG-2", "subject": "Sprint", "is_read": False},     # same after normalize
+                {"id": "AAMkG-3", "subject": "Different thread", "is_read": False}]}
+        return {}
     monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
 
-    await email_mod._mark_folder_read("AAQkOWA-conv-9", "Re: Topic")
+    item = _make_item("f1", sourceFolder="1 leads", subject="Re: Sprint",
+                      conversationId="AAQkOWA-conv-1")
+    out = await email_mod._resolve_folder_graph_message_ids(item)
 
-    assert len(calls) == 1
-    name, args = calls[0]
-    assert name == "email_read"
-    assert args.get("conversationId") == "AAQkOWA-conv-9"
-    assert args.get("markAs") == "read"
+    # BOTH subject-matching unread ids collected; the non-matching one excluded.
+    assert set(out.keys()) == {"AAMkG-1", "AAMkG-2"}
+    assert all(v == "Re: Sprint" for v in out.values())
+    # get_emails was called with the BASE64URL-translated folder id (T0-verified).
+    assert seen_get_emails and seen_get_emails[0]["folder"] == "AAMk-FID_leads"
+    assert seen_get_emails[0].get("unread_only") is True
+    # The raw OWA conversation id was NEVER used as a Graph id.
+    assert "AAQkOWA-conv-1" not in out
 
 
-async def test_d070_mark_folder_read_warns_on_non_success(monkeypatch, caplog):
-    """VERIFY-EFFECT-NOT-CALLER: a non-success / empty / malformed OWA response is
-    logged at WARNING — never silently assumed successful."""
-    async def fake_read_tool_fail(name, arguments):
-        return {"success": False, "error": "OWA did not flip"}
-    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool_fail)
+async def test_d071_resolve_folder_graph_ids_empty_when_folder_unresolved(monkeypatch):
+    """When email_list_folders does not resolve the subfolder name, the resolver
+    returns {} (the markReadFailed case) and NEVER fabricates an id / calls Graph."""
+    get_emails_calls = []
+
+    async def fake_read_tool(name, arguments):
+        if name == "email_list_folders":
+            return {"folders": [{"name": "Inbox", "children": []}]}  # name not present
+        if name == "get_emails":
+            get_emails_calls.append(arguments)
+            return {"emails": [{"id": "AAMkG-X", "subject": "Re: Sprint", "is_read": False}]}
+        return {}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    item = _make_item("f1", sourceFolder="1 leads", subject="Re: Sprint")
+    out = await email_mod._resolve_folder_graph_message_ids(item)
+    assert out == {}
+    assert get_emails_calls == [], "no Graph read once the folder id can't be resolved"
+
+
+async def test_d071_mark_folder_read_inline_returns_false_on_empty_resolution(monkeypatch):
+    """_mark_folder_read_inline returns False (markReadFailed) when the resolver finds
+    no Graph id, and never touches the Graph write path in that case."""
+    # Restore the REAL inline helper (autouse stubbed it to a no-op).
+    monkeypatch.setattr(email_mod, "_mark_folder_read_inline", _REAL_MARK_FOLDER_READ_INLINE)
+    writes = []
+
+    async def fake_resolve(item):
+        return {}
+    async def fake_graph_write(name, arguments):
+        writes.append(name)
+        return {"results": []}
+    monkeypatch.setattr(email_mod, "_resolve_folder_graph_message_ids", fake_resolve)
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_graph_write)
+
+    ok = await email_mod._mark_folder_read_inline(_make_item("f1", sourceFolder="1 leads"))
+    assert ok is False
+    assert writes == [], "no Graph mark_email_read when there is nothing to mark"
+
+
+async def test_d071_mark_folder_read_inline_is_non_fatal_on_raise(monkeypatch, caplog):
+    """An OWA/Graph outage (resolver raises) degrades to False + a WARNING — it must
+    NEVER raise into the approve/dismiss handler (AC-11)."""
+    monkeypatch.setattr(email_mod, "_mark_folder_read_inline", _REAL_MARK_FOLDER_READ_INLINE)
+
+    async def fake_resolve_raise(item):
+        raise RuntimeError("OWA/Graph session dead")
+    monkeypatch.setattr(email_mod, "_resolve_folder_graph_message_ids", fake_resolve_raise)
 
     import logging
     with caplog.at_level(logging.WARNING):
-        await email_mod._mark_folder_read("AAQkOWA-conv-bad", "Re: Topic")
-    assert any("AAQkOWA-conv-bad" in r.getMessage() for r in caplog.records), \
-        "a non-success OWA mark-read must log a WARNING naming the conversation"
+        ok = await email_mod._mark_folder_read_inline(
+            _make_item("f1", sourceFolder="1 leads", conversationId="AAQkOWA-conv-z"))
+    assert ok is False
+    assert any("AAQkOWA-conv-z" in r.getMessage() or "folder mark-read inline failed"
+               in r.getMessage() for r in caplog.records)
 
 
-async def test_d070_mark_folder_read_is_non_fatal(monkeypatch, caplog):
-    """An OWA outage (call_read_tool raises) must be swallowed + logged, never raised."""
-    async def fake_read_tool_raise(name, arguments):
-        raise RuntimeError("OWA session dead")
-    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool_raise)
+async def test_d071_mark_folder_read_inline_true_on_graph_success(monkeypatch):
+    """When the resolver finds ids AND Graph mark_email_read flips them all,
+    _mark_folder_read_inline returns True (no markReadFailed)."""
+    monkeypatch.setattr(email_mod, "_mark_folder_read_inline", _REAL_MARK_FOLDER_READ_INLINE)
 
-    import logging
-    with caplog.at_level(logging.WARNING):
-        # Must NOT raise.
-        await email_mod._mark_folder_read("AAQkOWA-conv-x", "Re: Topic")
-    assert any("AAQkOWA-conv-x" in r.getMessage() for r in caplog.records)
+    async def fake_resolve(item):
+        return {"AAMkG-1": "Re: Sprint", "AAMkG-2": "Re: Sprint"}
+    async def fake_graph_write(name, arguments):
+        emails = arguments.get("emails") or {}
+        return {"results": [{"message_id": m, "success": True} for m in emails]}
+    monkeypatch.setattr(email_mod, "_resolve_folder_graph_message_ids", fake_resolve)
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_graph_write)
+
+    ok = await email_mod._mark_folder_read_inline(_make_item("f1", sourceFolder="1 leads"))
+    assert ok is True
 
 
-async def test_d070_approve_folder_item_marks_owa_read(client, email_file, monkeypatch):
-    """Approving a FOLDER item marks the original read via the OWA email_read+markAs
-    path — NOT the Graph mark_email_read path (which silently fails for an OWA id)."""
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+def test_d071_inbox_dispatch_unchanged_via_spawn_mark_read(monkeypatch):
+    """An INBOX item (sourceFolder unset or 'Inbox') keeps the EXISTING fire-and-forget
+    Graph path via the {message_id: subject} map — byte-for-byte the old behavior — and
+    a folder item is NOT routed through the inbox spawner (the handler marks it inline)."""
+    graph_calls = []
+    monkeypatch.setattr(email_mod, "_spawn_mark_read",
+                        lambda messages: graph_calls.append(messages))
+
+    # sourceFolder unset.
+    email_mod._spawn_mark_read_for_item(
+        _make_item("ib1", messageId="AAMkMSG-1", conversationId="AAMkMSG-1", subject="Re: Hi"))
+    # sourceFolder explicitly 'Inbox'.
+    email_mod._spawn_mark_read_for_item(
+        _make_item("ib2", sourceFolder="Inbox", messageId="AAMkMSG-2",
+                   conversationId="AAMkMSG-2", subject="Re: Yo"))
+    assert graph_calls == [{"AAMkMSG-1": "Re: Hi"}, {"AAMkMSG-2": "Re: Yo"}]
+
+    # A FOLDER item must NOT be routed through the inbox Graph spawner (no false
+    # mark of the raw OWA id; the handler owns the folder inline mark-read now).
+    graph_calls.clear()
+    email_mod._spawn_mark_read_for_item(
+        _make_item("f1", sourceFolder="Projects", conversationId="AAQkOWA-x",
+                   messageId="AAQkOWA-x", subject="Re: Folder"))
+    assert graph_calls == [], "a folder item must not reach the inbox Graph mark-read spawner"
+
+
+# === D-071: reroute subfolder (OWA) mark-read through off-quota Graph =========
+# D-070 routed folder items through email_read+markAs:'read' — a VERIFIED silent
+# no-op (the OWA SetReadState hardcodes the inbox ContextFolderId, and the response
+# is never inspected; see docs/email-mcp-architecture-v2.md). D-071 reverses that:
+# a folder item resolves its OWA conversationId to a Graph message id, then marks it
+# read via the SAME proven, off-quota Graph mark_email_read path the Inbox already
+# uses (_mark_messages_read_result -> _call_graph_write_tool_oneshot).
+#
+# T0-VERIFIED resolution (live, 2026-06-30): get_emails(folder=<sourceFolder NAME>)
+# does NOT work — Graph 400s a display name AND the raw OWA folder id. The chain is:
+# email_list_folders -> the Inbox child whose name == sourceFolder -> its OWA folder
+# id -> translate to Graph base64url ('/'->'-', '+'->'_') -> get_emails(folder=<that
+# id>, unread_only=True) returns the subfolder's unread Graph message ids; get_emails
+# rows expose NO conversation field, so the match predicate is the SUBJECT (NBSP +
+# Re:/Fwd: tolerant). mark_email_read flipped the resolved id, confirmed by a clean
+# re-read, then restored (net no-op probe). The Inbox branch is unchanged. The
+# scan/prefetch/backfill path NEVER marks read. When the Graph id can't be resolved
+# (or the mark fails) approve/dismiss still SUCCEED (draft-save is primary) but
+# surface markReadFailed:true + markReadMessage so the page shows a non-blocking
+# "Draft saved — couldn't mark the original read."
+#
+# These tests pin ROUTING + the response CONTRACT only; they monkeypatch the MCP
+# seams. The LIVE isRead flip at the destination (AC-1/AC-2) is settled by T0's
+# real re-read in Outlook, NOT by these mocked tests. The discriminator under test
+# is the sourceFolder predicate (set and != 'Inbox'), NEVER an id-shape sniff.
+
+
+# A real allowlisted subfolder name (EMAIL_SCAN_SUBFOLDERS) used by the folder
+# tests, so T1's resolver can map it to a folder id. The folder->Graph id
+# resolution walks email_list_folders -> the Inbox folder -> its children, matching
+# a child whose `name` == the item's sourceFolder (T0-verified, qa.md 2026-06-30).
+_D071_FOLDER_NAME = "1 leads"
+_D071_OWA_FOLDER_ID = "AAMkFOLDERID-1leads"
+
+
+def _capture_graph_and_owa(monkeypatch, resolver_payload=None,
+                           mark_result=None, mark_raises=False,
+                           folder_name=_D071_FOLDER_NAME):
+    """Record the Graph mark_email_read writes AND any OWA email_read calls.
+
+    Returns (graph_writes, owa_reads, resolver_reads):
+      - graph_writes: list of {message_id: subject} batches that reached the Graph
+        write path (mark_email_read) via _call_graph_write_tool_oneshot. This is
+        where a CORRECT folder->Graph reroute lands, with the RESOLVED Graph id.
+      - owa_reads: list of email_read argument dicts. The RETIRED no-op path is the
+        one carrying markAs:'read' — it must NEVER fire for a folder mark-read.
+      - resolver_reads: list of get_emails argument dicts (the folder->Graph id
+        resolution lookups).
+
+    Stubs the full T0-verified resolution chain at the call_read_tool seam:
+      1. email_list_folders -> an Inbox folder whose `children` include the seeded
+         ``folder_name`` mapped to a folder id, so the name->id step resolves;
+      2. get_emails(folder=<id>, unread_only=True) -> ``resolver_payload`` (defaults
+         to a single message whose Graph id is 'AAMkRESOLVED-1', subject 'Re: Sprint',
+         matching the seeded folder item below).
+    ``mark_result``/``mark_raises`` control the Graph write outcome so the
+    failure-surfacing test can drive a genuine failure.
+
+    The default get_emails payload models the REAL Graph row shape (T0's live probe,
+    qa.md 2026-06-30): the row exposes id/subject/from/received/is_read and carries
+    NO conversation* field, so the OWA conversationId -> Graph message-id resolution
+    joins on the SUBJECT, not a conversationId echo. The row's subject matches the
+    seeded folder item's subject ('Re: Sprint') so a subject-join resolves it; the
+    test asserts only that the RESOLVED Graph id ('AAMkRESOLVED-1') reaches
+    mark_email_read, never the raw OWA id — it does NOT pin the join mechanism.
+    """
+    graph_writes: list = []
+    owa_reads: list = []
+    resolver_reads: list = []
+
+    if resolver_payload is None:
+        resolver_payload = {"emails": [
+            {"id": "AAMkRESOLVED-1", "subject": "Re: Sprint",
+             "from": {"name": "Sender", "email": "sender@example.com"},
+             "received": "2026-06-02T10:00:00Z", "is_read": False}]}
+
+    async def fake_read_tool(name, arguments):
+        args = dict(arguments)
+        if name == "email_list_folders":
+            # Inbox + children, so the sourceFolder NAME resolves to a folder id.
+            return {"folders": [{"name": "Inbox", "id": "INBOX", "children": [
+                {"name": folder_name, "id": _D071_OWA_FOLDER_ID, "unreadCount": 1}]}]}
+        if name == "get_emails":
+            resolver_reads.append(args)
+            return resolver_payload
+        if name == "email_read":
+            owa_reads.append(args)
+            # Mimic the OWA email_read shape (so an accidental OWA mark-read path
+            # would still "look successful" — exactly the no-op trap we forbid).
+            return {"success": True, "messages": [{"id": "x", "isRead": True}]}
+        return {}
+
+    async def fake_graph_write(name, arguments):
+        graph_writes.append((name, dict(arguments)))
+        if mark_raises:
+            raise RuntimeError("Graph mark_email_read unavailable")
+        if mark_result is not None:
+            return mark_result
+        # Default: a clean per-id success for every requested id.
+        emails = arguments.get("emails") or {}
+        return {"results": [
+            {"message_id": mid, "success": True} for mid in emails]}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_graph_write)
+    # Restore the REAL inline folder mark-read (the autouse fixture stubbed it to a
+    # no-op): these tests exercise the genuine resolve-Graph-id + mark path through
+    # the call_read_tool / _call_graph_write_tool_oneshot stubs installed above.
+    if _REAL_MARK_FOLDER_READ_INLINE is not None:
+        monkeypatch.setattr(email_mod, "_mark_folder_read_inline",
+                            _REAL_MARK_FOLDER_READ_INLINE)
+    return graph_writes, owa_reads, resolver_reads
+
+
+def _graph_write_ids(graph_writes):
+    """Flatten every {message_id: subject} batch sent to mark_email_read into a set
+    of message ids (only the mark_email_read calls — ignore any other gated write)."""
+    ids: set = set()
+    for name, args in graph_writes:
+        if name != "mark_email_read":
+            continue
+        emails = args.get("emails") or {}
+        ids.update(str(mid) for mid in emails)
+    return ids
+
+
+async def test_d071_folder_approve_and_dismiss_route_to_graph_resolved_id(
+        client, email_file, monkeypatch):
+    """AC-12 (a) FOLDER -> GRAPH routing.
+
+    A subfolder (OWA) item carries an OWA conversation id (AAQk…) that Graph
+    mark_email_read cannot PATCH. On approve AND dismiss the fix must:
+      1. resolve that conversation to a Graph message id via get_emails(folder=…),
+      2. mark THAT resolved id read through the off-quota Graph mark_email_read
+         (_call_graph_write_tool_oneshot), and
+      3. NEVER touch the retired OWA email_read+markAs:'read' no-op path, and
+         NEVER feed the raw AAQk conversation id straight to Graph (that PATCH
+         returns success:false and the original stays unread — the whole bug).
+
+    Goes RED against D-070's code (which routes the folder item to email_read+
+    markAs, never to mark_email_read), and RED against any impl that hands the raw
+    AAQk id to Graph instead of the resolved 'AAMkRESOLVED-1'.
+    """
+    async def fake_owa_write(name, arguments):
+        # email_draft create succeeds so approve reaches the mark-read side-effect.
+        return {"success": True, "content": {"draftId": "D1"}}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    def folder_item(item_id, status):
+        return _make_item(
+            item_id, status=status, draft="final reply",
+            sourceFolder=_D071_FOLDER_NAME,  # folder discriminator (D-058)
+            senderEmail="sender@example.com",
+            conversationId="AAQkOWA-conv-1",     # OWA-shaped — Graph cannot PATCH it
+            messageId="AAQkOWA-conv-1",
+            subject="Re: Sprint",
+            toRecipients=[{"name": "Bob", "email": "bob@example.com"}],
+            ccRecipients=[])
+
+    # --- APPROVE ---
+    graph_writes, owa_reads, resolver_reads = _capture_graph_and_owa(monkeypatch)
+    _seed(email_file, [folder_item("f-approve", "needs-review")])
+    resp = await client.post("/api/email/queue/f-approve/approve", json={})
+    assert resp.status == 200, await resp.text()
+
+    marked = _graph_write_ids(graph_writes)
+    assert "AAMkRESOLVED-1" in marked, (
+        "approve of a folder item must mark the RESOLVED Graph id read via "
+        f"mark_email_read; Graph writes were {graph_writes}")
+    assert "AAQkOWA-conv-1" not in marked, (
+        "the raw OWA conversation id must NEVER be fed to Graph mark_email_read "
+        "(it returns success:false and leaves the original unread)")
+    # The retired OWA no-op path must never fire for the mark-read.
+    assert not any(r.get("markAs") for r in owa_reads), (
+        "folder mark-read must NOT route through email_read+markAs (the verified "
+        f"silent no-op); OWA email_read calls were {owa_reads}")
+
+    # --- DISMISS (same routing, no draft) ---
+    graph_writes, owa_reads, resolver_reads = _capture_graph_and_owa(monkeypatch)
+    _seed(email_file, [folder_item("f-dismiss", "needs-review")])
+    resp = await client.delete("/api/email/queue/f-dismiss", json={})
+    assert resp.status == 200, await resp.text()
+
+    marked = _graph_write_ids(graph_writes)
+    assert "AAMkRESOLVED-1" in marked, (
+        "dismiss of a folder item must mark the RESOLVED Graph id read via "
+        f"mark_email_read; Graph writes were {graph_writes}")
+    assert "AAQkOWA-conv-1" not in marked
+    assert not any(r.get("markAs") for r in owa_reads), (
+        "folder dismiss must NOT route through email_read+markAs; "
+        f"OWA email_read calls were {owa_reads}")
+
+
+async def test_d071_inbox_approve_and_dismiss_unchanged_graph_path(
+        client, email_file, monkeypatch):
+    """AC-12 (b) INBOX no-regression.
+
+    An inbox (Graph) item — sourceFolder unset, already carrying a Graph message id
+    — keeps the EXACT existing _spawn_mark_read / _mark_read_map_for chain (the
+    {message_id: subject} batch), with NO resolution lookup and NO markReadFailed in
+    the response (the inbox path is verified working and is byte-for-byte unchanged).
+
+    Captures at the same dispatch seam test_email_dismiss_marks_message_read /
+    test_email_approve_marks_read_but_mute_does_not assert against, so this pins the
+    unchanged inbox contract directly.
+    """
+    calls = _capture_mark_read(monkeypatch)  # records the {message_id: subject} map
 
     async def fake_owa_write(name, arguments):
         return {"success": True, "content": {"draftId": "D1"}}
     monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
 
+    # --- APPROVE (inbox) ---
     _seed(email_file, [_make_item(
-        "f1", status="needs-review", draft="final reply", sourceFolder="Team Updates",
-        senderEmail="sender@example.com", conversationId="AAQkOWA-conv-1",
-        messageId="AAQkOWA-conv-1", subject="Re: Sprint",
+        "ib-approve", status="needs-review", draft="final reply",
+        senderEmail="bob@example.com", messageId="AAMkINBOX-9",
+        conversationId="AAMkINBOX-9", subject="Re: Hi",
         toRecipients=[{"name": "Bob", "email": "bob@example.com"}], ccRecipients=[])])
-
-    resp = await client.post("/api/email/queue/f1/approve", json={})
-    assert resp.status == 200
-    assert graph_calls == []
-    assert folder_calls == [("AAQkOWA-conv-1", "Re: Sprint")]
-
-
-async def test_d070_dismiss_folder_item_marks_owa_read(client, email_file, monkeypatch):
-    """Dismissing a FOLDER item routes mark-read through the OWA folder path."""
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
-    _seed(email_file, [_make_item(
-        "f1", sourceFolder="Team Updates", conversationId="AAQkOWA-conv-2",
-        messageId="AAQkOWA-conv-2", subject="Re: Standup")])
-
-    resp = await client.delete("/api/email/queue/f1", json={})
-    assert resp.status == 200
-    assert graph_calls == []
-    assert folder_calls == [("AAQkOWA-conv-2", "Re: Standup")]
-
-
-async def test_d070_dismiss_inbox_item_still_marks_graph(client, email_file, monkeypatch):
-    """An INBOX item's dismiss still routes through the Graph mark-read path (no
-    regression)."""
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
-    _seed(email_file, [_make_item(
-        "ib1", messageId="AAMkINBOX-1", conversationId="AAMkINBOX-1", subject="Re: Hi")])
-
-    resp = await client.delete("/api/email/queue/ib1", json={})
-    assert resp.status == 200
-    assert folder_calls == []
-    assert graph_calls == [{"AAMkINBOX-1": "Re: Hi"}]
-
-
-async def test_d070_folder_mark_read_failure_does_not_break_dismiss(
-        client, email_file, monkeypatch):
-    """A folder mark-read failure (OWA outage) is swallowed: the dismiss that already
-    persisted still returns 200 (never a 409/500)."""
-    # Run the REAL dispatcher + REAL _mark_folder_read (un-stub the inert default),
-    # but make the underlying OWA call_read_tool raise to simulate an outage.
-    spawned = []
-
-    def capture_spawn(cid, subject):
-        # Delegate to the real fire-and-forget so _mark_folder_read actually runs.
-        task = __import__("asyncio").ensure_future(email_mod._mark_folder_read(cid, subject))
-        spawned.append(task)
-    monkeypatch.setattr(email_mod, "_spawn_mark_folder_read", capture_spawn)
-
-    async def fake_read_tool_raise(name, arguments):
-        raise RuntimeError("OWA session dead")
-    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool_raise)
-
-    _seed(email_file, [_make_item(
-        "f1", sourceFolder="Team Updates", conversationId="AAQkOWA-conv-3",
-        messageId="AAQkOWA-conv-3", subject="Re: Late")])
-
-    resp = await client.delete("/api/email/queue/f1", json={})
-    assert resp.status == 200
+    resp = await client.post("/api/email/queue/ib-approve/approve", json={})
+    assert resp.status == 200, await resp.text()
     body = await resp.json()
-    assert body["item"]["status"] == "dismissed"
-    # Drain the background mark-read task so it does not leak across tests; it must
-    # have swallowed the OWA error (never raised into the dismiss).
-    import asyncio as _asyncio
-    if spawned:
-        await _asyncio.gather(*spawned)  # would re-raise if _mark_folder_read leaked
+    # Unchanged Graph path: the inbox message id is marked read via the {id: subj} map.
+    assert calls == [{"AAMkINBOX-9": "Re: Hi"}]
+    # markReadFailed must be absent/false for an inbox approve (anti false-alarm, AC-5).
+    assert body.get("markReadFailed") in (None, False), (
+        "an inbox approve marks read via the working Graph path and must NEVER "
+        f"set markReadFailed; body was {body}")
 
-
-async def test_d070_mute_folder_item_does_not_mark_read(client, email_file, monkeypatch):
-    """Mute on a FOLDER item must NOT mark read (mute and dismiss are distinct signals)."""
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    # --- DISMISS (inbox) ---
+    calls.clear()
     _seed(email_file, [_make_item(
-        "f1", sourceFolder="Team Updates", conversationId="AAQkOWA-conv-4",
-        messageId="AAQkOWA-conv-4", subject="Re: Noise")])
+        "ib-dismiss", messageId="AAMkINBOX-7", conversationId="AAMkINBOX-7",
+        subject="Re: Yo")])
+    resp = await client.delete("/api/email/queue/ib-dismiss", json={})
+    assert resp.status == 200, await resp.text()
+    body = await resp.json()
+    assert calls == [{"AAMkINBOX-7": "Re: Yo"}]
+    assert body.get("markReadFailed") in (None, False)
 
-    resp = await client.post("/api/email/queue/f1/mute", json={})
-    assert resp.status == 200
-    assert graph_calls == [] and folder_calls == []
 
+async def test_d071_scan_path_omits_markas_and_acquires_no_mark_email_read(
+        email_file, monkeypatch):
+    """AC-12 (c) / AC-6 SCAN omits markAs and never marks read.
 
-async def test_d070_scan_path_email_read_calls_carry_no_markas(email_file, monkeypatch):
-    """LOAD-BEARING never-mark-read invariant: every scan/backfill email_read call must
-    issue {conversationId, format} WITHOUT any markAs key. markAs:'read' lives ONLY in
-    the approve/dismiss side-effect (_mark_folder_read), never the scan path.
+    The reroute applies ONLY to the deliberate approve/dismiss action. A scan cycle
+    (inbox fetch + folder body-prefetch + backfill) must:
+      - issue every email_read with {conversationId, format} and NO markAs key, and
+      - acquire NO Graph mark_email_read call (no new off-quota write on scan).
 
-    Drives the REAL _scan_once against a stubbed call_read_tool that records every
-    email_read invocation, then asserts NONE carry a markAs argument (a behavior-based
-    proof, not a fragile source grep — the comments in _scan_once mention 'markAs')."""
+    Drives the REAL _scan_once against stubbed seams that record every email_read
+    and every Graph gated-write, then asserts the never-mark-read invariant survives
+    the reroute (a behavior proof, not a source grep)."""
     _seed(email_file, [])
-    read_calls = []
+    read_calls: list = []
+    graph_writes: list = []
 
     async def fake_read_tool(name, arguments):
         read_calls.append((name, dict(arguments)))
@@ -8458,8 +8731,12 @@ async def test_d070_scan_path_email_read_calls_carry_no_markas(email_file, monke
                                 "body": "<p>hi</p>"}]}
         return {}
 
+    async def fake_graph_write(name, arguments):
+        graph_writes.append((name, dict(arguments)))
+        return {"results": []}
+
     monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
-    # Ensure the subfolder allowlist admits our folder name.
+    monkeypatch.setattr(email_mod, "_call_graph_write_tool_oneshot", fake_graph_write)
     monkeypatch.setattr(email_mod, "EMAIL_SCAN_SUBFOLDERS",
                         frozenset({"Team Updates"}))
 
@@ -8472,39 +8749,75 @@ async def test_d070_scan_path_email_read_calls_carry_no_markas(email_file, monke
     email_read_calls = [args for (name, args) in read_calls if name == "email_read"]
     assert email_read_calls, "the folder candidate should have triggered an email_read"
     for args in email_read_calls:
-        assert "markAs" not in args, \
-            f"scan-path email_read must NOT carry markAs (never-mark-read): {args}"
+        assert "markAs" not in args, (
+            f"scan-path email_read must NOT carry markAs (never-mark-read): {args}")
+    # No mark_email_read may be acquired during a scan cycle (the reroute must not
+    # leak a Graph mark onto the scan/prefetch/backfill path).
+    assert not any(name == "mark_email_read" for name, _ in graph_writes), (
+        "a scan cycle must acquire NO Graph mark_email_read call; "
+        f"Graph writes were {graph_writes}")
 
 
-def test_d070_dispatch_keys_on_source_not_id_format(monkeypatch):
-    """ANTI-TRAP (USER-INTENT #1): routing must key on the sourceFolder discriminator,
-    NEVER on whether the id 'looks like' an OWA ('AAQk…') vs Graph ('AAMk…') id.
+async def test_d071_folder_mark_read_failure_surfaces_markreadfailed_without_blocking(
+        client, email_file, monkeypatch):
+    """AC-12 (d) / AC-5 markReadFailed surfacing (and the anti-false-alarm contrast).
 
-    Force the discriminator and the id-shape to DISAGREE in both directions:
-      - a FOLDER item carrying a GRAPH-shaped conversationId ('AAMk…') must STILL go
-        the OWA folder path (an id-sniffer would misroute it to Graph -> silently
-        stays unread, the exact bug);
-      - an INBOX item carrying an OWA-shaped conversationId ('AAQk…') must STILL go the
-        Graph path (an id-sniffer would misroute it to OWA).
-
-    The two routes never both fire, and the conversationId is passed THROUGH verbatim
-    (no id-shape rewriting). This is the test the prefix-shaped dispatch cases above
-    cannot catch, since there sourceFolder and id-shape happen to agree.
+    When a folder item's mark-read genuinely cannot complete — the Graph id is
+    UNRESOLVED (get_emails returns no matching row) — the approve MUST still succeed
+    (draft-save is the primary action), the item MUST still flip to 'approved', and
+    the response MUST carry markReadFailed:true + a non-empty markReadMessage so the
+    page can show the non-blocking "Draft saved — couldn't mark the original read."
+    notice instead of a silent green. Then the CONTRAST: when resolution + mark
+    succeed, markReadFailed must be absent/false (so the notice never false-alarms).
     """
-    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    async def fake_owa_write(name, arguments):
+        return {"success": True, "content": {"draftId": "D1"}}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
 
-    # FOLDER item, but its conversationId is Graph-shaped ('AAMk…').
-    folder_item = _make_item("f-graphid", sourceFolder="Projects",
-                             conversationId="AAMkGRAPH-LOOKING-1",
-                             messageId="AAMkGRAPH-LOOKING-1", subject="Re: Folder/GraphId")
-    email_mod._spawn_mark_read_for_item(folder_item)
-    assert graph_calls == [], "a folder item must NOT use the Graph path even with a Graph-shaped id"
-    assert folder_calls == [("AAMkGRAPH-LOOKING-1", "Re: Folder/GraphId")]
+    def folder_item(item_id):
+        return _make_item(
+            item_id, status="needs-review", draft="final reply",
+            sourceFolder=_D071_FOLDER_NAME, senderEmail="sender@example.com",
+            conversationId="AAQkOWA-conv-unresolvable", messageId="AAQkOWA-conv-unresolvable",
+            subject="Re: Sprint",
+            toRecipients=[{"name": "Bob", "email": "bob@example.com"}], ccRecipients=[])
 
-    # INBOX item (no sourceFolder), but its conversationId is OWA-shaped ('AAQk…').
-    inbox_item = _make_item("ib-owaid", conversationId="AAQkOWA-LOOKING-2",
-                            messageId="AAQkOWA-LOOKING-2", subject="Re: Inbox/OwaId")
-    email_mod._spawn_mark_read_for_item(inbox_item)
-    assert folder_calls == [("AAMkGRAPH-LOOKING-1", "Re: Folder/GraphId")], \
-        "an inbox item must NOT use the OWA folder path even with an OWA-shaped id"
-    assert graph_calls == [{"AAQkOWA-LOOKING-2": "Re: Inbox/OwaId"}]
+    # --- FAILURE: the resolver finds NO matching Graph id (empty get_emails) ---
+    graph_writes, owa_reads, resolver_reads = _capture_graph_and_owa(
+        monkeypatch, resolver_payload={"emails": []})
+    _seed(email_file, [folder_item("f-fail")])
+    resp = await client.post("/api/email/queue/f-fail/approve", json={})
+    assert resp.status == 200, await resp.text()  # NEVER block the approve
+    body = await resp.json()
+    # The draft-save is the primary action and is NOT blocked: the item is approved.
+    assert body["item"]["status"] == "approved"
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "approved"
+    # The non-blocking failure flag + a human-readable message are surfaced.
+    assert body.get("markReadFailed") is True, (
+        "an unresolvable folder mark-read must surface markReadFailed:true so the "
+        f"page can warn the user (not a silent green); body was {body}")
+    assert isinstance(body.get("markReadMessage"), str) and body["markReadMessage"].strip(), (
+        "markReadFailed must come with a non-empty markReadMessage for the notice")
+    # The raw OWA id was never fed to Graph (no false success), and the retired OWA
+    # markAs no-op path never fired.
+    assert "AAQkOWA-conv-unresolvable" not in _graph_write_ids(graph_writes)
+    assert not any(r.get("markAs") for r in owa_reads)
+
+    # --- CONTRAST: resolution + mark succeed -> markReadFailed absent/false ---
+    graph_writes, owa_reads, resolver_reads = _capture_graph_and_owa(
+        monkeypatch,
+        resolver_payload={"emails": [
+            {"id": "AAMkRESOLVED-OK", "subject": "Re: Sprint",
+             "from": {"name": "Sender", "email": "sender@example.com"},
+             "received": "2026-06-02T10:00:00Z", "is_read": False}]})
+    _seed(email_file, [folder_item("f-ok")])
+    resp = await client.post("/api/email/queue/f-ok/approve", json={})
+    assert resp.status == 200, await resp.text()
+    body = await resp.json()
+    assert body["item"]["status"] == "approved"
+    assert "AAMkRESOLVED-OK" in _graph_write_ids(graph_writes), (
+        "the contrast case must actually resolve + mark the Graph id read")
+    assert body.get("markReadFailed") in (None, False), (
+        "a SUCCESSFUL folder mark-read must NOT set markReadFailed (anti "
+        f"false-alarm, AC-5); body was {body}")
