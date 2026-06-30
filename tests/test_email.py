@@ -107,6 +107,11 @@ def _inert_mark_read(monkeypatch):
     """
     if hasattr(email_mod, "_spawn_mark_read"):
         monkeypatch.setattr(email_mod, "_spawn_mark_read", lambda cid: None)
+    # The source-aware dispatcher (D-070) spawns an OWA mark-read for folder items;
+    # neutralize that background task too so a folder dismiss/approve in a test that
+    # does not specifically assert mark-read never opens a real MCP stdio connection.
+    if hasattr(email_mod, "_spawn_mark_folder_read"):
+        monkeypatch.setattr(email_mod, "_spawn_mark_folder_read", lambda cid, subject: None)
 
 
 def _stub_agent(monkeypatch, result):
@@ -8240,3 +8245,232 @@ def test_d069_my_email_me_filtering_active_when_set(monkeypatch):
     # Self APPENDED to CC exactly once.
     assert cc_lower.count("xulaicao@amazon.com") == 1
     assert "carol@example.com" in cc_lower
+
+
+# === D-070: source-aware mark-read on approve/dismiss ========================
+# Folder (OWA) items carry an OWA conversation id the Graph mark_email_read can't
+# flip; route them through email_read+markAs:'read'. Inbox items keep the Graph
+# path. Scan/backfill must NEVER carry markAs. mute never marks read.
+
+
+def _capture_dispatch(monkeypatch):
+    """Record which mark-read seam (Graph vs OWA-folder) the dispatcher chooses."""
+    graph_calls = []
+    folder_calls = []
+    monkeypatch.setattr(email_mod, "_spawn_mark_read",
+                        lambda messages: graph_calls.append(messages))
+    monkeypatch.setattr(email_mod, "_spawn_mark_folder_read",
+                        lambda cid, subject: folder_calls.append((cid, subject)))
+    return graph_calls, folder_calls
+
+
+def test_d070_dispatch_folder_item_routes_to_owa(monkeypatch):
+    """A FOLDER item (sourceFolder set and != 'Inbox') routes to the OWA folder
+    mark-read with its conversationId DIRECTLY — NOT the Graph {message_id: subject}
+    map (which reproduces the bug)."""
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    item = _make_item("f1", sourceFolder="Team Updates",
+                      conversationId="AAQkOWA-conv-1", subject="Re: Sprint")
+    email_mod._spawn_mark_read_for_item(item)
+    assert graph_calls == []
+    assert folder_calls == [("AAQkOWA-conv-1", "Re: Sprint")]
+
+
+def test_d070_dispatch_inbox_item_routes_to_graph(monkeypatch):
+    """An INBOX item (sourceFolder unset or 'Inbox') keeps the Graph mark-read path
+    via the {message_id: subject} map — byte-for-byte the old behavior."""
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    # sourceFolder unset
+    item1 = _make_item("ib1", messageId="AAMkMSG-1", conversationId="AAMkMSG-1",
+                       subject="Re: Hi")
+    email_mod._spawn_mark_read_for_item(item1)
+    # sourceFolder explicitly 'Inbox'
+    item2 = _make_item("ib2", sourceFolder="Inbox", messageId="AAMkMSG-2",
+                       conversationId="AAMkMSG-2", subject="Re: Yo")
+    email_mod._spawn_mark_read_for_item(item2)
+    assert folder_calls == []
+    assert graph_calls == [{"AAMkMSG-1": "Re: Hi"}, {"AAMkMSG-2": "Re: Yo"}]
+
+
+async def test_d070_mark_folder_read_calls_email_read_with_markas(monkeypatch):
+    """_mark_folder_read calls email_read with conversationId + markAs:'read' (the
+    OWA SetReadState primitive) — the ONLY place markAs appears."""
+    calls = []
+
+    async def fake_read_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        return {"success": True, "messages": [{"id": "x", "isRead": True}]}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    await email_mod._mark_folder_read("AAQkOWA-conv-9", "Re: Topic")
+
+    assert len(calls) == 1
+    name, args = calls[0]
+    assert name == "email_read"
+    assert args.get("conversationId") == "AAQkOWA-conv-9"
+    assert args.get("markAs") == "read"
+
+
+async def test_d070_mark_folder_read_warns_on_non_success(monkeypatch, caplog):
+    """VERIFY-EFFECT-NOT-CALLER: a non-success / empty / malformed OWA response is
+    logged at WARNING — never silently assumed successful."""
+    async def fake_read_tool_fail(name, arguments):
+        return {"success": False, "error": "OWA did not flip"}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool_fail)
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        await email_mod._mark_folder_read("AAQkOWA-conv-bad", "Re: Topic")
+    assert any("AAQkOWA-conv-bad" in r.getMessage() for r in caplog.records), \
+        "a non-success OWA mark-read must log a WARNING naming the conversation"
+
+
+async def test_d070_mark_folder_read_is_non_fatal(monkeypatch, caplog):
+    """An OWA outage (call_read_tool raises) must be swallowed + logged, never raised."""
+    async def fake_read_tool_raise(name, arguments):
+        raise RuntimeError("OWA session dead")
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool_raise)
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        # Must NOT raise.
+        await email_mod._mark_folder_read("AAQkOWA-conv-x", "Re: Topic")
+    assert any("AAQkOWA-conv-x" in r.getMessage() for r in caplog.records)
+
+
+async def test_d070_approve_folder_item_marks_owa_read(client, email_file, monkeypatch):
+    """Approving a FOLDER item marks the original read via the OWA email_read+markAs
+    path — NOT the Graph mark_email_read path (which silently fails for an OWA id)."""
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+
+    async def fake_owa_write(name, arguments):
+        return {"success": True, "content": {"draftId": "D1"}}
+    monkeypatch.setattr(email_mod, "_call_owa_write_tool", fake_owa_write)
+
+    _seed(email_file, [_make_item(
+        "f1", status="needs-review", draft="final reply", sourceFolder="Team Updates",
+        senderEmail="sender@example.com", conversationId="AAQkOWA-conv-1",
+        messageId="AAQkOWA-conv-1", subject="Re: Sprint",
+        toRecipients=[{"name": "Bob", "email": "bob@example.com"}], ccRecipients=[])])
+
+    resp = await client.post("/api/email/queue/f1/approve", json={})
+    assert resp.status == 200
+    assert graph_calls == []
+    assert folder_calls == [("AAQkOWA-conv-1", "Re: Sprint")]
+
+
+async def test_d070_dismiss_folder_item_marks_owa_read(client, email_file, monkeypatch):
+    """Dismissing a FOLDER item routes mark-read through the OWA folder path."""
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    _seed(email_file, [_make_item(
+        "f1", sourceFolder="Team Updates", conversationId="AAQkOWA-conv-2",
+        messageId="AAQkOWA-conv-2", subject="Re: Standup")])
+
+    resp = await client.delete("/api/email/queue/f1", json={})
+    assert resp.status == 200
+    assert graph_calls == []
+    assert folder_calls == [("AAQkOWA-conv-2", "Re: Standup")]
+
+
+async def test_d070_dismiss_inbox_item_still_marks_graph(client, email_file, monkeypatch):
+    """An INBOX item's dismiss still routes through the Graph mark-read path (no
+    regression)."""
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    _seed(email_file, [_make_item(
+        "ib1", messageId="AAMkINBOX-1", conversationId="AAMkINBOX-1", subject="Re: Hi")])
+
+    resp = await client.delete("/api/email/queue/ib1", json={})
+    assert resp.status == 200
+    assert folder_calls == []
+    assert graph_calls == [{"AAMkINBOX-1": "Re: Hi"}]
+
+
+async def test_d070_folder_mark_read_failure_does_not_break_dismiss(
+        client, email_file, monkeypatch):
+    """A folder mark-read failure (OWA outage) is swallowed: the dismiss that already
+    persisted still returns 200 (never a 409/500)."""
+    # Run the REAL dispatcher + REAL _mark_folder_read (un-stub the inert default),
+    # but make the underlying OWA call_read_tool raise to simulate an outage.
+    spawned = []
+
+    def capture_spawn(cid, subject):
+        # Delegate to the real fire-and-forget so _mark_folder_read actually runs.
+        task = __import__("asyncio").ensure_future(email_mod._mark_folder_read(cid, subject))
+        spawned.append(task)
+    monkeypatch.setattr(email_mod, "_spawn_mark_folder_read", capture_spawn)
+
+    async def fake_read_tool_raise(name, arguments):
+        raise RuntimeError("OWA session dead")
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool_raise)
+
+    _seed(email_file, [_make_item(
+        "f1", sourceFolder="Team Updates", conversationId="AAQkOWA-conv-3",
+        messageId="AAQkOWA-conv-3", subject="Re: Late")])
+
+    resp = await client.delete("/api/email/queue/f1", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "dismissed"
+    # Drain the background mark-read task so it does not leak across tests; it must
+    # have swallowed the OWA error (never raised into the dismiss).
+    import asyncio as _asyncio
+    if spawned:
+        await _asyncio.gather(*spawned)  # would re-raise if _mark_folder_read leaked
+
+
+async def test_d070_mute_folder_item_does_not_mark_read(client, email_file, monkeypatch):
+    """Mute on a FOLDER item must NOT mark read (mute and dismiss are distinct signals)."""
+    graph_calls, folder_calls = _capture_dispatch(monkeypatch)
+    _seed(email_file, [_make_item(
+        "f1", sourceFolder="Team Updates", conversationId="AAQkOWA-conv-4",
+        messageId="AAQkOWA-conv-4", subject="Re: Noise")])
+
+    resp = await client.post("/api/email/queue/f1/mute", json={})
+    assert resp.status == 200
+    assert graph_calls == [] and folder_calls == []
+
+
+async def test_d070_scan_path_email_read_calls_carry_no_markas(email_file, monkeypatch):
+    """LOAD-BEARING never-mark-read invariant: every scan/backfill email_read call must
+    issue {conversationId, format} WITHOUT any markAs key. markAs:'read' lives ONLY in
+    the approve/dismiss side-effect (_mark_folder_read), never the scan path.
+
+    Drives the REAL _scan_once against a stubbed call_read_tool that records every
+    email_read invocation, then asserts NONE carry a markAs argument (a behavior-based
+    proof, not a fragile source grep — the comments in _scan_once mention 'markAs')."""
+    _seed(email_file, [])
+    read_calls = []
+
+    async def fake_read_tool(name, arguments):
+        read_calls.append((name, dict(arguments)))
+        if name == "get_emails":
+            return {"emails": []}
+        if name == "email_list_folders":
+            return {"folders": [{"name": "Inbox", "children": [
+                {"name": "Team Updates", "id": "FOLDER-1", "unreadCount": 1}]}]}
+        if name == "email_folders":
+            return {"emails": [
+                {"conversationId": "AAQkOWA-scan-1", "topic": "Sprint",
+                 "unreadCount": 1, "lastDeliveryTime": "2026-06-02T10:00:00Z"}]}
+        if name == "email_read":
+            return {"emails": [{"itemId": "AAQkOWA-scan-1", "subject": "Sprint",
+                                "from": {"name": "A", "email": "a@x.com"},
+                                "body": "<p>hi</p>"}]}
+        return {}
+
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+    # Ensure the subfolder allowlist admits our folder name.
+    monkeypatch.setattr(email_mod, "EMAIL_SCAN_SUBFOLDERS",
+                        frozenset({"Team Updates"}))
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    await email_mod._scan_once({"ws_manager": _WS()})
+
+    email_read_calls = [args for (name, args) in read_calls if name == "email_read"]
+    assert email_read_calls, "the folder candidate should have triggered an email_read"
+    for args in email_read_calls:
+        assert "markAs" not in args, \
+            f"scan-path email_read must NOT carry markAs (never-mark-read): {args}"

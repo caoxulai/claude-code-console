@@ -5000,6 +5000,111 @@ def _mark_read_map_for(item: dict) -> dict:
     return {msg_id: (str(subject) if subject else None)}
 
 
+async def _mark_folder_read(conversation_id: str, subject: str | None) -> None:
+    """Mark ONE folder (OWA) conversation read in Outlook via email_read+markAs.
+
+    Folder items (D-058) carry an OWA CONVERSATION id (not a Graph message id), so
+    the Graph mark_email_read path can't flip them (it returns success:false and the
+    original stays unread -- the whole D-070 bug). The OWA backend instead exposes
+    ``email_read`` with a ``markAs`` parameter: ``markAs:'read'`` fires the OWA
+    ApplyConversationAction/SetReadState that flips the conversation's read state
+    (see the load-bearing comment at the folder body-prefetch).
+
+    SEAM CHOICE: this goes through ``call_read_tool('email_read', ...)`` -- email_read
+    is ALREADY in _EMAIL_READ_ONLY_TOOLS, so we add NO new tool to the allowlist and
+    NEVER weaken the send boundary (send/reply/forward stay refused by name). The
+    markAs:'read' key lives ONLY here, never in any scan/prefetch/backfill email_read
+    call site (the load-bearing never-mark-read invariant), so the read client can
+    neither send nor accidentally mark the mailbox read while triaging.
+
+    VERIFY EFFECT, NOT CALLER (mirrors _mark_messages_read): we INSPECT the response
+    -- a non-success flag, or an empty/malformed/no-message payload, is treated as a
+    failure and logged at WARNING; we never claim a read that did not happen. NON-
+    FATAL: a failure (OWA outage included) is swallowed so it can never break the
+    approve/dismiss the caller already persisted.
+    """
+    conv_id = str(conversation_id or "").strip()
+    if not conv_id:
+        return
+    try:
+        result = await call_read_tool(
+            "email_read", {"conversationId": conv_id, "markAs": "read"}
+        )
+    except Exception as e:  # noqa: BLE001 -- never fail the approve/dismiss
+        logger.warning(
+            "folder mark-read failed for conversation %s: %s",
+            _scrub(conv_id), _scrub(str(e)),
+        )
+        return
+
+    # Inspect the actual response: a {success:false} OR an empty/missing message list
+    # means the read did NOT flip. Surface it at WARNING (never assume success).
+    if not _owa_mark_read_succeeded(result):
+        logger.warning(
+            "folder mark-read did NOT flip is_read for conversation %s (response: %s)",
+            _scrub(conv_id), _scrub(_one_line(str(result), 200)),
+        )
+
+
+def _owa_mark_read_succeeded(result: object) -> bool:
+    """True iff an OWA email_read+markAs response confirms the read flipped.
+
+    Accepts the response only when it is a dict that either carries an explicit
+    truthy ``success`` flag OR a non-empty message list (emails/messages/items) --
+    the populated conversation the SetReadState acted on. An error dict, an empty
+    payload, or a non-dict is a FAILURE (verify-effect-not-caller).
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("success") is False or result.get("error"):
+        return False
+    if result.get("success") is True:
+        return True
+    for key in ("emails", "messages", "items"):
+        val = result.get(key)
+        if isinstance(val, list) and val:
+            return True
+    return False
+
+
+def _spawn_mark_folder_read(conversation_id: str, subject: str | None) -> None:
+    """Fire-and-forget the OWA folder mark-read (mirrors _spawn_mark_read).
+
+    Background task AFTER the durable write so the approve/dismiss response is not
+    delayed; holds a strong ref so the loop does not GC it mid-flight; errors are
+    inspected + logged inside _mark_folder_read (never re-raised). RuntimeError-
+    guarded for a no-running-loop (sync test) context, exactly like _spawn_mark_read.
+    """
+    if not str(conversation_id or "").strip():
+        return
+    try:
+        task = asyncio.ensure_future(_mark_folder_read(conversation_id, subject))
+        _MARK_READ_TASKS.add(task)
+        task.add_done_callback(_MARK_READ_TASKS.discard)
+    except RuntimeError:
+        logger.debug("folder mark-read skipped: no running loop")
+
+
+def _spawn_mark_read_for_item(item: dict) -> None:
+    """Route the approve/dismiss mark-read by the item's SOURCE (D-070).
+
+    A FOLDER item (``sourceFolder`` set and != 'Inbox' -- the SAME discriminator the
+    scan/backfill path uses, NOT id-format sniffing) carries an OWA conversation id
+    the Graph mark_email_read can't flip, so it is marked read via the OWA primitive
+    (email_read+markAs:'read') using its conversationId DIRECTLY -- never via the
+    Graph {message_id: subject} map, which reproduces the bug. An INBOX item (Graph
+    message id) keeps the EXISTING Graph mark_email_read path unchanged.
+    """
+    if not isinstance(item, dict):
+        return
+    source_folder = item.get("sourceFolder")
+    is_folder_item = bool(source_folder) and source_folder != "Inbox"
+    if is_folder_item:
+        _spawn_mark_folder_read(item.get("conversationId"), item.get("subject"))
+    else:
+        _spawn_mark_read(_mark_read_map_for(item))
+
+
 async def dismiss_item(request: web.Request) -> web.Response:
     """DELETE /api/email/queue/{item_id} -- soft-dismiss (preserve item).
 
@@ -5017,7 +5122,6 @@ async def dismiss_item(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
 
     item["status"] = "dismissed"
-    mark_read_map = _mark_read_map_for(item)
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -5028,11 +5132,13 @@ async def dismiss_item(request: web.Request) -> web.Response:
             status=409,
         )
 
-    # Dismiss persisted -> mark the message read in Outlook (best-effort,
+    # Dismiss persisted -> mark the original read in Outlook (best-effort,
     # background). Only after the durable write, so a 409'd dismiss never marks
-    # read. Approve/mute deliberately do NOT mark read -- dismiss is the one
-    # "I've consciously processed this" signal.
-    _spawn_mark_read(mark_read_map)
+    # read. SOURCE-AWARE (D-070): a folder (OWA) item goes through email_read+markAs
+    # while an inbox (Graph) item keeps the mark_email_read path. Approve/mute
+    # deliberately differ -- mute does NOT mark read; dismiss is the one "I've
+    # consciously processed this" signal.
+    _spawn_mark_read_for_item(item)
 
     ws = request.app["ws_manager"]
     await ws.broadcast("email_changed", {"id": item_id, "dismissed": True})
@@ -5428,7 +5534,11 @@ async def approve_item(request: web.Request) -> web.Response:
                     status=409,
                 )
 
-    _spawn_mark_read(_mark_read_map_for(item))
+    # Approve persisted -> mark the original read in Outlook (best-effort,
+    # background, AFTER the durable write so a 409'd approve never marks read).
+    # SOURCE-AWARE (D-070): folder (OWA) items route through email_read+markAs,
+    # inbox (Graph) items keep the mark_email_read path.
+    _spawn_mark_read_for_item(item)
 
     ws = request.app["ws_manager"]
     await ws.broadcast("email_changed", {"id": item_id, "approved": True})
