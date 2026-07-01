@@ -7577,21 +7577,33 @@ def test_slack_dm_candidates_distinguish_group_and_dm(reset_scan_ts):
 
 
 def test_slack_mention_candidates_from_unreads():
-    """_mention_candidates pulls ONLY channels where the user is @mentioned,
-    channelType 'mention', channelId verbatim."""
+    """_mention_candidates correctly processes all list-valued sections.
+
+    From the "mentions" section: channels without a @self-mention are excluded;
+    channels with a @self-mention are included as 'mention' type.
+    From the "dms" section: DMs are included regardless of mention (they don't
+    require a self-mention — all DM messages are candidates).
+    """
     payload = {"mentions": [
         {"channelId": "C_mention", "channel": "#proj",
          "messages": [{"user": "carol", "text": "hey <@W0187CHBRU0> ping", "ts": "1718.5"}]},
         {"channelId": "C_nomention", "channel": "#other",
          "messages": [{"user": "dave", "text": "random chat", "ts": "1718.6"}]},
-    ], "dms": [{"channelId": "D_ignored"}]}
+    ], "dms": [{"channelId": "D_also_included", "name": "bob",
+                "messages": [{"user": "bob", "text": "hey", "ts": "1718.7"}]}]}
     cands = slack_mod._mention_candidates(payload)
-    assert len(cands) == 1
-    m = cands[0]
-    assert m["channelId"] == "C_mention"
+    by_id = {c["channelId"]: c for c in cands}
+    # The @mention channel is included.
+    assert "C_mention" in by_id
+    m = by_id["C_mention"]
     assert m["channelType"] == "mention"
     assert m["sender"] == "carol"
     assert "ping" in m["snippet"]
+    # The non-@mention channel in "mentions" section is excluded (no self-mention).
+    assert "C_nomention" not in by_id
+    # The DM in the "dms" section IS now included (previously it was silently dropped).
+    assert "D_also_included" in by_id
+    assert by_id["D_also_included"]["channelType"] == "dm"
 
 
 def test_slack_merge_appends_skeletons_for_new_channels():
@@ -9743,6 +9755,100 @@ async def test_slack_scan_prunes_stale_muted_entries(
     assert "D_fresh" in saved["mutedThreads"]        # still live
 
 
+async def test_slack_scan_auto_dismisses_items_read_in_slack(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """Auto-dismiss: items whose channel is no longer unread in Slack get their
+    status flipped to 'dismissed', preserving ALL other fields. Items whose channel
+    IS still unread retain their active status unchanged.
+
+    The auto-dismiss reads from the RAW get_unreads+list_dms payloads (the complete
+    set of channels Slack considers unread), NOT from the filtered candidates (which
+    have bot/self/timestamp-window filtering that would incorrectly auto-dismiss
+    channels that are still unread but filtered out of the candidate set).
+    """
+    now_s = _time.time()
+    now_ms = int(now_s * 1000)
+
+    # Seed: 3 items across 2 channels.
+    # Items a,b are in C_read (which will NOT appear in the scan payload = read).
+    # Item c is in C_still_unread (which WILL appear in the scan payload = still unread).
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {
+            "id": "a", "channelId": "C_read", "channelType": "dm",
+            "status": "needs-review", "draft": "my draft", "sender": "alice",
+            "snippet": "hello", "ts": now_ms - 5000,
+        },
+        {
+            "id": "b", "channelId": "C_read", "channelType": "dm",
+            "status": "edited", "draft": "edited text", "generatedDraft": "gen",
+            "sender": "alice", "snippet": "world", "ts": now_ms - 4000,
+        },
+        {
+            "id": "c", "channelId": "C_still_unread", "channelType": "dm",
+            "status": "needs-review", "draft": "draft", "sender": "bob",
+            "snippet": "hey", "ts": now_ms - 3000,
+        },
+    ]}), encoding="utf-8")
+
+    recent_ts = f"{now_s - 1:.6f}"
+
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            # Only C_still_unread is unread — C_read is ABSENT (user read it in Slack).
+            return {"channels": [
+                {"channelId": "C_still_unread", "name": "x",
+                 "messages": [{"user": "bob", "text": "hi", "ts": recent_ts}]},
+            ]}
+        if name == "list_dms":
+            # list_dms also reports only C_still_unread as having recent activity.
+            return {"dms": [
+                {"channelId": "C_still_unread", "lastActivity": now_ms - 500},
+            ]}
+        if name == "get_messages":
+            # For the list_dms verification path: a valid message from a non-bot,
+            # non-self sender so the DM candidate is admitted.
+            return {"messages": [
+                {"user": "bob", "text": "hi there", "ts": recent_ts},
+            ]}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))
+    items = {it["id"]: it for it in saved["items"]}
+
+    # Items a and b: C_read is no longer unread -> auto-dismissed.
+    assert items["a"]["status"] == "dismissed"
+    assert items["b"]["status"] == "dismissed"
+
+    # Item c: C_still_unread IS still unread -> retains active status.
+    assert items["c"]["status"] == "needs-review"
+
+    # Dismissed items PRESERVE all fields (soft-dismiss, never hard-delete).
+    assert items["a"]["draft"] == "my draft"
+    assert items["a"]["sender"] == "alice"
+    assert items["a"]["channelId"] == "C_read"
+    assert items["a"]["snippet"] == "hello"
+    assert items["b"]["draft"] == "edited text"
+    assert items["b"]["generatedDraft"] == "gen"
+    assert items["b"]["channelId"] == "C_read"
+    assert items["b"]["channelType"] == "dm"
+
+
 # --- filestore async wrappers (B10) -----------------------------------------
 # async_read_json/async_write_json wrap the sync API in asyncio.to_thread so
 # request-path handlers don't block the loop. They MUST behave identically to
@@ -10381,3 +10487,90 @@ def test_slack_mention_candidates_uses_newest_message():
     # Verify it's classified as a DM (not mention).
     assert c["channelType"] == "dm"
     assert c["channelId"] == "D_regression_dm"
+
+
+def test_slack_mention_candidates_picks_up_group_dm_in_dms_section():
+    """_mention_candidates must process group DMs returned under any section key.
+
+    The Slack MCP may return group DMs under "dms" (not "channels"/"mentions").
+    The old code only checked a fixed list of keys and silently dropped anything
+    under "dms", causing new messages in group DMs to be missed. This regression
+    guard verifies that a group DM in the "dms" section is picked up correctly.
+    """
+    payload = {
+        "channels": [
+            {"channelId": "D_onetoone", "name": "alice",
+             "messages": [{"user": "alice", "text": "hi", "ts": "1700000100.000000"}]},
+        ],
+        "dms": [
+            {"channelId": "C0BD9SD2JBD", "name": "mpdm-siranjii--xulaicao--albalt-1",
+             "messages": [{"user": "tanqli", "text": "new group message", "ts": "1700000200.000000"}]},
+        ],
+    }
+    cands = slack_mod._mention_candidates(payload)
+    by_id = {c["channelId"]: c for c in cands}
+
+    # Both the 1:1 DM and the group DM must be detected.
+    assert "D_onetoone" in by_id, "1:1 DM in 'channels' section should be detected"
+    assert "C0BD9SD2JBD" in by_id, "group DM in 'dms' section was not detected (regression)"
+
+    grp = by_id["C0BD9SD2JBD"]
+    assert grp["channelType"] == "group_dm"
+    assert "new group message" in grp["snippet"]
+    assert grp["ts"] == 1700000200000
+
+
+async def test_slack_scan_does_not_dismiss_items_for_old_dms_outside_window(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """Auto-dismiss must use _unread_channel_ids (raw payload), NOT seen_ids (the
+    filtered candidates set).
+
+    Scenario: D_old is a channel whose message has a BOT sender ('slackbot').
+    - get_unreads includes D_old (Slack still considers it unread).
+    - _is_bot_sender removes it from candidates, so seen_ids does NOT include D_old.
+    - list_dms returns empty (D_old fell outside the time window).
+
+    The correct implementation extracts D_old from the RAW get_unreads payload via
+    _unread_channel_ids, so unread_ids INCLUDES D_old and the item is preserved.
+
+    WRONG-MODEL: if the implementation used seen_ids (which excludes D_old because
+    the bot-sender filter removed it from candidates), the auto-dismiss condition
+    (channelId not in seen_ids) would be True and the item would be incorrectly
+    dismissed — this test would FAIL.
+    """
+    # Seed the sidecar with a needs-review item for D_old, ts far in the past.
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "old_dm_item",
+        "channelId": "D_old",
+        "channelType": "dm",
+        "status": "needs-review",
+        "draft": "hi back",
+        "generatedDraft": "hi back",
+        "snippet": "hello from bot",
+        "ts": 1600000000000,  # far in the past
+    }]}), encoding="utf-8")
+
+    # get_unreads returns D_old with a bot sender — the bot-sender filter removes
+    # it from candidates (so seen_ids won't contain it), but _unread_channel_ids
+    # extracts it from the RAW payload (so unread_ids WILL contain it).
+    unreads = {"channels": [
+        {"channelId": "D_old", "name": "slackbot",
+         "messages": [{"user": "slackbot", "text": "reminder", "ts": "1600000001.000000"}]},
+    ]}
+
+    # list_dms returns empty — D_old fell outside the time window, so it would NOT
+    # appear in seen_ids via the dm_candidates path either.
+    # _run_one_scan_cycle already returns {"dms": []} for list_dms by default.
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    # Assert: item D_old is NOT auto-dismissed (still needs-review).
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    item = next(it for it in saved if it["id"] == "old_dm_item")
+    assert item["status"] == "needs-review", (
+        f"Item should remain 'needs-review' because D_old is still unread in the raw "
+        f"get_unreads payload; got status={item['status']!r}. "
+        f"If dismissed, the implementation incorrectly used seen_ids (filtered "
+        f"candidates) instead of _unread_channel_ids (raw payload)."
+    )

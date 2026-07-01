@@ -2762,14 +2762,32 @@ def _mention_candidates(unreads_payload) -> list[dict]:
     UI renders them correctly.
     """
     norm = _normalize_datamarks(unreads_payload)
-    section = None
+    # Collect channel entries from ALL list-valued sections of the get_unreads
+    # payload. The Slack MCP server may return group DMs under "dms", regular
+    # channels/mentions under "channels" or "mentions", etc. — and the key varies
+    # across server versions. Checking only a fixed list of keys silently drops any
+    # section whose key is not in the list (confirmed root cause: group DMs returned
+    # under "dms" were never processed). Deduplication by channelId below ensures a
+    # channel appearing in multiple sections is added only once.
+    section: list = []
+    seen_section_ids: set[str] = set()
     if isinstance(norm, dict):
-        for key in ("mentions", "channels", "channelMentions", "mention_channels"):
-            if isinstance(norm.get(key), list):
-                section = norm[key]
-                break
-    if section is None:
-        section = []
+        for val in norm.values():
+            if isinstance(val, list):
+                for entry in val:
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+                    if cid and cid not in seen_section_ids:
+                        seen_section_ids.add(cid)
+                        section.append(entry)
+    elif isinstance(norm, list):
+        for entry in norm:
+            if isinstance(entry, dict):
+                cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+                if cid and cid not in seen_section_ids:
+                    seen_section_ids.add(cid)
+                    section.append(entry)
 
     out: list[dict] = []
     for raw in section:
@@ -2834,6 +2852,52 @@ def _mention_candidates(unreads_payload) -> list[dict]:
             "ts": _as_int_ms(ts_raw),
         })
     return out
+
+
+def _unread_channel_ids(unreads_payload, dms_payload) -> set:
+    """Return the authoritative set of channel IDs Slack currently considers unread.
+
+    This combines ALL channels from the raw get_unreads payload (every list-valued
+    section, same iteration pattern as _mention_candidates) with ALL channels from
+    the raw list_dms payload (without the timestamp-window cutoff that _dm_candidates
+    applies).  The result is the COMPLETE set of channels Slack reports as having
+    unread messages — used by the auto-dismiss logic to detect items whose channel
+    is no longer unread.
+
+    IMPORTANT: this reads from the RAW payloads, NOT from the filtered candidates
+    list.  The candidates list has bot/self-sender filtering and timestamp-window
+    filtering applied, so using it would incorrectly auto-dismiss channels that are
+    still unread but filtered (e.g. bot channels, old-but-still-unread DMs).
+    """
+    ids: set = set()
+
+    # --- get_unreads payload: normalize datamarks, iterate all list-valued sections ---
+    norm = _normalize_datamarks(unreads_payload)
+    if isinstance(norm, dict):
+        for val in norm.values():
+            if isinstance(val, list):
+                for entry in val:
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+                    if cid:
+                        ids.add(cid)
+    elif isinstance(norm, list):
+        for entry in norm:
+            if isinstance(entry, dict):
+                cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+                if cid:
+                    ids.add(cid)
+
+    # --- list_dms payload: unwrap without the timestamp-window cutoff ---
+    for entry in _unwrap_list(dms_payload, "dms", "conversations", "ims", "items"):
+        if not isinstance(entry, dict):
+            continue
+        cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+        if cid:
+            ids.add(cid)
+
+    return ids
 
 
 def _skeleton_for(cand: dict) -> dict:
@@ -3196,6 +3260,15 @@ async def _scan_once(app) -> None:
             histories[cid] = await _fetch_history_for(cid)
 
     changed = _merge_scan_candidates(data["items"], candidates)
+
+    # Auto-dismiss: items whose channel is no longer unread in Slack (AC-1).
+    unread_ids = _unread_channel_ids(unreads_payload, dms_payload)
+    for item in data["items"]:
+        if (item.get("status") in _SCAN_ACTIVE_STATUSES
+                and item.get("channelId")
+                and item["channelId"] not in unread_ids):
+            item["status"] = "dismissed"
+            changed = True
 
     # Attach pre-fetched history to newly-appended skeletons. Freshly-scanned
     # skeletons land in 'needs-classify' now (D-025), so key the attach on that
