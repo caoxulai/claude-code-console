@@ -469,7 +469,7 @@ _SCAN_WINDOW_MS = 24 * 60 * 60 * 1000  # 24h on first scan (no prior ts); catche
 _SCAN_OVERLAP_MS = 60 * 1000
 
 # How many DMs/group DMs list_dms is asked to return per scan.
-_SCAN_LIST_DMS_LIMIT = 30
+_SCAN_LIST_DMS_LIMIT = 200
 
 # ── Thread muting (D-025) ─────────────────────────────────────────────────────
 # A muted thread's scan candidates are dropped before the merge. Each mutedThreads
@@ -604,6 +604,7 @@ _SLACK_READ_ONLY_TOOLS = frozenset({
     "lookup_user",
     "get_messages",
     "get_thread",
+    "get_conversation_details",
     "search",
     "batch_get_messages",
     "batch_get_threads",
@@ -3220,13 +3221,86 @@ async def _scan_once(app) -> None:
         candidates.append(dc)
         seen_ids.add(cid)
 
+    # --- Org-shared DM peek (D-073) -------------------------------------------
+    # Org-shared enterprise-grid 1:1 DMs are invisible to get_unreads and have a
+    # frozen lastActivity in list_dms (equal to the channel creation time), so
+    # _dm_candidates drops them via the timestamp-window cutoff. For each 1:1 DM
+    # in the RAW list_dms payload that wasn't already surfaced, peek via
+    # get_conversation_details to check unread state. Load data early to skip
+    # DMs that already have an active queue item.
+    data, current_etag = _load()
+    active_ids = {
+        str(it.get("channelId", ""))
+        for it in data["items"]
+        if it.get("status") in _SCAN_ACTIVE_STATUSES
+    }
+    for entry in _unwrap_list(dms_payload, "dms", "conversations", "ims", "items"):
+        if not isinstance(entry, dict):
+            continue
+        cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+        if not cid or not cid.startswith("D"):
+            continue
+        # Skip group DMs (only 1:1 DMs).
+        if entry.get("isGroup") or entry.get("is_mpim") or entry.get("isMpdm"):
+            continue
+        # Skip if already surfaced by get_unreads or the existing list_dms peek.
+        if cid in seen_ids:
+            continue
+        # Skip if already represented by an active queue item.
+        if cid in active_ids:
+            continue
+        # Bot check BEFORE the get_conversation_details call (saves I/O).
+        name = str(entry.get("name") or entry.get("username") or "")
+        if _is_bot_sender(name):
+            continue
+        try:
+            details = await _scan_read("get_conversation_details", {"channelId": cid})
+        except Exception:  # noqa: BLE001 — skip unreadable DMs, never fail the scan
+            continue
+        if not isinstance(details, dict):
+            continue
+        im = details.get("im") or {}
+        if not isinstance(im, dict):
+            continue
+        # Determine unread: unread_count > 0 OR latest > last_read.
+        unread_count = im.get("unread_count", 0)
+        latest_ts = str(im.get("latest") or "")
+        last_read = str(im.get("last_read") or "")
+        is_unread = (
+            (isinstance(unread_count, int) and unread_count > 0)
+            or (latest_ts and last_read and latest_ts > last_read)
+        )
+        if not is_unread:
+            continue
+        # Use the real latest ts (NOT the frozen lastActivity).
+        if not latest_ts:
+            continue
+        latest_ms = int(float(latest_ts) * 1000)
+        # Determine sender.
+        sender = name or str(im.get("user") or entry.get("userId") or entry.get("user") or "")
+        # Self-sender check.
+        if _MY_USERNAME and sender.lower() == _MY_USERNAME:
+            continue
+        # Belt-and-suspenders bot check on the resolved name.
+        if _is_bot_sender(sender):
+            continue
+        user_id = str(im.get("user") or entry.get("userId") or entry.get("user") or "")
+        candidates.append({
+            "channelId": cid,
+            "userId": user_id,
+            "channelType": "dm",
+            "sender": _scrub(sender)[:_SNIPPET_CAP],
+            "channel": _scrub(f"DM with {sender}" if sender else cid)[:_SNIPPET_CAP],
+            "snippet": "",
+            "ts": latest_ms,
+        })
+        seen_ids.add(cid)
+
     # Filter out bot senders that never need replies.
     candidates = [c for c in candidates if not _is_bot_sender(c.get("sender", ""))]
 
     # Filter out conversations where we are the last sender — nothing to reply to.
     candidates = [c for c in candidates if not _MY_USERNAME or c.get("sender", "").lower() != _MY_USERNAME]
-
-    data, current_etag = _load()
 
     # Thread muting (D-025): prune entries older than the 30-day TTL on EVERY scan
     # cycle (persisted in the same write below), then drop any candidate whose mute

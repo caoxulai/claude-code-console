@@ -10574,3 +10574,260 @@ async def test_slack_scan_does_not_dismiss_items_for_old_dms_outside_window(
         f"If dismissed, the implementation incorrectly used seen_ids (filtered "
         f"candidates) instead of _unread_channel_ids (raw payload)."
     )
+
+
+# --- Org-shared enterprise-grid DM detection (D-073) -------------------------
+
+
+async def test_slack_scan_detects_org_shared_dm_missed_by_get_unreads(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """An org-shared 1:1 DM that get_unreads omits and list_dms reports with a
+    frozen (creation-time) lastActivity is detected via get_conversation_details
+    and produces a needs-classify skeleton with the correct sender and ts derived
+    from the real latest message (NOT the frozen lastActivity).
+    """
+    now_s = _time.time()
+    now_ms = int(now_s * 1000)
+    frozen_activity = now_ms - 30 * 24 * 60 * 60 * 1000  # 30 days ago (frozen)
+    real_latest_ts = f"{now_s - 5:.6f}"  # 5 seconds ago
+    real_latest_ms = int(float(real_latest_ts) * 1000)
+
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            # get_unreads OMITS the org-shared DM entirely.
+            return {"channels": []}
+        if name == "list_dms":
+            # list_dms returns the org-shared DM with a FROZEN lastActivity.
+            return {"dms": [
+                {"channelId": "D_orgshared", "name": "yxiaol",
+                 "lastActivity": frozen_activity, "userId": "U_yxiaol",
+                 "isGroup": False},
+            ]}
+        if name == "get_messages":
+            return {"messages": []}
+        if name == "get_conversation_details":
+            assert arguments.get("channelId") == "D_orgshared"
+            return {"im": {
+                "id": "D_orgshared",
+                "unread_count": 3,
+                "last_read": "1719000000.000000",
+                "latest": real_latest_ts,
+                "user": "U_yxiaol",
+            }}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 1, f"Expected 1 skeleton, got {len(saved)}: {saved}"
+    item = saved[0]
+    assert item["channelId"] == "D_orgshared"
+    assert item["status"] == "needs-classify"
+    assert item["sender"] == "yxiaol"
+    # ts must be from the REAL latest message, NOT the frozen lastActivity.
+    assert item["ts"] == real_latest_ms
+    assert item["ts"] != frozen_activity
+
+
+async def test_slack_scan_org_shared_dm_not_auto_dismissed(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """An existing active queue item for an org-shared DM is NOT auto-dismissed
+    while the DM is still unread. The raised list_dms limit ensures the DM's
+    channelId is in the unread_ids set (computed from the raw list_dms payload).
+    """
+    now_s = _time.time()
+    now_ms = int(now_s * 1000)
+    frozen_activity = now_ms - 30 * 24 * 60 * 60 * 1000
+    real_latest_ts = f"{now_s - 5:.6f}"
+
+    # Seed: existing needs-review item for the org-shared DM.
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "org_item",
+        "channelId": "D_orgshared",
+        "channelType": "dm",
+        "status": "needs-review",
+        "draft": "hello",
+        "generatedDraft": "hello",
+        "sender": "yxiaol",
+        "snippet": "hi there",
+        "ts": now_ms - 60000,
+    }]}), encoding="utf-8")
+
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            # get_unreads OMITS the org-shared DM.
+            return {"channels": []}
+        if name == "list_dms":
+            # list_dms reports it (within the raised 200 limit) with frozen lastActivity.
+            return {"dms": [
+                {"channelId": "D_orgshared", "name": "yxiaol",
+                 "lastActivity": frozen_activity, "userId": "U_yxiaol",
+                 "isGroup": False},
+            ]}
+        if name == "get_messages":
+            return {"messages": []}
+        if name == "get_conversation_details":
+            return {"im": {
+                "id": "D_orgshared",
+                "unread_count": 2,
+                "last_read": "1719000000.000000",
+                "latest": real_latest_ts,
+                "user": "U_yxiaol",
+            }}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    item = next(it for it in saved if it["id"] == "org_item")
+    # MUST NOT be auto-dismissed — the DM's channelId is in the list_dms payload
+    # which feeds _unread_channel_ids.
+    assert item["status"] == "needs-review", (
+        f"Org-shared DM item should remain 'needs-review' (not auto-dismissed); "
+        f"got status={item['status']!r}. The raised list_dms limit must ensure "
+        f"the channelId is in the unread_ids set."
+    )
+
+
+async def test_slack_scan_skips_peek_for_already_read_dm(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """A 1:1 DM present in list_dms whose get_conversation_details shows
+    unread_count == 0 produces NO new skeleton.
+    """
+    now_s = _time.time()
+    now_ms = int(now_s * 1000)
+    frozen_activity = now_ms - 30 * 24 * 60 * 60 * 1000
+
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            return {"channels": []}
+        if name == "list_dms":
+            return {"dms": [
+                {"channelId": "D_read_dm", "name": "alice",
+                 "lastActivity": frozen_activity, "userId": "U_alice",
+                 "isGroup": False},
+            ]}
+        if name == "get_messages":
+            return {"messages": []}
+        if name == "get_conversation_details":
+            # DM is already read — unread_count == 0.
+            return {"im": {
+                "id": "D_read_dm",
+                "unread_count": 0,
+                "last_read": "1720000010.000000",
+                "latest": "1720000010.000000",
+                "user": "U_alice",
+            }}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 0, f"No skeleton expected for an already-read DM; got {saved}"
+
+
+async def test_slack_scan_does_not_peek_bot_dms(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """A bot DM (sender name in _BOT_SENDERS) is skipped BEFORE any
+    get_conversation_details call — we record all peek calls and assert
+    the bot channelId was never peeked.
+    """
+    now_s = _time.time()
+    now_ms = int(now_s * 1000)
+    frozen_activity = now_ms - 30 * 24 * 60 * 60 * 1000
+
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+    peeked_channels = []
+
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            return {"channels": []}
+        if name == "list_dms":
+            return {"dms": [
+                {"channelId": "D_botchan", "name": "slackbot",
+                 "lastActivity": frozen_activity, "userId": "U_bot",
+                 "isGroup": False},
+            ]}
+        if name == "get_messages":
+            return {"messages": []}
+        if name == "get_conversation_details":
+            peeked_channels.append(arguments.get("channelId"))
+            return {"im": {
+                "id": arguments.get("channelId"),
+                "unread_count": 5,
+                "last_read": "1719000000.000000",
+                "latest": f"{now_s - 1:.6f}",
+                "user": "U_bot",
+            }}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # Bot check must fire BEFORE get_conversation_details call.
+    assert "D_botchan" not in peeked_channels, (
+        f"get_conversation_details was called for bot DM D_botchan; "
+        f"the bot check should skip it BEFORE the peek call."
+    )
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    assert len(saved) == 0, f"No skeleton expected for bot DM; got {saved}"
