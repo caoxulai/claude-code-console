@@ -851,10 +851,46 @@ export default function SlackPage() {
       if (json && json.etag) setEtag(json.etag);
       setEditingId(null);
       refresh();
-    } catch {
-      delete _pendingSendStore[id];
-      setSendFailedIds(prev => new Map(prev).set(id, 'Network error — check connection'));
-      setError('Failed to send the reply.');
+    } catch (err) {
+      // Transient network errors (server restart, brief connectivity blip) are
+      // safe to retry because the backend's already-sent guard is idempotent.
+      let retried = false;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const { status, json: rJson } = await postApprove(id, text, baseline);
+          if (status >= 200 && status < 300) {
+            delete _pendingSendStore[id];
+            if (rJson && rJson.etag) setEtag(rJson.etag);
+            setEditingId(null);
+            refresh();
+            retried = true;
+            break;
+          }
+          if (status === 409) {
+            // Check if it was already sent by a prior attempt that landed.
+            try {
+              const r = await fetch('/api/slack/queue');
+              const fj = await r.json();
+              const list = Array.isArray(fj.items) ? fj.items : [];
+              setItems(list);
+              setEtag(fj.etag ?? null);
+              const fresh = list.find(it => it.id === id);
+              if (fresh && fresh.status === 'sent') {
+                delete _pendingSendStore[id];
+                setEditingId(null);
+                retried = true;
+                break;
+              }
+            } catch { /* fall through to next attempt */ }
+          }
+        } catch { /* still failing, try again */ }
+      }
+      if (!retried) {
+        delete _pendingSendStore[id];
+        setSendFailedIds(prev => new Map(prev).set(id, 'Network error — check connection'));
+        setError('Failed to send the reply.');
+      }
     } finally {
       setBusyId(null);
     }
