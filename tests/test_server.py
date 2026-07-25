@@ -5595,7 +5595,11 @@ async def test_slack_save_draft_marks_edited_and_round_trips(client, slack_file,
     assert saved["draft"] == "my own words"
 
 
-async def test_slack_save_draft_conflict_returns_409(client, slack_file):
+async def test_slack_save_draft_stale_client_etag_still_saves(client, slack_file):
+    """A STALE client etag no longer 409s the save (new contract): the server
+    guards the write with its OWN fresh re-read etag, so a background scan/draft
+    write that didn't touch THIS item can't discard the user's edit. The edit
+    must land and status flip to 'edited'."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
@@ -5603,9 +5607,33 @@ async def test_slack_save_draft_conflict_returns_409(client, slack_file):
         "generatedDraft": "d", "status": "needs-review", "ts": 1,
     }]}), encoding="utf-8")
     resp = await client.put("/api/slack/queue/i1", json={"draft": "x", "etag": "stale-etag"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["draft"] == "x"
+    assert body["item"]["status"] == "edited"
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["draft"] == "x"
+
+
+async def test_slack_save_draft_persistent_race_returns_409(client, slack_file, monkeypatch):
+    """Only a PERSISTENT race (every write attempt losing to a concurrent writer)
+    surfaces a 409 — the client keeps the user's text and can retry."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "d",
+        "generatedDraft": "d", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+
+    def always_conflict(path, data, expected_etag=None):
+        raise slack_mod.filestore.ConflictError(path, "expected", "actual")
+
+    monkeypatch.setattr(slack_mod.filestore, "write_json", always_conflict)
+    resp = await client.put("/api/slack/queue/i1", json={"draft": "x"})
     assert resp.status == 409
     body = await resp.json()
     assert body["error"] == "conflict"
+    assert "etag" in body
 
 
 async def test_slack_dismiss_sets_status_not_delete(client, slack_file):
@@ -5700,7 +5728,10 @@ async def test_slack_polish_returns_polished_text_without_touching_store(client,
     assert body["available"] is True
     assert body["draft"] == "my polished draft"
     # The seam was asked to POLISH the exact text we sent — never to read Slack.
-    assert agent.calls == [("polish", {"text": "my rough draft"})]
+    # threadContext/snippet ride along (context-aware polish) but default empty.
+    assert agent.calls == [
+        ("polish", {"text": "my rough draft", "threadContext": "", "snippet": ""})
+    ]
     # The store is untouched: no status flip, no draft overwrite, byte-identical.
     assert slack_file.read_text(encoding="utf-8") == before
 
@@ -6828,13 +6859,12 @@ def test_slack_polish_prompt_forbids_tools_translation_and_keeps_voice():
     user's text, requires preserving their voice and SAME language (no translation),
     and asks for the {draft} strict-JSON shape."""
     prompt = slack_mod._build_agent_prompt("polish", {"text": "MY_DRAFT_TEXT"})
-    assert "do NOT call any tools" in prompt
+    assert "Do NOT call any tools" in prompt
     assert "do NOT fetch anything" in prompt
     assert "do NOT send" in prompt
     # Preserve voice + language; never translate or change meaning.
     assert "do NOT translate" in prompt
-    assert "preserve MY" in prompt
-    assert "Do NOT change the meaning" in prompt
+    assert "preserve my intent" in prompt
     # The user's actual text is embedded and the return shape is enforced.
     assert "MY_DRAFT_TEXT" in prompt
     assert '"draft"' in prompt
@@ -10576,6 +10606,59 @@ async def test_slack_scan_does_not_dismiss_items_for_old_dms_outside_window(
     )
 
 
+async def test_slack_scan_does_not_dismiss_counts_only_channels(
+    client, slack_file, reset_scan_ts, monkeypatch
+):
+    """D-075 regression: a channel visible ONLY to get_unread_counts (invisible to
+    get_unreads AND list_dms — the exact gap the counts backfill exists for) must
+    NOT be auto-dismissed while Slack still reports it unread. Auto-dismiss truth
+    must include the counts payload, or every backfilled item dies on scan N+1."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "counts_only_item",
+        "channelId": "D_countsonly",
+        "channelType": "dm",
+        "status": "needs-review",
+        "draft": "hi back",
+        "generatedDraft": "hi back",
+        "snippet": "hello",
+        "ts": 1600000000000,
+    }]}), encoding="utf-8")
+
+    async def fake_scan_read(name, arguments):
+        if name == "get_unreads":
+            return {"channels": []}  # invisible here (enterprise grid)
+        if name == "list_dms":
+            return {"dms": []}       # and here
+        if name == "get_unread_counts":
+            return {"dms": [{"id": "D_countsonly", "name": "daria"}]}
+        if name == "get_messages":
+            return {"messages": []}  # peek finds nothing new to admit
+        if name == "get_conversation_details":
+            return {}
+        raise AssertionError(f"unexpected scan tool {name!r}")
+
+    monkeypatch.setattr(slack_mod, "_scan_read", fake_scan_read)
+    monkeypatch.setattr(slack_mod, "_probe_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(slack_mod, "SLACK_SCAN_INTERVAL_S", 0.01)
+    task = asyncio.create_task(slack_mod._scan_worker(client.app))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    item = next(it for it in saved if it["id"] == "counts_only_item")
+    assert item["status"] == "needs-review", (
+        f"Counts-only channel was auto-dismissed (status={item['status']!r}) — "
+        f"_unread_channel_ids must include the get_unread_counts payload."
+    )
+
+
 # --- Org-shared enterprise-grid DM detection (D-073) -------------------------
 
 
@@ -10610,7 +10693,8 @@ async def test_slack_scan_detects_org_shared_dm_missed_by_get_unreads(
         if name == "get_messages":
             return {"messages": []}
         if name == "get_conversation_details":
-            assert arguments.get("channelId") == "D_orgshared"
+            # The real slack-mcp tool's required parameter is 'channel'.
+            assert arguments.get("channel") == "D_orgshared"
             return {"im": {
                 "id": "D_orgshared",
                 "unread_count": 3,

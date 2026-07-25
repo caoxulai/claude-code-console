@@ -16,7 +16,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/slack-warmup-session.sh"
-[ -f "$SCRIPT" ] || { echo "FAIL: $SCRIPT not found"; exit 1; }
+# The subject script is internal-only (gitignored) — on a clean checkout it is
+# absent by design, so SKIP rather than fail.
+[ -f "$SCRIPT" ] || { echo "SKIP: $SCRIPT not present on this checkout (internal-only script)"; exit 0; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FiRefreshCw, FiSend, FiRotateCw, FiTrash2, FiSave, FiChevronDown, FiChevronRight,
   FiCheckCircle, FiAlertCircle, FiClock, FiXCircle, FiBellOff, FiPause, FiPlay,
@@ -84,6 +84,19 @@ function stripSlackXml(text) {
   });
 }
 
+// String-only variant for row cells / title attributes: Slack links become
+// their label (or bare URL) as plain text. stripSlackXml returns a JSX array
+// when links are present, which breaks truncate() (slices array ELEMENTS, not
+// chars) and coerces to garbage in a DOM title attribute.
+function stripSlackText(text) {
+  if (!text) return '';
+  return text.replace(/<slack-user-content[^>]*>([\s\S]*?)<\/slack-user-content>/g, '$1')
+    .replace(/\ue000/g, '')
+    .replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:\/\/[^>]+)>/g, '$1')
+    .trim();
+}
+
 // A compact word-level diff between the originally-generated draft and the
 // user's current edit. Returns an array of {value, type} tokens where type is
 // 'same' | 'added' | 'removed'. Used read-only in the detail panel so the user
@@ -138,7 +151,7 @@ function sourceLabel(item, localPart) {
     const ch = item.channel || '';
     if (ch.startsWith('mpdm-')) {
       const members = ch.replace(/^mpdm-/, '').replace(/-\d+$/, '')
-        .split('--').filter(n => localPart && n !== localPart);
+        .split('--').filter(n => !localPart || n !== localPart);
       return `Group · ${members.length ? members.join(', ') : 'group'}`;
     }
     return 'Group DM';
@@ -148,14 +161,14 @@ function sourceLabel(item, localPart) {
   const ch = item.channel || '';
   if (ch.startsWith('mpdm-')) {
     const members = ch.replace(/^mpdm-/, '').replace(/-\d+$/, '')
-      .split('--').filter(n => localPart && n !== localPart);
+      .split('--').filter(n => !localPart || n !== localPart);
     return `Group · ${members.length ? members.join(', ') : 'group'}`;
   }
   if (ch) {
     const name = item.channelName
       ? `#${String(item.channelName).replace(/^#/, '')}`
       : (ch.startsWith('#') ? ch : `#${ch}`);
-    return `${name} · @`;
+    return item.sender ? `${name} · from ${item.sender}` : name;
   }
   return '';
 }
@@ -492,6 +505,20 @@ export default function SlackPage() {
     });
   };
 
+  // Settle a fired send (success OR terminal failure): drop the module-store
+  // entry AND the rendered map entry. Leaving the rendered entry behind kept a
+  // permanent "sending…" badge on the row and — because anyPending stayed true —
+  // silently disabled the 25s backstop poll for the rest of the page's life.
+  const settlePendingSend = (id) => {
+    delete _pendingSendStore[id];
+    setPendingSends(prev => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
   // On unmount (tab switch), clear only the visual countdown intervals — let
   // confirmed send timers fire in the background so a tab switch after Approve
   // doesn't silently cancel an already-confirmed send.
@@ -560,14 +587,22 @@ export default function SlackPage() {
     return () => clearInterval(id);
   }, []);
 
+  // The open row's STORED draft — the precise slice of `items` the autosize
+  // effect cares about (mirrors EmailPage's openItemDraft fix: depending on the
+  // whole array re-fired the effect on every queue refresh).
+  const openItemDraft = expandedId !== null
+    ? (items.find(it => it.id === expandedId)?.draft ?? '')
+    : '';
+
   // Auto-size the draft textarea whenever the row it belongs to opens or its
-  // displayed text changes by a NON-typing path — expanding a row, or Polish
-  // replacing the text. (Typing is sized inline in the textarea's onChange.) The
-  // textarea only exists while a row is expanded, so this no-ops otherwise.
+  // displayed text changes by a NON-typing path — expanding a row, Polish
+  // replacing the text, or a background re-draft of the open row. (Typing is
+  // sized inline in the textarea's onChange.) The textarea only exists while a
+  // row is expanded, so this no-ops otherwise.
   useEffect(() => {
     autoSizeDraft();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expandedId, editingId, draftText, items]);
+  }, [expandedId, editingId, draftText, openItemDraft]);
 
   // Manual Refresh triggers a REAL Slack scan and returns immediately. POST
   // /refresh wakes the in-process scan worker (the same `_scan_once` work the
@@ -707,19 +742,26 @@ export default function SlackPage() {
     }
   };
 
-  // Persist an edited draft. etag-guarded; a 409 means the queue changed under
-  // us — surface a conflict banner and refetch so the user re-reviews.
+  // Persist an edited draft. The backend now guards the write with its OWN fresh
+  // etag and retries internally, so a background scan/draft write that didn't
+  // touch THIS item no longer 409s the save (the old behavior silently discarded
+  // the edit). We still forward our etag for the happy path, but a 409 here now
+  // means only a persistent race — so we KEEP the editor open with the user's text
+  // intact and let them click Save again, rather than throwing the edit away.
   const saveDraft = async (id) => {
+    const captured = draftText;
     try {
       const res = await fetch(`/api/slack/queue/${encodeURIComponent(id)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft: draftText, etag }),
+        body: JSON.stringify({ draft: captured, etag }),
       });
       if (res.status === 409) {
-        setError('Conflict: the queue was modified elsewhere. Refreshing…');
-        setEditingId(null);
-        refresh();
+        // Adopt the fresh etag the backend returned so the retry lands, and keep
+        // the edit in the open editor — never discard the user's typed text.
+        const json = await res.json().catch(() => null);
+        if (json && json.etag) setEtag(json.etag);
+        setError('Save conflicted with a background update — your text is intact, click Save again.');
         return;
       }
       if (!res.ok) {
@@ -812,7 +854,7 @@ export default function SlackPage() {
         }
         if (fresh && fresh.status === 'sent') {
           // Already sent (double-send guard / a prior fire landed). Not an error.
-          delete _pendingSendStore[id];
+          settlePendingSend(id);
           setEditingId(null);
           refresh();
           return;
@@ -828,30 +870,30 @@ export default function SlackPage() {
         } else {
           // The item ACTUALLY changed underneath us (an edit / re-draft /
           // someone sent it) — do not silently resend stale text; surface it.
-          delete _pendingSendStore[id];
+          settlePendingSend(id);
           setError('Conflict: this item changed before the send. Re-review and approve again.');
           return;
         }
       }
       if (status === 409) {
         // Still conflicting after the single retry — surface it.
-        delete _pendingSendStore[id];
+        settlePendingSend(id);
         setError('Conflict: the queue was modified elsewhere before the send. Re-review and approve again.');
         refresh();
         return;
       }
       if (status < 200 || status >= 300) {
         const reason = (json && json.reason) || 'Send failed';
-        delete _pendingSendStore[id];
+        settlePendingSend(id);
         setSendFailedIds(prev => new Map(prev).set(id, reason));
         setError('Failed to send the reply.');
         return;
       }
-      delete _pendingSendStore[id];
+      settlePendingSend(id);
       if (json && json.etag) setEtag(json.etag);
       setEditingId(null);
       refresh();
-    } catch (err) {
+    } catch {
       // Transient network errors (server restart, brief connectivity blip) are
       // safe to retry because the backend's already-sent guard is idempotent.
       let retried = false;
@@ -860,7 +902,7 @@ export default function SlackPage() {
         try {
           const { status, json: rJson } = await postApprove(id, text, baseline);
           if (status >= 200 && status < 300) {
-            delete _pendingSendStore[id];
+            settlePendingSend(id);
             if (rJson && rJson.etag) setEtag(rJson.etag);
             setEditingId(null);
             refresh();
@@ -877,7 +919,7 @@ export default function SlackPage() {
               setEtag(fj.etag ?? null);
               const fresh = list.find(it => it.id === id);
               if (fresh && fresh.status === 'sent') {
-                delete _pendingSendStore[id];
+                settlePendingSend(id);
                 setEditingId(null);
                 retried = true;
                 break;
@@ -887,7 +929,7 @@ export default function SlackPage() {
         } catch { /* still failing, try again */ }
       }
       if (!retried) {
-        delete _pendingSendStore[id];
+        settlePendingSend(id);
         setSendFailedIds(prev => new Map(prev).set(id, 'Network error — check connection'));
         setError('Failed to send the reply.');
       }
@@ -1661,7 +1703,7 @@ export default function SlackPage() {
           const rowUpdating = item.status === 'needs-review' && rowHasDraft && item.needsRedraft === true;
           return (
             <Fragment key={item.id}>
-              <tr onClick={() => toggleExpand(item)} style={{ cursor: 'pointer' }}>
+              <tr onClick={() => toggleExpand(item)} tabIndex={0} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(item); } }} style={{ cursor: 'pointer' }}>
                 <td>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em' }}>
                     <span style={{ color: 'var(--muted)' }}>
@@ -1671,7 +1713,7 @@ export default function SlackPage() {
                   </span>
                 </td>
                 <td>{item.sender || 'unknown'}</td>
-                <td title={stripSlackXml(item.snippet)}>{truncate(stripSlackXml(item.snippet), 80)}</td>
+                <td title={stripSlackText(item.snippet)}>{truncate(stripSlackText(item.snippet), 80)}</td>
                 <td style={{ color: 'var(--muted)', fontSize: '0.85em', textAlign: 'center' }}>{relativeTime(item.ts)}</td>
                 <td style={{ textAlign: 'center' }}>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4em', flexWrap: 'wrap', justifyContent: 'center' }}>
@@ -1762,9 +1804,31 @@ export default function SlackPage() {
   //   fyi         — classified "no reply likely needed" (still drafted & sendable)
   //   classifying — still being triaged (needs-classify), no draft yet
   // Sent / Dismissed are the only terminal, non-counting states (own sections).
-  const needsReviewItems = items.filter(isActionable);
-  const sentItems = items.filter(it => it.status === 'sent');
-  const dismissedItems = items.filter(it => it.status === 'dismissed');
+  // Partition + sort memoized on `items` alone (mirrors EmailPage's D-066 memo):
+  // this block re-ran — including all the sorts — on every render tick (the 20s
+  // label tick, every countdown second during an undo window) even when the
+  // queue was unchanged. isActionable/reviewGroup are pure stable imports.
+  const {
+    needsReviewItems, sentItems, dismissedItems,
+    replyItems, fyiItems, classifyingItems,
+    dmItems, groupDmItems, channelItems,
+  } = useMemo(() => {
+    const byNewest = (a, b) => (b.ts || 0) - (a.ts || 0);
+    const needsReview = items.filter(isActionable);
+    const reply = needsReview.filter(it => reviewGroup(it) === 'reply');
+    return {
+      needsReviewItems: needsReview,
+      sentItems: items.filter(it => it.status === 'sent').sort(byNewest),
+      dismissedItems: items.filter(it => it.status === 'dismissed').sort(byNewest),
+      replyItems: reply,
+      fyiItems: needsReview.filter(it => reviewGroup(it) === 'fyi').sort(byNewest),
+      classifyingItems: needsReview.filter(it => reviewGroup(it) === 'classifying').sort(byNewest),
+      // Sub-partition the reply group by channel type, newest-first.
+      dmItems: reply.filter(it => it.channelType === 'dm').sort(byNewest),
+      groupDmItems: reply.filter(it => it.channelType === 'group_dm').sort(byNewest),
+      channelItems: reply.filter(it => it.channelType !== 'dm' && it.channelType !== 'group_dm').sort(byNewest),
+    };
+  }, [items]);
 
   // Muted-threads management (D-025): the keys of the muted map, newest first,
   // plus a resolver from a mute key to a friendly label. A mute key is a
@@ -1783,31 +1847,33 @@ export default function SlackPage() {
     return 'Muted conversation';
   };
 
-  const replyItems = needsReviewItems.filter(it => reviewGroup(it) === 'reply');
-  const fyiItems = needsReviewItems.filter(it => reviewGroup(it) === 'fyi');
-  const classifyingItems = needsReviewItems.filter(it => reviewGroup(it) === 'classifying');
-
-  // Sub-partition the reply group by channel type (DMs / Group DMs / Channels).
-  const dmItems = replyItems.filter(it => it.channelType === 'dm');
-  const groupDmItems = replyItems.filter(it => it.channelType === 'group_dm');
-  const channelItems = replyItems.filter(it => it.channelType !== 'dm' && it.channelType !== 'group_dm');
-
   // Dismiss all items in a list (sequential, best-effort per item).
   const dismissAll = async (list) => {
+    let cur = etag;
     for (const item of list) {
-      if (item.status === 'sent') continue;
-      try {
-        const res = await fetch(`/api/slack/queue/${encodeURIComponent(item.id)}`, {
+      if (item.status === 'sent' || item.status === 'dismissed') continue;
+      const del = (withEtag) =>
+        fetch(`/api/slack/queue/${encodeURIComponent(item.id)}`, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ etag }),
+          body: JSON.stringify({ etag: withEtag }),
         });
+      try {
+        let res = await del(cur);
+        if (res.status === 409) {
+          const fresh = await fetch('/api/slack/queue').then(r => r.json()).catch(() => null);
+          if (fresh && fresh.etag) {
+            cur = fresh.etag;
+            res = await del(cur);
+          }
+        }
         if (res.ok) {
-          const json = await res.json();
-          setEtag(json.etag ?? null);
+          const json = await res.json().catch(() => null);
+          if (json && json.etag) cur = json.etag;
         }
       } catch { /* best-effort */ }
     }
+    setEtag(cur ?? null);
     refresh();
   };
 
@@ -1954,7 +2020,7 @@ export default function SlackPage() {
         );
       })()}
 
-      {error && <div className="conflict-banner"><span>{error}</span></div>}
+      {error && <div className="conflict-banner" role="alert"><span>{error}</span></div>}
 
       {/* --- Needs review (actionable) ------------------------------------- */}
       {needsReviewItems.length === 0 ? (

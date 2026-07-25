@@ -600,6 +600,7 @@ _SCAN_MCP_RETRY_BACKOFF_S = (1.0,)
 _SLACK_READ_ONLY_TOOLS = frozenset({
     "list_dms",
     "get_unreads",
+    "get_unread_counts",
     "list_my_channels",
     "lookup_user",
     "get_messages",
@@ -615,7 +616,7 @@ _SLACK_READ_ONLY_TOOLS = frozenset({
 # but ONLY in extracted string FIELDS, AFTER json parsing the payload (normalizing
 # the raw JSON BEFORE parse corrupts escape sequences — the known LLM-scan trap
 # from the investigation / D-012).
-_DATAMARK_SENTINEL = ""
+_DATAMARK_SENTINEL = "\ue000"  # U+E000 private-use; escaped so editors/linters cannot silently strip it
 
 # Per-line read buffer for the subprocess's stdout/stderr StreamReader. The
 # stream-json `result` event for a real Slack fetch (many unread conversations +
@@ -2209,9 +2210,13 @@ async def _draft_one(app, sem: asyncio.Semaphore, item_id: str, prompt: str,
 
     # generatedDraft defaults to the draft (it's the machine baseline). history3d
     # is scrubbed per-field and capped (newest kept) — never trust the subprocess
-    # to bound it for us.
+    # to bound it for us. D-074: the MCP-FREE subprocess returns no history3d (it
+    # doesn't fetch), so prefer the pre-fetched history we already have; only
+    # overwrite from the subprocess if it actually returned a non-empty array.
     generated = _scrub(str(result.get("generatedDraft", new_draft)))[:_DRAFT_CAP]
-    history3d = _sanitize_history3d(result.get("history3d"))
+    subprocess_history = _sanitize_history3d(result.get("history3d"))
+    if subprocess_history:
+        history3d = subprocess_history
 
     # RE-READ fresh right before the write so a concurrent cron/watcher/approve that
     # touched the file doesn't make us clobber their change; re-locate by id.
@@ -2855,15 +2860,17 @@ def _mention_candidates(unreads_payload) -> list[dict]:
     return out
 
 
-def _unread_channel_ids(unreads_payload, dms_payload) -> set:
+def _unread_channel_ids(unreads_payload, dms_payload, counts_payload=None) -> set:
     """Return the authoritative set of channel IDs Slack currently considers unread.
 
     This combines ALL channels from the raw get_unreads payload (every list-valued
     section, same iteration pattern as _mention_candidates) with ALL channels from
     the raw list_dms payload (without the timestamp-window cutoff that _dm_candidates
-    applies).  The result is the COMPLETE set of channels Slack reports as having
-    unread messages — used by the auto-dismiss logic to detect items whose channel
-    is no longer unread.
+    applies), plus ALL channels from the raw get_unread_counts payload (D-075 —
+    channels visible ONLY to get_unread_counts would otherwise be auto-dismissed by
+    the very next scan after the backfill created them).  The result is the COMPLETE
+    set of channels Slack reports as having unread messages — used by the
+    auto-dismiss logic to detect items whose channel is no longer unread.
 
     IMPORTANT: this reads from the RAW payloads, NOT from the filtered candidates
     list.  The candidates list has bot/self-sender filtering and timestamp-window
@@ -2872,23 +2879,30 @@ def _unread_channel_ids(unreads_payload, dms_payload) -> set:
     """
     ids: set = set()
 
-    # --- get_unreads payload: normalize datamarks, iterate all list-valued sections ---
-    norm = _normalize_datamarks(unreads_payload)
-    if isinstance(norm, dict):
-        for val in norm.values():
-            if isinstance(val, list):
-                for entry in val:
-                    if not isinstance(entry, dict):
-                        continue
+    def _collect(payload) -> None:
+        """Add channel ids from every list-valued section of a raw payload."""
+        if isinstance(payload, dict):
+            for val in payload.values():
+                if isinstance(val, list):
+                    for entry in val:
+                        if not isinstance(entry, dict):
+                            continue
+                        cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
+                        if cid:
+                            ids.add(cid)
+        elif isinstance(payload, list):
+            for entry in payload:
+                if isinstance(entry, dict):
                     cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
                     if cid:
                         ids.add(cid)
-    elif isinstance(norm, list):
-        for entry in norm:
-            if isinstance(entry, dict):
-                cid = str(entry.get("channelId") or entry.get("id") or entry.get("channel") or "").strip()
-                if cid:
-                    ids.add(cid)
+
+    # --- get_unreads payload: normalize datamarks, iterate all list-valued sections ---
+    _collect(_normalize_datamarks(unreads_payload))
+
+    # --- get_unread_counts payload (D-075): same iteration pattern ---
+    if counts_payload is not None:
+        _collect(counts_payload)
 
     # --- list_dms payload: unwrap without the timestamp-window cutoff ---
     for entry in _unwrap_list(dms_payload, "dms", "conversations", "ims", "items"):
@@ -3221,6 +3235,67 @@ async def _scan_once(app) -> None:
         candidates.append(dc)
         seen_ids.add(cid)
 
+    # --- Unread-counts backfill (D-075) -----------------------------------------
+    # get_unreads returns ZERO DMs/group-DMs on enterprise-grid workspaces, and
+    # list_dms reports a frozen/stale lastActivity for many DMs (especially
+    # org-shared ones), so _dm_candidates drops them via the timestamp-window
+    # cutoff. get_unread_counts is a lightweight API that authoritatively reports
+    # which DMs and group DMs currently have unread messages — use it to backfill
+    # any channels the above two sources missed.
+    try:
+        counts_payload = await _scan_read("get_unread_counts", {})
+    except Exception:  # noqa: BLE001 — non-fatal; degrade to existing sources
+        counts_payload = {}
+    if isinstance(counts_payload, dict):
+        # Collect DM and group-DM channel IDs reported as unread.
+        unread_dm_ids: list[dict] = []
+        for entry in (counts_payload.get("dms") or []):
+            if isinstance(entry, dict):
+                cid = str(entry.get("id") or entry.get("channelId") or "").strip()
+                if cid and cid not in seen_ids:
+                    unread_dm_ids.append({"channelId": cid, "name": str(entry.get("name", ""))})
+        for entry in (counts_payload.get("mpims") or []):
+            if isinstance(entry, dict):
+                cid = str(entry.get("id") or entry.get("channelId") or "").strip()
+                if cid and cid not in seen_ids:
+                    unread_dm_ids.append({"channelId": cid, "name": str(entry.get("name", ""))})
+        for info in unread_dm_ids:
+            cid = info["channelId"]
+            name = info["name"]
+            if _is_bot_sender(name):
+                continue
+            try:
+                peek = await _scan_read("get_messages", {"channel": cid, "limit": 1})
+                msgs = (peek.get("messages") if isinstance(peek, dict) else peek) or []
+                if not msgs:
+                    continue
+                last_msg = msgs[0] if isinstance(msgs, list) else {}
+                raw_user = last_msg.get("user") or last_msg.get("sender") or ""
+                if isinstance(raw_user, dict):
+                    last_author = raw_user.get("name") or raw_user.get("id") or ""
+                else:
+                    last_author = str(raw_user)
+                if _MY_USERNAME and last_author.lower() == _MY_USERNAME:
+                    continue
+                is_group = "mpdm-" in name or cid.startswith("C")
+                channel_type = "group_dm" if is_group else "dm"
+                sender = last_author or name
+                ts_val = _as_int_ms(last_msg.get("ts") or last_msg.get("timestamp"))
+                candidates.append({
+                    "channelId": cid,
+                    "userId": "",
+                    "channelType": channel_type,
+                    "sender": _scrub(sender)[:_SNIPPET_CAP],
+                    "channel": _scrub(name or (f"DM with {sender}" if sender else cid))[:_SNIPPET_CAP],
+                    "snippet": _scrub(
+                        _resolve_mentions(_strip_slack_xml(str(last_msg.get("text", ""))))
+                    )[:_SNIPPET_CAP],
+                    "ts": ts_val,
+                })
+                seen_ids.add(cid)
+            except Exception:  # noqa: BLE001 — skip unreadable channels
+                continue
+
     # --- Org-shared DM peek (D-073) -------------------------------------------
     # Org-shared enterprise-grid 1:1 DMs are invisible to get_unreads and have a
     # frozen lastActivity in list_dms (equal to the channel creation time), so
@@ -3254,7 +3329,7 @@ async def _scan_once(app) -> None:
         if _is_bot_sender(name):
             continue
         try:
-            details = await _scan_read("get_conversation_details", {"channelId": cid})
+            details = await _scan_read("get_conversation_details", {"channel": cid})
         except Exception:  # noqa: BLE001 — skip unreadable DMs, never fail the scan
             continue
         if not isinstance(details, dict):
@@ -3272,10 +3347,13 @@ async def _scan_once(app) -> None:
         )
         if not is_unread:
             continue
-        # Use the real latest ts (NOT the frozen lastActivity).
+        # Use the real latest ts (NOT the frozen lastActivity). _as_int_ms never
+        # raises (an ISO-8601 or garbage 'latest' must not abort the whole scan).
         if not latest_ts:
             continue
-        latest_ms = int(float(latest_ts) * 1000)
+        latest_ms = _as_int_ms(latest_ts)
+        if not latest_ms:
+            continue
         # Determine sender.
         sender = name or str(im.get("user") or entry.get("userId") or entry.get("user") or "")
         # Self-sender check.
@@ -3325,6 +3403,63 @@ async def _scan_once(app) -> None:
         if c.get("channelId") not in existing_ids
     ]
 
+    # FRESHNESS PEEK (D-074): get_unreads often reports the "unread since" ts
+    # rather than the latest message ts — or even ts=0 with an empty snippet (the
+    # channel is listed as unread but no message data is provided). When the scan
+    # candidate's ts is stale or missing, _merge_scan_candidates can never detect
+    # that the conversation has grown (cand_ts <= item.ts → no needsRedraft). For
+    # each candidate whose channel ALREADY has an active needs-review item, peek
+    # the actual latest message via get_messages(limit=1) to get the real newest
+    # timestamp and snippet. If it's newer than the stored item's ts, update the
+    # candidate so the merge fires needsRedraft and the draft worker re-fetches
+    # full history. This adds one cheap get_messages(limit=1) per active
+    # needs-review channel per scan — typically 0-5 extra calls.
+    active_ts_map = {
+        str(it.get("channelId", "")): _as_int_ms(it.get("ts"))
+        for it in data["items"]
+        if it.get("status") == "needs-review" and it.get("channelId")
+    }
+    for cand in candidates:
+        cid = cand.get("channelId", "")
+        if not cid or cid not in active_ts_map:
+            continue
+        # Scope to DMs/group DMs only — mention-type channels are busy and a peek
+        # on every new unrelated message would trigger needless redrafts (the mention
+        # item's ts is anchored to the specific @-mention message, not the channel's
+        # latest activity). DMs are the channels where multi-message bursts need the
+        # freshness correction.
+        if cand.get("channelType") not in ("dm", "group_dm"):
+            continue
+        cand_ts = _as_int_ms(cand.get("ts"))
+        item_ts = active_ts_map[cid]
+        # If the candidate already has a ts newer than the stored item, the merge
+        # will handle it — no peek needed.
+        if cand_ts > item_ts:
+            continue
+        try:
+            peek = await _scan_read("get_messages", {"channel": cid, "limit": 1})
+            msgs = (peek.get("messages") if isinstance(peek, dict) else peek) or []
+            if msgs and isinstance(msgs, list) and isinstance(msgs[0], dict):
+                msg = msgs[0]
+                latest_ts = _as_int_ms(msg.get("ts") or msg.get("timestamp"))
+                if latest_ts > item_ts:
+                    # Skip if the latest message is from us — nothing new to reply to.
+                    raw_user = msg.get("user") or msg.get("sender") or ""
+                    if isinstance(raw_user, dict):
+                        author = raw_user.get("name") or raw_user.get("id") or ""
+                    else:
+                        author = str(raw_user)
+                    if _MY_USERNAME and author.lower() == _MY_USERNAME:
+                        continue
+                    cand["ts"] = latest_ts
+                    text = str(msg.get("text", ""))
+                    if text.strip():
+                        cand["snippet"] = _scrub(
+                            _resolve_mentions(_strip_slack_xml(text))
+                        )[:_SNIPPET_CAP]
+        except Exception:  # noqa: BLE001 — non-fatal; skip peek on failure
+            pass
+
     # Pre-fetch history for new DM/group_dm candidates on the SAME MCP connection.
     # This means the draft worker won't need its own slack-mcp (zero extra auth).
     histories: dict[str, list] = {}
@@ -3336,7 +3471,9 @@ async def _scan_once(app) -> None:
     changed = _merge_scan_candidates(data["items"], candidates)
 
     # Auto-dismiss: items whose channel is no longer unread in Slack (AC-1).
-    unread_ids = _unread_channel_ids(unreads_payload, dms_payload)
+    # counts_payload rides along (D-075) so backfilled channels aren't
+    # auto-dismissed by the next scan while still unread.
+    unread_ids = _unread_channel_ids(unreads_payload, dms_payload, counts_payload)
     for item in data["items"]:
         if (item.get("status") in _SCAN_ACTIVE_STATUSES
                 and item.get("channelId")
@@ -3521,37 +3658,66 @@ async def save_draft(request: web.Request) -> web.Response:
     """Save an edited draft. Editing (text differs from the generated draft)
     flips status to 'edited' — that edit is the preference-learning signal,
     consumed on approve. NEVER sends.
+
+    ETAG STALENESS (mirrors approve_item): the client's ``etag`` is the WHOLE-FILE
+    etag captured when the editor opened, but the scan/draft workers rewrite
+    slack_threads.json every couple of minutes WITHOUT touching this item — which
+    moves the file etag and used to 409 a perfectly good save, silently discarding
+    the user's edit. Saving a draft mutates only THIS item's draft/status, so an
+    unrelated concurrent write must not block it. We therefore guard the write with
+    the FRESH etag from our own re-read (never the client's stale one) and, on a
+    genuine race (a write landing between our read and our write), RE-READ, re-apply
+    the single-item edit to the fresh data, and retry — preserving the concurrent
+    write's changes to OTHER items rather than blindly overwriting them.
     """
     item_id = request.match_info["item_id"]
     body = await read_json_body(request)
-    expected_etag = body.get("etag")
     if "draft" not in body:
         raise web.HTTPBadRequest(reason="draft field required")
     new_draft = _scrub(str(body["draft"]))[:_DRAFT_CAP]
 
-    data, current_etag = await _load_async()
-    item = next((it for it in data["items"] if it.get("id") == item_id), None)
-    if not item:
-        raise web.HTTPNotFound(reason=f"item {item_id} not found")
-    if item.get("status") == "sent":
-        raise web.HTTPConflict(reason="item already sent")
+    # Apply the single-item edit to freshly-read data, guarding with the FRESH
+    # etag; on a true read-vs-write race, re-read and retry once so a concurrent
+    # scan/draft write to other items is preserved (never blindly clobbered).
+    saved_item = None
+    new_etag = None
+    for _attempt in range(2):
+        data, current_etag = await _load_async()
+        item = next((it for it in data["items"] if it.get("id") == item_id), None)
+        if not item:
+            raise web.HTTPNotFound(reason=f"item {item_id} not found")
+        if item.get("status") == "sent":
+            raise web.HTTPConflict(reason="item already sent")
 
-    item["draft"] = new_draft
-    if new_draft.strip() != str(item.get("generatedDraft", "")).strip():
-        item["status"] = "edited"
+        item["draft"] = new_draft
+        if new_draft.strip() != str(item.get("generatedDraft", "")).strip():
+            item["status"] = "edited"
 
-    try:
-        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
-    except filestore.ConflictError as e:
+        try:
+            new_etag = filestore.write_json(SLACK_PATH, data, current_etag)
+            saved_item = item
+            break
+        except filestore.ConflictError:
+            # A write landed between our read and write — loop to re-read fresh
+            # and re-apply the edit onto the concurrent write's data.
+            continue
+
+    if saved_item is None:
+        # Both attempts lost the race — surface a conflict so the client re-reads.
         current, current_etag = filestore.read_json(SLACK_PATH)
         return web.json_response(
-            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            {
+                "error": "conflict",
+                "message": "the queue kept changing under the save; please retry",
+                "current": current,
+                "etag": current_etag,
+            },
             status=409,
         )
 
     ws = request.app["ws_manager"]
     await ws.broadcast("slack_changed", {"id": item_id})
-    return web.json_response({"item": item, "etag": new_etag})
+    return web.json_response({"item": saved_item, "etag": new_etag})
 
 
 async def dismiss_item(request: web.Request) -> web.Response:
@@ -3992,30 +4158,39 @@ async def approve_item(request: web.Request) -> web.Response:
     # double-sends. If a concurrent write moved the etag, re-read and retry
     # the persist (the send is irreversible; failing to mark it is the bug
     # that causes double-sends via client retry).
+    sent_item = item  # keep a handle for the response even if a re-read loses the item
+    new_etag = write_etag
     for _persist_attempt in range(3):
         try:
             new_etag = filestore.write_json(SLACK_PATH, data, write_etag)
             break
         except filestore.ConflictError:
             data, write_etag = await _load_async()
+            new_etag = write_etag
             item = next((it for it in data["items"] if it.get("id") == item_id), None)
             if item is None:
                 break
+            sent_item = item
             if item.get("status") == "sent":
-                new_etag = write_etag
                 break
             item["status"] = "sent"
             item["finalText"] = final_text
             item["sentAt"] = int(time.time() * 1000)
     else:
-        new_etag = write_etag
+        # All persist attempts lost the etag race: the message WENT OUT but
+        # status='sent' never landed on disk. Log loud — this is the residual
+        # double-send-on-retry window.
+        logger.error(
+            "Slack approve: send succeeded for %s but persisting status='sent' "
+            "kept conflicting; queue file may still show it unsent", item_id,
+        )
 
     # Clear unread badge in Slack (best-effort, non-fatal).
-    await _mark_channel_read(item.get("channelId", ""))
+    await _mark_channel_read(sent_item.get("channelId", ""))
 
     ws = request.app["ws_manager"]
     await ws.broadcast("slack_changed", {"id": item_id, "sent": True})
-    return web.json_response({"available": True, "item": item, "etag": new_etag})
+    return web.json_response({"available": True, "item": sent_item, "etag": new_etag})
 
 
 # ── Preference-learning + topic memory (human-readable, append-and-reconcile) ──
