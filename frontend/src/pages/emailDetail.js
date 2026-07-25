@@ -193,13 +193,13 @@ function _isShortQuestionLine(line) {
 // "****", "********", or bold wrapping only a non-breaking space ("** **").
 // ReactMarkdown renders these as stray <hr>/empty-<strong> noise. A line is an
 // artifact ONLY when, after removing every '*' '_' and whitespace (incl. the
-// non-breaking space  ), NOTHING is left — so any line carrying real words
+// non-breaking space U+00A0), NOTHING is left — so any line carrying real words
 // (even "**Bold text**") is never matched. Dropping the whole line preserves all
 // real content (the artifact had no words to lose).
 function _isEmptyEmphasisArtifact(line) {
   const trimmed = line.trim();
   if (trimmed === '') return false; // a real blank line — preserved as a separator
-  return /^[*_\s ]+$/.test(trimmed) && /[*_]/.test(trimmed);
+  return /^[*_\s\u00a0]+$/.test(trimmed) && /[*_]/.test(trimmed);
 }
 
 export function autoFormatBody(text) {
@@ -294,12 +294,12 @@ export function replyAllRecipients(item) {
   // the original To list isn't doubled. When me is blank (env unset), the filter
   // is inert — no address removed.
   const toRaw = [sender, ...origTo.map(_emailOf)].filter(
-    addr => addr && myKey && addr.toLowerCase() !== myKey,
+    addr => addr && (!myKey || addr.toLowerCase() !== myKey),
   );
   const to = _dedupeByEmailCI(toRaw);
 
   // CC = original CC minus me, then always add me last (only if me is known).
-  const ccRaw = origCc.map(_emailOf).filter(addr => addr && myKey && addr.toLowerCase() !== myKey);
+  const ccRaw = origCc.map(_emailOf).filter(addr => addr && (!myKey || addr.toLowerCase() !== myKey));
   const cc = _dedupeByEmailCI([...ccRaw, ...(me ? [me] : [])]);
 
   return { to, cc };

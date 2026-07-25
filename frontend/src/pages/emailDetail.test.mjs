@@ -759,6 +759,26 @@ test('replyAllRecipients: DEGRADE — no captured to/cc => To=[sender], CC=[me] 
   assert.deepEqual(r.cc, ['testuser@example.com']);
 });
 
+test('replyAllRecipients: blank me (config fetch failed/unset) — minus-me filter is INERT, no address removed', () => {
+  // Regression: the filter predicate `addr && myKey && ...` removed EVERY
+  // address when myKey was blank, seeding an empty recipient editor and a
+  // guaranteed 422 no_recipient on approve.
+  setMyEmail('');
+  try {
+    const item = {
+      senderEmail: 'alice@amazon.com',
+      toRecipients: [{ name: 'Bob', email: 'bob@amazon.com' }],
+      ccRecipients: [{ name: 'Carol', email: 'carol@amazon.com' }],
+    };
+    const r = replyAllRecipients(item);
+    assert.deepEqual(r.to, ['alice@amazon.com', 'bob@amazon.com']);
+    // me is unknown, so it is NOT appended to CC — but the originals survive.
+    assert.deepEqual(r.cc, ['carol@amazon.com']);
+  } finally {
+    setMyEmail('testuser@example.com'); // restore for subsequent tests
+  }
+});
+
 test('replyAllRecipients: only me in original To/CC => To=[sender], CC=[me] (no self-reply)', () => {
   const item = {
     senderEmail: 'eve@amazon.com',

@@ -2006,6 +2006,37 @@ async def test_draft_worker_persists_threadask_and_context(email_file, monkeypat
     assert saved["threadAsk"] == "Confirm Friday ship date."
 
 
+async def test_draft_worker_does_not_resurrect_dismissed_item(email_file, monkeypatch):
+    """TOCTOU guard: if the user dismisses an item while its (up to 120s) draft
+    subprocess is running, the worker must NOT write the draft — writing would
+    flip status back to needs-review and resurrect the dismissed item."""
+    _seed(email_file, [_make_item("i1", status="needs-draft", draft="", generatedDraft="")])
+
+    dismissed_marker = {"done": False}
+
+    async def stub_agent(action, payload):
+        # Simulate the user dismissing the item DURING the seam call.
+        data = json.loads(email_file.read_text(encoding="utf-8"))
+        data["items"][0]["status"] = "dismissed"
+        email_file.write_text(json.dumps(data), encoding="utf-8")
+        dismissed_marker["done"] = True
+        return {"available": True, "draft": "late draft", "generatedDraft": "late draft"}
+
+    monkeypatch.setattr(email_mod, "_run_email_agent", stub_agent)
+
+    class _WS:
+        async def broadcast(self, *a, **k):
+            pass
+
+    sem = email_mod.asyncio.Semaphore(1)
+    await email_mod._draft_one({"ws_manager": _WS()}, sem, "i1")
+
+    assert dismissed_marker["done"]
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "dismissed", "dismissed item was resurrected by the draft worker"
+    assert saved.get("draft", "") == "", "draft was written onto a dismissed item"
+
+
 async def test_draft_worker_missing_ask_leaves_prior_untouched(email_file, monkeypatch):
     """An absent ask in the draft result never fails the save and leaves any prior
     threadAsk untouched (never blanks it, never writes 'undefined')."""

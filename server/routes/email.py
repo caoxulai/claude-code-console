@@ -5,9 +5,10 @@ A JSON sidecar (email_threads.json) stores the queue; a _run_email_agent
 delegation seam handles agent operations; a _EMAIL_READ_ONLY_TOOLS frozenset
 enforces the send-safety boundary.
 
-The email system NEVER sends email directly. The approve path saves a draft
-via the delegation seam (action 'save_draft') -- it does NOT call 'reply' or
-'send'. The user sends from their own email client.
+The email system NEVER sends email directly. The approve path saves an Outlook
+draft via the gated OWA write path (_call_owa_write_tool, tool 'email_draft')
+-- it does NOT call 'reply' or 'send'. The user sends from their own email
+client.
 
 DETERMINISTIC SCAN: the _scan_worker drives the email MCP server DIRECTLY
 via the `mcp` Python SDK (call_read_tool -> stdio_client -> ClientSession).
@@ -24,6 +25,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import glob
 import html
 import json
@@ -972,8 +974,10 @@ def _is_transient_mcp_error(exc: BaseException) -> bool:
         seen.add(id(e))
         if isinstance(e, (BrokenPipeError, ConnectionResetError)):
             return True
-        if isinstance(e, OSError) and getattr(e, "errno", None) in (
-            os.errno.EPIPE if hasattr(os, "errno") else None,
+        # os.errno does not exist in Python 3 — the old check silently never
+        # matched. Mirror slack.py's errno-module frozenset instead.
+        if isinstance(e, OSError) and e.errno in (
+            errno.EPIPE, errno.ECONNRESET, errno.ESHUTDOWN,
         ):
             return True
         # Try anyio types if available (they're our dep via mcp SDK)
@@ -1075,9 +1079,10 @@ async def call_read_tool(name: str, arguments: dict) -> object:
 
 
 # Graph WRITE tools reachable ONLY through the separate gated path below. This is
-# DELIBERATELY tiny: mark_email_read is the only write this change authorizes. It
-# is NOT in _EMAIL_READ_ONLY_TOOLS and NEVER routes through call_read_tool, so the
-# read client can never reach send/reply/forward/delete/move.
+# DELIBERATELY tiny: mark_email_read (clear unread badge) and delete_email (the
+# explicit per-item Delete action) are the ONLY writes authorized here. Neither is
+# in _EMAIL_READ_ONLY_TOOLS and neither routes through call_read_tool, so the read
+# client can never reach send/reply/forward/move — the send-safety property holds.
 _GRAPH_GATED_WRITE_TOOLS = frozenset({"mark_email_read", "delete_email"})
 
 
@@ -1085,8 +1090,9 @@ async def _call_graph_write_tool(name: str, arguments: dict) -> object:
     """SEPARATE explicitly-gated path for the one authorized Graph WRITE tool.
 
     Distinct from call_read_tool by design: it accepts ONLY the gated write tools
-    (mark_email_read), routes to the manager-outlook-mcp session, and FAILS LOUD on
-    anything else -- the structural guarantee that the read client never sends.
+    (mark_email_read, delete_email), routes to the manager-outlook-mcp session, and
+    FAILS LOUD on anything else -- the structural guarantee that the read client
+    never sends.
     """
     if name not in _GRAPH_GATED_WRITE_TOOLS:
         raise EmailMcpError(
@@ -1339,7 +1345,9 @@ def _build_prompt(action: str, payload: dict) -> str:
             'If the save fails, return {"draftSaved": false, "draftId": null}.'
         )
     else:
-        prompt = f"Unknown action: {action}. Return ONLY {{}}."
+        # Fail loud BEFORE spawning a subprocess — an unknown action would
+        # otherwise burn a full `claude --print` run just to echo {}.
+        raise ValueError(f"unknown email agent action: {action!r}")
     return _scrub(prompt)
 
 
@@ -1459,6 +1467,10 @@ async def _drive_agent(action: str, payload: dict) -> dict:
     """
     claude_bin = shutil.which("claude") or "claude"
 
+    # Build the prompt FIRST (pure) so an unknown action fails loud before we
+    # spawn a subprocess or write a temp MCP config.
+    prompt = _build_prompt(action, payload)
+
     # Only save_draft needs MCP (the write tool).
     needs_mcp = action == "save_draft"
     if needs_mcp:
@@ -1522,7 +1534,6 @@ async def _drive_agent(action: str, payload: dict) -> dict:
 
     stderr_task = asyncio.create_task(_drain_stderr())
 
-    prompt = _build_prompt(action, payload)
     msg = json.dumps({
         "type": "user",
         "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
@@ -4981,8 +4992,12 @@ async def _draft_one(app, sem: asyncio.Semaphore, item_id: str) -> None:
     if item is None:
         return  # Vanished (dismissed/approved)
 
-    if item.get("status") == "approved":
-        return  # Already approved under us
+    # Status moved on under us (approved/dismissed/deleted/...) — do NOT write.
+    # Anything but the pre-call 'needs-draft' gate would resurrect e.g. an item
+    # the user dismissed during the (up to 120s) subprocess run, because the
+    # write below flips status back to 'needs-review'.
+    if item.get("status") != "needs-draft":
+        return
 
     # Only draft machine-generated items
     cur_draft = str(item.get("draft", ""))

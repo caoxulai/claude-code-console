@@ -603,9 +603,11 @@ export default function EmailPage() {
         body: JSON.stringify(payload),
       });
       if (res.status === 409) {
-        setError('Conflict: the queue was modified elsewhere. Refreshing...');
-        setEditingId(null);
-        refresh();
+        // Keep the editor open with the user's text intact (parity with the
+        // Slack save path) — adopt the fresh etag so the next Save lands.
+        const json = await res.json().catch(() => null);
+        if (json && json.etag) setEtag(json.etag);
+        setError('Save conflicted with a background update — your text is intact, click Save again.');
         return;
       }
       if (!res.ok) {
@@ -2208,7 +2210,7 @@ export default function EmailPage() {
         </div>
       )}
 
-      {error && <div className="conflict-banner"><span>{error}</span></div>}
+      {error && <div className="conflict-banner" role="alert"><span>{error}</span></div>}
 
       {/* --- Reply section (always expanded) --- */}
       {replyItems.length === 0 && fyiItems.length === 0 && classifyingItems.length === 0 ? (
