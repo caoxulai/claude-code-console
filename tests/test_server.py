@@ -7966,16 +7966,16 @@ async def test_slack_scan_noop_still_advances_last_scan_and_broadcasts(
     client, slack_file, reset_scan_ts, monkeypatch
 ):
     """A no-op scan (nothing new/changed) STILL advances the persisted lastScanAt
-    AND broadcasts 'slack_changed' (D-023, spec item 4). Before D-023 _scan_once
-    returned early when ``not changed and not histories`` — leaving the "Updated …"
-    label stale and the manual-refresh "Scanning…" hint hanging after a no-op.
+    AND broadcasts 'slack_changed' (D-023, spec item 4) — and since D-076 the
+    freshness stamp lives in the tiny scan-meta sidecar, so the no-op scan leaves
+    the MAIN sidecar byte-identical (no etag churn → no spurious conflicts).
 
     The queue already holds an ACTIVE needs-draft for channel D_seen; get_unreads
     re-surfaces ONLY that same channel, so the dedupe finds it already represented
     → zero new/changed candidates, zero history pre-fetches. We assert (a) a
     'slack_changed' broadcast fired so open pages re-render the freshness label and
-    the "Scanning…" hint clears, and (b) the persisted top-level lastScanAt advanced
-    past its prior value, even though the items array is otherwise unchanged.
+    the "Scanning…" hint clears, (b) GET /queue reports an advanced lastScanAt,
+    and (c) the MAIN sidecar file is byte-for-byte unchanged.
     """
     prior_scan = 1_700_000_000_000  # an old, fixed timestamp on disk
     slack_file.parent.mkdir(parents=True, exist_ok=True)
@@ -7986,7 +7986,7 @@ async def test_slack_scan_noop_still_advances_last_scan_and_broadcasts(
             "status": "needs-draft", "snippet": "already here", "ts": 1,
         }],
     }), encoding="utf-8")
-    items_before = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    bytes_before = slack_file.read_text(encoding="utf-8")
 
     # Record every broadcast (mirror test_slack_watcher_broadcasts_on_external_change).
     events: list = []
@@ -8005,14 +8005,15 @@ async def test_slack_scan_noop_still_advances_last_scan_and_broadcasts(
     ]}
     await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
 
-    saved = json.loads(slack_file.read_text(encoding="utf-8"))
     # (a) A no-op scan still notifies open pages so freshness re-renders.
     assert any(ev[0] == "slack_changed" for ev in events), \
         "a no-op scan must still broadcast slack_changed so the freshness label advances"
-    # (b) The persisted freshness timestamp advanced past its prior value...
-    assert saved["lastScanAt"] > prior_scan
-    # ...even though the items array is unchanged (this WAS a no-op for the queue).
-    assert saved["items"] == items_before
+    # (b) The freshness timestamp the QUEUE reports advanced past its prior value
+    # (served from the scan-meta sidecar since D-076)...
+    queue = await (await client.get("/api/slack/queue")).json()
+    assert queue["lastScanAt"] > prior_scan
+    # ...while the MAIN sidecar is byte-for-byte unchanged (this WAS a no-op).
+    assert slack_file.read_text(encoding="utf-8") == bytes_before
 
 
 async def test_slack_scan_worker_inert_under_harness_via_sleep_first(
@@ -10915,3 +10916,188 @@ async def test_slack_scan_does_not_peek_bot_dms(
     )
     saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
     assert len(saved) == 0, f"No skeleton expected for bot DM; got {saved}"
+
+
+# ─── D-076: queue reliability batch (Slack side) ─────────────────────────────
+
+
+async def test_slack_retention_prunes_old_terminal_keeps_recent_and_active(
+    client, slack_file, reset_scan_ts, monkeypatch,
+):
+    """Retention (D-076 item 1): a scan cycle drops terminal items older than
+    the window, KEEPS recent terminal items (Sent/Dismissed sections + undo
+    keep working), NEVER prunes active items regardless of age, and lazily
+    stamps legacy terminal items instead of pruning them."""
+    now_ms = int(_time.time() * 1000)
+    old = now_ms - 20 * 24 * 3600 * 1000
+    recent = now_ms - 2 * 24 * 3600 * 1000
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "old_sent", "channelId": "D1", "channelType": "dm",
+         "status": "sent", "sentAt": old, "draft": "d", "generatedDraft": "d",
+         "snippet": "x", "ts": 1},
+        {"id": "old_dismissed", "channelId": "D2", "channelType": "dm",
+         "status": "dismissed", "terminalAt": old, "draft": "d",
+         "generatedDraft": "d", "snippet": "x", "ts": 1},
+        {"id": "recent_sent", "channelId": "D3", "channelType": "dm",
+         "status": "sent", "sentAt": recent, "draft": "d",
+         "generatedDraft": "d", "snippet": "x", "ts": 1},
+        {"id": "legacy_no_stamp", "channelId": "D4", "channelType": "dm",
+         "status": "dismissed", "draft": "d", "generatedDraft": "d",
+         "snippet": "x", "ts": 1},
+        {"id": "ancient_active", "channelId": "D5", "channelType": "dm",
+         "status": "needs-review", "draft": "d", "generatedDraft": "d",
+         "snippet": "x", "ts": 1},
+    ]}), encoding="utf-8")
+
+    # D5 stays "unread" so the active item is not auto-dismissed by this cycle.
+    unreads = {"channels": [
+        {"channelId": "D5", "name": "keeper",
+         "messages": [{"user": "alice", "text": "still here",
+                       "ts": f"{_time.time() - 1:.6f}"}]},
+    ]}
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["id"]: it for it in saved}
+    assert "old_sent" not in by_id and "old_dismissed" not in by_id
+    assert "recent_sent" in by_id
+    assert "ancient_active" in by_id
+    assert "legacy_no_stamp" in by_id  # stamped, not pruned (grandfather clause)
+    assert isinstance(by_id["legacy_no_stamp"].get("terminalAt"), int)
+
+
+async def test_slack_dismiss_stamps_terminal_at_and_undismiss_clears(
+    client, slack_file,
+):
+    """dismiss stamps terminalAt (retention clock); undismiss clears it."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [{
+        "id": "i1", "sender": "a", "channel": "c", "channelType": "dm",
+        "snippet": "hi", "threadContext": "", "draft": "d",
+        "generatedDraft": "d", "status": "needs-review", "ts": 1,
+    }]}), encoding="utf-8")
+
+    resp = await client.delete("/api/slack/queue/i1", json={})
+    assert resp.status == 200
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "dismissed"
+    assert isinstance(saved.get("terminalAt"), int)
+
+    resp = await client.post("/api/slack/queue/i1/undismiss", json={})
+    assert resp.status == 200
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert "terminalAt" not in saved
+
+
+async def test_slack_scan_string_payload_never_mass_dismisses(
+    client, slack_file, reset_scan_ts, monkeypatch,
+):
+    """Malformed-payload guard (D-076 item 4): a get_unreads payload that is a
+    plain STRING must leave every seeded active item untouched — the old code
+    extracted zero candidates from it and auto-dismissed the whole queue."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "a1", "channelId": "D1", "channelType": "dm",
+         "status": "needs-review", "draft": "d", "generatedDraft": "d",
+         "snippet": "x", "ts": 1},
+        {"id": "a2", "channelId": "D2", "channelType": "dm",
+         "status": "edited", "draft": "e", "generatedDraft": "d",
+         "snippet": "y", "ts": 2},
+    ]}), encoding="utf-8")
+
+    await _run_one_scan_cycle(
+        client.app, monkeypatch,
+        unreads="502 Bad Gateway: upstream error (not json)")
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["id"]: it for it in saved}
+    assert by_id["a1"]["status"] == "needs-review"
+    assert by_id["a2"]["status"] == "edited"
+
+
+async def test_slack_scan_conflict_preserves_concurrent_dismiss(
+    client, slack_file, reset_scan_ts, monkeypatch,
+):
+    """Conflict-tolerant scan write (D-076 item 3): a user dismissal landing
+    mid-scan survives, AND the scan's newly discovered channel still lands."""
+    slack_file.parent.mkdir(parents=True, exist_ok=True)
+    slack_file.write_text(json.dumps({"items": [
+        {"id": "mine", "channelId": "D_mine", "channelType": "dm",
+         "status": "needs-review", "draft": "d", "generatedDraft": "d",
+         "snippet": "x", "ts": 1},
+    ]}), encoding="utf-8")
+
+    now_s = _time.time()
+    unreads = {"channels": [
+        {"channelId": "D_mine", "name": "mine",
+         "messages": [{"user": "alice", "text": "x", "ts": f"{now_s - 5:.6f}"}]},
+        {"channelId": "D_new", "name": "newbie",
+         "messages": [{"user": "bob", "text": "fresh message",
+                       "ts": f"{now_s - 2:.6f}"}]},
+    ]}
+
+    real_write = slack_mod.filestore.write_json
+    state = {"conflicted": False}
+
+    def conflict_once(path, data, expected_etag=None):
+        if not state["conflicted"]:
+            state["conflicted"] = True
+            cur = json.loads(slack_file.read_text(encoding="utf-8"))
+            for it in cur["items"]:
+                if it["id"] == "mine":
+                    it["status"] = "dismissed"
+                    it["terminalAt"] = int(_time.time() * 1000)
+            real_write(slack_mod.SLACK_PATH, cur, None)
+            raise slack_mod.filestore.ConflictError(path, "expected", "actual")
+        return real_write(path, data, expected_etag)
+    monkeypatch.setattr(slack_mod.filestore, "write_json", conflict_once)
+
+    await _run_one_scan_cycle(client.app, monkeypatch, unreads=unreads)
+
+    saved = json.loads(slack_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["id"]: it for it in saved}
+    # The user's concurrent dismissal survived...
+    assert by_id["mine"]["status"] == "dismissed"
+    # ...AND the scan's new channel landed (the cycle was not discarded).
+    assert any(it.get("channelId") == "D_new" for it in saved)
+
+
+async def test_slack_mcp_call_timeout_recovers_via_reconnect(
+    monkeypatch, reset_mcp_state,
+):
+    """MCP call timeout (D-076 item 5): a hung session.call_tool is bounded by
+    the wall-clock timeout and treated as transient — the session reconnects
+    and the retry succeeds instead of wedging the scan worker forever."""
+    calls = {"n": 0}
+
+    class _HangThenOkSession:
+        async def call_tool(self, name, arguments):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await asyncio.sleep(3600)  # hung call — must be timed out
+            class _R:
+                isError = False
+                content = [type("T", (), {"type": "text", "text": '{"channels": []}'})()]
+                structuredContent = {"channels": []}
+            return _R()
+
+    disconnects = {"n": 0}
+
+    async def fake_connect():
+        slack_mod._mcp_state.session = _HangThenOkSession()
+
+    async def fake_disconnect():
+        disconnects["n"] += 1
+        slack_mod._mcp_state.session = None
+
+    monkeypatch.setattr(slack_mod, "_connect_mcp", fake_connect)
+    monkeypatch.setattr(slack_mod, "_disconnect_mcp", fake_disconnect)
+    monkeypatch.setattr(slack_mod, "_SCAN_MCP_CALL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(slack_mod, "_SCAN_MCP_RETRY_BACKOFF_S", (0.01,))
+
+    result = await slack_mod.call_read_tool("get_unreads", {})
+    assert result == {"channels": []}
+    assert calls["n"] == 2          # hung once, succeeded on the fresh session
+    assert disconnects["n"] == 1    # the hang tore the session down

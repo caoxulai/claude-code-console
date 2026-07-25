@@ -478,6 +478,52 @@ _SCAN_LIST_DMS_LIMIT = 200
 # forever (the user can re-mute if it's still noise).
 _MUTE_TTL_S = 30 * 24 * 60 * 60  # 30 days
 
+# ── Terminal-item retention (D-076) ──────────────────────────────────────────
+# Terminal items (sent/dismissed) were never pruned, so the sidecar grew without
+# bound and every worker tick / queue GET / etag retry paid for the full file.
+# _scan_once ages out terminal items whose terminal timestamp (sentAt, or the
+# terminalAt stamp set when an item is dismissed) is older than this window.
+# Legacy terminal items with no timestamp are lazily STAMPED (terminalAt=now)
+# rather than pruned, so the feature never wrongly nukes recent history — they
+# age out one window later. Non-terminal items are NEVER pruned regardless of age.
+def _retention_ms_from_env(var: str, default_days: int = 14) -> int:
+    try:
+        days = int(os.environ.get(var, "") or default_days)
+    except ValueError:
+        days = default_days
+    return max(1, days) * 24 * 60 * 60 * 1000
+
+
+_RETENTION_MS = _retention_ms_from_env("CLAUDE_WEB_SLACK_RETENTION_DAYS")
+
+
+def _prune_terminal_items(items: list, now_ms: int, retention_ms: int) -> tuple[list, bool]:
+    """Return (kept_items, changed): drop terminal items older than the window.
+
+    Terminal timestamp preference: sentAt (sent items), then terminalAt (stamped
+    on dismiss). A terminal item with NEITHER gets terminalAt stamped now (the
+    grandfather clause — converges without ever wrongly pruning something the
+    user just dismissed). mutedThreads is untouched (it has its own TTL).
+    """
+    kept: list = []
+    changed = False
+    cutoff = now_ms - retention_ms
+    for it in items:
+        if it.get("status") not in _TERMINAL_STATUSES:
+            kept.append(it)
+            continue
+        term_ts = _as_int_ms(it.get("sentAt")) or _as_int_ms(it.get("terminalAt"))
+        if not term_ts:
+            it["terminalAt"] = now_ms
+            changed = True
+            kept.append(it)
+            continue
+        if term_ts < cutoff:
+            changed = True  # aged out — drop
+            continue
+        kept.append(it)
+    return kept, changed
+
 # Bot senders that never need a human reply — skip during scan.
 _BOT_SENDERS = frozenset({
     "slackbot",
@@ -495,9 +541,36 @@ _BOT_SENDERS = frozenset({
 # until the first cycle completes; kept as a module attribute so it survives across
 # cycles and stays inspectable. Reset by tests that exercise the window directly.
 # This drives the activity-WINDOW math (_scan_window_start_ms). Its persisted
-# mirror is the top-level ``lastScanAt`` key written into slack_threads.json by
-# _scan_once (so the "Updated …" freshness label survives a server restart).
+# mirror lives in the tiny scan-meta sidecar (D-076 item 6) — moved OUT of
+# slack_threads.json so an idle scan leaves the main sidecar byte-identical
+# (no etag churn → no spurious conflicts for user writes).
 _LAST_SCAN_TS_MS: int | None = None
+
+
+def _scan_meta_path() -> Path:
+    """Sibling scan-meta file (freshness only). Computed at CALL time from the
+    module-level SLACK_PATH so tests that monkeypatch SLACK_PATH move it too."""
+    return SLACK_PATH.with_name(SLACK_PATH.stem + "_scan_meta.json")
+
+
+def _read_last_scan_at() -> int | None:
+    """Read lastScanAt from the scan-meta sidecar; None when absent/invalid."""
+    data, _ = filestore.read_json(_scan_meta_path())
+    v = data.get("lastScanAt") if isinstance(data, dict) else None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return int(v)
+    return None
+
+
+def _write_last_scan_at(now_ms: int) -> None:
+    """Persist scan freshness to the tiny meta sidecar (single writer, no etag).
+
+    Best-effort: freshness is a label, never worth failing a scan over.
+    """
+    try:
+        filestore.write_json(_scan_meta_path(), {"lastScanAt": now_ms})
+    except OSError:
+        logger.warning("Slack scan: could not persist lastScanAt meta", exc_info=True)
 
 # ── Shared scan guard + manual-refresh wake Event (D-023) ─────────────────────
 # A SINGLE shared guard gives mutual exclusion between the periodic worker scan
@@ -582,6 +655,13 @@ _mcp_connect_lock: asyncio.Lock | None = None
 #   reconnect. The name-guard rejection happens with ZERO attempts (before any
 #   session access). A non-transient error is never retried.
 _SCAN_MCP_RETRY_ATTEMPTS = 2  # 1 call on existing session + 1 retry after reconnect
+
+# Wall-clock bound on ONE persistent-session tool call (D-076 item 5). Without
+# it a hung call wedges the scan worker forever WHILE holding the scan guard, so
+# manual Refresh permanently reports "already in progress". A timeout is treated
+# as a transient stream failure (disconnect → reconnect-once), mirroring
+# email.py's _call_session_tool. 60s comfortably exceeds any healthy call.
+_SCAN_MCP_CALL_TIMEOUT_S = 60.0
 # Backoff (seconds) before the single reconnect attempt. Gives the previous
 # process time to fully terminate and any transient OS resource contention to
 # clear before we spawn the replacement.
@@ -1698,13 +1778,21 @@ async def call_read_tool(name: str, arguments: dict) -> object:
 
             # Call the tool on the persistent session. The call may take seconds;
             # it runs outside any lock (in practice the scan worker is sequential).
-            result = await _mcp_state.session.call_tool(name, arguments or {})
+            # Wall-clock bounded (D-076 item 5): a hung call must not wedge the
+            # scan worker while it holds the scan guard.
+            result = await asyncio.wait_for(
+                _mcp_state.session.call_tool(name, arguments or {}),
+                timeout=_SCAN_MCP_CALL_TIMEOUT_S,
+            )
             break
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — classify, reconnect transient, else fail loud
             remaining = _SCAN_MCP_RETRY_ATTEMPTS - 1 - attempt
-            if remaining > 0 and _is_transient_mcp_error(e):
+            # A timeout means the session is wedged — same treatment as a broken
+            # stream: tear down, reconnect once, retry.
+            if remaining > 0 and (isinstance(e, asyncio.TimeoutError)
+                                  or _is_transient_mcp_error(e)):
                 # Transient stream break — the persistent session is dead. Tear it
                 # down (reaps the subprocess) and reconnect fresh on the next attempt.
                 logger.debug(
@@ -1917,19 +2005,22 @@ def build_draft_prompt(item: dict) -> str:
 async def get_queue(request: web.Request) -> web.Response:
     """GET the warm queue plus the durable last-scan timestamp (D-023).
 
-    ``lastScanAt`` is the top-level epoch-millis key _scan_once persists into
-    slack_threads.json on EVERY completed scan; it mirrors the in-memory
-    ``_LAST_SCAN_TS_MS`` and survives a server restart (``_load`` does not strip
-    unknown keys). The frontend renders "Updated {relativeTime(lastScanAt)}" from
-    it so the freshness label reflects Slack-scan freshness, not page-fetch
-    freshness. It is ``None`` (omitted) until the first scan ever completes, so the
-    page degrades gracefully (no "just now" when nothing was scanned).
+    ``lastScanAt`` is the epoch-millis freshness stamp _scan_once persists on
+    EVERY completed scan; it mirrors the in-memory ``_LAST_SCAN_TS_MS`` and
+    survives a server restart. Since D-076 it lives in the tiny scan-meta sidecar
+    (NOT slack_threads.json) so an idle scan doesn't move the queue etag; the
+    legacy in-file key is the read fallback for pre-migration files. The frontend
+    renders "Updated {relativeTime(lastScanAt)}" from it. It is ``None`` (omitted)
+    until the first scan ever completes, so the page degrades gracefully.
     """
     data, etag = await _load_async()
+    last_scan = await asyncio.to_thread(_read_last_scan_at)
+    if last_scan is None:
+        last_scan = data.get("lastScanAt")
     return web.json_response({
         "items": data["items"],
         "etag": etag,
-        "lastScanAt": data.get("lastScanAt"),
+        "lastScanAt": last_scan,
         # The on/off toggle (D-025). Absent on disk == unpaused (read at use sites
         # with .get(..., False), never seeded into _load's default).
         "paused": data.get("paused", False),
@@ -2220,48 +2311,57 @@ async def _draft_one(app, sem: asyncio.Semaphore, item_id: str, prompt: str,
 
     # RE-READ fresh right before the write so a concurrent cron/watcher/approve that
     # touched the file doesn't make us clobber their change; re-locate by id.
-    data, current_etag = _load()
-    item = next((it for it in data["items"] if it.get("id") == item_id), None)
-    if item is None:
-        # The item vanished (e.g. dismissed/sent) between select and persist —
-        # nothing to draft into. Idempotent no-op.
-        return
+    # RETRY-ON-CONFLICT (D-076 item 3): a lost etag race used to DROP this
+    # completed LLM draft and re-spawn a whole subprocess next cycle — now we
+    # re-read fresh (all guards re-checked against the fresh item) and retry once.
+    for _attempt in range(2):
+        data, current_etag = _load()
+        item = next((it for it in data["items"] if it.get("id") == item_id), None)
+        if item is None:
+            # The item vanished (e.g. dismissed/sent) between select and persist —
+            # nothing to draft into. Idempotent no-op.
+            return
 
-    # EDITED-ITEM GUARD re-checked against the FRESH item: if it was edited or sent
-    # under us, do NOT overwrite the user's draft. Refresh history3d for context
-    # only (so they see the new messages) and clear needsRedraft without touching
-    # the draft (spec item 4: edited items keep their draft; needsRedraft is not
-    # re-set, but if it's lingering we clear it so the worker stops re-selecting).
-    status = item.get("status")
-    cur_draft = str(item.get("draft", ""))
-    cur_generated = str(item.get("generatedDraft", ""))
-    if status == "sent":
-        return
-    if status == "edited" or cur_draft.strip() != cur_generated.strip():
-        # The user edited this draft under us — leave their text ALONE. Only
-        # refresh history3d (so the new messages are visible) and clear any
-        # lingering needsRedraft so the worker stops re-selecting it.
-        if history3d:
-            item["history3d"] = history3d
-        item.pop("needsRedraft", None)
+        # EDITED-ITEM GUARD re-checked against the FRESH item: if it was edited or
+        # sent under us, do NOT overwrite the user's draft. Refresh history3d for
+        # context only (so they see the new messages) and clear needsRedraft
+        # without touching the draft (spec item 4: edited items keep their draft;
+        # needsRedraft is not re-set, but a lingering one is cleared so the worker
+        # stops re-selecting).
+        status = item.get("status")
+        cur_draft = str(item.get("draft", ""))
+        cur_generated = str(item.get("generatedDraft", ""))
+        if status == "sent":
+            return
+        if status == "edited" or cur_draft.strip() != cur_generated.strip():
+            # The user edited this draft under us — leave their text ALONE. Only
+            # refresh history3d (so the new messages are visible) and clear any
+            # lingering needsRedraft so the worker stops re-selecting it.
+            if history3d:
+                item["history3d"] = history3d
+            item.pop("needsRedraft", None)
+        else:
+            # Machine-generated (untouched) draft — safe to (re)draft.
+            item["draft"] = new_draft
+            item["generatedDraft"] = generated
+            if history3d:
+                item["history3d"] = history3d
+            thread_ctx = result.get("threadContext", "")
+            if isinstance(thread_ctx, str) and thread_ctx.strip():
+                item["threadContext"] = thread_ctx.strip()
+            item["status"] = "needs-review"
+            item.pop("needsRedraft", None)
+
+        try:
+            filestore.write_json(SLACK_PATH, data, current_etag)
+            break
+        except filestore.ConflictError:
+            # Another writer won — loop to re-read fresh and re-apply (the next
+            # cycle would re-draft harmlessly anyway, but retrying here saves a
+            # whole subprocess spawn).
+            continue
     else:
-        # Machine-generated (untouched) draft — safe to (re)draft.
-        item["draft"] = new_draft
-        item["generatedDraft"] = generated
-        if history3d:
-            item["history3d"] = history3d
-        thread_ctx = result.get("threadContext", "")
-        if isinstance(thread_ctx, str) and thread_ctx.strip():
-            item["threadContext"] = thread_ctx.strip()
-        item["status"] = "needs-review"
-        item.pop("needsRedraft", None)
-
-    try:
-        filestore.write_json(SLACK_PATH, data, current_etag)
-    except filestore.ConflictError:
-        # Another writer won — idempotent by construction: the next cycle re-reads
-        # and either finds the item already drafted or re-drafts harmlessly.
-        return
+        return  # both attempts lost the race — next cycle re-drafts
 
     await app["ws_manager"].broadcast("slack_changed", {"id": item_id, "drafted": True})
 
@@ -3381,13 +3481,12 @@ async def _scan_once(app) -> None:
     candidates = [c for c in candidates if not _MY_USERNAME or c.get("sender", "").lower() != _MY_USERNAME]
 
     # Thread muting (D-025): prune entries older than the 30-day TTL on EVERY scan
-    # cycle (persisted in the same write below), then drop any candidate whose mute
-    # key matches a (still-live) muted thread. The drop happens BEFORE the merge so a
-    # muted conversation never produces a skeleton. A pruned/empty dict is written
-    # back so a stale mute can't suppress a conversation indefinitely.
+    # cycle, then drop any candidate whose mute key matches a (still-live) muted
+    # thread. The drop happens BEFORE the merge so a muted conversation never
+    # produces a skeleton. The pruned dict is PERSISTED inside _apply_scan_results
+    # below (not here) so the change detector sees prune-only cycles too.
     now_s = now_ms / 1000.0
     muted = _prune_muted(data.get("mutedThreads") or {}, now_s)
-    data["mutedThreads"] = muted
     if muted:
         candidates = [c for c in candidates if _mute_key_for(c) not in muted]
 
@@ -3468,51 +3567,104 @@ async def _scan_once(app) -> None:
         if cid:
             histories[cid] = await _fetch_history_for(cid)
 
-    changed = _merge_scan_candidates(data["items"], candidates)
+    # MALFORMED-PAYLOAD GUARD (D-076 item 4): a non-JSON tool result reaches here
+    # as a raw string; candidate extraction then yields [] and — without this
+    # guard — the auto-dismiss pass would flip EVERY active item to dismissed
+    # ("channel no longer unread"). One bad payload must never nuke the queue.
+    payloads_ok = (isinstance(unreads_payload, (dict, list))
+                   and isinstance(dms_payload, (dict, list)))
+    if not payloads_ok:
+        logger.warning(
+            "Slack scan: get_unreads/list_dms payload was not dict/list-shaped — "
+            "skipping auto-dismiss this cycle (types: %s, %s)",
+            type(unreads_payload).__name__, type(dms_payload).__name__,
+        )
 
-    # Auto-dismiss: items whose channel is no longer unread in Slack (AC-1).
-    # counts_payload rides along (D-075) so backfilled channels aren't
-    # auto-dismissed by the next scan while still unread.
-    unread_ids = _unread_channel_ids(unreads_payload, dms_payload, counts_payload)
-    for item in data["items"]:
-        if (item.get("status") in _SCAN_ACTIVE_STATUSES
-                and item.get("channelId")
-                and item["channelId"] not in unread_ids):
-            item["status"] = "dismissed"
+    def _apply_scan_results(target: dict) -> bool:
+        """Apply this cycle's results to a (possibly freshly re-read) data dict.
+
+        Deterministic over the cycle's captured candidates/payloads/histories, so
+        it can be re-applied to fresh data after a write conflict (D-076 item 3)
+        — preserving a concurrent user write instead of discarding the cycle.
+        Returns True when anything changed (idle scans skip the write entirely).
+        """
+        changed = _merge_scan_candidates(target["items"], candidates)
+
+        # Auto-dismiss: items whose channel is no longer unread in Slack (AC-1).
+        # counts_payload rides along (D-075) so backfilled channels aren't
+        # auto-dismissed by the next scan while still unread. Skipped entirely
+        # when either source payload was malformed (guard above).
+        if payloads_ok:
+            unread_ids = _unread_channel_ids(unreads_payload, dms_payload, counts_payload)
+            for item in target["items"]:
+                if (item.get("status") in _SCAN_ACTIVE_STATUSES
+                        and item.get("channelId")
+                        and item["channelId"] not in unread_ids):
+                    item["status"] = "dismissed"
+                    item["terminalAt"] = now_ms
+                    changed = True
+
+        # Attach pre-fetched history to newly-appended skeletons. Freshly-scanned
+        # skeletons land in 'needs-classify' now (D-025), so key the attach on that
+        # status — the history rides along through classification into drafting.
+        if histories:
+            for item in target["items"]:
+                cid = item.get("channelId", "")
+                if (item.get("status") == "needs-classify"
+                        and cid in histories
+                        and not item.get("history3d")):
+                    item["history3d"] = histories[cid]
+                    changed = True
+
+        # Mute-TTL prune (D-025) — persisted with the same write.
+        pruned_muted = _prune_muted(target.get("mutedThreads") or {}, now_s)
+        if pruned_muted != (target.get("mutedThreads") or {}):
             changed = True
+        target["mutedThreads"] = pruned_muted
 
-    # Attach pre-fetched history to newly-appended skeletons. Freshly-scanned
-    # skeletons land in 'needs-classify' now (D-025), so key the attach on that
-    # status — the history rides along through classification into drafting.
-    if histories:
-        for item in data["items"]:
-            cid = item.get("channelId", "")
-            if (item.get("status") == "needs-classify"
-                    and cid in histories
-                    and not item.get("history3d")):
-                item["history3d"] = histories[cid]
+        # Terminal-item retention (D-076 item 1): age out sent/dismissed items
+        # older than the retention window. Never touches non-terminal items.
+        kept, retention_changed = _prune_terminal_items(
+            target["items"], now_ms, _RETENTION_MS)
+        if retention_changed:
+            target["items"] = kept
+            changed = True
+        return changed
+
+    # CONFLICT-TOLERANT WRITE (D-076 item 3): the read happened before many
+    # seconds of MCP work, so a user action (save/dismiss/approve) may have moved
+    # the etag. On conflict, re-read FRESH (keeping the user's write) and re-apply
+    # this cycle's results, then retry once. Both-lost is logged, not silent.
+    wrote_changes = False
+    for _attempt in range(2):
+        if not _apply_scan_results(data):
+            break  # idle scan: nothing changed — leave the sidecar byte-identical
+        try:
+            filestore.write_json(SLACK_PATH, data, current_etag)
+            wrote_changes = True
+            break
+        except filestore.ConflictError:
+            data, current_etag = _load()
+            continue
+    else:
+        logger.warning(
+            "Slack scan: results write kept conflicting — cycle's merge deferred "
+            "to the next scan (user writes preserved)")
 
     _LAST_SCAN_TS_MS = now_ms
 
-    # EVERY completed scan advances freshness, even a no-op that found nothing new
-    # (D-023, spec item 4). We persist the top-level ``lastScanAt`` mirror so the
-    # "Updated …" label reflects when a scan actually completed (and survives a
-    # restart), then broadcast 'slack_changed' so open pages re-render the label
-    # and the manual-refresh "Scanning…" hint clears. When nothing changed the
-    # items array is byte-identical — only ``lastScanAt`` advances.
-    data["lastScanAt"] = now_ms
-
-    try:
-        filestore.write_json(SLACK_PATH, data, current_etag)
-    except filestore.ConflictError:
-        # A concurrent write won — skip this cycle (same fail-safe as before; the
-        # next scan re-reads fresh). Freshness still advances on the next cycle.
-        return
+    # EVERY completed scan advances freshness, even a no-op that found nothing
+    # new (D-023, spec item 4) — persisted to the tiny scan-meta sidecar (D-076
+    # item 6) so an idle scan never rewrites (or moves the etag of) the main
+    # sidecar. Broadcast 'slack_changed' so open pages re-render the "Updated …"
+    # label and the manual-refresh "Scanning…" hint clears.
+    _write_last_scan_at(now_ms)
 
     # Reuse the existing 'slack_changed' event so the frontend's existing
     # useLiveUpdates path clears the "Scanning…" hint and re-renders freshness —
     # no new broadcast type needed.
-    await app["ws_manager"].broadcast("slack_changed", {"scanned": True})
+    await app["ws_manager"].broadcast(
+        "slack_changed", {"scanned": True, "changed": wrote_changes})
 
 
 async def _scan_worker(app) -> None:
@@ -3604,10 +3756,16 @@ async def _start_scan_worker(app) -> None:
         global _LAST_SCAN_TS_MS
         if _LAST_SCAN_TS_MS is None:
             try:
-                data, _ = _load()
-                persisted = data.get("lastScanAt")
-                if isinstance(persisted, (int, float)) and not isinstance(persisted, bool):
-                    _LAST_SCAN_TS_MS = int(persisted)
+                persisted = _read_last_scan_at()
+                if persisted is None:
+                    # Legacy fallback: pre-D-076 files carried lastScanAt in the
+                    # main sidecar.
+                    data, _ = _load()
+                    v = data.get("lastScanAt")
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        persisted = int(v)
+                if persisted is not None:
+                    _LAST_SCAN_TS_MS = persisted
             except Exception:  # noqa: BLE001 — seeding is best-effort, never blocks startup
                 pass
 
@@ -3745,7 +3903,9 @@ async def dismiss_item(request: web.Request) -> web.Response:
         raise web.HTTPConflict(reason="cannot dismiss a sent item")
 
     # Soft state flip — preserve every other field so Undo can restore it.
+    # terminalAt drives retention aging (D-076); undismiss clears it.
     item["status"] = "dismissed"
+    item["terminalAt"] = int(time.time() * 1000)
 
     try:
         new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
@@ -3793,6 +3953,7 @@ async def undismiss_item(request: web.Request) -> web.Response:
     draft = str(item.get("draft", ""))
     generated = str(item.get("generatedDraft", ""))
     item["status"] = "edited" if draft.strip() != generated.strip() else "needs-review"
+    item.pop("terminalAt", None)  # active again — stop the retention clock
 
     try:
         new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
@@ -3849,6 +4010,7 @@ async def mute_item(request: web.Request) -> web.Response:
     # Record the mute (unix seconds) and soft-dismiss the item.
     data.setdefault("mutedThreads", {})[mute_key] = int(time.time())
     item["status"] = "dismissed"
+    item["terminalAt"] = int(time.time() * 1000)
 
     try:
         new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
@@ -3921,8 +4083,10 @@ async def regenerate_item(request: web.Request) -> web.Response:
     fabricating a draft. NEVER sends.
     """
     item_id = request.match_info["item_id"]
-    body = await read_json_body(request) if request.can_read_body else {}
-    expected_etag = body.get("etag")
+    # A client etag in the body is accepted for API compatibility but no longer
+    # gates the write (see the conflict-tolerant persist below).
+    if request.can_read_body:
+        await read_json_body(request)
 
     data, current_etag = await _load_async()
     item = next((it for it in data["items"] if it.get("id") == item_id), None)
@@ -3936,12 +4100,15 @@ async def regenerate_item(request: web.Request) -> web.Response:
     # PERSISTENT warm-auth session and inject it so build_draft_prompt renders it
     # (via _format_history3d) into the prompt the MCP-free subprocess drafts from.
     # An unreadable channel ([] result) just leaves the existing prompt — we still
-    # redraft, never falling back to a cold-auth MCP subprocess.
+    # redraft, never falling back to a cold-auth MCP subprocess. Captured so the
+    # conflict-tolerant persist below can re-apply it onto freshly-read data.
+    fetched_history: list | None = None
     if not item.get("history3d"):
         channel_id = item.get("channelId", "")
         if channel_id:
             fetched = await _fetch_history_for(channel_id)
             if fetched:
+                fetched_history = fetched
                 item["history3d"] = fetched
 
     result = await _run_slack_agent("regenerate", {
@@ -3961,24 +4128,48 @@ async def regenerate_item(request: web.Request) -> web.Response:
         )
 
     new_draft = _scrub(str(result.get("draft", "")))[:_DRAFT_CAP]
-    item["draft"] = new_draft
-    # A regenerated draft is the new baseline for the edit-diff signal, and the
-    # item goes back to needs-review (it's a fresh machine draft, not an edit).
-    item["generatedDraft"] = new_draft
-    item["status"] = "needs-review"
 
-    try:
-        new_etag = filestore.write_json(SLACK_PATH, data, expected_etag or current_etag)
-    except filestore.ConflictError as e:
+    # CONFLICT-TOLERANT PERSIST (D-076 item 3): the seam call above can take up
+    # to 2 minutes, and the scan/draft workers rewrite the sidecar every couple
+    # of minutes — so the pre-call etag is routinely stale for a perfectly good
+    # regenerate. Re-read FRESH, re-locate by id, apply the single-item update,
+    # and retry once on a true race. Mirrors save_draft's contract: a client
+    # etag no longer blocks on unrelated writes; only a persistent race 409s.
+    saved_item = None
+    new_etag = None
+    for _attempt in range(2):
+        data, current_etag = await _load_async()
+        item = next((it for it in data["items"] if it.get("id") == item_id), None)
+        if not item:
+            raise web.HTTPNotFound(reason=f"item {item_id} not found")
+        if item.get("status") == "sent":
+            raise web.HTTPConflict(reason="item already sent")
+        item["draft"] = new_draft
+        # A regenerated draft is the new baseline for the edit-diff signal, and
+        # the item goes back to needs-review (a fresh machine draft, not an edit).
+        item["generatedDraft"] = new_draft
+        item["status"] = "needs-review"
+        if fetched_history and not item.get("history3d"):
+            item["history3d"] = fetched_history
+        try:
+            new_etag = filestore.write_json(SLACK_PATH, data, current_etag)
+            saved_item = item
+            break
+        except filestore.ConflictError:
+            continue  # a write landed between our read and write — re-read fresh
+
+    if saved_item is None:
         current, current_etag = filestore.read_json(SLACK_PATH)
         return web.json_response(
-            {"error": "conflict", "message": str(e), "current": current, "etag": current_etag},
+            {"error": "conflict",
+             "message": "the queue kept changing under the regenerate; please retry",
+             "current": current, "etag": current_etag},
             status=409,
         )
 
     ws = request.app["ws_manager"]
     await ws.broadcast("slack_changed", {"id": item_id})
-    return web.json_response({"available": True, "item": item, "etag": new_etag})
+    return web.json_response({"available": True, "item": saved_item, "etag": new_etag})
 
 
 async def polish_text(request: web.Request) -> web.Response:
