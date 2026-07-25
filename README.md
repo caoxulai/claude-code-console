@@ -206,6 +206,27 @@ cd frontend && npm run build             # rebuild the UI
 
 The build is a two-step hybrid: `npm run build` produces the static frontend under `frontend/dist/`, which is copied into `server/static/` and shipped as package data so the server serves the UI at runtime with no Node present.
 
+### One-command check gate
+
+Before opening a change, run the repo check gate:
+
+```bash
+bash scripts/check.sh
+```
+
+It runs, in order, and exits non-zero on the first failure:
+
+1. **Backend tests** — `.venv/bin/python -m pytest tests/ -q` *(fatal)*
+2. **Frontend tests** — `cd frontend && npm test` *(fatal)*
+3. **Frontend build** — `cd frontend && npm run build` *(fatal)*
+4. **Lint** — `npx eslint .` *(non-fatal, reported only)*
+
+The lint step is intentionally **non-fatal**: the repo carries ~50 pre-existing
+lint errors scheduled for a later clean-up batch, so its result is printed but
+does not fail the gate. Once that batch lands, an in-script comment marks
+exactly where to flip lint to fatal. The script resolves the repo root from its
+own location, so it works from any working directory.
+
 ## Project layout
 
 ```
