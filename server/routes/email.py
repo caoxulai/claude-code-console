@@ -1622,8 +1622,96 @@ async def _run_email_agent(action: str, payload: dict) -> dict:
 _scan_in_progress_lock: asyncio.Lock | None = None
 _scan_wake_event: asyncio.Event | None = None
 
-# Tracks last successful scan (epoch ms) -- survives across cycles.
+# Tracks last successful scan (epoch ms) -- survives across cycles. Its
+# persisted mirror lives in the tiny scan-meta sidecar (D-076 item 6) so an
+# idle scan doesn't rewrite (or move the etag of) the main sidecar.
 _LAST_SCAN_TS_MS: int | None = None
+
+
+def _scan_meta_path() -> Path:
+    """Sibling scan-meta file (freshness only). Computed at CALL time from the
+    module-level EMAIL_PATH so tests that monkeypatch EMAIL_PATH move it too."""
+    return EMAIL_PATH.with_name(EMAIL_PATH.stem + "_scan_meta.json")
+
+
+def _read_last_scan_at() -> int | None:
+    """Read lastScanAt from the scan-meta sidecar; None when absent/invalid."""
+    data, _ = filestore.read_json(_scan_meta_path())
+    v = data.get("lastScanAt") if isinstance(data, dict) else None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return int(v)
+    return None
+
+
+def _write_last_scan_at(now_ms: int) -> None:
+    """Persist scan freshness to the tiny meta sidecar (single writer, no etag)."""
+    try:
+        filestore.write_json(_scan_meta_path(), {"lastScanAt": now_ms})
+    except OSError:
+        logger.warning("Email scan: could not persist lastScanAt meta", exc_info=True)
+
+
+# ── Terminal-item retention (D-076 item 1) ───────────────────────────────────
+# Terminal items (approved/dismissed/deleted) were never pruned, so the sidecar
+# grew to multi-MB and every worker tick / queue GET / etag retry paid for the
+# full file. _scan_once ages out terminal items whose terminalAt stamp is older
+# than this window. Legacy terminal items with no stamp are lazily STAMPED
+# (terminalAt=now) rather than pruned — they age out one window later, so the
+# feature never wrongly nukes recent history. Non-terminal items are NEVER
+# pruned regardless of age; mutedThreads has its own TTL and is untouched.
+def _retention_ms_from_env(var: str, default_days: int = 14) -> int:
+    try:
+        days = int(os.environ.get(var, "") or default_days)
+    except ValueError:
+        days = default_days
+    return max(1, days) * 24 * 60 * 60 * 1000
+
+
+_RETENTION_MS = _retention_ms_from_env("CLAUDE_WEB_EMAIL_RETENTION_DAYS")
+
+
+def _prune_terminal_items(items: list, now_ms: int, retention_ms: int) -> tuple[list, bool]:
+    """Return (kept_items, changed): drop terminal items older than the window."""
+    kept: list = []
+    changed = False
+    cutoff = now_ms - retention_ms
+    for it in items:
+        if it.get("status") not in _TERMINAL_STATUSES:
+            kept.append(it)
+            continue
+        term_ts = it.get("terminalAt")
+        if isinstance(term_ts, bool) or not isinstance(term_ts, (int, float)):
+            it["terminalAt"] = now_ms  # grandfather clause — stamp, don't prune
+            changed = True
+            kept.append(it)
+            continue
+        if int(term_ts) < cutoff:
+            changed = True  # aged out — drop
+            continue
+        kept.append(it)
+    return kept, changed
+
+
+def _persist_throttle_stamp(throttled_until: float, reason: str, now_ms: int) -> None:
+    """IMMEDIATELY persist the Graph throttle window via its own small
+    read-modify-write (D-076 item 2).
+
+    The end-of-cycle scan write can lose an etag race and be discarded — which
+    used to drop the throttle stamp exactly when a 429 storm needed it (the
+    descendant of the GRASP 500/day incident). This write is independent of the
+    rest of the cycle: re-read fresh, set only the throttle keys, retry once.
+    Best-effort beyond that (the in-memory copy still throttles THIS process).
+    """
+    for _attempt in range(2):
+        fresh, fresh_etag = _load()
+        fresh["graphThrottledUntil"] = throttled_until
+        fresh["lastGraphError"] = {"reason": reason, "ts": now_ms}
+        try:
+            filestore.write_json(EMAIL_PATH, fresh, fresh_etag)
+            return
+        except filestore.ConflictError:
+            continue
+    logger.warning("Email scan: could not persist graphThrottledUntil (kept in memory)")
 
 
 def _get_scan_lock() -> asyncio.Lock:
@@ -4389,17 +4477,24 @@ async def _scan_once(app) -> None:
             if _is_graph_quota_error(e):
                 quota_hit = True
                 reason = _scrub(_one_line(str(e), 2000))
-                data["graphThrottledUntil"] = now_epoch + _GRAPH_THROTTLE_WINDOW_S
+                until = now_epoch + _GRAPH_THROTTLE_WINDOW_S
+                data["graphThrottledUntil"] = until
                 data["lastGraphError"] = {"reason": reason, "ts": now_ms}
+                # Persist the stamp IMMEDIATELY via its own write (D-076 item 2)
+                # — the end-of-cycle write can lose an etag race and be
+                # discarded, which used to drop the backoff exactly when a 429
+                # storm needed it.
+                _persist_throttle_stamp(until, reason, now_ms)
                 logger.warning(
                     "Email scan: GRASP quota/429 detected -> backing off for %ds: %s",
                     _GRAPH_THROTTLE_WINDOW_S, reason,
                 )
 
-    # Prune mutes
+    # Prune mutes for THIS cycle's candidate filtering; the pruned dict is
+    # PERSISTED inside _apply_scan_results below (not here) so the idle-cycle
+    # change detector sees prune-only cycles too.
     now_s = now_ms / 1000.0
     muted = _prune_muted(data.get("mutedThreads") or {}, now_s)
-    data["mutedThreads"] = muted
 
     # Existing Graph message_ids in active statuses (keyed natively on messageId;
     # conversationId is its alias so older items resolve too).
@@ -4619,6 +4714,10 @@ async def _scan_once(app) -> None:
         and it.get("status") in {"needs-classify", "needs-draft", "needs-review", "edited"}
         and (it.get("messageId") or it.get("conversationId"))
     ][:_BACKFILL_PER_CYCLE]
+    # Pre-backfill snapshots (D-076 item 3): lets the conflict re-apply below know
+    # WHICH items this cycle's backfill actually changed, and detect no-op cycles.
+    _pre_backfill = {str(it.get("id", "")): json.dumps(it, sort_keys=True)
+                     for it in missing_body}
     # Quoted-copy fallback: some Graph message_ids fail get_email persistently while
     # the SAME message is quoted inside a reply thread we already fetched and split.
     # Build the index once so a body-less item can recover its content from that
@@ -4709,8 +4808,11 @@ async def _scan_once(app) -> None:
             # the latest sender in the From column.
             _apply_latest_sender(it, history)
 
-    # Write needs-classify skeletons (admitted items only — the cap was applied
-    # above, so non-admitted unread are NOT persisted this cycle).
+    # Build needs-classify skeletons (admitted items only — the cap was applied
+    # above, so non-admitted unread are NOT persisted this cycle). Built into a
+    # standalone list so the conflict re-apply below can append them to freshly
+    # re-read data.
+    new_skeletons: list[dict] = []
     for raw in admitted:
         skeleton = _skeleton_for(raw)
         # Source-folder tag (D-058, AC-2/AC-7): the folder display name for folder-
@@ -4739,17 +4841,89 @@ async def _scan_once(app) -> None:
             # _skeleton_for re-derives sender from). An empty history leaves the
             # seeded sender untouched (no overwrite, no blank).
             _apply_latest_sender(skeleton, history)
-        data["items"].append(skeleton)
+        new_skeletons.append(skeleton)
 
-    # Update lastScanAt
+    # Snapshot of the items the BACKFILL loop above mutated in place (body/sender/
+    # recipient heals), keyed by queue id — so the conflict re-apply can graft the
+    # heals onto freshly re-read data without redoing MCP work.
+    backfilled: dict[str, dict] = {}
+    for it in missing_body:
+        iid = str(it.get("id", ""))
+        if iid and json.dumps(it, sort_keys=True) != _pre_backfill.get(iid):
+            backfilled[iid] = it
+
+    # Captured locals (not closure refs to `data`, which gets re-bound on the
+    # conflict re-read) so the re-apply stays deterministic.
+    throttle_until_mem = data.get("graphThrottledUntil")
+    graph_err_mem = data.get("lastGraphError")
+
+    def _apply_scan_results(target: dict) -> bool:
+        """Apply this cycle's captured results to a (possibly re-read) data dict.
+
+        Deterministic over new_skeletons/backfilled/muted, so it can be re-applied
+        to fresh data after a write conflict (D-076 item 3) — preserving the
+        concurrent user write instead of discarding the whole cycle. Returns True
+        when anything changed (idle scans skip the write entirely).
+        """
+        changed = False
+        existing = {str(it.get("id", "")) for it in target["items"]}
+        for sk in new_skeletons:
+            if str(sk.get("id", "")) not in existing:
+                target["items"].append(sk)
+                changed = True
+        for iid, healed in backfilled.items():
+            cur = next((it for it in target["items"] if str(it.get("id", "")) == iid), None)
+            # Graft the heal only onto an item still awaiting it — a concurrent
+            # user action (dismiss/approve/edit) wins over a background heal.
+            if cur is not None and cur.get("status") in {
+                    "needs-classify", "needs-draft", "needs-review", "edited"}:
+                if cur is not healed:
+                    cur.update({k: v for k, v in healed.items() if k != "status"})
+                changed = True
+        # Throttle stamp: mirror THIS cycle's in-memory stamp (the immediate
+        # _persist_throttle_stamp write is the durable one; this keeps the
+        # end-of-cycle write consistent with it on a conflict re-read).
+        if throttle_until_mem is not None and (
+                target.get("graphThrottledUntil") != throttle_until_mem):
+            target["graphThrottledUntil"] = throttle_until_mem
+            target["lastGraphError"] = graph_err_mem
+            changed = True
+        # Mute-TTL prune, persisted with the same write.
+        pruned = _prune_muted(target.get("mutedThreads") or {}, now_s)
+        if pruned != (target.get("mutedThreads") or {}):
+            changed = True
+        target["mutedThreads"] = pruned
+        # Terminal-item retention (D-076 item 1).
+        kept, retention_changed = _prune_terminal_items(
+            target["items"], now_ms, _RETENTION_MS)
+        if retention_changed:
+            target["items"] = kept
+            changed = True
+        return changed
+
+    # CONFLICT-TOLERANT WRITE (D-076 item 3): a user action during the (long) MCP
+    # phase used to make this write 409 and DISCARD the entire cycle's fetched
+    # bodies and skeletons. Re-read fresh (keeping the user's write), re-apply,
+    # retry once.
+    for _attempt in range(2):
+        if not _apply_scan_results(data):
+            break  # idle cycle — leave the sidecar byte-identical
+        try:
+            filestore.write_json(EMAIL_PATH, data, current_etag)
+            break
+        except filestore.ConflictError:
+            data, current_etag = _load()
+            continue
+    else:
+        logger.warning(
+            "Email scan: results write kept conflicting — cycle's merge deferred "
+            "to the next scan (user writes preserved)")
+
+    # Freshness advances on EVERY completed cycle — persisted to the tiny
+    # scan-meta sidecar (D-076 item 6) so an idle scan never rewrites the main
+    # sidecar (no etag churn → no spurious conflicts for user actions).
     _LAST_SCAN_TS_MS = now_ms
-    data["lastScanAt"] = now_ms
-
-    try:
-        filestore.write_json(EMAIL_PATH, data, current_etag)
-    except filestore.ConflictError:
-        # Concurrent write won -- skip this cycle.
-        return
+    _write_last_scan_at(now_ms)
 
     await app["ws_manager"].broadcast("email_changed", {"scanned": True})
 
@@ -4986,42 +5160,49 @@ async def _draft_one(app, sem: asyncio.Semaphore, item_id: str) -> None:
 
     generated = _scrub(str(result.get("generatedDraft", new_draft)))[:_DRAFT_CAP]
 
-    # Re-read fresh right before the write
-    data, current_etag = _load()
-    item = next((it for it in data["items"] if it.get("id") == item_id), None)
-    if item is None:
-        return  # Vanished (dismissed/approved)
+    # Re-read fresh right before the write. RETRY-ON-CONFLICT (D-076 item 3): a
+    # lost etag race used to DROP this completed LLM draft and re-spawn a whole
+    # subprocess next cycle — now we re-read fresh (all guards re-checked against
+    # the fresh item) and retry once.
+    for _attempt in range(2):
+        data, current_etag = _load()
+        item = next((it for it in data["items"] if it.get("id") == item_id), None)
+        if item is None:
+            return  # Vanished (dismissed/approved)
 
-    # Status moved on under us (approved/dismissed/deleted/...) — do NOT write.
-    # Anything but the pre-call 'needs-draft' gate would resurrect e.g. an item
-    # the user dismissed during the (up to 120s) subprocess run, because the
-    # write below flips status back to 'needs-review'.
-    if item.get("status") != "needs-draft":
-        return
+        # Status moved on under us (approved/dismissed/deleted/...) — do NOT write.
+        # Anything but the pre-call 'needs-draft' gate would resurrect e.g. an item
+        # the user dismissed during the (up to 120s) subprocess run, because the
+        # write below flips status back to 'needs-review'.
+        if item.get("status") != "needs-draft":
+            return
 
-    # Only draft machine-generated items
-    cur_draft = str(item.get("draft", ""))
-    cur_generated = str(item.get("generatedDraft", ""))
-    if cur_draft.strip() and cur_draft.strip() != cur_generated.strip():
-        return  # User edited -- don't overwrite
+        # Only draft machine-generated items
+        cur_draft = str(item.get("draft", ""))
+        cur_generated = str(item.get("generatedDraft", ""))
+        if cur_draft.strip() and cur_draft.strip() != cur_generated.strip():
+            return  # User edited -- don't overwrite
 
-    item["draft"] = new_draft
-    item["generatedDraft"] = generated
-    thread_ctx = result.get("threadContext", "")
-    if isinstance(thread_ctx, str) and thread_ctx.strip():
-        item["threadContext"] = thread_ctx.strip()
-    # threadAsk (what the sender needs from me) rides the SAME draft call. An
-    # absent/empty ask leaves any prior threadAsk untouched and never fails the
-    # save -- a no-ask FYI keeps an empty ask, never a fabricated one.
-    ask = result.get("threadAsk", "")
-    if isinstance(ask, str) and ask.strip():
-        item["threadAsk"] = ask.strip()
-    item["status"] = "needs-review"
+        item["draft"] = new_draft
+        item["generatedDraft"] = generated
+        thread_ctx = result.get("threadContext", "")
+        if isinstance(thread_ctx, str) and thread_ctx.strip():
+            item["threadContext"] = thread_ctx.strip()
+        # threadAsk (what the sender needs from me) rides the SAME draft call. An
+        # absent/empty ask leaves any prior threadAsk untouched and never fails the
+        # save -- a no-ask FYI keeps an empty ask, never a fabricated one.
+        ask = result.get("threadAsk", "")
+        if isinstance(ask, str) and ask.strip():
+            item["threadAsk"] = ask.strip()
+        item["status"] = "needs-review"
 
-    try:
-        filestore.write_json(EMAIL_PATH, data, current_etag)
-    except filestore.ConflictError:
-        return  # Concurrent write -- retry next cycle
+        try:
+            filestore.write_json(EMAIL_PATH, data, current_etag)
+            break
+        except filestore.ConflictError:
+            continue  # Concurrent write -- re-read fresh and retry once
+    else:
+        return  # both attempts lost the race -- next cycle re-drafts
 
     await app["ws_manager"].broadcast("email_changed", {"id": item_id, "drafted": True})
 
@@ -5093,10 +5274,16 @@ async def _start_scan_worker(app) -> None:
     global _LAST_SCAN_TS_MS
     if _LAST_SCAN_TS_MS is None:
         try:
-            data, _ = _load()
-            persisted = data.get("lastScanAt")
-            if isinstance(persisted, (int, float)) and not isinstance(persisted, bool):
-                _LAST_SCAN_TS_MS = int(persisted)
+            persisted = _read_last_scan_at()
+            if persisted is None:
+                # Legacy fallback: pre-D-076 files carried lastScanAt in the
+                # main sidecar.
+                data, _ = _load()
+                v = data.get("lastScanAt")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    persisted = int(v)
+            if persisted is not None:
+                _LAST_SCAN_TS_MS = persisted
         except Exception:
             pass
     task = app.get("email_scan_task")
@@ -5214,12 +5401,19 @@ def _last_graph_error_reason(data: dict) -> str | None:
 
 
 async def get_queue(request: web.Request) -> web.Response:
-    """GET /api/email/queue -- return the email queue."""
+    """GET /api/email/queue -- return the email queue.
+
+    lastScanAt is served from the tiny scan-meta sidecar (D-076 item 6; legacy
+    in-file key as fallback for pre-migration files).
+    """
     data, etag = await _load_async()
+    last_scan = await asyncio.to_thread(_read_last_scan_at)
+    if last_scan is None:
+        last_scan = data.get("lastScanAt")
     return web.json_response({
         "items": data["items"],
         "etag": etag,
-        "lastScanAt": data.get("lastScanAt"),
+        "lastScanAt": last_scan,
         "paused": data.get("paused", False),
         # Machine-readable throttle flag (computed LIVE -> self-clearing) + the
         # human/operator reason so the UI can honestly show "Outlook temporarily
@@ -5754,6 +5948,7 @@ async def dismiss_item(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
 
     item["status"] = "dismissed"
+    item["terminalAt"] = int(time.time() * 1000)  # retention clock (D-076)
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -5797,6 +5992,7 @@ async def undismiss_item(request: web.Request) -> web.Response:
     draft = str(item.get("draft", ""))
     generated = str(item.get("generatedDraft", ""))
     item["status"] = "edited" if draft.strip() != generated.strip() else "needs-review"
+    item.pop("terminalAt", None)  # active again — stop the retention clock
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -5939,6 +6135,7 @@ async def delete_item(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(reason=f"item {item_id} not found")
     if item.get("status") == "deleted":
         fresh_item["status"] = "deleted"
+        fresh_item["terminalAt"] = int(time.time() * 1000)  # retention clock (D-076)
         fresh_item.pop("lastActionError", None)
     else:
         fresh_item["lastActionError"] = item.get("lastActionError")
@@ -6141,6 +6338,7 @@ async def approve_item(request: web.Request) -> web.Response:
         logger.warning("Email approve: topic-note append failed: %s", _scrub(str(e)))
 
     item["status"] = "approved"
+    item["terminalAt"] = int(time.time() * 1000)  # retention clock (D-076)
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)
@@ -6154,6 +6352,7 @@ async def approve_item(request: web.Request) -> web.Response:
         else:
             if item:
                 item["status"] = "approved"
+                item["terminalAt"] = int(time.time() * 1000)
             try:
                 new_etag = filestore.write_json(EMAIL_PATH, data, current_etag)
             except filestore.ConflictError as e:
@@ -6209,6 +6408,7 @@ async def mute_item(request: web.Request) -> web.Response:
     # dismiss is the one "I've consciously processed this" signal.
     data.setdefault("mutedThreads", {})[mute_key] = int(time.time())
     item["status"] = "dismissed"
+    item["terminalAt"] = int(time.time() * 1000)  # retention clock (D-076)
 
     try:
         new_etag = filestore.write_json(EMAIL_PATH, data, expected_etag or current_etag)

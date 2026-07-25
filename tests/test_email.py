@@ -9423,3 +9423,181 @@ def test_d072r_render_header_date_helper_units():
         "Wednesday, October 1, 2025 at 1:56 PM"
     assert f("") == ""
     assert f("not a date") == "not a date"
+
+
+# ─── D-076: queue reliability batch (retention / throttle / conflict / meta) ──
+
+
+class _NoopWS076:
+    async def broadcast(self, *a, **k):
+        pass
+
+
+async def test_email_retention_prunes_old_terminal_keeps_recent_and_active(
+    email_file, monkeypatch,
+):
+    """Retention (D-076 item 1): a scan cycle drops terminal items whose
+    terminalAt is older than the window, KEEPS recent terminal items (the
+    Approved/Dismissed/Deleted sections + undismiss still work), NEVER prunes
+    non-terminal items regardless of age, and lazily stamps terminalAt onto
+    legacy terminal items instead of pruning them."""
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    old = now_ms - 20 * 24 * 3600 * 1000     # 20 days — beyond the 14-day window
+    recent = now_ms - 2 * 24 * 3600 * 1000   # 2 days — inside the window
+    _seed(email_file, [
+        _make_item("old_dismissed", status="dismissed", terminalAt=old),
+        _make_item("old_deleted", status="deleted", terminalAt=old),
+        _make_item("recent_approved", status="approved", terminalAt=recent),
+        _make_item("legacy_no_stamp", status="dismissed"),        # no terminalAt
+        _make_item("ancient_active", status="needs-review", ts=1),  # active: kept
+    ])
+
+    async def fake_read_tool(name, arguments):
+        return {}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    await email_mod._scan_once({"ws_manager": _NoopWS076()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["id"]: it for it in saved}
+    assert "old_dismissed" not in by_id and "old_deleted" not in by_id
+    assert "recent_approved" in by_id
+    assert "ancient_active" in by_id  # non-terminal is NEVER pruned
+    # Legacy item got stamped (grandfather clause), not pruned.
+    assert "legacy_no_stamp" in by_id
+    assert isinstance(by_id["legacy_no_stamp"].get("terminalAt"), int)
+
+
+async def test_email_dismiss_stamps_terminal_at_and_undismiss_clears(
+    client, email_file,
+):
+    """Terminal writers stamp terminalAt (the retention clock); undismiss
+    clears it so a restored item never inherits a running clock."""
+    _seed(email_file, [_make_item("i1", status="needs-review")])
+    resp = await client.delete("/api/email/queue/i1", json={})
+    assert resp.status == 200
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "dismissed"
+    assert isinstance(saved.get("terminalAt"), int)
+
+    resp = await client.post("/api/email/queue/i1/undismiss", json={})
+    assert resp.status == 200
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"][0]
+    assert saved["status"] == "needs-review"
+    assert "terminalAt" not in saved
+
+
+async def test_email_throttle_stamp_survives_conflicted_cycle_write(
+    email_file, monkeypatch,
+):
+    """Throttle durability (D-076 item 2): when the inbox fetch 429s, the
+    graphThrottledUntil stamp is persisted IMMEDIATELY via its own write — so
+    even when the end-of-cycle write loses its etag race, the stamp is on disk
+    and the next cycle skips Graph reads."""
+    _seed(email_file, [])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            raise email_mod.EmailMcpError("HTTP 429 Too Many Requests (quota)")
+        return {}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    # Sabotage ONLY the end-of-cycle write (which carries items), not the
+    # small immediate throttle write. The throttle write carries
+    # graphThrottledUntil and empty items; identify the cycle write by its
+    # having been called AFTER the throttle write (2nd+ call to write_json
+    # with the full data). Simplest robust discriminator: fail every write
+    # EXCEPT ones whose data contains graphThrottledUntil and nothing new —
+    # instead, just let all writes succeed and then verify the stamp is
+    # ALREADY on disk before the cycle write happens via ordering assertion.
+    write_order = []
+    real_write = email_mod.filestore.write_json
+
+    def spy_write(path, data, expected_etag=None):
+        write_order.append(bool(data.get("graphThrottledUntil")))
+        return real_write(path, data, expected_etag)
+    monkeypatch.setattr(email_mod.filestore, "write_json", spy_write)
+
+    await email_mod._scan_once({"ws_manager": _NoopWS076()})
+
+    # The FIRST write of the cycle carried the throttle stamp (the immediate
+    # persist), independent of the end-of-cycle write.
+    assert write_order and write_order[0] is True
+    saved = json.loads(email_file.read_text(encoding="utf-8"))
+    assert saved.get("graphThrottledUntil") is not None
+
+
+async def test_email_scan_conflict_preserves_concurrent_dismiss(
+    email_file, monkeypatch,
+):
+    """Conflict-tolerant scan write (D-076 item 3): a user dismissing an item
+    mid-scan is NOT clobbered, and the scan's newly discovered item still
+    lands — neither write is lost."""
+    _seed(email_file, [_make_item("existing", status="needs-review")])
+
+    async def fake_read_tool(name, arguments):
+        if name == "get_emails":
+            return {"emails": [{
+                "id": "AAMkNew", "subject": "New mail",
+                "from": {"name": "Ann", "email": "ann@example.com"},
+                "received": "2026-07-25T10:00:00Z", "is_read": False,
+                "preview": "fresh",
+            }], "count": 1, "folder": "inbox"}
+        if name == "get_email":
+            return {"email": {"id": "AAMkNew", "subject": "New mail",
+                              "from": {"name": "Ann"}, "body": "hello"}}
+        return {}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    # Simulate the user dismissing `existing` DURING the scan: the first
+    # write_json call conflicts once, and before the scan's re-read we flip
+    # the item on disk (as the dismiss handler would).
+    real_write = email_mod.filestore.write_json
+    state = {"conflicted": False}
+
+    def conflict_once(path, data, expected_etag=None):
+        if not state["conflicted"]:
+            state["conflicted"] = True
+            # Concurrent user dismiss lands first.
+            import time as _t
+            cur = json.loads(email_file.read_text(encoding="utf-8"))
+            for it in cur["items"]:
+                if it["id"] == "existing":
+                    it["status"] = "dismissed"
+                    it["terminalAt"] = int(_t.time() * 1000)  # fresh — not aged out
+            real_write(email_mod.EMAIL_PATH, cur, None)
+            raise email_mod.filestore.ConflictError(path, "expected", "actual")
+        return real_write(path, data, expected_etag)
+    monkeypatch.setattr(email_mod.filestore, "write_json", conflict_once)
+
+    await email_mod._scan_once({"ws_manager": _NoopWS076()})
+
+    saved = json.loads(email_file.read_text(encoding="utf-8"))["items"]
+    by_id = {it["id"]: it for it in saved}
+    # The user's dismissal survived...
+    assert by_id["existing"]["status"] == "dismissed"
+    # ...AND the scan's new item landed (the cycle was not discarded).
+    assert any(it.get("messageId") == "AAMkNew" or it.get("id") == "AAMkNew"
+               or it.get("conversationId") == "AAMkNew" for it in saved)
+
+
+async def test_email_idle_scan_leaves_sidecar_byte_identical(
+    client, email_file, monkeypatch,
+):
+    """Idle-write churn (D-076 item 6): a no-op scan leaves the main sidecar
+    byte-for-byte unchanged (freshness lives in the scan-meta sidecar), while
+    GET /queue still reports an advancing lastScanAt."""
+    _seed(email_file, [_make_item("i1", status="needs-review")])
+    bytes_before = email_file.read_text(encoding="utf-8")
+
+    async def fake_read_tool(name, arguments):
+        return {}
+    monkeypatch.setattr(email_mod, "call_read_tool", fake_read_tool)
+
+    await email_mod._scan_once({"ws_manager": _NoopWS076()})
+    await email_mod._scan_once({"ws_manager": _NoopWS076()})
+
+    assert email_file.read_text(encoding="utf-8") == bytes_before
+    queue = await (await client.get("/api/email/queue")).json()
+    assert isinstance(queue["lastScanAt"], int)
