@@ -11,7 +11,9 @@ dynamic = ["scripts", "dependencies"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "aiohttp[testing]",
+    # Provides the aiohttp_client fixture every route test uses. (aiohttp has no
+    # 'testing' extra — declaring aiohttp[testing] installs nothing extra.)
+    "pytest-aiohttp>=1.1",
 ]
 
 [tool.setuptools.packages.find]

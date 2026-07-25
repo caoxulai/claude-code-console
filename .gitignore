@@ -15,6 +15,7 @@ frontend/dist/
 # Local per-instance state (Vite dep cache, Claude Code agent worktrees)
 .vite/
 .claude/
+.dev-team-worktrees/
 
 # Runtime data files (email/slack/cron state)
 data/

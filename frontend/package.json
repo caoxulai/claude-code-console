@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node src/pages/emailDetail.test.mjs && node src/components/reconcileOutcome.test.mjs"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",

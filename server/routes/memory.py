@@ -42,6 +42,10 @@ def register(app: web.Application):
 def _safe_name(name: str) -> str:
     """Sanitize filename to prevent directory traversal."""
     name = name.strip()
+    if not name:
+        # An empty name would otherwise become a hidden file literally named
+        # '.md' once the suffix is appended.
+        raise web.HTTPBadRequest(reason="invalid filename")
     if not name.endswith(".md"):
         name += ".md"
     if "/" in name or "\\" in name or ".." in name:

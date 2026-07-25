@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useLiveUpdates } from '../hooks/useLiveUpdates';
 
 function relativeTime(iso) {
@@ -33,11 +33,6 @@ export default function WorkersPage() {
   const [filter, setFilter] = useState('all');
   const [loading, setLoading] = useState(true);
 
-  // Keep a ref to the latest filter so the interval callback reads it without
-  // recreating the interval on filter change.
-  const filterRef = useRef(filter);
-  filterRef.current = filter;
-
   const fetchWorkers = useCallback(async (opts) => {
     const silent = opts && opts.silent;
     try {
@@ -55,7 +50,10 @@ export default function WorkersPage() {
 
   useEffect(() => {
     fetchWorkers();
-    const id = setInterval(() => fetchWorkers({ silent: true }), 5000);
+    const id = setInterval(() => {
+      if (document.hidden) return; // don't poll a hidden tab
+      fetchWorkers({ silent: true });
+    }, 5000);
     return () => clearInterval(id);
   }, [fetchWorkers]);
 
