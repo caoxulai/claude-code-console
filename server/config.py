@@ -43,7 +43,6 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 class AppConfig:
     """Immutable application configuration derived from env vars at startup."""
 
-    secret: str
     port: int
     default_cwd: Path
     my_email: str
@@ -106,15 +105,6 @@ def _resolve_identity_list(env_value: str, file_value, *, lower: bool) -> tuple[
 # ── Build the singleton ──────────────────────────────────────────────────────
 
 def _build_config() -> AppConfig:
-    # secret: REQUIRED -- fail loud if missing/empty
-    secret = os.environ.get("CLAUDE_WEB_SECRET", "").strip()
-    if not secret:
-        raise RuntimeError(
-            "CLAUDE_WEB_SECRET is not set or empty. "
-            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\" "
-            "and add it to your .env file."
-        )
-
     # port
     port = int(os.environ.get("CLAUDE_WEB_PORT", "9000"))
 
@@ -190,7 +180,6 @@ def _build_config() -> AppConfig:
     )
 
     return AppConfig(
-        secret=secret,
         port=port,
         default_cwd=default_cwd,
         my_email=my_email,

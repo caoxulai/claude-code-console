@@ -1,1 +1,3 @@
-recursive-include frontend/dist *
+# The built UI lives in server/static (populated by scripts/copy-dist.mjs). It is
+# gitignored, so an sdist has to declare it explicitly.
+recursive-include server/static *

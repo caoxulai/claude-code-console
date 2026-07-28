@@ -10,6 +10,7 @@ import json
 import logging
 import shutil
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -491,6 +492,11 @@ class SessionManager:
         # must never be held while awaiting another method that needs the same
         # id's lock.
         self._mgr_locks: dict[str, asyncio.Lock] = {}
+        # In-flight lifecycle ops per session id (incremented on entry to
+        # _lock_scope, BEFORE acquiring, so a queued waiter counts). A lock
+        # entry is dropped only when this returns to 0 AND the id is gone from
+        # _sessions — see _lock_scope.
+        self._lock_waiters: dict[str, int] = {}
         # Brand-new sessions arrive with session_id=None (no resume id), so there
         # is no id to key a lock on at creation time. Concurrent no-id creates are
         # serialized by this single creation lock; each produces its own session
@@ -517,6 +523,34 @@ class SessionManager:
             lock = asyncio.Lock()
             self._mgr_locks[session_id] = lock
         return lock
+
+    @asynccontextmanager
+    async def _lock_scope(self, session_id: str) -> AsyncIterator[None]:
+        """Hold the per-id lifecycle lock, dropping the entry after teardown.
+
+        The lock map used to grow one asyncio.Lock per session id forever. Here
+        cleanup is REFCOUNTED: an in-flight counter is bumped BEFORE acquiring
+        (so a caller queued on the lock counts too) and the `_mgr_locks` entry is
+        popped on exit ONLY when the counter is back to 0 AND the id is absent
+        from `_sessions` — i.e. only after the session is genuinely torn down.
+
+        Popping on every release would be a correctness regression, not a fix: a
+        queued waiter would be left holding an orphaned Lock while the next
+        caller minted a SECOND Lock for the same id, reopening the double-spawn
+        race the per-id lock exists to prevent. A live session keeps its lock.
+        """
+        self._lock_waiters[session_id] = self._lock_waiters.get(session_id, 0) + 1
+        try:
+            async with self._lock_for(session_id):
+                yield
+        finally:
+            remaining = self._lock_waiters.get(session_id, 1) - 1
+            if remaining > 0:
+                self._lock_waiters[session_id] = remaining
+            else:
+                self._lock_waiters.pop(session_id, None)
+                if session_id not in self._sessions:
+                    self._mgr_locks.pop(session_id, None)
 
     @staticmethod
     def _warm_key(cwd: str | None, permission_mode: str) -> tuple[str, str]:
@@ -589,7 +623,7 @@ class SessionManager:
 
         # Resuming a known id: serialize the read-then-mutate critical section so
         # two concurrent requests for the same id can't both spawn a subprocess.
-        async with self._lock_for(session_id):
+        async with self._lock_scope(session_id):
             if session_id in self._sessions:
                 session = self._sessions[session_id]
                 if session.alive:
@@ -672,7 +706,7 @@ class SessionManager:
 
     async def stop(self, session_id: str):
         """Stop a specific session."""
-        async with self._lock_for(session_id):
+        async with self._lock_scope(session_id):
             if session_id in self._sessions:
                 await self._sessions[session_id].stop()
                 del self._sessions[session_id]
@@ -698,7 +732,7 @@ class SessionManager:
         # same id can't interleave. Do the start-failure cleanup inline rather
         # than via self.stop() — asyncio.Lock is not reentrant and self.stop()
         # would deadlock on this same per-id lock.
-        async with self._lock_for(session_id):
+        async with self._lock_scope(session_id):
             existing = self._sessions.get(session_id)
             resume_cwd = cwd or (existing.cwd if existing else None)
             resume_mode = permission_mode or (existing.permission_mode if existing else "default")
@@ -831,6 +865,13 @@ class SessionManager:
         )
         self._sessions.clear()
         self._warm_pool.clear()
+        # stop_all() stops the PersistentSessions directly (not via self.stop()),
+        # so their per-id lock entries would otherwise survive the teardown. Drop
+        # them only when nothing is in flight — an op still holding/queued on a
+        # lock must keep its entry, or the next caller for that id would mint a
+        # second Lock and lose the serialization.
+        if not self._lock_waiters:
+            self._mgr_locks.clear()
 
     @property
     def active_sessions(self) -> list[str]:

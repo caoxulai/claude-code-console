@@ -1,11 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "claude-web"
-version = "0.2.0"
+# Single source of truth for the version — bump it here and nowhere else.
+version = "1.0.0"
 description = "Web UI for managing Claude Code sessions, memory, skills, and projects"
 requires-python = ">=3.10"
-# scripts (console entry points) and dependencies are declared in setup.py so
-# the same metadata drives every `pip install .`.
-dynamic = ["scripts", "dependencies"]
+dependencies = [
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+    "croniter>=2.0",
+    "mcp>=1.27,<2",
+]
+
+[project.scripts]
+claude-web = "server.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -19,6 +30,8 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["server*"]
 
+# The built frontend (copied to server/static by frontend's `npm run postbuild`)
+# ships as package data so the server serves the UI with no Node present.
 [tool.setuptools.package-data]
 server = ["static/**/*"]
 

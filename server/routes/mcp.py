@@ -54,9 +54,9 @@ def _is_secret_key(key: str) -> bool:
     return any(hint in key.upper() for hint in _SECRET_HINTS)
 
 
-def _load_all_servers() -> tuple[dict, str | None]:
+async def _load_all_servers() -> tuple[dict, str | None]:
     """Load MCP servers from the active config file."""
-    data, etag = filestore.read_json(_mcp_config_path())
+    data, etag = await filestore.async_read_json(_mcp_config_path())
     servers = data.get("mcpServers", {})
     return servers, etag
 
@@ -94,7 +94,7 @@ def _unmask_secrets(new_config: dict, existing_config: dict) -> dict:
 
 
 async def list_mcp(request: web.Request) -> web.Response:
-    servers, etag = _load_all_servers()
+    servers, etag = await _load_all_servers()
     result = []
     for name, config in servers.items():
         entry = {
@@ -121,7 +121,7 @@ async def update_mcp(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="config must be a JSON object")
 
     path = _mcp_config_path()
-    data, current_etag = filestore.read_json(path)
+    data, current_etag = await filestore.async_read_json(path)
     servers = data.get("mcpServers", {})
     if name not in servers:
         raise web.HTTPNotFound(reason=f"MCP server {name} not found")
@@ -133,7 +133,7 @@ async def update_mcp(request: web.Request) -> web.Response:
     data["mcpServers"] = servers
 
     try:
-        new_etag = filestore.write_json(path, data, expected_etag)
+        new_etag = await filestore.async_write_json(path, data, expected_etag)
     except filestore.ConflictError as e:
         return web.json_response({"error": "conflict", "message": str(e)}, status=409)
 
@@ -154,7 +154,7 @@ async def add_mcp(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="config must be a JSON object")
 
     path = _mcp_config_path()
-    data, current_etag = filestore.read_json(path)
+    data, current_etag = await filestore.async_read_json(path)
     servers = data.get("mcpServers", {})
     if name in servers:
         raise web.HTTPConflict(reason=f"MCP server {name} already exists")
@@ -163,7 +163,7 @@ async def add_mcp(request: web.Request) -> web.Response:
     data["mcpServers"] = servers
 
     try:
-        new_etag = filestore.write_json(path, data, expected_etag)
+        new_etag = await filestore.async_write_json(path, data, expected_etag)
     except filestore.ConflictError as e:
         return web.json_response({"error": "conflict", "message": str(e)}, status=409)
 
@@ -178,7 +178,7 @@ async def delete_mcp(request: web.Request) -> web.Response:
     expected_etag = body.get("etag")
 
     path = _mcp_config_path()
-    data, current_etag = filestore.read_json(path)
+    data, current_etag = await filestore.async_read_json(path)
     servers = data.get("mcpServers", {})
     if name not in servers:
         raise web.HTTPNotFound(reason=f"MCP server {name} not found")
@@ -187,7 +187,7 @@ async def delete_mcp(request: web.Request) -> web.Response:
     data["mcpServers"] = servers
 
     try:
-        new_etag = filestore.write_json(path, data, expected_etag)
+        new_etag = await filestore.async_write_json(path, data, expected_etag)
     except filestore.ConflictError as e:
         return web.json_response({"error": "conflict", "message": str(e)}, status=409)
 

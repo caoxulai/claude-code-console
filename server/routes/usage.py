@@ -45,6 +45,15 @@ _CACHE_WRITE_MULT = 1.25
 
 _CACHE_TTL = 120  # seconds
 
+# How long the cheap incremental path may run before a FULL reconcile (D-078
+# item 27b). The incremental scan only ever ADDS: it cannot know that a line
+# vanished from a rewritten/compacted transcript, so records, `seen` and
+# file_mtimes accumulate monotonically in a long-lived process. Periodically we
+# force the existing full-rescan branch, which rebuilds all three TOGETHER from
+# the files currently on disk — records and `seen` must move in LOCKSTEP or an
+# orphaned UUID would suppress a record's reappearance (D-037).
+_RECONCILE_INTERVAL_S = 3600
+
 
 def register(app: web.Application):
     app.router.add_get("/api/usage", get_usage)
@@ -136,6 +145,8 @@ class _Cache:
     seen: set[str] = field(default_factory=set)
     responses: dict = field(default_factory=dict)  # pre-computed endpoint responses
     updated_at: float = 0.0
+    # monotonic stamp of the last FULL rebuild (0.0 = never scanned yet).
+    reconciled_at: float = 0.0
 
 
 _cache = _Cache()
@@ -213,6 +224,7 @@ def _scan_incremental(
     prev_records: list[_Record],
     prev_file_mtimes: dict[str, tuple[int, int]],
     prev_seen: set[str],
+    force_full: bool = False,
 ) -> tuple[list[_Record], dict[str, tuple[int, int]], set[str]]:
     """Incremental scan: only re-parse new or changed files.
 
@@ -220,6 +232,12 @@ def _scan_incremental(
     Deletion of files (rare) triggers a full rescan to keep the seen set
     consistent — we cannot efficiently evict orphaned UUIDs without storing
     them per-file, and a full rescan on deletion is acceptable given its rarity.
+
+    `force_full` (the periodic reconcile, _RECONCILE_INTERVAL_S) takes that same
+    full-rescan branch unconditionally. The incremental path only ever ADDS, so
+    records/seen/file_mtimes retain entries for lines that were rewritten away;
+    rebuilding all three from the files on disk is the only way to shed them, and
+    doing it through this ONE branch keeps records and `seen` in lockstep.
     """
     if not CLAUDE_PROJECTS_BASE.is_dir():
         return [], {}, set()
@@ -237,9 +255,10 @@ def _scan_incremental(
             continue
 
     # Detect deleted files — if any were deleted, do a full rescan to keep
-    # the seen set in sync (prevents orphaned-UUID suppression trap).
+    # the seen set in sync (prevents orphaned-UUID suppression trap). The
+    # periodic reconcile reuses this same branch.
     deleted = set(prev_file_mtimes.keys()) - set(current_files.keys())
-    if deleted:
+    if deleted or force_full:
         seen: set[str] = set()
         file_mtimes: dict[str, tuple[int, int]] = {}
         all_records: list[_Record] = []
@@ -389,20 +408,33 @@ async def _ensure_cache() -> dict:
         prev_file_mtimes = _cache.file_mtimes
         prev_seen = _cache.seen
 
+        # Periodic FULL reconcile: past the interval, rebuild records/seen/
+        # file_mtimes from the files on disk instead of accumulating additions
+        # forever (a rewritten transcript's dropped lines are otherwise cached
+        # for the process's lifetime).
+        # A cold scan (no prior file_mtimes) is already a full one, so count it
+        # as the reconcile that starts the clock.
+        force_full = (
+            not prev_file_mtimes
+            or (now - _cache.reconciled_at) >= _RECONCILE_INTERVAL_S
+        )
+
         def _scan_and_compute():
             records, file_mtimes, seen = _scan_incremental(
-                prev_records, prev_file_mtimes, prev_seen
+                prev_records, prev_file_mtimes, prev_seen, force_full=force_full
             )
             responses = _build_all_responses(records)
             return records, file_mtimes, seen, responses
 
         records, file_mtimes, seen, responses = await asyncio.to_thread(_scan_and_compute)
+        completed_at = time.monotonic()
         _cache = _Cache(
             records=records,
             file_mtimes=file_mtimes,
             seen=seen,
             responses=responses,
-            updated_at=time.monotonic(),
+            updated_at=completed_at,
+            reconciled_at=completed_at if force_full else _cache.reconciled_at,
         )
         return responses
 

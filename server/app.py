@@ -1,6 +1,7 @@
 """aiohttp application factory for Claude Code Console."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from aiohttp import web
@@ -9,21 +10,34 @@ from server.config import cfg
 from server.ws import WebSocketManager
 from server.routes import chat, sessions, settings, memory, skills, hooks, mcp, crons, oscron, tasks, plugins, usage, agents, slack, email, workers
 
+logger = logging.getLogger(__name__)
+
+# Dev mode: frontend/dist lives next to the server/ package.
+_DEV_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+# Installed mode: static/ is bundled inside the server package as package data.
+_PACKAGED_DIST = Path(__file__).parent / "static"
+
 
 def _resolve_frontend_dist() -> Path:
     """Find the frontend dist directory (works both in dev and installed mode)."""
-    # Dev mode: frontend/dist lives next to the server/ package
-    dev_path = Path(__file__).parent.parent / "frontend" / "dist"
-    if dev_path.is_dir():
-        return dev_path
-    # Installed mode: static/ is bundled inside the server package
-    installed_path = Path(__file__).parent / "static"
-    if installed_path.is_dir():
-        return installed_path
-    return dev_path  # fallback (will just fail gracefully in create_app)
+    if _DEV_DIST.is_dir():
+        return _DEV_DIST
+    if _PACKAGED_DIST.is_dir():
+        return _PACKAGED_DIST
+    return _DEV_DIST  # fallback (will just fail gracefully in create_app)
 
 
 FRONTEND_DIST = _resolve_frontend_dist()
+
+
+def _frontend_dist_label(dist: Path) -> str:
+    """Name the branch that produced `dist`, for the startup log line."""
+    if dist == _DEV_DIST:
+        return "dev frontend/dist"
+    if dist == _PACKAGED_DIST:
+        return "packaged server/static"
+    return "custom path"
+
 
 ALLOWED_CWD_ROOTS = [
     Path.home(),
@@ -38,8 +52,12 @@ def create_app() -> web.Application:
     app["default_cwd"] = cfg.default_cwd
     app["allowed_cwd_roots"] = ALLOWED_CWD_ROOTS
     # Resolve the permission mode once at startup so chat.py can read it
-    # per-request without re-parsing config (env > config.json > bypassPermissions).
-    app["permission_mode"] = cfg.permission_mode
+    # per-request without re-parsing config (env > config.json 'permissionMode' >
+    # bypassPermissions). Imported function-locally: cli.py lazily imports
+    # create_app inside cmd_start, so a module-level import here would cycle.
+    from server.cli import resolve_permission_mode
+
+    app["permission_mode"] = resolve_permission_mode()
 
     # WebSocket
     app.router.add_get("/ws", app["ws_manager"].handle)
@@ -66,8 +84,16 @@ def create_app() -> web.Application:
     # Health check
     app.router.add_get("/healthz", _healthz)
 
-    # SPA fallback: serve frontend dist, fall back to index.html for client routes
-    if FRONTEND_DIST.is_dir():
+    # SPA fallback: serve frontend dist, fall back to index.html for client routes.
+    # One line naming the dist dir that actually won, so a stale or absent build is
+    # visible in the log instead of silently serving the wrong (or no) UI.
+    serving = FRONTEND_DIST.is_dir()
+    logger.info(
+        "Frontend dist: %s (%s)",
+        FRONTEND_DIST,
+        _frontend_dist_label(FRONTEND_DIST) if serving else "missing — UI not served",
+    )
+    if serving:
         app.router.add_static("/assets", FRONTEND_DIST / "assets", show_index=False)
         app.router.add_get("/{path:.*}", _spa_handler)
 
@@ -78,7 +104,16 @@ async def _healthz(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def _spa_handler(_request: web.Request) -> web.Response:
+async def _spa_handler(request: web.Request) -> web.Response:
+    # An unmatched /api/ path is a backend miss, never a client route: answering it
+    # with the SPA shell (HTTP 200 + index.html) makes a typo or a removed endpoint
+    # look like a successful request to every fetch() caller. The guard lives here
+    # rather than as an /api/{path:.*} route on purpose — a route-level catch-all
+    # would turn POSTs to removed endpoints from 405 into 404.
+    if request.path.startswith("/api/"):
+        return web.json_response(
+            {"error": "not found", "path": request.path}, status=404
+        )
     index = FRONTEND_DIST / "index.html"
     if index.exists():
         return web.FileResponse(index)

@@ -993,6 +993,22 @@ def _cwd_to_project_dir(cwd: str) -> str:
     return "-" + cwd.lstrip("/").replace("/", "-")
 
 
+def _int_param(query, name: str, default: int) -> int:
+    """Parse a non-negative int query param, degrading to `default`.
+
+    A hand-typed or stale URL (?limit=abc, ?offset=-5) must never turn into a 500
+    traceback: a malformed or negative value falls back to the documented default.
+    """
+    raw = query.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
 def _validate_session_id(session_id: str) -> None:
     """Reject session ids containing path-traversal characters.
 
@@ -1106,8 +1122,8 @@ async def list_sessions(request: web.Request) -> web.Response:
     """
     global _sessions_cache
     project = request.query.get("project")
-    limit = int(request.query.get("limit", "50"))
-    offset = int(request.query.get("offset", "0"))
+    limit = _int_param(request.query, "limit", 50)
+    offset = _int_param(request.query, "offset", 0)
 
     # Determine the home-cwd bucket name (used to decide where interactive filter applies)
     default_cwd = str(request.app["default_cwd"])
@@ -1184,6 +1200,123 @@ def _read_transcript_records(path: Path) -> list:
     return records
 
 
+# Transcript tail-window sizing. Real transcripts reach ~50MB / ~21k records
+# (~2.4KB per record) and SessionsPage re-fetches on a 30s poll, so reading and
+# json-parsing the whole file for a 200-record tail view is the dominant cost.
+# The initial window covers ~400 real records; it GROWS geometrically (and
+# finally becomes a whole-file read) until it holds offset+limit records, so a
+# short window can never return fewer/different records than the full read.
+_TRANSCRIPT_TAIL_WINDOW_BYTES = 1024 * 1024
+_TRANSCRIPT_TAIL_WINDOW_GROWTH = 4
+_TRANSCRIPT_COUNT_CHUNK_BYTES = 1024 * 1024
+
+
+def _split_transcript_lines(chunk: bytes) -> list[str]:
+    """Split a raw transcript chunk into lines EXACTLY like `for line in fh` does.
+
+    Deliberately splits on "\\n" only, NOT via str.splitlines(): the CLI writes
+    JSON with ensure_ascii=False, so message content can carry a raw U+2028 LINE
+    SEPARATOR (verified present in a real 50MB transcript) or a \\x0b/\\x0c/\\x85,
+    all of which splitlines() treats as line breaks while the full read does not.
+    Splitting on those shatters one record into two unparseable fragments and
+    shifts the whole tail window — a silently wrong 200 messages.
+
+    Decoded with errors='replace' so a multi-byte char cut at the window boundary
+    can't raise.
+    """
+    return chunk.decode("utf-8", errors="replace").split("\n")
+
+
+def _parse_transcript_lines(lines) -> list:
+    """Parse JSONL lines, SKIPPING malformed ones (same tolerance as the full read)."""
+    records = []
+    for line in lines:
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def _read_transcript_tail(path: Path, needed: int) -> tuple[list, bool]:
+    """Read the last `needed` records of a transcript via a windowed read from EOF.
+
+    Returns (records, read_whole_file). `records` is always a SUFFIX of what
+    _read_transcript_records would return for the same file — byte-for-byte the
+    same records, so a windowed tail view can never silently drop a message:
+
+      * lines are split by _split_transcript_lines (newline-only, matching the
+        full read) and the FIRST one is dropped, since a seek from EOF can land
+        mid-line — mirrors _extract_title's tail chunk;
+      * a malformed line is skipped, never aborts (the _read_transcript_records
+        tolerance contract);
+      * when the window yields fewer than `needed` records it GROWS and re-reads,
+        ending in a whole-file read once the window covers the file. Small files
+        are read whole on the first pass (no seek, no dropped line).
+    """
+    window = max(_TRANSCRIPT_TAIL_WINDOW_BYTES, 1)
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        while True:
+            if window >= size:
+                fh.seek(0)
+                return _parse_transcript_lines(_split_transcript_lines(fh.read())), True
+            fh.seek(-window, os.SEEK_END)
+            chunk = fh.read(window)
+            # Drop the first (possibly partial) line of the window.
+            records = _parse_transcript_lines(_split_transcript_lines(chunk)[1:])
+            if len(records) >= needed:
+                return records, False
+            window *= _TRANSCRIPT_TAIL_WINDOW_GROWTH
+
+
+def _count_transcript_lines(path: Path) -> int:
+    """Count lines in a transcript with a chunked byte read and NO json parsing.
+
+    This is how `total` is computed on the windowed tail path: counting newlines
+    is ~two orders of magnitude cheaper than parsing every record, and the
+    envelope contract requires the key to stay present. CAVEAT: the count equals
+    the parsed-record count unless the file contains a malformed or blank line
+    (those are skipped by the parsers but still counted here). No frontend
+    consumer reads `total`; the tail slice is computed from record positions
+    counted backward from EOF, never from this number, so an off-by-a-malformed-
+    line total cannot affect which messages are returned.
+    """
+    count = 0
+    last = b"\n"
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(_TRANSCRIPT_COUNT_CHUNK_BYTES)
+            if not chunk:
+                break
+            count += chunk.count(b"\n")
+            last = chunk[-1:]
+    if last != b"\n":
+        count += 1  # final line without a trailing newline
+    return count
+
+
+def _read_transcript_tail_window(path: Path, offset: int, limit: int) -> tuple[list, int]:
+    """The tail slice (offset counts records backward from EOF) plus `total`.
+
+    Equivalent to the old full-read `records[max(0, T-offset-limit):T-offset]`:
+    _read_transcript_tail guarantees its result is a SUFFIX of the full read and
+    holds at least offset+limit records unless it read the whole file, so the
+    local slice below picks exactly the same records the full read did.
+    """
+    records, read_whole = _read_transcript_tail(path, offset + limit)
+    if read_whole:
+        total = len(records)
+        end = total - offset
+    else:
+        # A partial window covered offset+limit records, so no clamping at the
+        # file start can apply and the slice never touches records outside it.
+        total = _count_transcript_lines(path)
+        end = len(records) - offset
+    start = max(0, end - limit)
+    return records[start:max(start, end)], total
+
+
 async def get_transcript(request: web.Request) -> web.Response:
     """Stream a session transcript as JSON array (paginated by line count)."""
     session_id = request.match_info["session_id"]
@@ -1200,31 +1333,30 @@ async def get_transcript(request: web.Request) -> web.Response:
     if not path:
         raise web.HTTPNotFound(reason="session not found")
 
-    limit = int(request.query.get("limit", "200"))
-    offset = int(request.query.get("offset", "0"))
+    limit = _int_param(request.query, "limit", 200)
+    offset = _int_param(request.query, "offset", 0)
     # tail=true returns the LAST `limit` records instead of the first ones —
     # the right default for a transcript viewer, which should show the most
     # recent activity. Sessions can be thousands of lines long; showing the
     # head means the recent messages are never visible.
     tail = request.query.get("tail", "").lower() in ("1", "true", "yes")
 
-    # Parse all records (session files are local and at most a few thousand
-    # lines, so a full read is cheap and lets us compute total + tail slice).
     # The read + per-line json.loads runs OFF the event loop: a synchronous
     # open()+parse here blocks every concurrent SSE stream and API call for the
     # duration of the parse, which is exactly the "app hangs" symptom on every
     # ClarifyChat resume of a large transcript. Mirrors every other heavy reader
     # in this file, which already offload via asyncio.to_thread.
-    records = await asyncio.to_thread(_read_transcript_records, path)
-
-    total = len(records)
     if tail:
-        # Last `limit` records; offset counts backward from the end so the UI
-        # can page toward older messages.
-        end = total - offset
-        start = max(0, end - limit)
-        window = records[start:max(start, end)]
+        # Windowed tail read: every live caller asks for tail=true, and a full
+        # read+parse of a ~50MB transcript on a 30s poll is the whole cost. The
+        # window is grown/escalated to a full read until it covers offset+limit
+        # records, so `records` is always a SUFFIX of the full read's output and
+        # the slice below is byte-for-byte identical to the old full-read slice.
+        window, total = await asyncio.to_thread(_read_transcript_tail_window,
+                                               path, offset, limit)
     else:
+        records = await asyncio.to_thread(_read_transcript_records, path)
+        total = len(records)
         window = records[offset:offset + limit]
 
     return web.json_response({

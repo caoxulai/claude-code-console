@@ -48,13 +48,18 @@ The server runs locally on `127.0.0.1:9000` by default and serves a pre-built Re
 git clone https://github.com/caoxulai/claude-code-console.git claude-web
 cd claude-web
 
-# 2. Build the frontend (produces frontend/dist/)
+# 2. Build the frontend (produces frontend/dist/, then copies it to server/static/)
 cd frontend && npm install && npm run build && cd ..
 
 # 3. Install the package
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
+
+Step 2 is what ships the UI: `npm run build` writes `frontend/dist/`, and its
+`postbuild` hook (`scripts/copy-dist.mjs`) copies that into `server/static/`,
+which `pip install` picks up as package data. Build before installing, or the
+installed server has no UI to serve.
 
 For frontend hot-reload during development, run the Vite dev server (proxies
 `/api` to the backend) alongside the backend:
@@ -204,7 +209,22 @@ control the network and accept that risk, pass `--allow-remote` (or set
 cd frontend && npm run build             # rebuild the UI
 ```
 
-The build is a two-step hybrid: `npm run build` produces the static frontend under `frontend/dist/`, which is copied into `server/static/` and shipped as package data so the server serves the UI at runtime with no Node present.
+The build is a two-step hybrid: `npm run build` produces the static frontend
+under `frontend/dist/`, then its `postbuild` hook runs `scripts/copy-dist.mjs`,
+which wipes and repopulates `server/static/` from it. `server/static/` is
+gitignored (build output) but shipped as package data, so the installed server
+serves the UI at runtime with no Node present. In dev mode the server prefers
+`frontend/dist/`, and on every start it prints one line naming the directory it
+actually serves, so a stale or absent build is visible:
+
+```
+[claude-web] INFO server.app: Frontend dist: /path/to/server/static (packaged server/static)
+[claude-web] INFO server.app: Frontend dist: /path/to/frontend/dist (missing — UI not served)
+```
+
+Packaging metadata lives entirely in `pyproject.toml` — version, dependencies,
+the `claude-web` console script, and package data. There is no `setup.py`;
+bump the version in `pyproject.toml` only.
 
 ### One-command check gate
 

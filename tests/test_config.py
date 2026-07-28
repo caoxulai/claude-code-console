@@ -32,11 +32,13 @@ from server.config import _build_config  # noqa: E402
 def _clean_identity_env(monkeypatch, tmp_path):
     """Isolate every env var _build_config reads for identity resolution.
 
-    CLAUDE_WEB_SECRET is required (else _build_config raises); the two identity
-    vars and CLAUDE_WEB_CONFIG start CLEARED so each test opts in explicitly and
-    the real user config is never read.
+    CLAUDE_WEB_SECRET is deliberately CLEARED: it was removed entirely in D-078
+    (its only consumer was the deleted root server.py), so _build_config must
+    build fine without it.  The two identity vars and CLAUDE_WEB_CONFIG start
+    CLEARED too, so each test opts in explicitly and the real user config is
+    never read.
     """
-    monkeypatch.setenv("CLAUDE_WEB_SECRET", "test-secret")
+    monkeypatch.delenv("CLAUDE_WEB_SECRET", raising=False)
     monkeypatch.delenv("CLAUDE_WEB_SELF_MENTION_IDS", raising=False)
     monkeypatch.delenv("CLAUDE_WEB_BOT_SENDERS", raising=False)
     # Point config at a tmp path that does NOT exist by default (absent file).
@@ -47,6 +49,22 @@ def _write_config(tmp_path: Path, data: dict) -> Path:
     path = tmp_path / "config.json"
     path.write_text(json.dumps(data))
     return path
+
+
+# ─── CLAUDE_WEB_SECRET removed (D-078 item 24) ───────────────────────────────
+
+def test_build_config_succeeds_without_secret_env_var():
+    """No CLAUDE_WEB_SECRET anywhere must be a NON-event (was an import-time raise)."""
+    cfg = _build_config()  # must not raise
+    assert cfg.port > 0
+
+
+def test_app_config_has_no_secret_field():
+    cfg = _build_config()
+    assert not hasattr(cfg, "secret"), (
+        "AppConfig.secret was removed in D-078 — nothing under server/ consumed "
+        "it once the legacy root server.py was deleted."
+    )
 
 
 # ─── defaults / absent ────────────────────────────────────────────────────────

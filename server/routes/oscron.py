@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -36,6 +37,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiohttp import web
+
+logger = logging.getLogger(__name__)
 
 # cron uses literal wall-clock time, so we must be explicit about the timezone we
 # compute next-runs in. A ``CRON_TZ=`` line wins when present; otherwise we default
@@ -59,6 +62,16 @@ _MAX_RUNS = 20
 # silently call them "succeeded" — cf. feedback_principle_fail_loud_on_missing_input).
 _RUNNING_RECENCY_MS = 30 * 60 * 1000  # 30 minutes
 
+# Every subprocess we shell out to is a fast local read (`crontab -l`,
+# `systemctl list-timers`, `journalctl -n`), so 10s (the hooks.py precedent) is
+# generous; past it the command is wedged (e.g. a hung dbus/journal) and the
+# request must degrade rather than hang forever.
+_SUBPROCESS_TIMEOUT_S = 10
+# journald keeps a unit's entire history; without a bound a busy unit's whole
+# journal is decoded into memory just to derive at most _MAX_RUNS runs. 500 lines
+# covers far more than the ~2 Starting/Finished events per run we need.
+_JOURNAL_MAX_LINES = 500
+
 
 def _looks_secret(text: str) -> bool:
     low = text.lower()
@@ -79,8 +92,9 @@ def register(app: web.Application):
 async def _run(argv: list[str]) -> tuple[int, str]:
     """Run a command OFF the event loop; return (returncode, decoded stdout).
 
-    Returns (127, "") if the binary is missing so callers degrade gracefully into
-    an empty list instead of raising / 500-ing.
+    Returns (127, "") if the binary is missing OR the call exceeds
+    _SUBPROCESS_TIMEOUT_S, so callers degrade gracefully into an empty list
+    instead of raising / 500-ing / hanging the request forever.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -90,7 +104,19 @@ async def _run(argv: list[str]) -> tuple[int, str]:
         )
     except (FileNotFoundError, OSError):
         return 127, ""
-    out, _err = await proc.communicate()
+    try:
+        out, _err = await asyncio.wait_for(proc.communicate(), timeout=_SUBPROCESS_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        # wait_for cancels communicate() but leaves the child running; kill it and
+        # reap it so a wedged crontab/systemctl/journalctl doesn't orphan a
+        # process still holding its pipes.
+        proc.kill()
+        await proc.wait()
+        logger.warning(
+            "oscron: %s timed out after %ss; degrading to no output",
+            argv[0], _SUBPROCESS_TIMEOUT_S,
+        )
+        return 127, ""
     return proc.returncode or 0, out.decode("utf-8", errors="replace")
 
 
@@ -110,12 +136,19 @@ async def _run_systemctl_system() -> tuple[int, str]:
 # events; `systemctl show` gives the single most-recent invocation as a fallback.
 # `--timestamp=unix` renders ExecMain* timestamps as ``@<epoch-seconds>`` which is
 # deterministically parseable (the default human string is locale/format-fragile).
+# `-n` bounds the read so a busy unit's whole journal never lands in memory.
 async def _run_journalctl_user(unit: str) -> tuple[int, str]:
-    return await _run(["journalctl", "--user", "-u", unit, "-o", "json", "--no-pager"])
+    return await _run([
+        "journalctl", "--user", "-u", unit, "-o", "json", "--no-pager",
+        "-n", str(_JOURNAL_MAX_LINES),
+    ])
 
 
 async def _run_journalctl_system(unit: str) -> tuple[int, str]:
-    return await _run(["journalctl", "-u", unit, "-o", "json", "--no-pager"])
+    return await _run([
+        "journalctl", "-u", unit, "-o", "json", "--no-pager",
+        "-n", str(_JOURNAL_MAX_LINES),
+    ])
 
 
 async def _run_systemctl_show_user(unit: str) -> tuple[int, str]:

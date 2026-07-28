@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# Build output — frontend dist copied here by build-tools/bin/custom-build
+# Build output — frontend dist copied here by scripts/copy-dist.mjs (npm postbuild)
 server/static/
 frontend/dist/
 
