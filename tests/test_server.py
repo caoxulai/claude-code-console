@@ -6034,8 +6034,8 @@ async def test_slack_approve_sends_to_channel_id(client, slack_file, monkeypatch
     seam — the subprocess receives the routable ID, not a display name."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
-        "channelType": "dm", "channelId": "D02P0TU89CN", "userId": "U02P2R0L3DX",
+        "id": "i1", "sender": "Test Peer", "channel": "DM with Test Peer",
+        "channelType": "dm", "channelId": "D0TESTPEER1", "userId": "U0TESTPEER1",
         "snippet": "hi", "threadContext": "", "draft": "sounds good",
         "generatedDraft": "sounds good", "status": "needs-review", "ts": 1,
     }]}), encoding="utf-8")
@@ -6049,7 +6049,7 @@ async def test_slack_approve_sends_to_channel_id(client, slack_file, monkeypatch
     # post_message received the channelId as channel, NOT the display name.
     send_calls = [c for c in gated.calls if c[0] == "post_message"]
     assert len(send_calls) == 1
-    assert send_calls[0][1]["channel"] == "D02P0TU89CN"
+    assert send_calls[0][1]["channel"] == "D0TESTPEER1"
     assert send_calls[0][1]["text"] == "sounds good"
 
 
@@ -6058,8 +6058,8 @@ async def test_slack_approve_falls_back_to_user_id(client, slack_file, monkeypat
     the routable target."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
-        "channelType": "dm", "userId": "U02P2R0L3DX",
+        "id": "i1", "sender": "Test Peer", "channel": "DM with Test Peer",
+        "channelType": "dm", "userId": "U0TESTPEER1",
         "snippet": "hi", "threadContext": "", "draft": "ok",
         "generatedDraft": "ok", "status": "needs-review", "ts": 1,
     }]}), encoding="utf-8")
@@ -6071,7 +6071,7 @@ async def test_slack_approve_falls_back_to_user_id(client, slack_file, monkeypat
     body = await resp.json()
     assert body["item"]["status"] == "sent"
     send_calls = [c for c in gated.calls if c[0] == "post_message"]
-    assert send_calls[0][1]["channel"] == "U02P2R0L3DX"
+    assert send_calls[0][1]["channel"] == "U0TESTPEER1"
 
 
 async def test_slack_approve_unroutable_item_fails_loudly(client, slack_file, monkeypatch):
@@ -6079,7 +6079,7 @@ async def test_slack_approve_unroutable_item_fails_loudly(client, slack_file, mo
     — the send seam is NEVER called, the item stays unsent."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
+        "id": "i1", "sender": "Test Peer", "channel": "DM with Test Peer",
         "channelType": "dm",
         "snippet": "hi", "threadContext": "", "draft": "sounds good",
         "generatedDraft": "sounds good", "status": "needs-review", "ts": 1,
@@ -8680,8 +8680,8 @@ async def test_slack_approve_uses_channel_id_in_send_payload(client, slack_file,
     channelId is preferred over userId when both are present."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
-        "channelType": "dm", "channelId": "D02P0TU89CN", "userId": "U02P2R0L3DX",
+        "id": "i1", "sender": "Test Peer", "channel": "DM with Test Peer",
+        "channelType": "dm", "channelId": "D0TESTPEER1", "userId": "U0TESTPEER1",
         "snippet": "can you review?", "threadContext": "", "draft": "sure thing",
         "generatedDraft": "sure thing", "status": "needs-review", "ts": 1,
     }]}), encoding="utf-8")
@@ -8694,9 +8694,9 @@ async def test_slack_approve_uses_channel_id_in_send_payload(client, slack_file,
     send_calls = [c for c in gated.calls if c[0] == "post_message"]
     assert len(send_calls) == 1
     channel = send_calls[0][1]["channel"]
-    assert channel == "D02P0TU89CN"
+    assert channel == "D0TESTPEER1"
     # channelId is PREFERRED over userId — verify userId is NOT the target.
-    assert channel != "U02P2R0L3DX"
+    assert channel != "U0TESTPEER1"
     # The human-readable 'channel' field must NOT appear as the send target.
     assert "DM with" not in channel
 
@@ -8707,8 +8707,8 @@ async def test_slack_approve_double_send_guard_still_holds_with_channel_id(clien
     and the send seam is never called."""
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
-        "id": "i1", "sender": "Huan Wang", "channel": "DM with Huan Wang",
-        "channelType": "dm", "channelId": "D02P0TU89CN", "userId": "U02P2R0L3DX",
+        "id": "i1", "sender": "Test Peer", "channel": "DM with Test Peer",
+        "channelType": "dm", "channelId": "D0TESTPEER1", "userId": "U0TESTPEER1",
         "snippet": "done?", "threadContext": "", "draft": "yep",
         "generatedDraft": "yep", "status": "sent", "ts": 1, "finalText": "yep",
     }]}), encoding="utf-8")
@@ -8735,7 +8735,7 @@ async def test_slack_group_dm_item_round_trips(client, slack_file):
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "gdm1", "sender": "alice", "channel": "mpdm-alice--testuser--bob-1",
-        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "channelType": "group_dm", "channelId": "C0TESTGDM01",
         "snippet": "hey team, quick sync?", "threadContext": "",
         "draft": "sure, let me check my calendar", "generatedDraft": "sure, let me check my calendar",
         "status": "needs-review", "ts": 1718600000,
@@ -8746,7 +8746,7 @@ async def test_slack_group_dm_item_round_trips(client, slack_file):
     assert len(body["items"]) == 1
     item = body["items"][0]
     assert item["channelType"] == "group_dm"
-    assert item["channelId"] == "C0BC0TT5Z2L"
+    assert item["channelId"] == "C0TESTGDM01"
     assert item["channel"] == "mpdm-alice--testuser--bob-1"
     assert item["sender"] == "alice"
     assert item["status"] == "needs-review"
@@ -8758,7 +8758,7 @@ async def test_slack_group_dm_approve_routes_via_channel_id(client, slack_file, 
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "gdm1", "sender": "alice", "channel": "mpdm-alice--testuser--bob-1",
-        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "channelType": "group_dm", "channelId": "C0TESTGDM01",
         "snippet": "hey team", "threadContext": "",
         "draft": "on it", "generatedDraft": "on it",
         "status": "needs-review", "ts": 1718600000,
@@ -8773,7 +8773,7 @@ async def test_slack_group_dm_approve_routes_via_channel_id(client, slack_file, 
     # post_message was called with channelId as the channel.
     send_calls = [c for c in gated.calls if c[0] == "post_message"]
     assert len(send_calls) == 1
-    assert send_calls[0][1]["channel"] == "C0BC0TT5Z2L"
+    assert send_calls[0][1]["channel"] == "C0TESTGDM01"
     # The human-readable mpdm slug must NOT be used as the send target.
     assert "mpdm" not in send_calls[0][1]["channel"]
 
@@ -8784,7 +8784,7 @@ async def test_slack_group_dm_dismiss_and_undismiss(client, slack_file):
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "gdm1", "sender": "bob", "channel": "mpdm-alice--testuser--bob-1",
-        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "channelType": "group_dm", "channelId": "C0TESTGDM01",
         "snippet": "thoughts?", "threadContext": "",
         "draft": "let me think about it", "generatedDraft": "let me think about it",
         "status": "needs-review", "ts": 1718600000,
@@ -8817,7 +8817,7 @@ async def test_slack_channeltype_group_dm_accepted_by_save_draft(client, slack_f
     slack_file.parent.mkdir(parents=True, exist_ok=True)
     slack_file.write_text(json.dumps({"items": [{
         "id": "gdm1", "sender": "alice", "channel": "mpdm-alice--testuser--bob-1",
-        "channelType": "group_dm", "channelId": "C0BC0TT5Z2L",
+        "channelType": "group_dm", "channelId": "C0TESTGDM01",
         "snippet": "can you review this PR?", "threadContext": "",
         "draft": "auto draft", "generatedDraft": "auto draft",
         "status": "needs-review", "ts": 1718600000,
