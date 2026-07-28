@@ -122,6 +122,7 @@ async def list_files(request: web.Request) -> web.Response:
 async def get_file(request: web.Request) -> web.Response:
     name = _safe_name(request.match_info["name"])
     path = MEMORY_DIR / name
+    # Left sync by the D-078 async-I/O sweep: filestore has no async text sibling.
     content, etag = filestore.read_text(path)
     if not content and etag is None:
         raise web.HTTPNotFound(reason=f"{name} not found")

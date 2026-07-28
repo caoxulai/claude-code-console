@@ -21,7 +21,7 @@ def register(app: web.Application):
 
 
 async def get_settings(request: web.Request) -> web.Response:
-    data, etag = filestore.read_json(SETTINGS_PATH)
+    data, etag = await filestore.async_read_json(SETTINGS_PATH)
     return web.json_response({"data": data, "etag": etag})
 
 
@@ -34,9 +34,9 @@ async def put_settings(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="data field required")
 
     try:
-        new_etag = filestore.write_json(SETTINGS_PATH, data, expected_etag)
+        new_etag = await filestore.async_write_json(SETTINGS_PATH, data, expected_etag)
     except filestore.ConflictError as e:
-        current_data, current_etag = filestore.read_json(SETTINGS_PATH)
+        current_data, current_etag = await filestore.async_read_json(SETTINGS_PATH)
         return web.json_response(
             {"error": "conflict", "message": str(e), "current": current_data, "etag": current_etag},
             status=409,
@@ -50,5 +50,5 @@ async def put_settings(request: web.Request) -> web.Response:
 
 
 async def get_settings_local(request: web.Request) -> web.Response:
-    data, etag = filestore.read_json(SETTINGS_LOCAL_PATH)
+    data, etag = await filestore.async_read_json(SETTINGS_LOCAL_PATH)
     return web.json_response({"data": data, "etag": etag})
