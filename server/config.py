@@ -7,6 +7,7 @@ circular-import hazards.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,49 @@ class AppConfig:
     node24_bin_override: str
     config_path: Path
     allow_remote: bool
+    slack_self_mention_ids: tuple[str, ...]
+    slack_bot_senders: tuple[str, ...]
+
+
+# ── Config-file reader (tolerant) ─────────────────────────────────────────────
+
+def _read_config_file(path: Path) -> dict:
+    """Load the user config JSON, degrading to {} on any read/parse failure.
+
+    A missing or corrupt config file must never crash startup, so we swallow
+    OSError (unreadable) and JSONDecodeError (malformed) and also ignore a
+    non-dict top-level document.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_identity_list(env_value: str, file_value, *, lower: bool) -> tuple[str, ...]:
+    """Resolve one identity list with env (comma-separated) > file (JSON array) > empty.
+
+    Entries are stripped and empties dropped; non-string file items are ignored.
+    ``lower=True`` lowercases each entry (bot senders), else case is preserved
+    (self-mention IDs). A blank/whitespace-only env value falls through to the
+    file rather than shadowing it with an empty list.
+    """
+    raw: list = []
+    stripped_env = env_value.strip()
+    if stripped_env:
+        raw = stripped_env.split(",")
+    elif isinstance(file_value, list):
+        raw = file_value
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        val = item.strip()
+        if not val:
+            continue
+        out.append(val.lower() if lower else val)
+    return tuple(out)
 
 
 # ── Build the singleton ──────────────────────────────────────────────────────
@@ -129,6 +173,22 @@ def _build_config() -> AppConfig:
     # allow_remote: whether to permit binding to non-loopback hosts
     allow_remote = os.environ.get("CLAUDE_WEB_ALLOW_REMOTE") == "1"
 
+    # Slack personal identity: env (comma-separated) > config-file key (JSON
+    # array) > empty. Ships EMPTY so no personal identity lives in the repo; an
+    # empty tuple means "never match" for the consumer (self-mention detection
+    # disabled), NEVER "match everything".
+    _config_data = _read_config_file(config_path)
+    slack_self_mention_ids = _resolve_identity_list(
+        os.environ.get("CLAUDE_WEB_SELF_MENTION_IDS", ""),
+        _config_data.get("slackSelfMentionIds"),
+        lower=False,
+    )
+    slack_bot_senders = _resolve_identity_list(
+        os.environ.get("CLAUDE_WEB_BOT_SENDERS", ""),
+        _config_data.get("slackBotSenders"),
+        lower=True,
+    )
+
     return AppConfig(
         secret=secret,
         port=port,
@@ -145,6 +205,8 @@ def _build_config() -> AppConfig:
         node24_bin_override=node24_bin_override,
         config_path=config_path,
         allow_remote=allow_remote,
+        slack_self_mention_ids=slack_self_mention_ids,
+        slack_bot_senders=slack_bot_senders,
     )
 
 
