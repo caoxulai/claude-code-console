@@ -541,7 +541,28 @@ def _new_entry_indices(project_dir: Path, name: str, entries: list[dict]) -> lis
 # RE-RUN against the freshly-read dismissed set every call (the conflict COUNT is
 # never cached: a cluster dismiss lowers the true count without moving the .md
 # mtime, so keying the count on the .md etag alone would serve a stale count).
+#
+# BOUNDED TWO WAYS (D-078 item 27a) — an etag-keyed dict grows forever otherwise,
+# since every append to a role's .md mints a fresh (and permanently unreachable)
+# key. It stays a PLAIN dict (tests monkeypatch it with `{}`); the bounding lives
+# in the write path in `_parse_cache_store`:
+#   1. same-file eviction — storing a new etag for a (project_dir, name) drops
+#      every other key for that same file. This is the eviction that matches the
+#      REAL churn pattern: one long-lived role file rewritten N times.
+#   2. a hard `_PARSE_CACHE_MAX` cap evicting oldest-inserted (dict insertion
+#      order) as a backstop for breadth — many distinct files/roles seen once.
 _PARSE_CACHE: dict[tuple, list[dict]] = {}
+_PARSE_CACHE_MAX = 256
+
+
+def _parse_cache_store(cache_key: tuple, entries: list[dict]) -> None:
+    """Insert a parsed-entries memo entry, keeping _PARSE_CACHE bounded."""
+    file_key = cache_key[:2]
+    for stale in [k for k in _PARSE_CACHE if k[:2] == file_key and k != cache_key]:
+        del _PARSE_CACHE[stale]
+    _PARSE_CACHE[cache_key] = entries
+    while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+        del _PARSE_CACHE[next(iter(_PARSE_CACHE))]
 
 
 def context_summary(project_dir: Path, name: str) -> dict:
@@ -575,7 +596,7 @@ def context_summary(project_dir: Path, name: str) -> dict:
         else:
             entries = parse_context_entries(content)
             if etag is not None:
-                _PARSE_CACHE[cache_key] = entries
+                _parse_cache_store(cache_key, entries)
         new_count = len(_new_entry_indices(project_dir, name, entries))
         dismissed = _read_dismissed_keys(project_dir, name)
         context_bytes = len(content.encode("utf-8"))
