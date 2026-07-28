@@ -1185,6 +1185,40 @@ test('approveOutcome: a null/garbage body never crashes and degrades to "error" 
   assert.equal(approveOutcome(200, null).outcome, 'ok');
 });
 
+// --- approveOutcome: the SIXTH outcome — draft_save_failed (D-077 item 2) -----
+// The backend no longer degrades a failed Outlook draft save into a green
+// 200/approved/draftSaved:false: it returns 502 {error:'draft_save_failed',
+// message, etag} WITHOUT flipping the item, which stays actionable for a retry.
+// approveOutcome must map it to its own tagged outcome so the page shows the
+// SAME red-banner treatment as the 422 recipient shapes — never the green
+// "Copied!" toast, and never the 409 "Conflict... Refreshing" (a refresh would
+// clear the banner and fix nothing).
+
+test('approveOutcome: 502 draft_save_failed -> distinct red-banner outcome, item stays actionable', () => {
+  const r = approveOutcome(502, {
+    error: 'draft_save_failed',
+    message: 'Outlook draft save failed — item NOT approved; retry once the email connection recovers',
+    etag: 'e9',
+  });
+  assert.equal(r.outcome, 'draft_save_failed');
+  assert.equal(r.draftSaved, false);
+  assert.ok(r.message.includes('NOT approved'));
+  assert.notEqual(r.outcome, 'ok');        // never the green "Copied!"
+  assert.notEqual(r.outcome, 'conflict');  // never "Conflict... Refreshing"
+});
+
+test('approveOutcome: 502 draft_save_failed with a missing message -> sane retry default', () => {
+  const r = approveOutcome(502, { error: 'draft_save_failed' });
+  assert.equal(r.outcome, 'draft_save_failed');
+  assert.ok(r.message && r.message.length > 0);
+  assert.notEqual(r.message, 'undefined');
+});
+
+test('approveOutcome: a 502 WITHOUT the draft_save_failed code stays a generic "error"', () => {
+  const r = approveOutcome(502, { error: 'bad_gateway', message: 'upstream sad' });
+  assert.equal(r.outcome, 'error');
+});
+
 // --- approveOutcome: the FIFTH outcome — unresolved_recipients (D-069 part 4) -
 // The contacts resolver leaves a genuinely-unresolvable name-only TO recipient
 // with email:'' rather than fabricating an address. Saving a partial draft would

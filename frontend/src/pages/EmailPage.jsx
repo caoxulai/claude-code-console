@@ -720,6 +720,15 @@ export default function EmailPage() {
         setError(message);
         return;
       }
+      if (outcome === 'draft_save_failed') {
+        // D-077 item 2: the Outlook draft save failed (MCP/auth/network) and the
+        // backend kept the item UNAPPROVED — same red-banner treatment as the
+        // recipient shapes: no refresh() (it would clear the banner; the item is
+        // already in the list, unchanged) and no editingId change, so the user
+        // simply retries Approve once the email connection recovers.
+        setError(message);
+        return;
+      }
       if (outcome === 'error') {
         setError(message || 'Failed to approve the draft.');
         return;

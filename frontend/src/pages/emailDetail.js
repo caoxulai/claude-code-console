@@ -542,6 +542,17 @@ export function approveOutcome(httpStatus, body) {
         : "Couldn't resolve one or more recipients — draft not saved; add them manually and retry.");
     return { outcome: 'unresolved_recipients', etag, message, names, draftSaved: false };
   }
+  if (httpStatus === 502 && b.error === 'draft_save_failed') {
+    // D-077 item 2: the Outlook draft save was ATTEMPTED and FAILED (MCP/auth/
+    // network) — the backend did NOT flip the item to approved and did NOT write
+    // the sidecar, so it is still actionable. Same RED-banner treatment as the
+    // 422 recipient shapes (distinct from the 409 "Conflict... Refreshing"),
+    // and NEVER the green "Copied!" — the user retries once things recover.
+    const message = (typeof b.message === 'string' && b.message.trim())
+      ? b.message.trim()
+      : 'Outlook draft save failed — item NOT approved; retry once the email connection recovers.';
+    return { outcome: 'draft_save_failed', etag, message, draftSaved: false };
+  }
   const ok2xx = httpStatus >= 200 && httpStatus < 300;
   if (ok2xx) {
     return {
