@@ -214,7 +214,13 @@ under `frontend/dist/`, then its `postbuild` hook runs `scripts/copy-dist.mjs`,
 which wipes and repopulates `server/static/` from it. `server/static/` is
 gitignored (build output) but shipped as package data, so the installed server
 serves the UI at runtime with no Node present. In dev mode the server prefers
-`frontend/dist/` and logs which directory it is serving at startup.
+`frontend/dist/`, and on every start it prints one line naming the directory it
+actually serves, so a stale or absent build is visible:
+
+```
+[claude-web] INFO server.app: Frontend dist: /path/to/server/static (packaged server/static)
+[claude-web] INFO server.app: Frontend dist: /path/to/frontend/dist (missing — UI not served)
+```
 
 Packaging metadata lives entirely in `pyproject.toml` — version, dependencies,
 the `claude-web` console script, and package data. There is no `setup.py`;

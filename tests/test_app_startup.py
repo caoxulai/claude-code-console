@@ -30,6 +30,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -241,6 +242,77 @@ def test_create_app_logs_missing_frontend_dist(tmp_path, monkeypatch, caplog):
     assert len(lines) == 1, lines
     assert str(missing) in lines[0]
     assert "missing" in lines[0].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Item 23 (visibility half) — the line actually reaches the operator's terminal
+#
+# caplog attaches its OWN handler, so the tests above pin the call site only.
+# Nothing in this process ever called logging.basicConfig/addHandler, so the root
+# logger stayed at WARNING with no handlers and the INFO record was DISCARDED —
+# a real `claude-web start` printed nothing. These tests run the real cmd_start
+# entry point and read captured stderr, so they fail if the handler wiring
+# regresses.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def _restore_logging(monkeypatch):
+    """Undo cmd_start's process-wide logging setup after the test."""
+    root = logging.getLogger()
+    before = list(root.handlers)
+    server_level = logging.getLogger("server").level
+    monkeypatch.setattr(cli_mod, "_LOGGING_CONFIGURED", False, raising=True)
+    yield
+    for handler in list(root.handlers):
+        if handler not in before:
+            root.removeHandler(handler)
+    logging.getLogger("server").setLevel(server_level)
+
+
+def _run_cmd_start(tmp_path, monkeypatch, dist: Path):
+    """Run the real CLI start path with run_app/browser stubbed out."""
+    _point_config_at(tmp_path, monkeypatch, None)
+    monkeypatch.setattr("server.config.cfg.permission_mode", "bypassPermissions")
+    monkeypatch.setattr(app_mod, "FRONTEND_DIST", dist)
+    monkeypatch.setattr(app_mod, "ALLOWED_CWD_ROOTS", [tmp_path])
+    monkeypatch.setenv("CLAUDE_WEB_CWD", str(tmp_path))
+    monkeypatch.setattr(cli_mod.web, "run_app", lambda app, **kw: None)
+    args = SimpleNamespace(host="127.0.0.1", port=9765, no_browser=True, allow_remote=False)
+    cli_mod.cmd_start(args)
+
+
+def test_cmd_start_makes_the_dist_line_visible_on_stderr(
+    tmp_path, monkeypatch, capsys, _restore_logging
+):
+    """`claude-web start` must actually PRINT which dist dir it serves."""
+    dist = _fake_dist(tmp_path)
+    _run_cmd_start(tmp_path, monkeypatch, dist)
+
+    err = capsys.readouterr().err
+    assert "Frontend dist" in err, err
+    assert str(dist) in err, err
+
+
+def test_cmd_start_makes_the_missing_dist_line_visible(
+    tmp_path, monkeypatch, capsys, _restore_logging
+):
+    """The UI-less-install failure mode (404 on / and /sessions) is the reason
+    this line exists — it must be visible without any extra env/flag."""
+    _run_cmd_start(tmp_path, monkeypatch, tmp_path / "nope-dist")
+
+    err = capsys.readouterr().err
+    assert "Frontend dist" in err, err
+    assert "missing" in err.lower(), err
+
+
+def test_configure_logging_is_idempotent(_restore_logging):
+    """Repeated calls must not stack handlers (duplicate log lines)."""
+    root = logging.getLogger()
+    before = len(root.handlers)
+    cli_mod._configure_logging()
+    after_first = len(root.handlers)
+    cli_mod._configure_logging()
+    assert after_first == before + 1
+    assert len(root.handlers) == after_first
 
 
 # --------------------------------------------------------------------------- #

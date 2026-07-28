@@ -1,6 +1,7 @@
 """CLI entry point for claude-web."""
 import argparse
 import json
+import logging
 import sys
 import webbrowser
 from pathlib import Path
@@ -11,6 +12,32 @@ from server.config import cfg
 
 
 CONFIG_PATH = cfg.config_path
+
+# Nothing in this process ever configured logging, so the root logger had no
+# handlers and its default WARNING level: every logger.info() the server emits
+# (notably create_app's "Frontend dist: ..." line, which tells the operator
+# whether dev or packaged assets are live) was silently discarded, and WARNING+
+# only escaped via logging's handler of last resort. cmd_start installs a real
+# stderr handler once so those lines are actually visible.
+_LOGGING_CONFIGURED = False
+
+
+def _configure_logging() -> None:
+    """Install one stderr handler and enable INFO for the `server` package.
+
+    The INFO level is scoped to the `server` logger rather than the root logger
+    on purpose: raising the root level would also switch on aiohttp's
+    per-request access log, which this console has never printed.
+    Idempotent — repeated calls (tests, re-entry) never stack handlers.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[claude-web] %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger("server").setLevel(logging.INFO)
+    _LOGGING_CONFIGURED = True
 
 
 def load_config() -> dict:
@@ -96,6 +123,10 @@ def cmd_start(args):
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # Before create_app(), so its startup lines (e.g. which frontend dist is
+    # actually being served) reach the operator's terminal.
+    _configure_logging()
 
     from server.app import create_app
 
